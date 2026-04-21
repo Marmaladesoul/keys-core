@@ -1,0 +1,75 @@
+# CI for the private keys-core (keys-ffi) workspace.
+#
+# Wrinkle: keys-ffi currently depends on keepass-core and keepass-merge via
+# *path* dependencies (`../../../KeepassCore/crates/keepass-core`). That path
+# doesn't exist inside a single-repo checkout, so CI must check out both
+# repos side-by-side to match the local developer layout.
+#
+# When keepass-core publishes to crates.io (v0.1+), flip the dependencies
+# in crates/keys-ffi/Cargo.toml from path to version deps and simplify this
+# workflow — the side-by-side checkout step goes away.
+#
+# Linux-only while private (see KeepassCore/.github/workflows/ci.yml for
+# the budget rationale). Expand the matrix to macOS + Windows later.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  build:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Check out keys-core into KeysCore/
+      - name: Checkout keys-core
+        uses: actions/checkout@v4
+        with:
+          path: KeysCore
+
+      # 2. Check out keepass-core into KeepassCore/ (sibling directory).
+      #    Uses a fine-grained deploy key or SSH-deploy pattern once the
+      #    public repo is private. Once keepass-core is public, no auth
+      #    is needed.
+      - name: Checkout keepass-core
+        uses: actions/checkout@v4
+        with:
+          repository: Marmaladesoul/keepass-core
+          path: KeepassCore
+          # While keepass-core is private, this token must have access to
+          # the other repo. Options: a PAT stored as a secret, or a fine-
+          # grained deploy key (preferred). Configure before first push.
+          token: ${{ secrets.KEEPASS_CORE_READ_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: KeysCore
+
+      - name: fmt check
+        working-directory: KeysCore
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        working-directory: KeysCore
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: test
+        working-directory: KeysCore
+        run: cargo test --workspace --all-features --no-fail-fast
