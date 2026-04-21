@@ -40,14 +40,14 @@ jobs:
     steps:
       # 1. Check out keys-core into KeysCore/
       - name: Checkout keys-core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: KeysCore
 
       # 2. Check out keepass-core into KeepassCore/ (sibling directory).
       #    No token needed — the repo is public.
       - name: Checkout keepass-core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Marmaladesoul/keepass-core
           path: KeepassCore
