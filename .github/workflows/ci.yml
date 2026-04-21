@@ -5,12 +5,15 @@
 # doesn't exist inside a single-repo checkout, so CI must check out both
 # repos side-by-side to match the local developer layout.
 #
-# When keepass-core publishes to crates.io (v0.1+), flip the dependencies
-# in crates/keys-ffi/Cargo.toml from path to version deps and simplify this
-# workflow — the side-by-side checkout step goes away.
+# keepass-core is public so no authentication is required to check it out.
 #
-# Linux-only while private (see KeepassCore/.github/workflows/ci.yml for
-# the budget rationale). Expand the matrix to macOS + Windows later.
+# Once keepass-core publishes to crates.io (v0.1+), flip the dependencies in
+# crates/keys-ffi/Cargo.toml from path to version deps — at that point the
+# side-by-side checkout step goes away entirely.
+#
+# Linux-only on this private repo to conserve the 2,000 minute/month
+# free-plan Actions budget (which applies to private repos only; the
+# public keepass-core repo has unlimited minutes).
 
 name: CI
 
@@ -42,18 +45,12 @@ jobs:
           path: KeysCore
 
       # 2. Check out keepass-core into KeepassCore/ (sibling directory).
-      #    Uses a fine-grained deploy key or SSH-deploy pattern once the
-      #    public repo is private. Once keepass-core is public, no auth
-      #    is needed.
+      #    No token needed — the repo is public.
       - name: Checkout keepass-core
         uses: actions/checkout@v4
         with:
           repository: Marmaladesoul/keepass-core
           path: KeepassCore
-          # While keepass-core is private, this token must have access to
-          # the other repo. Options: a PAT stored as a secret, or a fine-
-          # grained deploy key (preferred). Configure before first push.
-          token: ${{ secrets.KEEPASS_CORE_READ_TOKEN || secrets.GITHUB_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
