@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+*.rs.bk
+
+# Reference material — other Rust KeePass libraries cloned for study.
+# Not part of our code; do not commit.
+/_reference/
+
+# Generated uniffi bindings — regenerated per build, not source of truth.
+/bindings/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# Temp
+*.swp
+*.swo
+*~

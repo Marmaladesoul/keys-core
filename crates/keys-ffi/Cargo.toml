@@ -1,0 +1,27 @@
+[package]
+name = "keys-ffi"
+description = "Private FFI facade for the Keys password manager. Consumes keepass-core and exposes a uniffi-generated API for SwiftUI and WinUI 3 frontends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Depends on the public crates via path for initial co-development.
+# Switch to a crates.io version dep once keepass-core v0.1 is published.
+keepass-core = { path = "../../../KeepassCore/crates/keepass-core" }
+keepass-merge = { path = "../../../KeepassCore/crates/keepass-merge" }
+
+# uniffi added when FFI surface is defined:
+# uniffi = { version = "0.28", features = ["cli"] }
+
+[build-dependencies]
+# uniffi-bindgen = "0.28"

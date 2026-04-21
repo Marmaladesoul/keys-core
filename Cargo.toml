@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/keys-ffi",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Marmaladesoul"]
+license = "UNLICENSED"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"  # not "forbid" — uniffi-generated code may need unsafe internally
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
