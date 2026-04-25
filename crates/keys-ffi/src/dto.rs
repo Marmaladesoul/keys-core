@@ -19,7 +19,7 @@ use keepass_core::model::{
 };
 
 /// KDBX canonical key for the always-protected password field.
-const PASSWORD_FIELD_NAME: &str = "Password";
+pub(crate) const PASSWORD_FIELD_NAME: &str = "Password";
 
 /// Lightweight projection of an [`Entry`] for list views — title +
 /// identifying metadata, no notes, no custom fields, no protected values.

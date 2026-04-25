@@ -15,11 +15,13 @@ use std::sync::{Arc, Mutex};
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
-use keepass_core::model::{Entry as KcEntry, EntryId, Group as KcGroup, GroupId};
+use keepass_core::model::{
+    CustomFieldValue, Entry as KcEntry, EntryId, Group as KcGroup, GroupId, HistoryPolicy,
+};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
-use crate::dto::{Entry, EntrySummary, Group};
+use crate::dto::{Entry, EntrySummary, Group, PASSWORD_FIELD_NAME};
 use crate::error::VaultError;
 
 /// An opened KDBX vault.
@@ -36,7 +38,7 @@ pub struct Vault {
     /// satisfies uniffi's `Send + Sync` requirement; it does **not** make
     /// the FFI re-entrant — every method that needs the unlocked state
     /// holds the lock for its full duration.
-    inner: Mutex<Option<Kdbx<Unlocked>>>,
+    pub(crate) inner: Mutex<Option<Kdbx<Unlocked>>>,
     /// Retained outside the `Mutex` so [`Self::path`] returns the
     /// constructor path even after `lock()` clears the inner state.
     path: PathBuf,
@@ -210,6 +212,143 @@ impl Vault {
             }
         });
         Ok(out)
+    }
+
+    /// Reveal the plaintext of a single protected field.
+    ///
+    /// `field_name` is the canonical KDBX key — `"Password"` for the
+    /// structural password slot, or the verbatim key of any protected
+    /// custom field. Case-sensitive (matches the on-disk XML).
+    ///
+    /// Slice 3's [`Self::get_entry`] returns every protected field
+    /// with `value: None`; this method is the only path that produces
+    /// plaintext across the FFI. The plaintext crosses as a `String`
+    /// because uniffi has no native `SecretString`-aware lift —
+    /// **binding-side zeroing is the frontend's responsibility**.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if no entry matches `entry_uuid`.
+    /// [`VaultError::FieldNotFound`] if the entry has no protected
+    /// field by `field_name` (passing the key of an unprotected
+    /// custom field also yields `FieldNotFound` — unprotected values
+    /// are reachable via `get_entry`).
+    pub fn reveal_field(
+        &self,
+        entry_uuid: String,
+        field_name: String,
+    ) -> Result<String, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let (_group_id, entry) =
+            find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+
+        if field_name == PASSWORD_FIELD_NAME {
+            return Ok(entry.password.clone());
+        }
+        entry
+            .custom_fields
+            .iter()
+            .find(|c| c.protected && c.key == field_name)
+            .map(|c| c.value.clone())
+            .ok_or(VaultError::FieldNotFound)
+    }
+
+    /// Sparse patch of a single protected field. Set-or-insert
+    /// semantics: if no field with that name exists, one is created;
+    /// otherwise the existing field's value is replaced and its
+    /// `protected` flag re-asserted.
+    ///
+    /// Goes through [`keepass_core::kdbx::Kdbx::edit_entry`] with
+    /// `HistoryPolicy::Snapshot`, so a credential change always lands
+    /// in entry history and bumps `last_modified_ms`.
+    ///
+    /// `new_value` crosses the boundary as `String`. Same binding-side
+    /// zeroing responsibility as [`Self::reveal_field`].
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if no entry matches `entry_uuid`.
+    pub fn set_protected_field(
+        &self,
+        entry_uuid: String,
+        field_name: String,
+        new_value: String,
+    ) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let secret = SecretString::from(new_value);
+
+        kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
+            if field_name == PASSWORD_FIELD_NAME {
+                editor.set_password(secret);
+            } else {
+                editor.set_custom_field(field_name, CustomFieldValue::Protected(secret));
+            }
+        })
+        .map_err(|_| VaultError::NotFound)
+    }
+
+    /// Remove a protected field from the entry.
+    ///
+    /// Distinct from `set_protected_field(_, _, "")` for protected
+    /// custom fields — clearing removes the field's `<String>` element
+    /// entirely.
+    ///
+    /// **`Password` is structural in KDBX** — there is no on-disk
+    /// representation for "absent password". Clearing the password
+    /// slot is therefore equivalent to setting it to the empty string;
+    /// frontends and the disk format treat the two identically.
+    ///
+    /// Passing the key of an unprotected custom field yields
+    /// [`VaultError::FieldNotFound`] — this method is the
+    /// protected-field-clear path; unprotected fields go through the
+    /// (slice-5) entry-mutation API.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if no entry matches `entry_uuid`.
+    /// [`VaultError::FieldNotFound`] if no protected field by
+    /// `field_name` exists on the entry (Password excepted — it is
+    /// always clearable per the doc above).
+    pub fn clear_protected_field(
+        &self,
+        entry_uuid: String,
+        field_name: String,
+    ) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+
+        // Pre-check the protected-only invariant before taking the
+        // mutable borrow for `edit_entry`. The read borrow is dropped
+        // before the mutation, so the borrow-checker is happy.
+        let is_password = field_name == PASSWORD_FIELD_NAME;
+        if !is_password {
+            let (_g, entry) = find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+            let exists_protected = entry
+                .custom_fields
+                .iter()
+                .any(|c| c.key == field_name && c.protected);
+            if !exists_protected {
+                return Err(VaultError::FieldNotFound);
+            }
+        }
+
+        kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
+            if is_password {
+                editor.set_password(SecretString::from(String::new()));
+            } else {
+                editor.remove_custom_field(&field_name);
+            }
+        })
+        .map_err(|_| VaultError::NotFound)?;
+        Ok(())
     }
 }
 

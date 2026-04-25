@@ -53,6 +53,13 @@ pub enum VaultError {
     /// passed in.
     #[error("entry or group not found")]
     NotFound,
+
+    /// Asked to reveal or clear a protected field by a name that
+    /// doesn't match any protected slot on the entry. Distinct from
+    /// [`Self::NotFound`] (entry-level miss). Same fixed-Display
+    /// posture, no payload.
+    #[error("protected field not found")]
+    FieldNotFound,
 }
 
 impl From<keepass_core::Error> for VaultError {
