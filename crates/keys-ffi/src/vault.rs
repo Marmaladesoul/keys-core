@@ -28,6 +28,7 @@ use crate::dto::{
     PASSWORD_FIELD_NAME,
 };
 use crate::error::{VaultError, model_err_to_vault_err};
+use crate::observer::{VaultChange, VaultObserver};
 use crate::portable::PortableEntry;
 
 /// An opened KDBX vault.
@@ -37,7 +38,7 @@ use crate::portable::PortableEntry;
 /// frontends reconstruct a new `Vault` if they need to unlock again.
 /// This matches `keepass-core`'s typestate (no `relock_then_unlock`
 /// on `Kdbx<Unlocked>`).
-#[derive(Debug, uniffi::Object)]
+#[derive(uniffi::Object)]
 #[non_exhaustive]
 pub struct Vault {
     /// `Some` while unlocked, `None` after [`Self::lock`]. The `Mutex`
@@ -48,6 +49,11 @@ pub struct Vault {
     /// Retained outside the `Mutex` so [`Self::path`] returns the
     /// constructor path even after `lock()` clears the inner state.
     path: PathBuf,
+    /// One observer per vault (slice 9). `Arc` is cloned under the
+    /// brief observer lock at fire time, then the lock drops before
+    /// `on_change` runs — so observer callbacks may reenter the
+    /// vault without deadlocking.
+    observer: Mutex<Option<Arc<dyn VaultObserver>>>,
 }
 
 #[uniffi::export]
@@ -82,6 +88,7 @@ impl Vault {
         Ok(Arc::new(Self {
             inner: Mutex::new(Some(kdbx)),
             path: path_buf,
+            observer: Mutex::new(None),
         }))
     }
 
@@ -105,6 +112,11 @@ impl Vault {
     /// — no method on `Vault` panics while holding the lock.
     pub fn lock(&self) -> Result<(), VaultError> {
         *self.inner.lock().expect("Vault mutex poisoned") = None;
+        // Fire `Locked` to the current observer, then clear it so no
+        // post-lock events can reach a stale handle. Per the spec
+        // invariant: `Locked` is the final event for this Vault.
+        self.fire(&VaultChange::Locked);
+        *self.observer.lock().expect("Vault observer mutex poisoned") = None;
         Ok(())
     }
 
@@ -289,14 +301,17 @@ impl Vault {
         let target = parse_entry_id(&entry_uuid)?;
         let secret = SecretString::from(new_value);
 
-        kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
+        let result = kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
             if field_name == PASSWORD_FIELD_NAME {
                 editor.set_password(secret);
             } else {
                 editor.set_custom_field(field_name, CustomFieldValue::Protected(secret));
             }
-        })
-        .map_err(model_err_to_vault_err)
+        });
+        drop(guard);
+        result.map_err(model_err_to_vault_err)?;
+        self.fire(&VaultChange::EntryModified { uuid: entry_uuid });
+        Ok(())
     }
 
     /// Remove a protected field from the entry.
@@ -346,14 +361,16 @@ impl Vault {
             }
         }
 
-        kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
+        let result = kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
             if is_password {
                 editor.set_password(SecretString::from(String::new()));
             } else {
                 editor.remove_custom_field(&field_name);
             }
-        })
-        .map_err(model_err_to_vault_err)?;
+        });
+        drop(guard);
+        result.map_err(model_err_to_vault_err)?;
+        self.fire(&VaultChange::EntryModified { uuid: entry_uuid });
         Ok(())
     }
 
@@ -398,7 +415,12 @@ impl Vault {
             .map_err(model_err_to_vault_err)?;
         }
 
-        Ok(new_id.0.to_string())
+        let new_uuid = new_id.0.to_string();
+        drop(guard);
+        self.fire(&VaultChange::EntryModified {
+            uuid: new_uuid.clone(),
+        });
+        Ok(new_uuid)
     }
 
     /// Sparse update of an existing entry's unprotected fields. `None`
@@ -471,6 +493,8 @@ impl Vault {
             }
         })
         .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::EntryModified { uuid: uuid.clone() });
         Ok(())
     }
 
@@ -487,7 +511,10 @@ impl Vault {
         let mut guard = self.inner.lock().expect("Vault mutex poisoned");
         let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
         let target = parse_entry_id(&uuid)?;
-        kdbx.delete_entry(target).map_err(model_err_to_vault_err)
+        kdbx.delete_entry(target).map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::EntryDeleted { uuid });
+        Ok(())
     }
 
     /// Stamp `last_access_ms` only — no `last_modified_ms` bump and
@@ -524,7 +551,10 @@ impl Vault {
         let target = parse_entry_id(&uuid)?;
         let new_parent = parse_group_id(&new_group_uuid)?;
         kdbx.move_entry(target, new_parent)
-            .map_err(model_err_to_vault_err)
+            .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::EntryModified { uuid });
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -553,7 +583,12 @@ impl Vault {
         let new_id = kdbx
             .add_group(parent, NewGroup::new(name))
             .map_err(model_err_to_vault_err)?;
-        Ok(new_id.0.to_string())
+        let new_uuid = new_id.0.to_string();
+        drop(guard);
+        self.fire(&VaultChange::GroupChanged {
+            uuid: new_uuid.clone(),
+        });
+        Ok(new_uuid)
     }
 
     /// Sparse update of a group's metadata. `None` on a patch field
@@ -575,7 +610,10 @@ impl Vault {
                 editor.set_notes(n);
             }
         })
-        .map_err(model_err_to_vault_err)
+        .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::GroupChanged { uuid });
+        Ok(())
     }
 
     /// Hard delete of a group and every entry / sub-group it
@@ -594,7 +632,10 @@ impl Vault {
         let mut guard = self.inner.lock().expect("Vault mutex poisoned");
         let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
         let target = parse_group_id(&uuid)?;
-        kdbx.delete_group(target).map_err(model_err_to_vault_err)
+        kdbx.delete_group(target).map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::GroupChanged { uuid });
+        Ok(())
     }
 
     /// Move a group under `new_parent_uuid`. A move that would make
@@ -613,7 +654,10 @@ impl Vault {
         let target = parse_group_id(&uuid)?;
         let new_parent = parse_group_id(&new_parent_uuid)?;
         kdbx.move_group(target, new_parent)
-            .map_err(model_err_to_vault_err)
+            .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::GroupChanged { uuid });
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -637,7 +681,12 @@ impl Vault {
         let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
         let target = parse_entry_id(&uuid)?;
         let bin = kdbx.recycle_entry(target).map_err(model_err_to_vault_err)?;
-        Ok(bin.map(|gid| gid.0.to_string()))
+        let bin_uuid = bin.map(|gid| gid.0.to_string());
+        drop(guard);
+        // Recycle is "gone from primary view" regardless of whether the
+        // bin was enabled (disabled-bin path falls through to hard delete).
+        self.fire(&VaultChange::EntryDeleted { uuid });
+        Ok(bin_uuid)
     }
 
     /// Soft-delete a group (and its descendants) into the recycle-
@@ -653,7 +702,10 @@ impl Vault {
         let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
         let target = parse_group_id(&uuid)?;
         let bin = kdbx.recycle_group(target).map_err(model_err_to_vault_err)?;
-        Ok(bin.map(|gid| gid.0.to_string()))
+        let bin_uuid = bin.map(|gid| gid.0.to_string());
+        drop(guard);
+        self.fire(&VaultChange::GroupChanged { uuid });
+        Ok(bin_uuid)
     }
 
     /// Permanently delete every entry and group inside the recycle-
@@ -665,7 +717,16 @@ impl Vault {
     pub fn empty_recycle_bin(&self) -> Result<u64, VaultError> {
         let mut guard = self.inner.lock().expect("Vault mutex poisoned");
         let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        // Capture the bin uuid (if set) before mutating, so the
+        // GroupChanged event carries it. None when no recycle bin is
+        // configured — emit a generic GroupChanged with an empty uuid
+        // is misleading, so we skip the event in that edge case.
+        let bin_uuid = kdbx.vault().meta.recycle_bin_uuid.map(|g| g.0.to_string());
         let n = kdbx.empty_recycle_bin().map_err(model_err_to_vault_err)?;
+        drop(guard);
+        if let Some(uuid) = bin_uuid {
+            self.fire(&VaultChange::GroupChanged { uuid });
+        }
         Ok(n as u64)
     }
 
@@ -877,6 +938,7 @@ impl Vault {
             .map_err(|e| VaultError::Io(e.to_string()))?;
         tmp.persist(&self.path)
             .map_err(|e| VaultError::Io(e.error.to_string()))?;
+        self.fire(&VaultChange::Saved);
         Ok(())
     }
 
@@ -978,7 +1040,10 @@ impl Vault {
         let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
         let target = parse_entry_id(&entry_uuid)?;
         kdbx.restore_entry_from_history(target, index as usize, HistoryPolicy::Snapshot)
-            .map_err(model_err_to_vault_err)
+            .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::EntryModified { uuid: entry_uuid });
+        Ok(())
     }
 
     /// Remove the history record at `index`. The live entry is
@@ -1002,7 +1067,9 @@ impl Vault {
                 editor.remove_history_at(index as usize)
             })
             .map_err(model_err_to_vault_err)?;
+        drop(guard);
         if removed {
+            self.fire(&VaultChange::EntryModified { uuid: entry_uuid });
             Ok(())
         } else {
             Err(VaultError::IndexOutOfRange)
@@ -1059,7 +1126,61 @@ impl Vault {
         let new_id = kdbx
             .import_entry(parent, inner, /*mint_new_uuid*/ true)
             .map_err(model_err_to_vault_err)?;
-        Ok(new_id.0.to_string())
+        let new_uuid = new_id.0.to_string();
+        drop(guard);
+        self.fire(&VaultChange::EntryModified {
+            uuid: new_uuid.clone(),
+        });
+        Ok(new_uuid)
+    }
+
+    // -------------------------------------------------------------------
+    // Observer (slice 9)
+    // -------------------------------------------------------------------
+
+    /// Register `observer` for change notifications. Replaces any
+    /// previously-registered observer — one observer per vault.
+    pub fn set_observer(&self, observer: Arc<dyn VaultObserver>) {
+        *self.observer.lock().expect("Vault observer mutex poisoned") = Some(observer);
+    }
+
+    /// Remove the currently-registered observer (if any). Subsequent
+    /// mutations fire no events until a new observer is set.
+    pub fn clear_observer(&self) {
+        *self.observer.lock().expect("Vault observer mutex poisoned") = None;
+    }
+}
+
+impl std::fmt::Debug for Vault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let locked = self.is_locked();
+        let has_observer = self
+            .observer
+            .lock()
+            .expect("Vault observer mutex poisoned")
+            .is_some();
+        f.debug_struct("Vault")
+            .field("path", &self.path)
+            .field("locked", &locked)
+            .field("has_observer", &has_observer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Vault {
+    /// Fire `change` to the current observer (if any) **outside**
+    /// the inner mutex. Snapshots the observer `Arc` under the brief
+    /// observer lock, drops the lock, then dispatches — so an
+    /// observer that calls back into the vault doesn't deadlock.
+    pub(crate) fn fire(&self, change: &VaultChange) {
+        let observer = self
+            .observer
+            .lock()
+            .expect("Vault observer mutex poisoned")
+            .clone();
+        if let Some(obs) = observer {
+            obs.on_change(change.clone());
+        }
     }
 }
 

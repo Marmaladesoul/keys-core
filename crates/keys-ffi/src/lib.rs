@@ -14,6 +14,7 @@ use keepass_merge as _;
 
 mod dto;
 mod error;
+mod observer;
 mod portable;
 mod vault;
 
@@ -22,6 +23,7 @@ pub use dto::{
     ProtectedField,
 };
 pub use error::VaultError;
+pub use observer::{VaultChange, VaultObserver};
 pub use portable::PortableEntry;
 pub use vault::Vault;
 
