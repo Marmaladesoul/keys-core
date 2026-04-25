@@ -10,6 +10,7 @@
 // would be more noise than signal.
 #![allow(clippy::missing_panics_doc)]
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -41,7 +42,7 @@ pub struct Vault {
     /// satisfies uniffi's `Send + Sync` requirement; it does **not** make
     /// the FFI re-entrant — every method that needs the unlocked state
     /// holds the lock for its full duration.
-    pub(crate) inner: Mutex<Option<Kdbx<Unlocked>>>,
+    inner: Mutex<Option<Kdbx<Unlocked>>>,
     /// Retained outside the `Mutex` so [`Self::path`] returns the
     /// constructor path even after `lock()` clears the inner state.
     path: PathBuf,
@@ -821,6 +822,107 @@ impl Vault {
         let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
         let id = Uuid::parse_str(&icon_uuid).map_err(|_| VaultError::NotFound)?;
         Ok(kdbx.custom_icon(id).map(<[u8]>::to_vec))
+    }
+
+    // -------------------------------------------------------------------
+    // Save + rekey (slice 7)
+    //
+    // `merge_external` is deferred to its own slice — `keepass-merge`
+    // is currently a stub crate (14 lines of doc-comment ending in
+    // "Implementation pending"). See PROGRESS.md `#R13` for the
+    // escalation.
+    // -------------------------------------------------------------------
+
+    /// Persist the vault to the path it was opened from.
+    ///
+    /// Atomic-write loop: serialise via [`keepass_core::kdbx::Kdbx::save_to_bytes`],
+    /// write to a sibling tempfile in the destination's parent directory,
+    /// `fsync`, then `rename(2)` over the destination via
+    /// [`tempfile::NamedTempFile::persist`]. POSIX guarantees the rename
+    /// is atomic on the same filesystem; `tempfile 3.20+` extends this to
+    /// Windows.
+    ///
+    /// **Why the atomic loop lives at the FFI facade.** `keepass-core`
+    /// only exposes `save_to_bytes` — there's no `save_to_path` helper
+    /// today. If keepass-core grows one, this method collapses to one
+    /// call.
+    ///
+    /// No "save as" — frontends use [`Self::save_to_bytes`] plus their
+    /// own file-write for arbitrary-path saves. That keeps file-picker
+    /// UX in the binding layer where it belongs.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::Io`] if any filesystem step fails (parent dir
+    /// missing, permission denied, fsync failure).
+    /// [`VaultError::WrongKey`] for any crypto-class failure during
+    /// re-encryption (matches the open-side collapse posture).
+    pub fn save(&self) -> Result<(), VaultError> {
+        let bytes = self.save_to_bytes()?;
+        // Same parent directory keeps `persist` to a single rename(2).
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| VaultError::Io("save path has no parent directory".to_owned()))?;
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(parent).map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.write_all(&bytes)
+            .map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.flush().map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.as_file_mut()
+            .sync_all()
+            .map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.persist(&self.path)
+            .map_err(|e| VaultError::Io(e.error.to_string()))?;
+        Ok(())
+    }
+
+    /// Serialise the in-memory vault to encrypted KDBX bytes without
+    /// touching disk. Useful for the `AutoFill` keychain-cache snapshot
+    /// flow and for tests that need round-trip verification.
+    ///
+    /// The output is loadable by [`Vault::new`] and produces a vault
+    /// model byte-identical to the in-memory one (unknown-XML
+    /// preservation included).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::WrongKey`] for any crypto-class failure during
+    /// re-encryption.
+    pub fn save_to_bytes(&self) -> Result<Vec<u8>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        kdbx.save_to_bytes().map_err(VaultError::from)
+    }
+
+    /// Re-derive the master key from `new_password` and rotate the
+    /// vault's outer-header seeds + encryption IV. **In-memory only**
+    /// — the next [`Self::save`] (or [`Self::save_to_bytes`]) writes
+    /// the rekeyed envelope. Reopen with the new password works after
+    /// save; reopen with the old one returns
+    /// [`VaultError::WrongKey`].
+    ///
+    /// `new_password` is wrapped in a [`SecretString`] immediately and
+    /// hashed into a [`CompositeKey`] inside this call; the boundary
+    /// `String` doesn't outlive the rekey. Binding-side zeroing of the
+    /// caller's copy is the frontend's responsibility — same posture as
+    /// [`Self::new`].
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::WrongKey`] for any crypto-class failure (the
+    /// `Kdbx::rekey` documentation calls `Error::Crypto` from rekey
+    /// "effectively unreachable", but if it fires it's a
+    /// `WrongKey` for collapse consistency).
+    pub fn rekey(&self, new_password: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let secret = SecretString::from(new_password);
+        let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
+        kdbx.rekey(&composite).map_err(VaultError::from)
     }
 }
 

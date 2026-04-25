@@ -14,12 +14,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [lints]
 workspace = true
 
-[features]
-# Enables the slice-4 round-trip helper `Vault::save_to_bytes_for_tests`.
-# Slice 7 lands the production `save` / `save_to_bytes` methods and this
-# feature gate is removed wholesale.
-test_helpers = []
-
 [dependencies]
 # Path deps during Phase 2 — flip to crates.io once keepass-core v0.1 ships.
 keepass-core = { path = "../../../KeepassCore/crates/keepass-core" }
@@ -33,6 +27,8 @@ secrecy = "0.10"
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 uuid = "1"
-
-[dev-dependencies]
+# tempfile drives the atomic `Vault::save` write loop (write-to-tempfile,
+# fsync, persist via rename(2)). Lives at the facade because keepass-core
+# only exposes `save_to_bytes`; if it ever gains a `save_to_path`, the
+# facade collapses to one call.
 tempfile = "3"

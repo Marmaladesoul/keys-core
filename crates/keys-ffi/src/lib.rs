@@ -14,8 +14,6 @@ use keepass_merge as _;
 
 mod dto;
 mod error;
-#[cfg(feature = "test_helpers")]
-mod test_support;
 mod vault;
 
 pub use dto::{

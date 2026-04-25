@@ -1,10 +1,7 @@
 //! Integration tests for slice 5 — entry mutation
 //! (create / update / delete / touch / move).
 //!
-//! Compile with `--features test_helpers` for the save+reopen
-//! round-trip helper.
-
-#![cfg(feature = "test_helpers")]
+//! Save+reopen round-trips use the production `save_to_bytes` introduced in slice 7.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -59,7 +56,7 @@ fn root_group_uuid(vault: &Vault) -> String {
 }
 
 fn save_and_reopen(vault: &Vault, password: &str) -> (Arc<Vault>, NamedTempFile) {
-    let bytes = vault.save_to_bytes_for_tests().expect("save");
+    let bytes = vault.save_to_bytes().expect("save");
     let mut tmp = NamedTempFile::new().expect("tempfile");
     tmp.write_all(&bytes).expect("write");
     tmp.flush().expect("flush");

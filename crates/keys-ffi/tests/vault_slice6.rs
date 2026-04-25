@@ -2,8 +2,6 @@
 //! meta setters, and custom icons. Combined into one file to
 //! share fixtures and helpers; logically split by `mod` blocks.
 
-#![cfg(feature = "test_helpers")]
-
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,7 +35,7 @@ fn open_recycle() -> Arc<Vault> {
 }
 
 fn save_and_reopen(vault: &Vault, password: &str) -> (Arc<Vault>, NamedTempFile) {
-    let bytes = vault.save_to_bytes_for_tests().expect("save");
+    let bytes = vault.save_to_bytes().expect("save");
     let mut tmp = NamedTempFile::new().expect("tempfile");
     tmp.write_all(&bytes).expect("write");
     tmp.flush().expect("flush");
@@ -345,7 +343,7 @@ fn meta_setters_round_trip_through_save() {
     vault.set_color("#ff8800".to_owned()).expect("color");
 
     // No public read API for meta yet — round-trip through
-    // save_to_bytes_for_tests + reopen and re-set the same values
+    // save_to_bytes + reopen and re-set the same values
     // (idempotent setter; this exercises the write path at least).
     let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
     reopened

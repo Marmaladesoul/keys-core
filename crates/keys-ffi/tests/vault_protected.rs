@@ -1,12 +1,7 @@
 //! Integration tests for slice 4 — protected-field reveal &
 //! sparse-patch write.
 //!
-//! Compile with `--features test_helpers` so
-//! `Vault::save_to_bytes_for_tests` is available for round-trip
-//! coverage. Slice 7 will replace the helper with the production
-//! `save` API and these tests rename in one go.
-
-#![cfg(feature = "test_helpers")]
+//! Save+reopen round-trips use the production `save_to_bytes` introduced in slice 7.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -48,7 +43,7 @@ fn first_entry_uuid(vault: &Vault) -> String {
 /// reopen with `password`. The temp file owns the bytes' lifetime so
 /// it must outlive the Vault that reads from it.
 fn save_and_reopen(vault: &Vault, password: &str) -> (Arc<Vault>, NamedTempFile) {
-    let bytes = vault.save_to_bytes_for_tests().expect("save");
+    let bytes = vault.save_to_bytes().expect("save");
     let mut tmp = NamedTempFile::new().expect("tempfile");
     tmp.write_all(&bytes).expect("write");
     tmp.flush().expect("flush");
