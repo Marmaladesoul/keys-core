@@ -16,12 +16,15 @@ use std::sync::{Arc, Mutex};
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{
-    CustomFieldValue, Entry as KcEntry, EntryId, Group as KcGroup, GroupId, HistoryPolicy, NewEntry,
+    CustomFieldValue, Entry as KcEntry, EntryId, Group as KcGroup, GroupId, HistoryPolicy,
+    NewEntry, NewGroup,
 };
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
-use crate::dto::{Entry, EntryCreate, EntryPatch, EntrySummary, Group, PASSWORD_FIELD_NAME};
+use crate::dto::{
+    Entry, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch, PASSWORD_FIELD_NAME,
+};
 use crate::error::{VaultError, model_err_to_vault_err};
 
 /// An opened KDBX vault.
@@ -519,6 +522,305 @@ impl Vault {
         let new_parent = parse_group_id(&new_group_uuid)?;
         kdbx.move_entry(target, new_parent)
             .map_err(model_err_to_vault_err)
+    }
+
+    // -------------------------------------------------------------------
+    // Group mutation (slice 6)
+    // -------------------------------------------------------------------
+
+    /// Insert a new group under `parent_uuid`. `None` parents the
+    /// group at the root.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `parent_uuid` doesn't match a
+    /// group.
+    pub fn create_group(
+        &self,
+        name: String,
+        parent_uuid: Option<String>,
+    ) -> Result<String, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let parent = match parent_uuid {
+            Some(s) => parse_group_id(&s)?,
+            None => kdbx.vault().root.id,
+        };
+        let new_id = kdbx
+            .add_group(parent, NewGroup::new(name))
+            .map_err(model_err_to_vault_err)?;
+        Ok(new_id.0.to_string())
+    }
+
+    /// Sparse update of a group's metadata. `None` on a patch field
+    /// leaves it alone; `Some(value)` replaces it.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match a group.
+    pub fn update_group(&self, uuid: String, patch: GroupPatch) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_group_id(&uuid)?;
+        kdbx.edit_group(target, |editor| {
+            if let Some(n) = patch.name {
+                editor.set_name(n);
+            }
+            if let Some(n) = patch.notes {
+                editor.set_notes(n);
+            }
+        })
+        .map_err(model_err_to_vault_err)
+    }
+
+    /// Hard delete of a group and every entry / sub-group it
+    /// contains. Records `<DeletedObjects>` tombstones for the
+    /// removed records so a later merge can distinguish "deleted
+    /// here" from "never seen".
+    ///
+    /// Slice 6's `recycle_group` is the soft-delete path.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match a group, or
+    /// if it identifies the root group (which can't be deleted).
+    pub fn delete_group(&self, uuid: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_group_id(&uuid)?;
+        kdbx.delete_group(target).map_err(model_err_to_vault_err)
+    }
+
+    /// Move a group under `new_parent_uuid`. A move that would make
+    /// the group a descendant of itself fails through the
+    /// `CircularMove → NotFound` mapping in
+    /// [`crate::error::model_err_to_vault_err`].
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if either `uuid` or `new_parent_uuid`
+    /// doesn't resolve, or the move would create a cycle.
+    pub fn move_group(&self, uuid: String, new_parent_uuid: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_group_id(&uuid)?;
+        let new_parent = parse_group_id(&new_parent_uuid)?;
+        kdbx.move_group(target, new_parent)
+            .map_err(model_err_to_vault_err)
+    }
+
+    // -------------------------------------------------------------------
+    // Recycle bin (slice 6)
+    // -------------------------------------------------------------------
+
+    /// Soft-delete an entry into the recycle-bin group.
+    ///
+    /// Returns `Ok(Some(uuid))` with the recycle-bin group's UUID
+    /// when the entry was moved there. Returns `Ok(None)` when the
+    /// recycle bin is **disabled** at the vault meta level — the
+    /// underlying `keepass-core` call falls through to a hard delete
+    /// in that mode, so the resulting state matches `delete_entry`.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match an entry.
+    pub fn recycle_entry(&self, uuid: String) -> Result<Option<String>, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&uuid)?;
+        let bin = kdbx.recycle_entry(target).map_err(model_err_to_vault_err)?;
+        Ok(bin.map(|gid| gid.0.to_string()))
+    }
+
+    /// Soft-delete a group (and its descendants) into the recycle-
+    /// bin group. See [`Self::recycle_entry`] for the disabled-bin
+    /// fall-through semantics.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match a group.
+    pub fn recycle_group(&self, uuid: String) -> Result<Option<String>, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_group_id(&uuid)?;
+        let bin = kdbx.recycle_group(target).map_err(model_err_to_vault_err)?;
+        Ok(bin.map(|gid| gid.0.to_string()))
+    }
+
+    /// Permanently delete every entry and group inside the recycle-
+    /// bin group. Returns the count of removed records.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn empty_recycle_bin(&self) -> Result<u64, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let n = kdbx.empty_recycle_bin().map_err(model_err_to_vault_err)?;
+        Ok(n as u64)
+    }
+
+    /// Configure the vault's recycle-bin policy. `enabled` toggles
+    /// soft-delete for `recycle_entry` / `recycle_group`;
+    /// `group_uuid` selects which group acts as the bin (or `None`
+    /// to clear the reference).
+    ///
+    /// `keepass-core` preserves both pieces of state independently —
+    /// passing `enabled = false` with `group_uuid = Some(...)`
+    /// remembers the bin reference for when the user toggles back on.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `group_uuid` doesn't match a
+    /// group.
+    pub fn set_recycle_bin(
+        &self,
+        enabled: bool,
+        group_uuid: Option<String>,
+    ) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let group = match group_uuid {
+            Some(s) => {
+                let id = parse_group_id(&s)?;
+                if find_group(&kdbx.vault().root, id).is_none() {
+                    return Err(VaultError::NotFound);
+                }
+                Some(id)
+            }
+            None => None,
+        };
+        kdbx.set_recycle_bin(enabled, group);
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Meta setters (slice 6)
+    // -------------------------------------------------------------------
+
+    /// Set the database display name (the `<DatabaseName>` element
+    /// of `<Meta>`).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn set_database_name(&self, name: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        kdbx.set_database_name(name);
+        Ok(())
+    }
+
+    /// Set the database description (`<DatabaseDescription>`).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn set_database_description(&self, description: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        kdbx.set_database_description(description);
+        Ok(())
+    }
+
+    /// Set the default username for newly created entries
+    /// (`<DefaultUserName>`).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn set_default_username(&self, username: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        kdbx.set_default_username(username);
+        Ok(())
+    }
+
+    /// Set the database accent colour (`<Color>`). Pass-through —
+    /// no validation. Frontends are expected to constrain to
+    /// `"#RRGGBB"` if they care; other clients may write `"#RGB"`,
+    /// named colours, etc., and rejecting at the facade would break
+    /// vaults written by them on the next save.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn set_color(&self, hex: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        kdbx.set_color(hex);
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Custom icons (slice 6)
+    // -------------------------------------------------------------------
+
+    /// Add a custom icon to the vault's icon pool. Returns the new
+    /// icon's UUID for use on entries / groups via
+    /// `set_custom_icon` (out-of-scope until a slice exposes the
+    /// icon field on `EntryPatch` / `GroupPatch`).
+    ///
+    /// `data` is the raw image bytes (PNG / JPEG, decoder is the
+    /// frontend's call). KDBX doesn't constrain encoding; the bytes
+    /// round-trip verbatim.
+    ///
+    /// **Save-time GC.** `keepass-core`'s save pipeline drops icons
+    /// not referenced by any entry / group. Until a future slice
+    /// exposes a `set_custom_icon` setter on `EntryPatch` /
+    /// `GroupPatch`, an icon added by this method is always orphan
+    /// and won't survive a save+reopen. The in-memory state is
+    /// authoritative until that slice lands.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn add_custom_icon(&self, data: Vec<u8>) -> Result<String, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let id = kdbx.add_custom_icon(data);
+        Ok(id.to_string())
+    }
+
+    /// Remove a custom icon from the pool. Returns `true` if an
+    /// icon with that UUID was removed, `false` if no such icon
+    /// existed.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `icon_uuid` is not a parseable
+    /// UUID string (a parseable UUID that doesn't match any icon
+    /// returns `Ok(false)`).
+    pub fn remove_custom_icon(&self, icon_uuid: String) -> Result<bool, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let id = Uuid::parse_str(&icon_uuid).map_err(|_| VaultError::NotFound)?;
+        Ok(kdbx.remove_custom_icon(id))
+    }
+
+    /// Look up a custom icon's bytes by UUID. Returns `Ok(None)`
+    /// if no icon with that UUID is in the pool (parseable-but-
+    /// missing); returns [`VaultError::NotFound`] if the string
+    /// isn't a valid UUID.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `icon_uuid` doesn't parse as
+    /// a UUID.
+    pub fn custom_icon(&self, icon_uuid: String) -> Result<Option<Vec<u8>>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let id = Uuid::parse_str(&icon_uuid).map_err(|_| VaultError::NotFound)?;
+        Ok(kdbx.custom_icon(id).map(<[u8]>::to_vec))
     }
 }
 

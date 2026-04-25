@@ -263,6 +263,32 @@ impl EntryPatch {
     }
 }
 
+/// Sparse patch for [`crate::Vault::update_group`].
+///
+/// Same `Option<T>` semantics as [`EntryPatch`] — `None` leaves the
+/// field alone; `Some(value)` replaces it. Only the fields the macOS
+/// surface uses today; richer setters (icon, expanded, auto-type)
+/// land in a follow-up if a frontend needs them.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct GroupPatch {
+    pub name: Option<String>,
+    pub notes: Option<String>,
+}
+
+impl GroupPatch {
+    /// All-`None` patch — a no-op when passed to `update_group`.
+    /// Required because `#[non_exhaustive]` blocks struct-literal
+    /// construction outside the crate.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            name: None,
+            notes: None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
