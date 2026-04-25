@@ -61,6 +61,13 @@ pub enum VaultError {
     /// posture, no payload.
     #[error("protected field not found")]
     FieldNotFound,
+
+    /// A history index passed to `restore_entry_from_history` /
+    /// `delete_history_at` was outside `0..entry.history.len()`.
+    /// Distinct from [`Self::NotFound`] — the entry exists; the
+    /// index doesn't. Same fixed-Display posture, no payload.
+    #[error("history index out of range")]
+    IndexOutOfRange,
 }
 
 /// Map a [`ModelError`] from any mutation call onto [`VaultError`].
@@ -77,6 +84,7 @@ pub(crate) fn model_err_to_vault_err(err: ModelError) -> VaultError {
         | ModelError::GroupNotFound(_)
         | ModelError::CircularMove { .. }
         | ModelError::DuplicateUuid(_) => VaultError::NotFound,
+        ModelError::HistoryIndexOutOfRange { .. } => VaultError::IndexOutOfRange,
         other => {
             panic!("unmapped keepass_core::model::ModelError variant in keys-ffi facade: {other:?}")
         }

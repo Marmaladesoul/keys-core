@@ -289,6 +289,46 @@ impl GroupPatch {
     }
 }
 
+/// A single entry-history snapshot — the no-plaintext summary
+/// returned from `entry_history`.
+///
+/// `protected_field_names` carries the **names** of every protected
+/// field present on this snapshot ("Password" plus any protected
+/// custom-field keys). Plaintext values stay inside the vault until
+/// the snapshot is restored via `restore_entry_from_history` and then
+/// revealed via `reveal_field`.
+///
+/// **Ordering.** `entry_history` returns records in keepass-core's
+/// on-disk order, oldest first. Frontends rendering "newest first"
+/// reverse the list themselves.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct HistoryRecord {
+    pub modified_ms: i64,
+    pub title: String,
+    pub username: String,
+    pub protected_field_names: Vec<String>,
+}
+
+impl HistoryRecord {
+    pub(crate) fn from_entry(snapshot: &KcEntry) -> Self {
+        let mut names = vec![PASSWORD_FIELD_NAME.to_owned()];
+        names.extend(
+            snapshot
+                .custom_fields
+                .iter()
+                .filter(|c| c.protected)
+                .map(|c| c.key.clone()),
+        );
+        Self {
+            modified_ms: ts_ms(snapshot.times.last_modification_time),
+            title: snapshot.title.clone(),
+            username: snapshot.username.clone(),
+            protected_field_names: names,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

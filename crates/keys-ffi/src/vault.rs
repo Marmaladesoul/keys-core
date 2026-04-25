@@ -24,9 +24,11 @@ use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
 use crate::dto::{
-    Entry, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch, PASSWORD_FIELD_NAME,
+    Entry, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch, HistoryRecord,
+    PASSWORD_FIELD_NAME,
 };
 use crate::error::{VaultError, model_err_to_vault_err};
+use crate::portable::PortableEntry;
 
 /// An opened KDBX vault.
 ///
@@ -923,6 +925,141 @@ impl Vault {
         let secret = SecretString::from(new_password);
         let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
         kdbx.rekey(&composite).map_err(VaultError::from)
+    }
+
+    // -------------------------------------------------------------------
+    // History + cross-vault import/export (slice 8)
+    // -------------------------------------------------------------------
+
+    /// List the entry's history snapshots, oldest first.
+    ///
+    /// Each [`HistoryRecord`] carries a no-plaintext summary —
+    /// `protected_field_names` is the set of names of every protected
+    /// field on that snapshot, never the values. To recover a
+    /// snapshot's plaintext, restore via
+    /// [`Self::restore_entry_from_history`] then reveal via
+    /// [`Self::reveal_field`].
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an
+    /// entry.
+    pub fn entry_history(&self, entry_uuid: String) -> Result<Vec<HistoryRecord>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let (_g, entry) = find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+        Ok(entry
+            .history
+            .iter()
+            .map(HistoryRecord::from_entry)
+            .collect())
+    }
+
+    /// Restore the entry to the state captured by history snapshot
+    /// `index`. The pre-restore state is itself snapshotted into the
+    /// entry's history (via `HistoryPolicy::Snapshot`) so the restore
+    /// is undoable through a subsequent `restore_entry_from_history`
+    /// call against the new top-of-history record.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an
+    /// entry. [`VaultError::IndexOutOfRange`] if `index >=
+    /// entry_history(entry_uuid).len()`.
+    pub fn restore_entry_from_history(
+        &self,
+        entry_uuid: String,
+        index: u32,
+    ) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        kdbx.restore_entry_from_history(target, index as usize, HistoryPolicy::Snapshot)
+            .map_err(model_err_to_vault_err)
+    }
+
+    /// Remove the history record at `index`. The live entry is
+    /// untouched — deleting a history record is itself not a content
+    /// edit (so `HistoryPolicy::NoSnapshot`).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an
+    /// entry. [`VaultError::IndexOutOfRange`] if the index isn't in
+    /// `0..entry.history.len()` (normalised from
+    /// [`keepass_core::model::EntryEditor::remove_history_at`]'s `bool`
+    /// return).
+    pub fn delete_history_at(&self, entry_uuid: String, index: u32) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let removed = kdbx
+            .edit_entry(target, HistoryPolicy::NoSnapshot, |editor| {
+                editor.remove_history_at(index as usize)
+            })
+            .map_err(model_err_to_vault_err)?;
+        if removed {
+            Ok(())
+        } else {
+            Err(VaultError::IndexOutOfRange)
+        }
+    }
+
+    /// Snapshot the entry plus all its history, attachments, and
+    /// referenced custom icons into an opaque carrier suitable for
+    /// import into a different vault.
+    ///
+    /// The returned [`PortableEntry`] is **single-use**: pass it to
+    /// [`Self::import_entry`] exactly once. A second `import_entry`
+    /// on the same handle returns [`VaultError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an
+    /// entry.
+    pub fn export_entry(&self, entry_uuid: String) -> Result<Arc<PortableEntry>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let portable = kdbx.export_entry(target).map_err(model_err_to_vault_err)?;
+        Ok(Arc::new(PortableEntry::new(portable)))
+    }
+
+    /// Insert a previously-exported entry under `group_uuid`. The
+    /// imported entry receives a freshly-minted UUID — cross-vault
+    /// duplication of the source UUID would set up merge conflicts
+    /// the API exists to avoid.
+    ///
+    /// **The carrier is consumed by this call.** A second
+    /// `import_entry` on the same `portable` handle returns
+    /// [`VaultError::NotFound`] — see [`PortableEntry`]'s
+    /// single-use note.
+    ///
+    /// Returns the new entry's UUID.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `group_uuid` doesn't match a
+    /// group, or if `portable` has already been imported.
+    pub fn import_entry(
+        &self,
+        portable: Arc<PortableEntry>,
+        group_uuid: String,
+    ) -> Result<String, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let parent = parse_group_id(&group_uuid)?;
+        let inner = portable.take()?;
+        let new_id = kdbx
+            .import_entry(parent, inner, /*mint_new_uuid*/ true)
+            .map_err(model_err_to_vault_err)?;
+        Ok(new_id.0.to_string())
     }
 }
 

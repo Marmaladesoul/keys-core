@@ -14,12 +14,15 @@ use keepass_merge as _;
 
 mod dto;
 mod error;
+mod portable;
 mod vault;
 
 pub use dto::{
-    CustomField, Entry, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch, ProtectedField,
+    CustomField, Entry, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch, HistoryRecord,
+    ProtectedField,
 };
 pub use error::VaultError;
+pub use portable::PortableEntry;
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();
