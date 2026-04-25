@@ -2,27 +2,28 @@
 //!
 //! Private FFI facade for the Keys password manager. Consumes the public
 //! `keepass-core` and `keepass-merge` crates and exposes a uniffi-generated
-//! API for consumption by the native Swift/SwiftUI and C#/WinUI 3 frontends.
+//! API for consumption by the native Swift/SwiftUI and C#/WinUI 3
+//! frontends.
 //!
-//! API shape is driven by Keys' UI needs and carries no stability guarantee
-//! for external consumers — hence this crate remains closed-source and is
-//! deliberately not published to crates.io.
-//!
-//! Slice 1: scaffolding only. Real surface (`Vault`, `Entry`, etc.) lands
-//! in slices 2+ per `_localdocs/FFI_PHASE2.md`.
+//! API shape is driven by Keys' UI needs and carries no stability
+//! guarantee for external consumers — hence this crate remains
+//! closed-source and is deliberately not published to crates.io.
 
-// Ensure the public crates link cleanly while the FFI surface is being defined.
-#[allow(unused_imports)]
-use keepass_core as _;
 #[allow(unused_imports)]
 use keepass_merge as _;
 
+mod error;
+mod vault;
+
+pub use error::VaultError;
+pub use vault::Vault;
+
 uniffi::setup_scaffolding!();
 
-/// Smoke-test entry point exercised by the Swift harness in slice 1.
+/// Smoke-test entry point exercised by the Swift harness from slice 1.
 ///
-/// Replaced by real surface in slice 2; kept stable so the harness has a
-/// trivial round-trip even after `Vault` lands.
+/// Stable through the rest of Phase 2 so the harness has a trivial
+/// round-trip even after `Vault` lands.
 #[uniffi::export]
 #[must_use]
 pub fn ping() -> String {

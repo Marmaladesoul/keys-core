@@ -23,3 +23,5 @@ keepass-merge = { path = "../../../KeepassCore/crates/keepass-merge" }
 # emits everything inline. The Swift bindgen ships as a separate
 # `uniffi-bindgen-swift` binary; see `bindgen/build-swift.sh`.
 uniffi = { version = "0.28" }
+secrecy = "0.10"
+thiserror = "2"

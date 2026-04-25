@@ -616,6 +616,8 @@ version = "0.0.0"
 dependencies = [
  "keepass-core",
  "keepass-merge",
+ "secrecy",
+ "thiserror 2.0.18",
  "uniffi",
 ]
 
