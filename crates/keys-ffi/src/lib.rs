@@ -18,7 +18,7 @@ mod error;
 mod test_support;
 mod vault;
 
-pub use dto::{CustomField, Entry, EntrySummary, Group, ProtectedField};
+pub use dto::{CustomField, Entry, EntryCreate, EntryPatch, EntrySummary, Group, ProtectedField};
 pub use error::VaultError;
 pub use vault::Vault;
 

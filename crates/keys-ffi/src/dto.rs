@@ -115,6 +115,19 @@ pub struct CustomField {
     pub value: String,
 }
 
+impl CustomField {
+    /// Construct a `CustomField` from name + value. Required because
+    /// `#[non_exhaustive]` blocks struct-literal construction outside
+    /// the crate (Swift bindings synthesise their own init).
+    #[must_use]
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
 impl From<KcCustomField> for CustomField {
     fn from(field: KcCustomField) -> Self {
         Self {
@@ -169,6 +182,83 @@ impl Group {
             parent_uuid: parent.map(|p| p.0.to_string()),
             child_group_uuids: group.groups.iter().map(|g| g.id.0.to_string()).collect(),
             entry_uuids: group.entries.iter().map(|e| e.id.0.to_string()).collect(),
+        }
+    }
+}
+
+/// Staging type for [`crate::Vault::create_entry`]. Carries every
+/// field the frontend can set at creation time **except protected
+/// fields** — those go through `set_protected_field` after the entry
+/// is created. Two FFI calls but no protected plaintext crosses the
+/// boundary in a DTO that didn't strictly need it.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct EntryCreate {
+    pub title: String,
+    pub username: String,
+    pub url: String,
+    pub notes: String,
+    pub tags: Vec<String>,
+    pub group_uuid: String,
+    /// Only unprotected fields by design. Seed protected fields
+    /// (Password, OTP, custom protected) via `set_protected_field`
+    /// after `create_entry` returns.
+    pub custom_fields: Vec<CustomField>,
+}
+
+impl EntryCreate {
+    /// Minimal constructor: title + parent group, everything else
+    /// empty / default. Required because `#[non_exhaustive]` blocks
+    /// struct-literal construction outside the crate.
+    #[must_use]
+    pub fn new(title: impl Into<String>, group_uuid: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            username: String::new(),
+            url: String::new(),
+            notes: String::new(),
+            tags: Vec::new(),
+            group_uuid: group_uuid.into(),
+            custom_fields: Vec::new(),
+        }
+    }
+}
+
+/// Sparse patch for [`crate::Vault::update_entry`].
+///
+/// `None` on a field means "leave alone". `Some(value)` means "replace".
+/// `Some(vec![])` on `tags` or `custom_fields` clears that list — same
+/// whole-list-replacement semantics, no separate "clear flag".
+///
+/// Protected fields are deliberately absent: they're updated via
+/// `set_protected_field` / `clear_protected_field`. An unprotected-list
+/// replacement of `custom_fields` never touches the entry's protected
+/// fields.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct EntryPatch {
+    pub title: Option<String>,
+    pub username: Option<String>,
+    pub url: Option<String>,
+    pub notes: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub custom_fields: Option<Vec<CustomField>>,
+}
+
+impl EntryPatch {
+    /// All-`None` patch — a no-op when passed to `update_entry`.
+    /// Required because `#[non_exhaustive]` blocks struct-literal
+    /// construction outside the crate; callers mutate the fields they
+    /// care about after constructing.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            title: None,
+            username: None,
+            url: None,
+            notes: None,
+            tags: None,
+            custom_fields: None,
         }
     }
 }

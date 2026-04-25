@@ -17,6 +17,7 @@
 //! into it.
 
 use keepass_core::format::FormatError;
+use keepass_core::model::ModelError;
 
 /// Errors returned across the FFI by every `Vault` method.
 ///
@@ -60,6 +61,26 @@ pub enum VaultError {
     /// posture, no payload.
     #[error("protected field not found")]
     FieldNotFound,
+}
+
+/// Map a [`ModelError`] from any mutation call onto [`VaultError`].
+///
+/// Every variant the FFI surface can hit today collapses to
+/// [`VaultError::NotFound`] — the entry, group, or destination wasn't
+/// where the caller said it was. The `_ =>` arm **panics with a clear
+/// message** so a future `keepass-core` validation variant trips CI on
+/// the first run instead of silently collapsing to `NotFound`. That's
+/// the forced code-review the carry-forward note from #R8 was after.
+pub(crate) fn model_err_to_vault_err(err: ModelError) -> VaultError {
+    match err {
+        ModelError::EntryNotFound(_)
+        | ModelError::GroupNotFound(_)
+        | ModelError::CircularMove { .. }
+        | ModelError::DuplicateUuid(_) => VaultError::NotFound,
+        other => {
+            panic!("unmapped keepass_core::model::ModelError variant in keys-ffi facade: {other:?}")
+        }
+    }
 }
 
 impl From<keepass_core::Error> for VaultError {

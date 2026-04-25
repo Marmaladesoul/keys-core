@@ -16,13 +16,13 @@ use std::sync::{Arc, Mutex};
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{
-    CustomFieldValue, Entry as KcEntry, EntryId, Group as KcGroup, GroupId, HistoryPolicy,
+    CustomFieldValue, Entry as KcEntry, EntryId, Group as KcGroup, GroupId, HistoryPolicy, NewEntry,
 };
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
-use crate::dto::{Entry, EntrySummary, Group, PASSWORD_FIELD_NAME};
-use crate::error::VaultError;
+use crate::dto::{Entry, EntryCreate, EntryPatch, EntrySummary, Group, PASSWORD_FIELD_NAME};
+use crate::error::{VaultError, model_err_to_vault_err};
 
 /// An opened KDBX vault.
 ///
@@ -290,7 +290,7 @@ impl Vault {
                 editor.set_custom_field(field_name, CustomFieldValue::Protected(secret));
             }
         })
-        .map_err(|_| VaultError::NotFound)
+        .map_err(model_err_to_vault_err)
     }
 
     /// Remove a protected field from the entry.
@@ -347,8 +347,178 @@ impl Vault {
                 editor.remove_custom_field(&field_name);
             }
         })
-        .map_err(|_| VaultError::NotFound)?;
+        .map_err(model_err_to_vault_err)?;
         Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Entry CRUD (slice 5)
+    // -------------------------------------------------------------------
+
+    /// Insert a new entry under `group_uuid`. Library generates the
+    /// new UUID; protected fields seeded via subsequent
+    /// `set_protected_field` calls (the workflow keeps protected
+    /// plaintext out of the create DTO entirely).
+    ///
+    /// Custom fields on the create DTO are inserted as **unprotected**
+    /// — protected custom fields go through `set_protected_field` after
+    /// creation. No history snapshot at creation (there's no prior
+    /// state to snapshot).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `group_uuid` doesn't match a group.
+    pub fn create_entry(&self, entry: EntryCreate) -> Result<String, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let parent = parse_group_id(&entry.group_uuid)?;
+
+        let template = NewEntry::new(entry.title)
+            .username(entry.username)
+            .url(entry.url)
+            .notes(entry.notes)
+            .tags(entry.tags);
+        let new_id = kdbx
+            .add_entry(parent, template)
+            .map_err(model_err_to_vault_err)?;
+
+        if !entry.custom_fields.is_empty() {
+            kdbx.edit_entry(new_id, HistoryPolicy::NoSnapshot, |editor| {
+                for cf in entry.custom_fields {
+                    editor.set_custom_field(cf.name, CustomFieldValue::Plain(cf.value));
+                }
+            })
+            .map_err(model_err_to_vault_err)?;
+        }
+
+        Ok(new_id.0.to_string())
+    }
+
+    /// Sparse update of an existing entry's unprotected fields. `None`
+    /// on a patch field leaves it alone; `Some(value)` replaces it.
+    /// `tags: Some(vec![])` and `custom_fields: Some(vec![])` clear
+    /// those lists wholesale — same whole-list-replacement semantics.
+    ///
+    /// Protected fields (`Password`, protected custom fields) are not
+    /// touched by this method — they go through `set_protected_field`
+    /// / `clear_protected_field`. A `custom_fields` replacement only
+    /// touches the entry's *unprotected* custom fields; protected
+    /// custom fields survive intact.
+    ///
+    /// History snapshot taken via `HistoryPolicy::Snapshot`;
+    /// `last_modified_ms` advances.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match an entry.
+    pub fn update_entry(&self, uuid: String, patch: EntryPatch) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&uuid)?;
+
+        // If the patch replaces custom_fields, peek the current
+        // unprotected keys before taking the mutable borrow — the
+        // edit closure removes them and inserts the new list.
+        // Protected custom fields are filtered out of the peek and
+        // therefore preserved.
+        let unprotected_keys_to_clear: Option<Vec<String>> = if patch.custom_fields.is_some() {
+            let (_g, entry) = find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+            Some(
+                entry
+                    .custom_fields
+                    .iter()
+                    .filter(|c| !c.protected)
+                    .map(|c| c.key.clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
+            if let Some(t) = patch.title {
+                editor.set_title(t);
+            }
+            if let Some(u) = patch.username {
+                editor.set_username(u);
+            }
+            if let Some(u) = patch.url {
+                editor.set_url(u);
+            }
+            if let Some(n) = patch.notes {
+                editor.set_notes(n);
+            }
+            if let Some(tags) = patch.tags {
+                editor.set_tags(tags);
+            }
+            if let (Some(new_list), Some(to_clear)) =
+                (patch.custom_fields, unprotected_keys_to_clear)
+            {
+                for key in to_clear {
+                    editor.remove_custom_field(&key);
+                }
+                for cf in new_list {
+                    editor.set_custom_field(cf.name, CustomFieldValue::Plain(cf.value));
+                }
+            }
+        })
+        .map_err(model_err_to_vault_err)?;
+        Ok(())
+    }
+
+    /// Hard delete: removes the entry and records a tombstone in
+    /// `<DeletedObjects>` so a later merge can distinguish "deleted
+    /// here" from "never seen". Slice 6's `recycle_entry` is the
+    /// soft-delete path.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match an entry.
+    pub fn delete_entry(&self, uuid: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&uuid)?;
+        kdbx.delete_entry(target).map_err(model_err_to_vault_err)
+    }
+
+    /// Stamp `last_access_ms` only — no `last_modified_ms` bump and
+    /// no history snapshot. Intended for read-touch flows (AutoFill
+    /// fulfilment, in-app password reveal).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match an entry.
+    #[allow(clippy::doc_markdown)]
+    pub fn touch_entry(&self, uuid: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&uuid)?;
+        kdbx.touch_entry(target).map_err(model_err_to_vault_err)
+    }
+
+    /// Move an entry to `new_group_uuid`. A move to the entry's
+    /// current parent is **not** a no-op at the data level — it
+    /// stamps `location_changed` and sets `previous_parent_group =
+    /// Some(same)` so the user's "I moved this" intent is recorded.
+    /// Frontends that want UI-level "no change" detection do it
+    /// themselves before calling.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if either `uuid` or `new_group_uuid`
+    /// doesn't resolve.
+    pub fn move_entry(&self, uuid: String, new_group_uuid: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&uuid)?;
+        let new_parent = parse_group_id(&new_group_uuid)?;
+        kdbx.move_entry(target, new_parent)
+            .map_err(model_err_to_vault_err)
     }
 }
 
