@@ -46,6 +46,13 @@ pub enum VaultError {
     /// frontends reconstruct a new `Vault` to unlock again.
     #[error("vault is locked")]
     Locked,
+
+    /// A `uuid` argument did not match any entry or group in the vault.
+    /// Unit variant by design — same collapse posture as
+    /// [`Self::WrongKey`]; the caller already knows the uuid they
+    /// passed in.
+    #[error("entry or group not found")]
+    NotFound,
 }
 
 impl From<keepass_core::Error> for VaultError {

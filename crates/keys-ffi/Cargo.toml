@@ -25,3 +25,5 @@ keepass-merge = { path = "../../../KeepassCore/crates/keepass-merge" }
 uniffi = { version = "0.28" }
 secrecy = "0.10"
 thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = "1"

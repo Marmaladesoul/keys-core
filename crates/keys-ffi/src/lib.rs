@@ -12,9 +12,11 @@
 #[allow(unused_imports)]
 use keepass_merge as _;
 
+mod dto;
 mod error;
 mod vault;
 
+pub use dto::{CustomField, Entry, EntrySummary, Group, ProtectedField};
 pub use error::VaultError;
 pub use vault::Vault;
 
