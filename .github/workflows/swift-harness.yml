@@ -1,0 +1,83 @@
+# Swift harness CI for keys-ffi.
+#
+# Runs on macOS (paid for private repos at 10x the Linux rate, so this
+# workflow is path-filtered to FFI-relevant changes plus every push to
+# main). Linux Rust-only checks live in `ci.yml`.
+#
+# What it proves: the proc-macro uniffi scaffolding compiles for both
+# Apple architectures, lipo'ing into a universal staticlib succeeds, the
+# `uniffi-bindgen-swift` step regenerates Swift sources idempotently, and
+# a SwiftPM consumer can call into the FFI via the generated module.
+
+name: Swift harness
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/keys-ffi/**'
+      - 'bindgen/**'
+      - 'swift-harness/**'
+      - '.github/workflows/swift-harness.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  swift-harness:
+    name: build + swift test (macOS universal)
+    runs-on: macos-14
+    steps:
+      - name: Checkout keys-core
+        uses: actions/checkout@v4
+        with:
+          path: KeysCore
+
+      - name: Checkout keepass-core
+        uses: actions/checkout@v4
+        with:
+          repository: Marmaladesoul/keepass-core
+          path: KeepassCore
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: KeysCore
+
+      - name: Build Swift bindings
+        working-directory: KeysCore
+        run: bindgen/build-swift.sh
+
+      - name: Idempotency — re-run produces identical tree
+        working-directory: KeysCore
+        run: |
+          before=$(find swift-harness/Sources/KeysCoreFFI swift-harness/KeysCoreFFI.xcframework \
+            -type f \( ! -name '.DS_Store' \) -print0 \
+            | sort -z | xargs -0 shasum -a 256 | shasum -a 256)
+          bindgen/build-swift.sh
+          after=$(find swift-harness/Sources/KeysCoreFFI swift-harness/KeysCoreFFI.xcframework \
+            -type f \( ! -name '.DS_Store' \) -print0 \
+            | sort -z | xargs -0 shasum -a 256 | shasum -a 256)
+          if [[ "$before" != "$after" ]]; then
+            echo "Bindgen output changed on second run — not idempotent."
+            echo "before: $before"
+            echo "after:  $after"
+            exit 1
+          fi
+
+      - name: swift test
+        working-directory: KeysCore/swift-harness
+        run: swift test

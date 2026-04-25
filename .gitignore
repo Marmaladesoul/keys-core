@@ -11,6 +11,13 @@ Cargo.lock.bak
 # Generated uniffi bindings — regenerated per build, not source of truth.
 /bindings/
 
+# Swift harness build outputs from `bindgen/build-swift.sh`.
+/swift-harness/Sources/KeysCoreFFI/
+/swift-harness/KeysCoreFFI.xcframework/
+/swift-harness/.build/
+/swift-harness/.swiftpm/
+/swift-harness/Package.resolved
+
 # IDE
 .idea/
 .vscode/
@@ -23,3 +30,4 @@ Cargo.lock.bak
 *.swp
 *.swo
 *~
+_localdocs/

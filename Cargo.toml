@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/keys-ffi",
+    "crates/uniffi-bindgen-swift",
 ]
 
 [workspace.package]

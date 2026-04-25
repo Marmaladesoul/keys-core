@@ -1,0 +1,23 @@
+[package]
+name = "uniffi-bindgen-swift"
+description = "Local bin shim around `uniffi`'s built-in Swift bindgen entrypoint, version-locked to the workspace's `uniffi` dep."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "src/main.rs"
+
+[dependencies]
+# `cli` feature exposes `uniffi::uniffi_bindgen_swift()` — Mozilla's
+# canonical pattern in 0.28.x is for each consumer to ship its own
+# bin shim rather than installing one from crates.io. See
+# https://mozilla.github.io/uniffi-rs/0.28/swift/swift_bindgen.html
+uniffi = { version = "0.28", features = ["cli"] }
