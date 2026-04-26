@@ -45,10 +45,15 @@
 // more noise than signal — same posture as `vault.rs`.
 #![allow(clippy::missing_panics_doc)]
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use keepass_core::model::{EntryId, Group as KcGroup, GroupId, Vault as KcVault};
-use keepass_merge::{FieldDeltaKind as KmFieldDeltaKind, MergeOutcome as KmOutcome};
+use keepass_merge::{
+    ConflictSide as KmConflictSide, DeleteEditChoice as KmDeleteEditChoice,
+    FieldDeltaKind as KmFieldDeltaKind, MergeOutcome as KmOutcome, Resolution as KmResolution,
+};
+use uuid::Uuid;
 
 use crate::dto::Entry;
 use crate::error::VaultError;
@@ -289,6 +294,183 @@ impl From<KmFieldDeltaKind> for FieldDeltaKindFfi {
 pub struct DeleteEditConflictFfi {
     pub entry_uuid: String,
     pub local: Option<Entry>,
+}
+
+// ---------------------------------------------------------------------------
+// Resolution carriers (slice 7.5b)
+// ---------------------------------------------------------------------------
+
+/// Caller's resolution choices for the conflict buckets of a
+/// [`MergeOutcome`].
+///
+/// Built by the Swift conflict-resolver UI from user input, then handed
+/// to [`crate::Vault::apply_merge_outcome`]. Empty maps are valid when
+/// the corresponding outcome buckets are also empty — that's the
+/// auto-applicable path.
+///
+/// Flat `Vec<...>` rather than nested `HashMap<EntryId, ...>` because
+/// uniffi 0.28 handles `HashMap<String, T>` cleanly but nested
+/// non-string-keyed maps are dicey across the FFI; the marshal layer
+/// rebuilds the upstream `HashMap` shape internally.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct ResolutionFfi {
+    /// One entry per [`EntryConflictFfi`]. Inner `field_choices` has
+    /// one entry per field key in the conflict's `field_deltas`.
+    pub entry_field_choices: Vec<EntryFieldChoiceFfi>,
+    /// One entry per [`DeleteEditConflictFfi`].
+    pub delete_edit_choices: Vec<DeleteEditChoiceEntryFfi>,
+}
+
+impl ResolutionFfi {
+    /// Empty resolution — valid only when the outcome has no
+    /// conflicts. Mirrors `EntryPatch::empty` / `GroupPatch::empty`.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(Vec::new(), Vec::new())
+    }
+
+    /// Construct a resolution from caller-built choice lists.
+    /// Required because `#[non_exhaustive]` blocks struct-literal
+    /// construction outside the crate (Swift bindings synthesise
+    /// their own init).
+    #[must_use]
+    pub fn new(
+        entry_field_choices: Vec<EntryFieldChoiceFfi>,
+        delete_edit_choices: Vec<DeleteEditChoiceEntryFfi>,
+    ) -> Self {
+        Self {
+            entry_field_choices,
+            delete_edit_choices,
+        }
+    }
+}
+
+impl EntryFieldChoiceFfi {
+    /// Construct an entry-field-choice carrier. Required because
+    /// `#[non_exhaustive]` blocks struct-literal construction
+    /// outside the crate.
+    #[must_use]
+    pub fn new(entry_uuid: impl Into<String>, field_choices: Vec<FieldChoiceFfi>) -> Self {
+        Self {
+            entry_uuid: entry_uuid.into(),
+            field_choices,
+        }
+    }
+}
+
+impl FieldChoiceFfi {
+    /// Construct a field-choice. Required because `#[non_exhaustive]`
+    /// blocks struct-literal construction outside the crate.
+    #[must_use]
+    pub fn new(key: impl Into<String>, side: ConflictSideFfi) -> Self {
+        Self {
+            key: key.into(),
+            side,
+        }
+    }
+}
+
+impl DeleteEditChoiceEntryFfi {
+    /// Construct a delete-edit choice carrier. Required because
+    /// `#[non_exhaustive]` blocks struct-literal construction
+    /// outside the crate.
+    #[must_use]
+    pub fn new(entry_uuid: impl Into<String>, choice: DeleteEditChoiceFfi) -> Self {
+        Self {
+            entry_uuid: entry_uuid.into(),
+            choice,
+        }
+    }
+}
+
+/// Per-entry resolution for one [`EntryConflictFfi`].
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct EntryFieldChoiceFfi {
+    pub entry_uuid: String,
+    pub field_choices: Vec<FieldChoiceFfi>,
+}
+
+/// Per-field winner inside an [`EntryFieldChoiceFfi`].
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct FieldChoiceFfi {
+    pub key: String,
+    pub side: ConflictSideFfi,
+}
+
+/// Per-entry resolution for one [`DeleteEditConflictFfi`].
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct DeleteEditChoiceEntryFfi {
+    pub entry_uuid: String,
+    pub choice: DeleteEditChoiceFfi,
+}
+
+/// Caller's choice for a single conflicting field.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConflictSideFfi {
+    Local,
+    Remote,
+}
+
+impl From<ConflictSideFfi> for KmConflictSide {
+    fn from(s: ConflictSideFfi) -> Self {
+        match s {
+            ConflictSideFfi::Local => Self::Local,
+            ConflictSideFfi::Remote => Self::Remote,
+        }
+    }
+}
+
+/// Caller's choice for a delete-vs-edit conflict.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeleteEditChoiceFfi {
+    KeepLocal,
+    AcceptRemoteDelete,
+}
+
+impl From<DeleteEditChoiceFfi> for KmDeleteEditChoice {
+    fn from(c: DeleteEditChoiceFfi) -> Self {
+        match c {
+            DeleteEditChoiceFfi::KeepLocal => Self::KeepLocal,
+            DeleteEditChoiceFfi::AcceptRemoteDelete => Self::AcceptRemoteDelete,
+        }
+    }
+}
+
+/// Translate a [`ResolutionFfi`] into the upstream
+/// [`keepass_merge::Resolution`] shape. UUID-parse failures surface as
+/// [`VaultError::Merge`] — they're caller-error class, not
+/// entry-lookup misses.
+pub(crate) fn resolution_ffi_to_km(resolution: &ResolutionFfi) -> Result<KmResolution, VaultError> {
+    let mut entry_field_choices: HashMap<EntryId, HashMap<String, KmConflictSide>> = HashMap::new();
+    for efc in &resolution.entry_field_choices {
+        let id = parse_entry_id(&efc.entry_uuid)?;
+        let inner = entry_field_choices.entry(id).or_default();
+        for fc in &efc.field_choices {
+            inner.insert(fc.key.clone(), fc.side.into());
+        }
+    }
+    let mut delete_edit_choices: HashMap<EntryId, KmDeleteEditChoice> = HashMap::new();
+    for dec in &resolution.delete_edit_choices {
+        let id = parse_entry_id(&dec.entry_uuid)?;
+        delete_edit_choices.insert(id, dec.choice.into());
+    }
+
+    let mut r = KmResolution::default();
+    r.entry_field_choices = entry_field_choices;
+    r.delete_edit_choices = delete_edit_choices;
+    Ok(r)
+}
+
+fn parse_entry_id(s: &str) -> Result<EntryId, VaultError> {
+    Uuid::parse_str(s)
+        .map(EntryId)
+        .map_err(|_| VaultError::Merge(format!("invalid uuid in resolution: {s:?}")))
 }
 
 // ---------------------------------------------------------------------------

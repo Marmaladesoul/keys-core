@@ -28,7 +28,7 @@ use crate::dto::{
     PASSWORD_FIELD_NAME,
 };
 use crate::error::{VaultError, model_err_to_vault_err};
-use crate::merge::MergeOutcome;
+use crate::merge::{MergeOutcome, ResolutionFfi, resolution_ffi_to_km};
 use crate::observer::{VaultChange, VaultObserver};
 use crate::portable::PortableEntry;
 
@@ -1170,8 +1170,14 @@ impl Vault {
         other_path: String,
         other_password: String,
     ) -> Result<Arc<MergeOutcome>, VaultError> {
-        // Open the other side first so we don't hold the local mutex
-        // across crypto work.
+        // Lock-check first so a locked self short-circuits before we
+        // burn crypto work unlocking the other side.
+        let local_vault = {
+            let guard = self.inner.lock().expect("Vault mutex poisoned");
+            let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+            kdbx.vault().clone()
+        };
+
         let other_path_buf = PathBuf::from(&other_path);
         let secret = SecretString::from(other_password);
         let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
@@ -1179,14 +1185,6 @@ impl Vault {
             .read_header()?
             .unlock(&composite)?;
         let remote_vault = other_kdbx.vault().clone();
-
-        // Snapshot the local vault under a brief lock; release before
-        // running the merge.
-        let local_vault = {
-            let guard = self.inner.lock().expect("Vault mutex poisoned");
-            let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
-            kdbx.vault().clone()
-        };
 
         let outcome =
             keepass_merge::merge(&local_vault, &remote_vault).map_err(merge_err_to_vault_err)?;
@@ -1196,6 +1194,92 @@ impl Vault {
             local: Mutex::new(Some(local_vault)),
             remote: Mutex::new(Some(remote_vault)),
         }))
+    }
+
+    /// Apply a [`MergeOutcome`] to this vault using `resolution`'s
+    /// caller-driven choices for any conflict buckets, run a
+    /// post-pass timestamp reconciliation, and fire the
+    /// [`VaultChange::BulkMerge`] observer event.
+    ///
+    /// The `outcome` carrier is **consumed**: subsequent accessors on
+    /// the same handle (and a second `apply_merge_outcome` call)
+    /// return [`VaultError::NotFound`]. Mirrors `PortableEntry`'s
+    /// single-use posture.
+    ///
+    /// **Lock-check is non-consuming.** Calling on a locked vault
+    /// returns [`VaultError::Locked`] *without* taking the carrier;
+    /// the caller can retry against a fresh `Vault`.
+    /// **Resolution-translation is also non-consuming.** A UUID
+    /// parse failure surfaces as [`VaultError::Merge`] before the
+    /// carrier is touched.
+    /// **Upstream resolution-validation errors *are* consuming.**
+    /// `MergeError::UnknownEntryInResolution` /
+    /// `UnknownFieldInResolution` /
+    /// `MissingResolutionForConflict` surface as
+    /// [`VaultError::Merge`] but the carrier is gone — the caller
+    /// must re-`merge_external` to retry.
+    ///
+    /// **Staleness contract.** Behaviour is undefined if this
+    /// `Vault` was mutated between the originating `merge_external`
+    /// and this call. The Swift conflict resolver is modal, which
+    /// makes such mutation structurally hard; we don't try to
+    /// detect it.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if the carrier has already been
+    /// consumed by a prior `apply_merge_outcome`.
+    /// [`VaultError::Merge`] if the resolution is inconsistent with
+    /// the outcome (unknown / missing entry, unknown field key) or a
+    /// UUID inside the resolution doesn't parse. See above for the
+    /// consume-vs-non-consume posture across the variants.
+    /// [`VaultError::WrongKey`] for any crypto-class failure
+    /// surfaced through `MergeError::Model` (none expected at the
+    /// merge step today; reserved for forward-compat).
+    pub fn apply_merge_outcome(
+        &self,
+        outcome: Arc<MergeOutcome>,
+        resolution: ResolutionFfi,
+    ) -> Result<(), VaultError> {
+        // Step 1: lock-check first — non-consuming.
+        {
+            let guard = self.inner.lock().expect("Vault mutex poisoned");
+            if guard.is_none() {
+                return Err(VaultError::Locked);
+            }
+        }
+
+        // Step 2: translate resolution — non-consuming.
+        let km_resolution = resolution_ffi_to_km(&resolution)?;
+
+        // Step 3: take the carrier slots. Any None → already consumed.
+        let mut inner_guard = outcome.inner.lock().expect("MergeOutcome mutex poisoned");
+        let mut local_guard = outcome.local.lock().expect("MergeOutcome mutex poisoned");
+        let mut remote_guard = outcome.remote.lock().expect("MergeOutcome mutex poisoned");
+        let km_outcome = inner_guard.take().ok_or(VaultError::NotFound)?;
+        let mut local_vault = local_guard.take().ok_or(VaultError::NotFound)?;
+        let remote_vault = remote_guard.take().ok_or(VaultError::NotFound)?;
+        drop(inner_guard);
+        drop(local_guard);
+        drop(remote_guard);
+
+        // Steps 4-5: apply + reconcile timestamps on the local clone.
+        keepass_merge::apply_merge(&mut local_vault, &remote_vault, &km_outcome, &km_resolution)
+            .map_err(merge_err_to_vault_err)?;
+        keepass_merge::reconcile_timestamps(&mut local_vault, &remote_vault);
+
+        // Step 6: swap the merged vault into self.inner via the
+        // upstream Kdbx::replace_vault.
+        {
+            let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+            let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+            kdbx.replace_vault(local_vault);
+        }
+
+        // Step 7: fire observer outside any lock.
+        self.fire(&VaultChange::BulkMerge);
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -1252,15 +1336,22 @@ impl Vault {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Map [`keepass_merge::MergeError`] onto [`VaultError`] for the
-/// 7.5a read path. Today only the `Model` variant is reachable —
-/// `merge` itself is documented "v0.1 never produces an error". The
-/// resolution-validation variants land via 7.5b's apply path. Panic
-/// on any unmapped variant so a future merge-crate addition trips
-/// CI on first run.
+/// Map [`keepass_merge::MergeError`] onto [`VaultError`].
+///
+/// `Model(_)` collapses through the existing `From<keepass_core::Error>`
+/// (so wrong-key / I/O classify as their familiar variants). The three
+/// resolution-validation variants surface as
+/// [`VaultError::Merge`] — caller-error class, distinct from
+/// [`VaultError::NotFound`]. Any unmapped future variant panics so a
+/// merge-crate addition trips CI on the first run.
 fn merge_err_to_vault_err(err: keepass_merge::MergeError) -> VaultError {
     match err {
         keepass_merge::MergeError::Model(e) => VaultError::from(e),
+        e @ (keepass_merge::MergeError::UnknownEntryInResolution { .. }
+        | keepass_merge::MergeError::UnknownFieldInResolution { .. }
+        | keepass_merge::MergeError::MissingResolutionForConflict { .. }) => {
+            VaultError::Merge(e.to_string())
+        }
         other => panic!("unmapped keepass_merge::MergeError variant in keys-ffi facade: {other:?}"),
     }
 }

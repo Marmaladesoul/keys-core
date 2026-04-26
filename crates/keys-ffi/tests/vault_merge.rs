@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use keys_ffi::{
-    EntryCreate, EntryPatch, FieldDeltaKindFfi, Vault, VaultChange, VaultError, VaultObserver,
+    ConflictSideFfi, DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, EntryCreate,
+    EntryFieldChoiceFfi, EntryPatch, FieldChoiceFfi, FieldDeltaKindFfi, ResolutionFfi, Vault,
+    VaultChange, VaultError, VaultObserver,
 };
 use tempfile::TempDir;
 
@@ -354,4 +356,366 @@ fn merge_external_does_not_mutate_local_or_fire_observer() {
         "merge_external must not fire observer events; got {:?}",
         recorder.snapshot()
     );
+}
+
+// =======================================================================
+// Slice 7.5b — apply_merge_outcome
+// =======================================================================
+
+fn entry_field_choice(uuid: &str, key: &str, side: ConflictSideFfi) -> EntryFieldChoiceFfi {
+    EntryFieldChoiceFfi::new(uuid, vec![FieldChoiceFfi::new(key, side)])
+}
+
+fn delete_edit_choice(uuid: &str, choice: DeleteEditChoiceFfi) -> DeleteEditChoiceEntryFfi {
+    DeleteEditChoiceEntryFfi::new(uuid, choice)
+}
+
+#[test]
+fn apply_merge_outcome_auto_applicable_disk_only() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut patch = EntryPatch::empty();
+    patch.title = Some("disk-only-title".to_owned());
+    remote.update_entry(target.clone(), patch).expect("remote");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    local
+        .apply_merge_outcome(outcome, ResolutionFfi::empty())
+        .expect("apply");
+
+    let after = local.get_entry(target).expect("get");
+    assert_eq!(after.title, "disk-only-title");
+}
+
+#[test]
+fn apply_merge_outcome_added_on_disk_brings_in_entry() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let group = personal_uuid(&remote);
+    let new_uuid = remote
+        .create_entry(EntryCreate::new("brand-new", group))
+        .expect("remote create");
+    remote.save().expect("remote save");
+    let count_before = local.list_entries(None).expect("list").len();
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    local
+        .apply_merge_outcome(outcome, ResolutionFfi::empty())
+        .expect("apply");
+
+    let after = local.list_entries(None).expect("list");
+    assert_eq!(after.len(), count_before + 1);
+    assert!(after.iter().any(|e| e.uuid == new_uuid));
+}
+
+#[test]
+fn apply_merge_outcome_deleted_on_disk_removes_entry() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    remote.delete_entry(target.clone()).expect("remote delete");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    local
+        .apply_merge_outcome(outcome, ResolutionFfi::empty())
+        .expect("apply");
+
+    let err = local.get_entry(target).expect_err("entry should be gone");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
+fn apply_merge_outcome_entry_conflict_keep_local() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut lp = EntryPatch::empty();
+    lp.title = Some("local-wins".to_owned());
+    local.update_entry(target.clone(), lp).expect("local");
+    let mut rp = EntryPatch::empty();
+    rp.title = Some("remote-loses".to_owned());
+    remote.update_entry(target.clone(), rp).expect("remote");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    let resolution = ResolutionFfi::new(
+        vec![entry_field_choice(&target, "Title", ConflictSideFfi::Local)],
+        Vec::new(),
+    );
+    local
+        .apply_merge_outcome(outcome, resolution)
+        .expect("apply");
+
+    assert_eq!(local.get_entry(target).expect("get").title, "local-wins");
+}
+
+#[test]
+fn apply_merge_outcome_entry_conflict_keep_remote() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut lp = EntryPatch::empty();
+    lp.title = Some("local-loses".to_owned());
+    local.update_entry(target.clone(), lp).expect("local");
+    let mut rp = EntryPatch::empty();
+    rp.title = Some("remote-wins".to_owned());
+    remote.update_entry(target.clone(), rp).expect("remote");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    let resolution = ResolutionFfi::new(
+        vec![entry_field_choice(
+            &target,
+            "Title",
+            ConflictSideFfi::Remote,
+        )],
+        Vec::new(),
+    );
+    local
+        .apply_merge_outcome(outcome, resolution)
+        .expect("apply");
+
+    assert_eq!(local.get_entry(target).expect("get").title, "remote-wins");
+}
+
+#[test]
+fn apply_merge_outcome_entry_conflict_per_field_split() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut lp = EntryPatch::empty();
+    lp.title = Some("local-title".to_owned());
+    lp.username = Some("local-user".to_owned());
+    local.update_entry(target.clone(), lp).expect("local");
+    let mut rp = EntryPatch::empty();
+    rp.title = Some("remote-title".to_owned());
+    rp.username = Some("remote-user".to_owned());
+    remote.update_entry(target.clone(), rp).expect("remote");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    let resolution = ResolutionFfi::new(
+        vec![EntryFieldChoiceFfi::new(
+            target.clone(),
+            vec![
+                FieldChoiceFfi::new("Title", ConflictSideFfi::Local),
+                FieldChoiceFfi::new("UserName", ConflictSideFfi::Remote),
+            ],
+        )],
+        Vec::new(),
+    );
+    local
+        .apply_merge_outcome(outcome, resolution)
+        .expect("apply");
+
+    let e = local.get_entry(target).expect("get");
+    assert_eq!(e.title, "local-title");
+    assert_eq!(e.username, "remote-user");
+}
+
+#[test]
+fn apply_merge_outcome_delete_edit_keep_local() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut lp = EntryPatch::empty();
+    lp.title = Some("kept-locally".to_owned());
+    local.update_entry(target.clone(), lp).expect("local edit");
+    remote.delete_entry(target.clone()).expect("remote delete");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    let resolution = ResolutionFfi::new(
+        Vec::new(),
+        vec![delete_edit_choice(&target, DeleteEditChoiceFfi::KeepLocal)],
+    );
+    local
+        .apply_merge_outcome(outcome, resolution)
+        .expect("apply");
+
+    let e = local.get_entry(target).expect("survived");
+    assert_eq!(e.title, "kept-locally");
+}
+
+#[test]
+fn apply_merge_outcome_delete_edit_accept_remote_delete() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut lp = EntryPatch::empty();
+    lp.title = Some("about-to-die".to_owned());
+    local.update_entry(target.clone(), lp).expect("local edit");
+    remote.delete_entry(target.clone()).expect("remote delete");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    let resolution = ResolutionFfi::new(
+        Vec::new(),
+        vec![delete_edit_choice(
+            &target,
+            DeleteEditChoiceFfi::AcceptRemoteDelete,
+        )],
+    );
+    local
+        .apply_merge_outcome(outcome, resolution)
+        .expect("apply");
+
+    let err = local.get_entry(target).expect_err("entry should be gone");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
+fn apply_merge_outcome_fires_bulk_merge_observer() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut patch = EntryPatch::empty();
+    patch.title = Some("auto".to_owned());
+    remote.update_entry(target, patch).expect("remote");
+    remote.save().expect("remote save");
+
+    let recorder = attach(&local);
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    local
+        .apply_merge_outcome(outcome, ResolutionFfi::empty())
+        .expect("apply");
+
+    let events = recorder.snapshot();
+    let bulk_count = events
+        .iter()
+        .filter(|e| matches!(e, VaultChange::BulkMerge))
+        .count();
+    assert_eq!(
+        bulk_count, 1,
+        "expected exactly one BulkMerge; got {events:?}"
+    );
+}
+
+#[test]
+fn apply_merge_outcome_consumes_carrier() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut patch = EntryPatch::empty();
+    patch.title = Some("once".to_owned());
+    remote.update_entry(target, patch).expect("remote");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    local
+        .apply_merge_outcome(outcome.clone(), ResolutionFfi::empty())
+        .expect("first apply");
+
+    // Accessors return NotFound after consume.
+    let summary_err = outcome.summary().expect_err("summary after consume");
+    assert!(
+        matches!(summary_err, VaultError::NotFound),
+        "{summary_err:?}"
+    );
+
+    // Second apply on the same handle returns NotFound.
+    let apply_err = local
+        .apply_merge_outcome(outcome, ResolutionFfi::empty())
+        .expect_err("second apply");
+    assert!(matches!(apply_err, VaultError::NotFound), "{apply_err:?}");
+}
+
+#[test]
+fn apply_merge_outcome_missing_resolution_yields_merge_error() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut lp = EntryPatch::empty();
+    lp.title = Some("local".to_owned());
+    local.update_entry(target.clone(), lp).expect("local");
+    let mut rp = EntryPatch::empty();
+    rp.title = Some("remote".to_owned());
+    remote.update_entry(target, rp).expect("remote");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    let err = local
+        .apply_merge_outcome(outcome, ResolutionFfi::empty())
+        .expect_err("should fail");
+    assert!(matches!(err, VaultError::Merge(_)), "got {err:?}");
+}
+
+#[test]
+fn apply_merge_outcome_unknown_field_in_resolution_yields_merge_error() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut lp = EntryPatch::empty();
+    lp.title = Some("local".to_owned());
+    local.update_entry(target.clone(), lp).expect("local");
+    let mut rp = EntryPatch::empty();
+    rp.title = Some("remote".to_owned());
+    remote.update_entry(target.clone(), rp).expect("remote");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    // Resolution names a field key that isn't in field_deltas.
+    let resolution = ResolutionFfi::new(
+        vec![entry_field_choice(
+            &target,
+            "NotARealField",
+            ConflictSideFfi::Local,
+        )],
+        Vec::new(),
+    );
+    let err = local
+        .apply_merge_outcome(outcome, resolution)
+        .expect_err("should fail");
+    assert!(matches!(err, VaultError::Merge(_)), "got {err:?}");
+}
+
+#[test]
+fn apply_merge_outcome_locked_vault_yields_locked_without_consuming() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    let mut patch = EntryPatch::empty();
+    patch.title = Some("auto".to_owned());
+    remote.update_entry(target, patch).expect("remote");
+    remote.save().expect("remote save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    local.lock().expect("lock");
+
+    let err = local
+        .apply_merge_outcome(outcome.clone(), ResolutionFfi::empty())
+        .expect_err("should fail");
+    assert!(matches!(err, VaultError::Locked), "got {err:?}");
+
+    // Carrier still usable — accessors don't return NotFound.
+    let summary = outcome.summary().expect("summary still works");
+    assert_eq!(summary.disk_only_count, 1);
 }

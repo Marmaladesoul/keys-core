@@ -111,4 +111,105 @@ final class VaultMergeTests: XCTestCase {
             }
         }
     }
+
+    // -----------------------------------------------------------------
+    // Slice 7.5b — applyMergeOutcome
+    // -----------------------------------------------------------------
+
+    func testApplyMergeOutcomeAutoApplicable() throws {
+        let (local, ldir, remote, rdir) = try makePair()
+        defer {
+            try? FileManager.default.removeItem(at: ldir)
+            try? FileManager.default.removeItem(at: rdir)
+        }
+        let target = try local.listEntries(groupUuid: nil).first!.uuid
+
+        var patch = EntryPatch(
+            title: "remote-only", username: nil, url: nil,
+            notes: nil, tags: nil, customFields: nil
+        )
+        try remote.updateEntry(uuid: target, patch: patch)
+        _ = patch
+        try remote.save()
+
+        let outcome = try local.mergeExternal(otherPath: remote.path(), otherPassword: Self.password)
+        try local.applyMergeOutcome(outcome: outcome, resolution: ResolutionFfi(entryFieldChoices: [], deleteEditChoices: []))
+
+        let after = try local.getEntry(uuid: target)
+        XCTAssertEqual(after.title, "remote-only")
+    }
+
+    func testApplyMergeOutcomeEntryConflictResolution() throws {
+        let (local, ldir, remote, rdir) = try makePair()
+        defer {
+            try? FileManager.default.removeItem(at: ldir)
+            try? FileManager.default.removeItem(at: rdir)
+        }
+        let target = try local.listEntries(groupUuid: nil).first!.uuid
+
+        let lp = EntryPatch(
+            title: "local-keeps", username: nil, url: nil,
+            notes: nil, tags: nil, customFields: nil
+        )
+        try local.updateEntry(uuid: target, patch: lp)
+        let rp = EntryPatch(
+            title: "remote-loses", username: nil, url: nil,
+            notes: nil, tags: nil, customFields: nil
+        )
+        try remote.updateEntry(uuid: target, patch: rp)
+        try remote.save()
+
+        let outcome = try local.mergeExternal(otherPath: remote.path(), otherPassword: Self.password)
+        let resolution = ResolutionFfi(
+            entryFieldChoices: [
+                EntryFieldChoiceFfi(
+                    entryUuid: target,
+                    fieldChoices: [FieldChoiceFfi(key: "Title", side: .local)]
+                )
+            ],
+            deleteEditChoices: []
+        )
+        try local.applyMergeOutcome(outcome: outcome, resolution: resolution)
+
+        XCTAssertEqual(try local.getEntry(uuid: target).title, "local-keeps")
+    }
+
+    func testApplyMergeOutcomeFiresBulkMerge() throws {
+        let (local, ldir, remote, rdir) = try makePair()
+        defer {
+            try? FileManager.default.removeItem(at: ldir)
+            try? FileManager.default.removeItem(at: rdir)
+        }
+        let target = try local.listEntries(groupUuid: nil).first!.uuid
+
+        let patch = EntryPatch(
+            title: "auto", username: nil, url: nil,
+            notes: nil, tags: nil, customFields: nil
+        )
+        try remote.updateEntry(uuid: target, patch: patch)
+        try remote.save()
+
+        let recorder = SwiftRecorder()
+        local.setObserver(observer: recorder)
+        let outcome = try local.mergeExternal(otherPath: remote.path(), otherPassword: Self.password)
+        try local.applyMergeOutcome(outcome: outcome, resolution: ResolutionFfi(entryFieldChoices: [], deleteEditChoices: []))
+
+        let bulkCount = recorder.events.filter { if case .bulkMerge = $0 { return true } else { return false } }.count
+        XCTAssertEqual(bulkCount, 1, "expected one BulkMerge event; got \(recorder.events)")
+    }
+}
+
+/// Recorder for VaultObserver — Swift mirror of the Rust integration
+/// test recorder.
+final class SwiftRecorder: VaultObserver, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _events: [VaultChange] = []
+    var events: [VaultChange] {
+        lock.lock(); defer { lock.unlock() }
+        return _events
+    }
+    func onChange(change: VaultChange) {
+        lock.lock(); defer { lock.unlock() }
+        _events.append(change)
+    }
 }

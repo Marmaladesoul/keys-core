@@ -68,6 +68,20 @@ pub enum VaultError {
     /// index doesn't. Same fixed-Display posture, no payload.
     #[error("history index out of range")]
     IndexOutOfRange,
+
+    /// A merge resolution was inconsistent with the outcome it was
+    /// built against — e.g. the outcome contains an entry conflict
+    /// the resolution doesn't cover, the resolution names a field
+    /// the conflict's `field_deltas` doesn't list, or a UUID inside
+    /// the resolution doesn't parse. The string carries the upstream
+    /// `keepass_merge::MergeError` Display (or a UUID-parse hint) so
+    /// the binding side can surface a useful diagnostic without
+    /// importing merge-crate types.
+    ///
+    /// Distinct from [`Self::NotFound`] — these are
+    /// resolution-validation failures, not entry-lookup misses.
+    #[error("merge resolution invalid: {0}")]
+    Merge(String),
 }
 
 /// Map a [`ModelError`] from any mutation call onto [`VaultError`].
