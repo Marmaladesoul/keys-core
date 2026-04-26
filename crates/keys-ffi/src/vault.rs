@@ -28,6 +28,7 @@ use crate::dto::{
     PASSWORD_FIELD_NAME,
 };
 use crate::error::{VaultError, model_err_to_vault_err};
+use crate::merge::MergeOutcome;
 use crate::observer::{VaultChange, VaultObserver};
 use crate::portable::PortableEntry;
 
@@ -1135,6 +1136,69 @@ impl Vault {
     }
 
     // -------------------------------------------------------------------
+    // External merge (slice 7.5a)
+    // -------------------------------------------------------------------
+
+    /// Run a three-way merge against the KDBX file at `other_path`,
+    /// unlocked with `other_password`. Returns an opaque
+    /// [`MergeOutcome`] handle the binding side reads to drive the
+    /// conflict resolver UI before handing back to
+    /// `apply_merge_outcome` (slice 7.5b).
+    ///
+    /// **Read-only.** This method does not mutate the local vault and
+    /// does not fire the `BulkMerge` observer event — both happen in
+    /// `apply_merge_outcome` once the caller has resolved any
+    /// conflicts. Reading the same `Vault` after `merge_external`
+    /// returns the pre-merge state.
+    ///
+    /// The local vault is cloned at merge time so the merge runs
+    /// outside the vault mutex; the clone is stashed on the returned
+    /// [`MergeOutcome`] for slice 7.5b's apply step. Two full deep
+    /// clones per call (local + remote); acceptable at v0.1 since
+    /// `merge_external` fires once per external-change event.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if this vault has been locked.
+    /// [`VaultError::Io`] if `other_path` can't be read.
+    /// [`VaultError::Format`] if `other_path` isn't a KDBX file.
+    /// [`VaultError::WrongKey`] if `other_password` doesn't unlock
+    /// the other file (or any other crypto-class failure during the
+    /// other-side open).
+    pub fn merge_external(
+        &self,
+        other_path: String,
+        other_password: String,
+    ) -> Result<Arc<MergeOutcome>, VaultError> {
+        // Open the other side first so we don't hold the local mutex
+        // across crypto work.
+        let other_path_buf = PathBuf::from(&other_path);
+        let secret = SecretString::from(other_password);
+        let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
+        let other_kdbx = Kdbx::open(&other_path_buf)?
+            .read_header()?
+            .unlock(&composite)?;
+        let remote_vault = other_kdbx.vault().clone();
+
+        // Snapshot the local vault under a brief lock; release before
+        // running the merge.
+        let local_vault = {
+            let guard = self.inner.lock().expect("Vault mutex poisoned");
+            let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+            kdbx.vault().clone()
+        };
+
+        let outcome =
+            keepass_merge::merge(&local_vault, &remote_vault).map_err(merge_err_to_vault_err)?;
+
+        Ok(Arc::new(MergeOutcome {
+            inner: Mutex::new(Some(outcome)),
+            local: Mutex::new(Some(local_vault)),
+            remote: Mutex::new(Some(remote_vault)),
+        }))
+    }
+
+    // -------------------------------------------------------------------
     // Observer (slice 9)
     // -------------------------------------------------------------------
 
@@ -1187,6 +1251,19 @@ impl Vault {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Map [`keepass_merge::MergeError`] onto [`VaultError`] for the
+/// 7.5a read path. Today only the `Model` variant is reachable —
+/// `merge` itself is documented "v0.1 never produces an error". The
+/// resolution-validation variants land via 7.5b's apply path. Panic
+/// on any unmapped variant so a future merge-crate addition trips
+/// CI on first run.
+fn merge_err_to_vault_err(err: keepass_merge::MergeError) -> VaultError {
+    match err {
+        keepass_merge::MergeError::Model(e) => VaultError::from(e),
+        other => panic!("unmapped keepass_merge::MergeError variant in keys-ffi facade: {other:?}"),
+    }
+}
 
 fn parse_group_id(s: &str) -> Result<GroupId, VaultError> {
     Uuid::parse_str(s)

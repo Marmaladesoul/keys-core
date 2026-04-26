@@ -9,11 +9,9 @@
 //! guarantee for external consumers — hence this crate remains
 //! closed-source and is deliberately not published to crates.io.
 
-#[allow(unused_imports)]
-use keepass_merge as _;
-
 mod dto;
 mod error;
+mod merge;
 mod observer;
 mod portable;
 mod vault;
@@ -23,6 +21,10 @@ pub use dto::{
     ProtectedField,
 };
 pub use error::VaultError;
+pub use merge::{
+    DeleteEditConflictFfi, EntryConflictFfi, FieldDeltaFfi, FieldDeltaKindFfi, MergeOutcome,
+    MergeSummary,
+};
 pub use observer::{VaultChange, VaultObserver};
 pub use portable::PortableEntry;
 pub use vault::Vault;
