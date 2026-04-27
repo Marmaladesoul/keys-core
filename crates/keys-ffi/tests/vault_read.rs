@@ -448,6 +448,67 @@ fn entry_attachments_return_locked_after_lock() {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-type (entry_auto_type)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn entry_auto_type_round_trips_non_default_block() {
+    // pykeepass/editor-fields sidecar declares a populated AutoType
+    // block on the Contoso Mail entry: enabled=false,
+    // data_transfer_obfuscation=1, default_sequence="{USERNAME}{TAB}",
+    // one association with window="Firefox - *" and
+    // keystroke_sequence="{PASSWORD}{ENTER}".
+    let vault = open_editor_fields();
+    let uuid = entry_uuid_by_title(&vault, "Contoso Mail");
+    let at = vault.entry_auto_type(uuid).expect("auto-type");
+    assert!(!at.enabled);
+    assert_eq!(at.data_transfer_obfuscation, 1);
+    assert_eq!(at.default_sequence, "{USERNAME}{TAB}");
+    assert_eq!(at.associations.len(), 1);
+    assert_eq!(at.associations[0].window, "Firefox - *");
+    assert_eq!(at.associations[0].keystroke_sequence, "{PASSWORD}{ENTER}");
+}
+
+#[test]
+fn entry_auto_type_returns_defaults_when_block_absent() {
+    // Basic fixture entries don't carry an explicit AutoType block —
+    // keepass-core's decoder synthesises the default-on shape.
+    let vault = open_basic();
+    let any_uuid = vault
+        .list_entries(None)
+        .expect("list")
+        .first()
+        .unwrap()
+        .uuid
+        .clone();
+    let at = vault.entry_auto_type(any_uuid).expect("auto-type");
+    assert!(at.enabled);
+    assert_eq!(at.data_transfer_obfuscation, 0);
+    assert_eq!(at.default_sequence, "");
+    assert!(at.associations.is_empty());
+}
+
+#[test]
+fn entry_auto_type_returns_locked_after_lock() {
+    let vault = open_editor_fields();
+    let uuid = entry_uuid_by_title(&vault, "Contoso Mail");
+    vault.lock().expect("lock");
+    assert!(matches!(
+        vault.entry_auto_type(uuid),
+        Err(VaultError::Locked)
+    ));
+}
+
+#[test]
+fn entry_auto_type_not_found_for_unknown_uuid() {
+    let vault = open_basic();
+    let err = vault
+        .entry_auto_type("00000000-0000-0000-0000-000000000000".to_owned())
+        .expect_err("unknown uuid");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+// ---------------------------------------------------------------------------
 // Vault-meta readers (database_name, database_description,
 // default_username, recycle_bin_group_uuid)
 // ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
 use crate::dto::{
-    Entry, EntryAttachment, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch,
+    AutoType, Entry, EntryAttachment, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch,
     HistoryRecord, PASSWORD_FIELD_NAME,
 };
 use crate::error::{VaultError, model_err_to_vault_err};
@@ -951,6 +951,31 @@ impl Vault {
             .get(att.ref_id as usize)
             .ok_or(VaultError::NotFound)?;
         Ok(bin.data.clone())
+    }
+
+    // -------------------------------------------------------------------
+    // Auto-type
+    // -------------------------------------------------------------------
+
+    /// Read the per-entry auto-type configuration.
+    ///
+    /// KDBX entries with a missing `<AutoType>` block decode to
+    /// [`AutoType`]'s defaults (`enabled = true`, no obfuscation,
+    /// empty default sequence, no associations) — `KeePass`'s
+    /// permissive convention. This method always returns a populated
+    /// record; the absence of an `<AutoType>` block in the source
+    /// XML is invisible to callers.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an entry.
+    pub fn entry_auto_type(&self, entry_uuid: String) -> Result<AutoType, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let (_, entry) = find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+        Ok(AutoType::from_auto_type(&entry.auto_type))
     }
 
     // -------------------------------------------------------------------

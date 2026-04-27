@@ -336,6 +336,58 @@ impl GroupPatch {
     }
 }
 
+/// Per-entry auto-type configuration. Mirrors `keepass-core`'s
+/// [`AutoType`](keepass_core::model::AutoType) onto the FFI.
+///
+/// `enabled` defaults to `true` for entries with no `<AutoType>`
+/// block (`KeePass`'s permissive convention; this conversion preserves
+/// it so the absence of a block looks the same as an explicit
+/// "enabled, defaults" block on the wire).
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct AutoType {
+    pub enabled: bool,
+    /// `<DataTransferObfuscation>` — delivery method. `0` is straight
+    /// keystroke stream; non-zero values are KeePass-specific
+    /// obfuscation strategies. Frontends that don't implement
+    /// obfuscation should fall back to `0` semantics.
+    pub data_transfer_obfuscation: u32,
+    /// `<DefaultSequence>` — fallback macro when no association
+    /// matches. Empty means "inherit from the parent group".
+    pub default_sequence: String,
+    /// `<Association>` — per-window override macros, in source order.
+    pub associations: Vec<AutoTypeAssociation>,
+}
+
+/// One `<Association>` inside an [`AutoType`] block.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct AutoTypeAssociation {
+    /// `<Window>` — glob pattern matched against the foreground
+    /// window's title.
+    pub window: String,
+    /// `<KeystrokeSequence>` — macro to play for this window match.
+    pub keystroke_sequence: String,
+}
+
+impl AutoType {
+    pub(crate) fn from_auto_type(at: &keepass_core::model::AutoType) -> Self {
+        Self {
+            enabled: at.enabled,
+            data_transfer_obfuscation: at.data_transfer_obfuscation,
+            default_sequence: at.default_sequence.clone(),
+            associations: at
+                .associations
+                .iter()
+                .map(|a| AutoTypeAssociation {
+                    window: a.window.clone(),
+                    keystroke_sequence: a.keystroke_sequence.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// One attachment on an entry, projected for list views — name +
 /// payload metadata, no bytes. Bytes-getter is
 /// [`crate::Vault::entry_attachment_bytes`].
