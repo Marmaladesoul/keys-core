@@ -825,6 +825,59 @@ impl Vault {
     }
 
     // -------------------------------------------------------------------
+    // Meta readers
+    // -------------------------------------------------------------------
+
+    /// Read the database display name (`<DatabaseName>`).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn database_name(&self) -> Result<String, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        Ok(kdbx.vault().meta.database_name.clone())
+    }
+
+    /// Read the database description (`<DatabaseDescription>`).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn database_description(&self) -> Result<String, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        Ok(kdbx.vault().meta.database_description.clone())
+    }
+
+    /// Read the default username for newly created entries
+    /// (`<DefaultUserName>`).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn default_username(&self) -> Result<String, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        Ok(kdbx.vault().meta.default_username.clone())
+    }
+
+    /// Read the recycle-bin group's UUID, if the vault has one
+    /// configured. `Ok(None)` means no recycle bin is set; this is
+    /// independent of `recycle_bin_enabled` — KDBX vaults can have a
+    /// recycle bin configured-but-disabled, or enabled-but-pointing-
+    /// at-no-group (in which case soft-delete creates one on first use).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn recycle_bin_group_uuid(&self) -> Result<Option<String>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        Ok(kdbx.vault().meta.recycle_bin_uuid.map(|g| g.0.to_string()))
+    }
+
+    // -------------------------------------------------------------------
     // Custom icons (slice 6)
     // -------------------------------------------------------------------
 

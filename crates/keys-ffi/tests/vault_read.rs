@@ -270,6 +270,83 @@ fn group_surfaces_editor_fields() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Vault-meta readers (database_name, database_description,
+// default_username, recycle_bin_group_uuid)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn database_name_round_trips_from_fixture() {
+    // kdbxweb/kdbx4-basic has a real <DatabaseName> meta element. (The
+    // keepassxc fixtures' sidecar `database_name` field is the root
+    // group's name, not the meta DatabaseName, so use kdbxweb here.)
+    let vault = Vault::new(
+        fixture("kdbxweb/kdbx4-basic.kdbx"),
+        "test-keeweb-201".to_owned(),
+    )
+    .expect("kdbxweb basic should open");
+    assert_eq!(
+        vault.database_name().expect("name"),
+        "kdbxweb Basic Fixture"
+    );
+}
+
+#[test]
+fn database_description_is_readable() {
+    let vault = open_basic();
+    // Sidecar doesn't pin description; just confirm the accessor works.
+    let _ = vault.database_description().expect("description readable");
+}
+
+#[test]
+fn default_username_is_readable() {
+    let vault = open_basic();
+    let _ = vault.default_username().expect("default username readable");
+}
+
+#[test]
+fn recycle_bin_group_uuid_present_when_fixture_has_one() {
+    // pykeepass/recycle.kdbx has a populated recycle bin per its sidecar.
+    let vault = Vault::new(
+        fixture("pykeepass/recycle.kdbx"),
+        "test-recycle-102".to_owned(),
+    )
+    .expect("recycle fixture should open");
+    let bin = vault.recycle_bin_group_uuid().expect("readable");
+    assert!(bin.is_some(), "expected recycle bin group uuid");
+    // Confirm it's a parseable UUID and matches a real group.
+    let uuid = bin.unwrap();
+    let groups = vault.list_groups().expect("groups");
+    assert!(
+        groups.iter().any(|g| g.uuid == uuid),
+        "recycle bin uuid should match a real group"
+    );
+}
+
+#[test]
+fn recycle_bin_group_uuid_none_when_fixture_lacks_one() {
+    // kdbx3-basic has no recycle bin configured.
+    let vault = open_basic();
+    let bin = vault.recycle_bin_group_uuid().expect("readable");
+    assert!(bin.is_none());
+}
+
+#[test]
+fn meta_readers_return_locked_after_lock() {
+    let vault = open_basic();
+    vault.lock().expect("lock");
+    assert!(matches!(vault.database_name(), Err(VaultError::Locked)));
+    assert!(matches!(
+        vault.database_description(),
+        Err(VaultError::Locked)
+    ));
+    assert!(matches!(vault.default_username(), Err(VaultError::Locked)));
+    assert!(matches!(
+        vault.recycle_bin_group_uuid(),
+        Err(VaultError::Locked)
+    ));
+}
+
 #[test]
 fn entry_with_default_editor_fields_uses_empties_and_zero() {
     // The basic fixture has no custom icons / colours / overrides set.
