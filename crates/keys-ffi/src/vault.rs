@@ -24,8 +24,8 @@ use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
 use crate::dto::{
-    Entry, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch, HistoryRecord,
-    PASSWORD_FIELD_NAME,
+    Entry, EntryAttachment, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch,
+    HistoryRecord, PASSWORD_FIELD_NAME,
 };
 use crate::error::{VaultError, model_err_to_vault_err};
 use crate::merge::{MergeOutcome, ResolutionFfi, resolution_ffi_to_km};
@@ -878,6 +878,82 @@ impl Vault {
     }
 
     // -------------------------------------------------------------------
+    // Attachments
+    // -------------------------------------------------------------------
+
+    /// List the attachments referenced by an entry. Returns name +
+    /// size + SHA-256 hash for each; the bytes themselves stay in the
+    /// vault until [`Self::entry_attachment_bytes`] is called.
+    ///
+    /// Order matches the on-disk `<Binary>` element order on the entry.
+    /// References that point at a `Vault::binaries` index that no
+    /// longer exists (corrupt vault) yield a [`VaultError::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an entry,
+    /// or if any attachment's `ref_id` is out of range for the vault's
+    /// binary pool.
+    pub fn entry_attachments(
+        &self,
+        entry_uuid: String,
+    ) -> Result<Vec<EntryAttachment>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let (_, entry) = find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+        let binaries = &kdbx.vault().binaries;
+        let mut out = Vec::with_capacity(entry.attachments.len());
+        for att in &entry.attachments {
+            let bin = binaries
+                .get(att.ref_id as usize)
+                .ok_or(VaultError::NotFound)?;
+            out.push(EntryAttachment {
+                name: att.name.clone(),
+                size_bytes: bin.data.len() as u64,
+                sha256_hex: sha256_hex(&bin.data),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fetch the decoded payload bytes of a named attachment.
+    ///
+    /// `name` is the user-visible filename from
+    /// [`Self::entry_attachments`]. If an entry has multiple
+    /// attachments with the same name (KDBX permits it; clients
+    /// rarely produce it), the first match in `<Binary>` order wins.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an
+    /// entry, no attachment by `name` exists on the entry, or the
+    /// attachment's `ref_id` is out of range.
+    pub fn entry_attachment_bytes(
+        &self,
+        entry_uuid: String,
+        name: String,
+    ) -> Result<Vec<u8>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let (_, entry) = find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+        let att = entry
+            .attachments
+            .iter()
+            .find(|a| a.name == name)
+            .ok_or(VaultError::NotFound)?;
+        let bin = kdbx
+            .vault()
+            .binaries
+            .get(att.ref_id as usize)
+            .ok_or(VaultError::NotFound)?;
+        Ok(bin.data.clone())
+    }
+
+    // -------------------------------------------------------------------
     // Custom icons (slice 6)
     // -------------------------------------------------------------------
 
@@ -1419,6 +1495,17 @@ fn parse_entry_id(s: &str) -> Result<EntryId, VaultError> {
     Uuid::parse_str(s)
         .map(EntryId)
         .map_err(|_| VaultError::NotFound)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
 }
 
 fn walk_entries<'a>(group: &'a KcGroup, visit: &mut dyn FnMut(GroupId, &'a KcEntry)) {

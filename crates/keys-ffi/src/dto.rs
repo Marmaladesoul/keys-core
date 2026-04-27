@@ -336,6 +336,26 @@ impl GroupPatch {
     }
 }
 
+/// One attachment on an entry, projected for list views — name +
+/// payload metadata, no bytes. Bytes-getter is
+/// [`crate::Vault::entry_attachment_bytes`].
+///
+/// `sha256_hex` is computed over the fully-decoded payload (post-
+/// decompression on KDBX3, post-decrypt on KDBX4). Identical payloads
+/// across attachments produce identical hashes — KDBX deduplicates
+/// payload storage but not the per-entry references; this lets a
+/// frontend de-duplicate display itself if it wants.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct EntryAttachment {
+    /// User-visible filename, from the entry's `<Binary><Key>` element.
+    pub name: String,
+    /// Decoded payload size in bytes.
+    pub size_bytes: u64,
+    /// Hex-encoded SHA-256 of the decoded payload bytes.
+    pub sha256_hex: String,
+}
+
 /// A single entry-history snapshot — the no-plaintext summary
 /// returned from `entry_history`.
 ///

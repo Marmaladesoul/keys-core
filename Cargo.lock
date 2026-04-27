@@ -639,6 +639,7 @@ dependencies = [
  "keepass-core",
  "keepass-merge",
  "secrecy",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "uniffi",

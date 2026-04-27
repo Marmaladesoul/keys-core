@@ -271,6 +271,183 @@ fn group_surfaces_editor_fields() {
 }
 
 // ---------------------------------------------------------------------------
+// Attachments (entry_attachments, entry_attachment_bytes)
+//
+// Both KDBX3 (Meta/Binaries) and KDBX4 (inner header) populate the
+// vault's binary pool. The positive tests below cover both.
+// ---------------------------------------------------------------------------
+
+fn open_kdbx4_attachments() -> std::sync::Arc<Vault> {
+    Vault::new(
+        fixture("kdbxweb/kdbx4-attachments.kdbx"),
+        "test-keeweb-202".to_owned(),
+    )
+    .expect("kdbx4-attachments fixture should open")
+}
+
+fn entry_uuid_by_title(vault: &Vault, title: &str) -> String {
+    vault
+        .list_entries(None)
+        .expect("list")
+        .into_iter()
+        .find(|e| e.title == title)
+        .unwrap_or_else(|| panic!("entry titled {title:?} present"))
+        .uuid
+}
+
+#[test]
+fn entry_attachments_lists_metadata_with_size_and_sha256() {
+    let vault = open_kdbx4_attachments();
+    let uuid = entry_uuid_by_title(&vault, "Small Image");
+    let attachments = vault.entry_attachments(uuid).expect("list");
+    assert_eq!(attachments.len(), 1);
+    let att = &attachments[0];
+    assert_eq!(att.name, "1x1.png");
+    assert_eq!(att.size_bytes, 68);
+    assert_eq!(
+        att.sha256_hex,
+        "43739c566e26fd7cb88f69d3864ea34740372f5ee99acac169e090beffbce5c6"
+    );
+}
+
+#[test]
+fn entry_attachments_handles_zero_byte_payload() {
+    let vault = open_kdbx4_attachments();
+    let uuid = entry_uuid_by_title(&vault, "Empty");
+    let attachments = vault.entry_attachments(uuid).expect("list");
+    assert_eq!(attachments.len(), 1);
+    let att = &attachments[0];
+    assert_eq!(att.name, "empty.dat");
+    assert_eq!(att.size_bytes, 0);
+    // SHA-256 of the empty string.
+    assert_eq!(
+        att.sha256_hex,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+}
+
+#[test]
+fn entry_attachments_handles_non_ascii_filename() {
+    let vault = open_kdbx4_attachments();
+    let uuid = entry_uuid_by_title(&vault, "Non-ASCII Filename");
+    let attachments = vault.entry_attachments(uuid).expect("list");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].name, "unicode-café.txt");
+    assert_eq!(attachments[0].size_bytes, 37);
+}
+
+#[test]
+fn entry_attachment_bytes_round_trips_payload() {
+    let vault = open_kdbx4_attachments();
+    let uuid = entry_uuid_by_title(&vault, "Small Text");
+    let bytes = vault
+        .entry_attachment_bytes(uuid, "hello.txt".to_owned())
+        .expect("bytes");
+    assert_eq!(bytes.len(), 13);
+    assert_eq!(bytes, b"Hello, world\n");
+}
+
+#[test]
+fn entry_attachment_bytes_round_trips_large_payload() {
+    let vault = open_kdbx4_attachments();
+    let uuid = entry_uuid_by_title(&vault, "Larger Binary");
+    let bytes = vault
+        .entry_attachment_bytes(uuid, "100kib.bin".to_owned())
+        .expect("bytes");
+    assert_eq!(bytes.len(), 102_400);
+}
+
+#[test]
+fn entry_attachment_bytes_returns_not_found_for_missing_name() {
+    let vault = open_kdbx4_attachments();
+    let uuid = entry_uuid_by_title(&vault, "Small Text");
+    let err = vault
+        .entry_attachment_bytes(uuid, "no-such-file.bin".to_owned())
+        .expect_err("missing attachment should fail");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
+fn entry_attachments_returns_empty_when_no_attachments() {
+    let vault = open_basic();
+    let any_uuid = vault
+        .list_entries(None)
+        .expect("list")
+        .first()
+        .unwrap()
+        .uuid
+        .clone();
+    let atts = vault.entry_attachments(any_uuid).expect("list");
+    assert!(atts.is_empty());
+}
+
+#[test]
+fn entry_attachments_kdbx3_round_trips_via_meta_binaries() {
+    // Companion to the KDBX4 coverage above: KDBX3 stores attachment
+    // bytes in <Meta><Binaries> rather than the inner header, but the
+    // FFI surface is identical. Sidecar at keepassxc/kdbx3-attachments
+    // declares one entry per fixture attachment with a known sha256.
+    let vault = Vault::new(
+        fixture("keepassxc/kdbx3-attachments.kdbx"),
+        "test-att-004".to_owned(),
+    )
+    .expect("kdbx3-attachments should open");
+    let uuid = entry_uuid_by_title(&vault, "Key Attachment");
+    let attachments = vault.entry_attachments(uuid).expect("list");
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].name, "mock-key.pem");
+    assert_eq!(attachments[0].size_bytes, 163);
+    assert_eq!(
+        attachments[0].sha256_hex,
+        "75c2ff133a0dae2ebb79647553ca6d512f1842eeda3fc9d290e18940c4195218"
+    );
+
+    // Multi-attachment entry from the same fixture, exercises ordering.
+    let small_uuid = entry_uuid_by_title(&vault, "Small Attachments");
+    let small = vault.entry_attachments(small_uuid).expect("list");
+    let names: Vec<_> = small.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["1x1.png", "empty.dat", "hello.txt", "unicode-café.txt"]
+    );
+}
+
+#[test]
+fn entry_attachment_bytes_kdbx3_round_trips() {
+    use sha2::{Digest, Sha256};
+    let vault = Vault::new(
+        fixture("keepassxc/kdbx3-attachments.kdbx"),
+        "test-att-004".to_owned(),
+    )
+    .expect("kdbx3-attachments should open");
+    let uuid = entry_uuid_by_title(&vault, "Key Attachment");
+    let bytes = vault
+        .entry_attachment_bytes(uuid, "mock-key.pem".to_owned())
+        .expect("bytes");
+    assert_eq!(bytes.len(), 163);
+    let got = format!("{:x}", Sha256::digest(&bytes));
+    assert_eq!(
+        got,
+        "75c2ff133a0dae2ebb79647553ca6d512f1842eeda3fc9d290e18940c4195218"
+    );
+}
+
+#[test]
+fn entry_attachments_return_locked_after_lock() {
+    let vault = open_kdbx4_attachments();
+    let uuid = entry_uuid_by_title(&vault, "Small Image");
+    vault.lock().expect("lock");
+    assert!(matches!(
+        vault.entry_attachments(uuid.clone()),
+        Err(VaultError::Locked)
+    ));
+    assert!(matches!(
+        vault.entry_attachment_bytes(uuid, "1x1.png".to_owned()),
+        Err(VaultError::Locked)
+    ));
+}
+
+// ---------------------------------------------------------------------------
 // Vault-meta readers (database_name, database_description,
 // default_username, recycle_bin_group_uuid)
 // ---------------------------------------------------------------------------
