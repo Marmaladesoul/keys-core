@@ -218,3 +218,69 @@ fn read_methods_return_locked_after_lock() {
         Err(VaultError::Locked)
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Editor-field surface (icon_id, custom_icon_uuid, foreground_color,
+// background_color, override_url, expires, expiry_time_ms)
+// ---------------------------------------------------------------------------
+
+fn open_editor_fields() -> std::sync::Arc<Vault> {
+    Vault::new(
+        fixture("pykeepass/editor-fields.kdbx"),
+        "test-editor-107".to_owned(),
+    )
+    .expect("editor-fields fixture should open")
+}
+
+#[test]
+fn entry_surfaces_editor_fields() {
+    let vault = open_editor_fields();
+    let summaries = vault.list_entries(None).expect("list");
+    let target = summaries
+        .iter()
+        .find(|e| e.title == "Contoso Mail")
+        .expect("Contoso Mail entry present");
+    let entry = vault.get_entry(target.uuid.clone()).expect("get");
+
+    assert_eq!(entry.icon_id, 25);
+    assert_eq!(
+        entry.custom_icon_uuid.as_deref(),
+        Some("aaaaaaaa-bbbb-cccc-dddd-000000000011")
+    );
+    assert_eq!(entry.foreground_color, "#FF0000");
+    assert_eq!(entry.background_color, "#00FFAA");
+    assert_eq!(entry.override_url, "cmd://firefox %1");
+    // Sidecar declares expiry_time = 2030-01-02T03:04:05Z.
+    let expiry = entry.expiry_time_ms.expect("expiry_time present");
+    assert_eq!(expiry, 1_893_553_445_000);
+}
+
+#[test]
+fn group_surfaces_editor_fields() {
+    let vault = open_editor_fields();
+    let groups = vault.list_groups().expect("groups");
+    let work = groups
+        .iter()
+        .find(|g| g.name == "Work")
+        .expect("Work group present");
+    assert_eq!(work.icon_id, 43);
+    assert_eq!(
+        work.custom_icon_uuid.as_deref(),
+        Some("aaaaaaaa-bbbb-cccc-dddd-000000000012")
+    );
+}
+
+#[test]
+fn entry_with_default_editor_fields_uses_empties_and_zero() {
+    // The basic fixture has no custom icons / colours / overrides set.
+    let vault = open_basic();
+    let summaries = vault.list_entries(None).expect("list");
+    let any = summaries.first().expect("at least one entry");
+    let entry = vault.get_entry(any.uuid.clone()).expect("get");
+
+    assert!(entry.custom_icon_uuid.is_none());
+    assert_eq!(entry.foreground_color, "");
+    assert_eq!(entry.background_color, "");
+    assert_eq!(entry.override_url, "");
+    assert!(!entry.expires);
+}

@@ -55,6 +55,18 @@ impl EntrySummary {
 /// `get_entry` returns recycled entries verbatim; filtering recycle-bin
 /// entries from the UI is the frontend's concern (call
 /// `list_entries(Some(recycle_bin_uuid))` to enumerate them).
+///
+/// ## Editor-field surface
+///
+/// `icon_id`, `custom_icon_uuid`, `foreground_color`, `background_color`,
+/// `override_url`, `expires`, and `expiry_time_ms` round-trip the
+/// equivalent KDBX `<IconID>` / `<CustomIconUUID>` / `<ForegroundColor>` /
+/// `<BackgroundColor>` / `<OverrideURL>` / `<Expires>` / `<ExpiryTime>`
+/// XML elements. Empty strings on the colour / override fields mean
+/// "client default" — KDBX's own absence representation. `expiry_time_ms`
+/// is `None` when the source XML had no `<ExpiryTime>` element; it's
+/// only meaningful when `expires` is `true` (KDBX may carry a stale
+/// timestamp on `expires == false` entries from third-party writers).
 #[derive(uniffi::Record, Debug, Clone)]
 #[non_exhaustive]
 pub struct Entry {
@@ -70,6 +82,27 @@ pub struct Entry {
     pub created_ms: i64,
     pub last_modified_ms: i64,
     pub last_access_ms: i64,
+    /// Index into `KeePass`'s built-in icon set (0–68). Defaults to `0`
+    /// for missing `<IconID>`. Overridden by `custom_icon_uuid` when both
+    /// are set; both still round-trip so by-id renderers don't lose the
+    /// user's pick.
+    pub icon_id: u32,
+    /// Hyphenated lowercase UUID into the vault's custom-icon pool, or
+    /// `None` for a built-in icon. Bytes available via [`crate::Vault::custom_icon`].
+    pub custom_icon_uuid: Option<String>,
+    /// `<ForegroundColor>` — `"#RRGGBB"` hex; empty string means default.
+    pub foreground_color: String,
+    /// `<BackgroundColor>` — `"#RRGGBB"` hex; empty string means default.
+    pub background_color: String,
+    /// `<OverrideURL>` — per-entry URL-scheme override; empty string
+    /// means use the client default.
+    pub override_url: String,
+    /// `<Expires>` — whether the entry has an expiration at all.
+    pub expires: bool,
+    /// `<ExpiryTime>` as Unix-epoch milliseconds. `None` when no
+    /// `<ExpiryTime>` element was present. Only meaningful when
+    /// [`Self::expires`] is `true`.
+    pub expiry_time_ms: Option<i64>,
 }
 
 impl Entry {
@@ -102,6 +135,13 @@ impl Entry {
             created_ms: ts_ms(entry.times.creation_time),
             last_modified_ms: ts_ms(entry.times.last_modification_time),
             last_access_ms: ts_ms(entry.times.last_access_time),
+            icon_id: entry.icon_id,
+            custom_icon_uuid: entry.custom_icon_uuid.map(|u| u.to_string()),
+            foreground_color: entry.foreground_color.clone(),
+            background_color: entry.background_color.clone(),
+            override_url: entry.override_url.clone(),
+            expires: entry.times.expires,
+            expiry_time_ms: entry.times.expiry_time.map(|t| t.timestamp_millis()),
         }
     }
 }
@@ -164,6 +204,9 @@ impl ProtectedField {
 /// A node in the vault's group tree, flattened for FFI consumption.
 /// `parent_uuid == None` marks the root. Reconstruct the tree by joining
 /// on `parent_uuid` / `child_group_uuids`.
+///
+/// `icon_id` and `custom_icon_uuid` round-trip the same way as on
+/// [`Entry`] — see that record's editor-field doc for the same caveats.
 #[derive(uniffi::Record, Debug, Clone)]
 #[non_exhaustive]
 pub struct Group {
@@ -172,6 +215,8 @@ pub struct Group {
     pub parent_uuid: Option<String>,
     pub child_group_uuids: Vec<String>,
     pub entry_uuids: Vec<String>,
+    pub icon_id: u32,
+    pub custom_icon_uuid: Option<String>,
 }
 
 impl Group {
@@ -182,6 +227,8 @@ impl Group {
             parent_uuid: parent.map(|p| p.0.to_string()),
             child_group_uuids: group.groups.iter().map(|g| g.id.0.to_string()).collect(),
             entry_uuids: group.entries.iter().map(|e| e.id.0.to_string()).collect(),
+            icon_id: group.icon_id,
+            custom_icon_uuid: group.custom_icon_uuid.map(|u| u.to_string()),
         }
     }
 }
