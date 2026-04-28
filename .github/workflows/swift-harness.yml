@@ -1,29 +1,32 @@
 # Swift harness CI for keys-ffi.
 #
-# Runs on macOS (paid for private repos at 10x the Linux rate, so this
-# workflow is path-filtered to FFI-relevant changes plus every push to
-# main). Linux Rust-only checks live in `ci.yml`.
+# Runs on macOS, paid for private repos at 10x the Linux rate. Triggered
+# only on demand and by a weekly heartbeat to stay inside the 2,000
+# minute/month free-tier budget — Phase 5 of the Keys-Mac integration
+# exhausted that budget in a single day with the previous per-push +
+# per-PR triggers. Linux Rust-only checks (clippy, fmt, cargo test) live
+# in `ci.yml` and continue to gate every push and PR — that's the
+# per-commit signal. This workflow is the deliberate "macOS-side
+# binding generation still works" check, hit before merging an
+# FFI-shape PR or by the Monday heartbeat.
 #
 # What it proves: the proc-macro uniffi scaffolding compiles for both
 # Apple architectures, lipo'ing into a universal staticlib succeeds, the
 # `uniffi-bindgen-swift` step regenerates Swift sources idempotently, and
 # a SwiftPM consumer can call into the FFI via the generated module.
+#
+# Local Mac dev workflow gives continuous pre-merge coverage: Keys-Mac's
+# Xcode pre-build phase invokes `bindgen/build-swift.sh`, which exercises
+# the same toolchain step this workflow does — so binding regressions
+# surface in a Mac dev's Xcode build well before reaching production.
 
 name: Swift harness
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-    paths:
-      - 'crates/keys-ffi/**'
-      - 'bindgen/**'
-      - 'swift-harness/**'
-      - '.github/workflows/swift-harness.yml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
   workflow_dispatch:
+  schedule:
+    # 04:07 UTC Monday — off-peak, off-:00 to spread fleet load.
+    - cron: '7 4 * * 1'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
