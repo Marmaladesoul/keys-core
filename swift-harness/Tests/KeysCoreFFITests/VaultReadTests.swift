@@ -44,15 +44,14 @@ final class VaultReadTests: XCTestCase {
         XCTAssertTrue(entries.allSatisfy { $0.groupUuid == personal.uuid })
     }
 
-    func testGetEntryReturnsProtectedFieldWithoutValue() throws {
+    func testGetEntryReturnsPasswordFieldWithoutValue() throws {
         let vault = try openBasic()
         let summaries = try vault.listEntries(groupUuid: nil)
         guard let first = summaries.first else { return XCTFail("no entries") }
 
         let entry = try vault.getEntry(uuid: first.uuid)
-        guard let password = entry.protectedFields.first(where: { $0.name == "Password" }) else {
-            return XCTFail("Password protected field missing")
-        }
+        let password = entry.passwordField
+        XCTAssertEqual(password.name, "Password")
         XCTAssertFalse(password.revealed)
         XCTAssertNil(password.value, "no plaintext crosses the boundary on get_entry")
     }

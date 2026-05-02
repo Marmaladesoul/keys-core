@@ -79,9 +79,10 @@ final class VaultProtectedTests: XCTestCase {
         )
 
         let entry = try vault.getEntry(uuid: uuid)
-        let totp = entry.protectedFields.first { $0.name == "TOTP Seed" }
+        let totp = entry.customFields.first { $0.name == "TOTP Seed" }
         XCTAssertNotNil(totp)
-        XCTAssertEqual(totp?.value, nil, "no plaintext on the read path")
+        XCTAssertEqual(totp?.isProtected, true)
+        XCTAssertEqual(totp?.value, "", "no plaintext on the read path")
 
         XCTAssertEqual(
             try vault.revealField(entryUuid: uuid, fieldName: "TOTP Seed"),
@@ -95,7 +96,7 @@ final class VaultProtectedTests: XCTestCase {
         try vault.clearProtectedField(entryUuid: uuid, fieldName: "API Secret")
 
         let entry = try vault.getEntry(uuid: uuid)
-        XCTAssertFalse(entry.protectedFields.contains { $0.name == "API Secret" })
+        XCTAssertFalse(entry.customFields.contains { $0.name == "API Secret" })
     }
 
     func testClearPasswordSetsEmptyString() throws {
@@ -104,7 +105,7 @@ final class VaultProtectedTests: XCTestCase {
         try vault.clearProtectedField(entryUuid: uuid, fieldName: "Password")
 
         let entry = try vault.getEntry(uuid: uuid)
-        XCTAssertTrue(entry.protectedFields.contains { $0.name == "Password" })
+        XCTAssertEqual(entry.passwordField.name, "Password")
 
         let pw = try vault.revealField(entryUuid: uuid, fieldName: "Password")
         XCTAssertEqual(pw, "")

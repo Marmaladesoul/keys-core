@@ -409,7 +409,13 @@ impl Vault {
 
         if !entry.custom_fields.is_empty() {
             kdbx.edit_entry(new_id, HistoryPolicy::NoSnapshot, |editor| {
-                for cf in entry.custom_fields {
+                // Drop protected entries from the create payload —
+                // protected custom fields are seeded via
+                // `set_protected_field` after create. The CustomField
+                // DTO carries `is_protected` so the read path can
+                // round-trip; on the write path we honour the
+                // existing "Plain only" contract.
+                for cf in entry.custom_fields.into_iter().filter(|c| !c.is_protected) {
                     editor.set_custom_field(cf.name, CustomFieldValue::Plain(cf.value));
                 }
             })
@@ -488,7 +494,10 @@ impl Vault {
                 for key in to_clear {
                     editor.remove_custom_field(&key);
                 }
-                for cf in new_list {
+                // Drop protected entries from the patch — see
+                // EntryPatch's doc comment. Protected fields are
+                // updated via `set_protected_field` separately.
+                for cf in new_list.into_iter().filter(|c| !c.is_protected) {
                     editor.set_custom_field(cf.name, CustomFieldValue::Plain(cf.value));
                 }
             }

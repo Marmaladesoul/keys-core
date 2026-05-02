@@ -121,9 +121,13 @@ fn create_entry_seeds_unprotected_custom_fields() {
         .collect();
     assert!(names.contains(&"License"));
     assert!(names.contains(&"Tier"));
-    // No protected plaintext is created — the Password slot is empty,
-    // and no protected custom field is auto-created.
-    assert!(entry.protected_fields.iter().all(|f| f.value.is_none()));
+    // No protected plaintext is created — Password's read DTO
+    // surfaces empty, and no protected custom field is auto-created.
+    assert!(entry.password_field.value.is_none());
+    assert!(
+        entry.custom_fields.iter().all(|f| !f.is_protected),
+        "no protected custom fields auto-created on create_entry"
+    );
 }
 
 #[test]
@@ -174,11 +178,19 @@ fn update_custom_fields_replaces_unprotected_only() {
     let summaries = vault.list_entries(None).expect("list");
     let uuid = summaries[0].uuid.clone();
     let before = vault.get_entry(uuid.clone()).expect("get");
-    let protected_before: Vec<_> = before
-        .protected_fields
-        .iter()
-        .map(|f| f.name.clone())
-        .collect();
+    // Snapshot protected names: password slot + protected custom fields.
+    let protected_names = |e: &keys_ffi::Entry| -> Vec<String> {
+        let mut names = vec![e.password_field.name.clone()];
+        names.extend(
+            e.custom_fields
+                .iter()
+                .filter(|c| c.is_protected)
+                .map(|c| c.name.clone()),
+        );
+        names.sort();
+        names
+    };
+    let protected_before = protected_names(&before);
 
     // Replace the unprotected custom-field list wholesale.
     let mut patch = empty_patch();
@@ -188,20 +200,16 @@ fn update_custom_fields_replaces_unprotected_only() {
         .expect("update custom_fields");
 
     let after = vault.get_entry(uuid).expect("get");
-    let custom_names: Vec<_> = after
+    let unprotected_names: Vec<_> = after
         .custom_fields
         .iter()
+        .filter(|f| !f.is_protected)
         .map(|f| f.name.as_str())
         .collect();
-    assert_eq!(custom_names, vec!["Replaced"]);
+    assert_eq!(unprotected_names, vec!["Replaced"]);
 
-    // Protected fields are untouched.
-    let protected_after: Vec<_> = after
-        .protected_fields
-        .iter()
-        .map(|f| f.name.clone())
-        .collect();
-    assert_eq!(protected_after, protected_before);
+    // Protected fields are untouched (Password slot + protected custom fields).
+    assert_eq!(protected_names(&after), protected_before);
 }
 
 #[test]
@@ -219,16 +227,25 @@ fn update_with_empty_custom_fields_clears_unprotected() {
     vault.update_entry(uuid.clone(), patch).expect("clear");
 
     let after = vault.get_entry(uuid).expect("get");
-    assert!(after.custom_fields.is_empty(), "all unprotected cleared");
-    // Protected slots survive (Password + the two protected custom fields).
+    // After clearing, only protected custom fields remain inside `custom_fields`.
+    assert!(
+        after.custom_fields.iter().all(|f| f.is_protected),
+        "all unprotected cleared"
+    );
+    // Protected slots survive (Password slot + the two protected custom fields).
     assert!(
         after
-            .protected_fields
+            .custom_fields
             .iter()
-            .any(|f| f.name == "API Secret")
+            .any(|f| f.is_protected && f.name == "API Secret")
     );
-    assert!(after.protected_fields.iter().any(|f| f.name == "PIN"));
-    assert!(after.protected_fields.iter().any(|f| f.name == "Password"));
+    assert!(
+        after
+            .custom_fields
+            .iter()
+            .any(|f| f.is_protected && f.name == "PIN")
+    );
+    assert_eq!(after.password_field.name, "Password");
 }
 
 #[test]

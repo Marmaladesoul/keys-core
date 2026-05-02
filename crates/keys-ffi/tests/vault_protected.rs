@@ -176,15 +176,16 @@ fn set_protected_field_inserts_new_field() {
         )
         .expect("insert TOTP Seed");
 
-    // get_entry now lists TOTP Seed among protected fields with no value.
+    // get_entry now surfaces TOTP Seed as a protected custom field
+    // with empty value (plaintext fetched via reveal_field).
     let entry = vault.get_entry(uuid.clone()).expect("get_entry");
     let totp = entry
-        .protected_fields
+        .custom_fields
         .iter()
         .find(|f| f.name == "TOTP Seed")
         .expect("TOTP Seed present");
-    assert!(!totp.revealed);
-    assert!(totp.value.is_none(), "no plaintext on the read path");
+    assert!(totp.is_protected);
+    assert!(totp.value.is_empty(), "no plaintext on the read path");
 
     // reveal_field produces the plaintext.
     assert_eq!(
@@ -254,24 +255,14 @@ fn clear_protected_custom_field_removes_it() {
         .clear_protected_field(uuid.clone(), "API Secret".to_owned())
         .expect("clear API Secret");
 
-    // Field is gone from get_entry's protected_fields list.
+    // Field is gone from get_entry's custom_fields list.
     let entry = vault.get_entry(uuid.clone()).expect("get");
-    assert!(
-        entry
-            .protected_fields
-            .iter()
-            .all(|f| f.name != "API Secret")
-    );
+    assert!(entry.custom_fields.iter().all(|f| f.name != "API Secret"));
 
     // Round-trip through save/reopen — also gone there.
     let (reopened, _tmp) = save_and_reopen(&vault, "test-custom-104");
     let entry = reopened.get_entry(uuid.clone()).unwrap();
-    assert!(
-        entry
-            .protected_fields
-            .iter()
-            .all(|f| f.name != "API Secret")
-    );
+    assert!(entry.custom_fields.iter().all(|f| f.name != "API Secret"));
 
     // And reveal returns FieldNotFound.
     let err = reopened
@@ -289,10 +280,10 @@ fn clear_password_sets_to_empty_string() {
         .clear_protected_field(uuid.clone(), "Password".to_owned())
         .expect("clear Password");
 
-    // Password slot still exists in get_entry's protected_fields —
+    // Password slot still exists in get_entry's password_field —
     // it's structural — but reveal returns "".
     let entry = vault.get_entry(uuid.clone()).expect("get");
-    assert!(entry.protected_fields.iter().any(|f| f.name == "Password"));
+    assert_eq!(entry.password_field.name, "Password");
 
     assert_eq!(
         vault

@@ -72,17 +72,21 @@ fn import_preserves_protected_field_structure() {
 
     let imported = dst.get_entry(new_uuid.clone()).expect("get imported");
     let src_entry = src.get_entry(src_uuid.clone()).unwrap();
-    let src_protected: Vec<_> = src_entry
-        .protected_fields
-        .iter()
-        .map(|f| f.name.as_str())
-        .collect();
-    let imp_protected: Vec<_> = imported
-        .protected_fields
-        .iter()
-        .map(|f| f.name.as_str())
-        .collect();
-    assert_eq!(src_protected, imp_protected);
+    // Compare the union of password slot + custom protected field
+    // names. Protected custom fields now surface inside
+    // `custom_fields` with `is_protected = true`; Password is its
+    // own singleton slot via `password_field`.
+    let protected_names = |e: &keys_ffi::Entry| -> Vec<String> {
+        let mut names = vec![e.password_field.name.clone()];
+        names.extend(
+            e.custom_fields
+                .iter()
+                .filter(|c| c.is_protected)
+                .map(|c| c.name.clone()),
+        );
+        names
+    };
+    assert_eq!(protected_names(&src_entry), protected_names(&imported));
 
     // Reveal carries protected plaintext through the round-trip.
     let src_pw = src.reveal_field(src_uuid, "Password".to_owned()).unwrap();

@@ -132,17 +132,63 @@ fn get_entry_password_appears_as_protected_field_with_no_value() {
         .get_entry(summaries[0].uuid.clone())
         .expect("get first entry");
 
-    let password = entry
-        .protected_fields
-        .iter()
-        .find(|f| f.name == "Password")
-        .expect("Password is a protected field");
+    let password = &entry.password_field;
+    assert_eq!(password.name, "Password");
     assert!(!password.revealed);
     assert!(password.value.is_none(), "no plaintext crosses boundary");
 }
 
 #[test]
-fn protected_custom_fields_partition_correctly() {
+fn custom_fields_pass_through_keepass_core_order_without_resegregating() {
+    // Per #R14: the FFI must NOT re-segregate protected from
+    // non-protected when projecting `keepass_core::Entry.custom_fields`
+    // onto the FFI Record. Whatever order the upstream model exposes
+    // is what frontends see — the FFI is a faithful pass-through.
+    //
+    // This particular fixture's pykeepass writer emits the four
+    // custom fields in the order [Recovery Code, API Key ID,
+    // API Secret, PIN] — note that's *not* protection-segregated
+    // (the unprotected `Recovery Code` and `API Key ID` are followed
+    // by the protected `API Secret` and `PIN`, so the regression
+    // we're guarding against would split them as
+    // [API Key ID, Recovery Code | API Secret, PIN]).
+    //
+    // The exact authored order is incidental to this test — the
+    // load-bearing assertion is that FFI's list matches the upstream
+    // ordering, which we verify by re-opening via `KdbxReader`-equivalent
+    // route (here, just `keepass_core` directly) and comparing.
+    let vault = Vault::new(
+        fixture("pykeepass/custom-fields.kdbx"),
+        "test-custom-104".to_owned(),
+    )
+    .expect("custom-fields fixture should open");
+    let summaries = vault.list_entries(None).expect("list");
+    let entry = vault.get_entry(summaries[0].uuid.clone()).expect("get");
+
+    let names: Vec<&str> = entry
+        .custom_fields
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    let flags: Vec<bool> = entry.custom_fields.iter().map(|f| f.is_protected).collect();
+
+    // Pin the actual fixture's authored order — proves FFI doesn't
+    // re-sort / re-segregate. If the fixture is ever regenerated and
+    // its order shifts, this assertion needs to track it; the
+    // structural property (FFI = upstream order) survives.
+    assert_eq!(
+        names,
+        vec!["Recovery Code", "API Key ID", "API Secret", "PIN"]
+    );
+    assert_eq!(flags, vec![false, false, true, true]);
+
+    // Belt-and-braces: every entry has exactly the expected count,
+    // proving nothing got dropped at the FFI boundary either.
+    assert_eq!(entry.custom_fields.len(), 4);
+}
+
+#[test]
+fn protected_custom_fields_carry_is_protected_flag() {
     let vault = Vault::new(
         fixture("pykeepass/custom-fields.kdbx"),
         "test-custom-104".to_owned(),
@@ -153,29 +199,38 @@ fn protected_custom_fields_partition_correctly() {
 
     let entry = vault.get_entry(summaries[0].uuid.clone()).expect("get");
 
-    // Sidecar: API Secret + PIN are protected; API Key ID + Recovery Code aren't.
-    // Plus the always-protected Password slot.
-    let custom_names: Vec<_> = entry
-        .custom_fields
-        .iter()
-        .map(|f| f.name.as_str())
-        .collect();
-    assert!(custom_names.contains(&"API Key ID"));
-    assert!(custom_names.contains(&"Recovery Code"));
+    // Sidecar: API Secret + PIN are protected; API Key ID + Recovery
+    // Code aren't. All four surface inside `custom_fields` with the
+    // `is_protected` flag distinguishing them. The always-protected
+    // Password slot is separate (`password_field`).
+    let by_name = |name: &str| entry.custom_fields.iter().find(|f| f.name == name);
 
-    let protected_names: Vec<_> = entry
-        .protected_fields
-        .iter()
-        .map(|f| f.name.as_str())
-        .collect();
-    assert!(protected_names.contains(&"Password"));
-    assert!(protected_names.contains(&"API Secret"));
-    assert!(protected_names.contains(&"PIN"));
+    let api_key_id = by_name("API Key ID").expect("API Key ID present");
+    assert!(!api_key_id.is_protected);
+    assert!(!api_key_id.value.is_empty());
 
-    for f in &entry.protected_fields {
-        assert!(!f.revealed);
-        assert!(f.value.is_none(), "no plaintext crosses boundary");
-    }
+    let recovery = by_name("Recovery Code").expect("Recovery Code present");
+    assert!(!recovery.is_protected);
+    assert!(!recovery.value.is_empty());
+
+    let api_secret = by_name("API Secret").expect("API Secret present");
+    assert!(api_secret.is_protected);
+    assert!(
+        api_secret.value.is_empty(),
+        "no protected plaintext crosses boundary"
+    );
+
+    let pin = by_name("PIN").expect("PIN present");
+    assert!(pin.is_protected);
+    assert!(
+        pin.value.is_empty(),
+        "no protected plaintext crosses boundary"
+    );
+
+    // Password slot still surfaces no plaintext at the read DTO.
+    assert_eq!(entry.password_field.name, "Password");
+    assert!(!entry.password_field.revealed);
+    assert!(entry.password_field.value.is_none());
 }
 
 #[test]

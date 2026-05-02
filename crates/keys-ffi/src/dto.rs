@@ -77,8 +77,24 @@ pub struct Entry {
     pub notes: String,
     pub tags: Vec<String>,
     pub group_uuid: String,
+    /// Every user-defined custom field on the entry, in source XML
+    /// declaration order. Protected and non-protected fields share
+    /// this single ordered array so frontends can render them
+    /// interleaved as `KeePass` does. Distinguish per element via
+    /// [`CustomField::is_protected`]; reveal protected plaintext via
+    /// [`crate::Vault::reveal_field`].
+    ///
+    /// Excludes the always-protected `Password` slot — that's surfaced
+    /// separately as [`Self::password_field`] because there's exactly
+    /// one per entry and it's structurally distinct from user-defined
+    /// custom fields.
     pub custom_fields: Vec<CustomField>,
-    pub protected_fields: Vec<ProtectedField>,
+    /// The always-present `Password` slot. KDBX entries have exactly
+    /// one Password per entry; surfacing it as a singleton here makes
+    /// that constraint explicit rather than masquerading inside a
+    /// `Vec`. Reveal plaintext via [`crate::Vault::reveal_field`] with
+    /// [`PASSWORD_FIELD_NAME`].
+    pub password_field: ProtectedField,
     pub created_ms: i64,
     pub last_modified_ms: i64,
     pub last_access_ms: i64,
@@ -107,20 +123,22 @@ pub struct Entry {
 
 impl Entry {
     pub(crate) fn from_entry(entry: &KcEntry, group_uuid: GroupId) -> Self {
-        let mut custom_fields = Vec::new();
-        let mut protected_fields = vec![ProtectedField {
+        // Walk `entry.custom_fields` in source XML declaration order
+        // and surface every element through the unified array.
+        // Protected vs non-protected is per-element via
+        // `CustomField::is_protected`; the Password slot is separate.
+        let custom_fields: Vec<CustomField> = entry
+            .custom_fields
+            .iter()
+            .cloned()
+            .map(CustomField::from)
+            .collect();
+
+        let password_field = ProtectedField {
             name: PASSWORD_FIELD_NAME.to_owned(),
             revealed: false,
             value: None,
-        }];
-
-        for field in &entry.custom_fields {
-            if field.protected {
-                protected_fields.push(ProtectedField::from_protected(field));
-            } else {
-                custom_fields.push(CustomField::from(field.clone()));
-            }
-        }
+        };
 
         Self {
             uuid: entry.id.0.to_string(),
@@ -131,7 +149,7 @@ impl Entry {
             tags: entry.tags.clone(),
             group_uuid: group_uuid.0.to_string(),
             custom_fields,
-            protected_fields,
+            password_field,
             created_ms: ts_ms(entry.times.creation_time),
             last_modified_ms: ts_ms(entry.times.last_modification_time),
             last_access_ms: ts_ms(entry.times.last_access_time),
@@ -146,59 +164,90 @@ impl Entry {
     }
 }
 
-/// A non-protected custom field. KDBX deduplicates by `name` per entry,
-/// so the binding side can map this to `[String: String]` losslessly.
+/// A user-defined custom field on an entry. KDBX deduplicates by
+/// `name` per entry, but the on-disk representation preserves source
+/// declaration order — this DTO mirrors that. Protected fields surface
+/// here too with `is_protected = true` and `value` empty; reveal
+/// plaintext via [`crate::Vault::reveal_field`].
+///
+/// The always-present Password slot is **not** here — see
+/// [`Entry::password_field`].
 #[derive(uniffi::Record, Debug, Clone)]
 #[non_exhaustive]
 pub struct CustomField {
     pub name: String,
+    /// Empty when `is_protected == true` — protected plaintext is
+    /// fetched via [`crate::Vault::reveal_field`], not surfaced in
+    /// the read DTO. Contains the on-disk value when the field is
+    /// non-protected.
     pub value: String,
+    /// `<Value Protected="True" />` on the source XML element. When
+    /// true, `value` is empty by design and frontends should fetch
+    /// plaintext on demand.
+    pub is_protected: bool,
 }
 
 impl CustomField {
-    /// Construct a `CustomField` from name + value. Required because
-    /// `#[non_exhaustive]` blocks struct-literal construction outside
-    /// the crate (Swift bindings synthesise their own init).
+    /// Construct a non-protected `CustomField` from name + value.
+    /// Required because `#[non_exhaustive]` blocks struct-literal
+    /// construction outside the crate (Swift bindings synthesise
+    /// their own init). Sets `is_protected = false`; see
+    /// [`Self::new_protected`] for the protected variant.
     #[must_use]
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             value: value.into(),
+            is_protected: false,
+        }
+    }
+
+    /// Construct a protected `CustomField` from name only. The
+    /// plaintext doesn't cross the FFI boundary at construction time;
+    /// frontends fetch via [`crate::Vault::reveal_field`].
+    #[must_use]
+    pub fn new_protected(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: String::new(),
+            is_protected: true,
         }
     }
 }
 
 impl From<KcCustomField> for CustomField {
     fn from(field: KcCustomField) -> Self {
+        // Protected fields surface here too, with empty `value` —
+        // plaintext is fetched on demand via `Vault::reveal_field`.
+        // Non-protected fields carry their on-disk value directly.
+        let value = if field.protected {
+            String::new()
+        } else {
+            field.value
+        };
         Self {
             name: field.key,
-            value: field.value,
+            value,
+            is_protected: field.protected,
         }
     }
 }
 
-/// A protected custom field or the always-protected `Password`. From
-/// [`get_entry`](crate::Vault::get_entry) `revealed` is always `false` and
-/// `value` is always `None` — slice 4 adds the reveal API. The fields are
-/// kept on this record so the binding contract doesn't break when the
-/// reveal path lands.
+/// The always-present `Password` slot on an [`Entry`]. KDBX entries
+/// have exactly one Password per entry, distinct from user-defined
+/// custom fields (those surface via [`CustomField`] with
+/// `is_protected = true`).
+///
+/// From [`get_entry`](crate::Vault::get_entry) `revealed` is always
+/// `false` and `value` is always `None` — slice 4 adds the reveal
+/// API. The fields are kept on this record so the binding contract
+/// doesn't break when the reveal path lands.
 #[derive(uniffi::Record, Debug, Clone)]
 #[non_exhaustive]
 pub struct ProtectedField {
     pub name: String,
     pub revealed: bool,
     pub value: Option<String>,
-}
-
-impl ProtectedField {
-    fn from_protected(field: &KcCustomField) -> Self {
-        debug_assert!(field.protected, "ProtectedField from non-protected field");
-        Self {
-            name: field.key.clone(),
-            revealed: false,
-            value: None,
-        }
-    }
 }
 
 /// A node in the vault's group tree, flattened for FFI consumption.
@@ -277,10 +326,13 @@ impl EntryCreate {
 /// `Some(vec![])` on `tags` or `custom_fields` clears that list — same
 /// whole-list-replacement semantics, no separate "clear flag".
 ///
-/// Protected fields are deliberately absent: they're updated via
-/// `set_protected_field` / `clear_protected_field`. An unprotected-list
-/// replacement of `custom_fields` never touches the entry's protected
-/// fields.
+/// Protected fields are deliberately absent from this patch surface:
+/// they're updated via `set_protected_field` / `clear_protected_field`.
+/// `custom_fields` here only carries the **unprotected** subset — entries
+/// with `is_protected = true` in the supplied list are silently dropped
+/// during apply (the read DTO surfaces protected fields too, but this
+/// write surface ignores them). An unprotected-list replacement never
+/// touches the entry's protected fields.
 #[derive(uniffi::Record, Debug, Clone)]
 #[non_exhaustive]
 pub struct EntryPatch {
