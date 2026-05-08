@@ -974,6 +974,39 @@ impl Vault {
         Ok(())
     }
 
+    /// Set the per-entry history-snapshot count cap
+    /// (`<HistoryMaxItems>`). Negative values mean unlimited; this
+    /// matches `keepass-core`'s convention and matches what other
+    /// `KeePass` clients write. Truncation runs automatically on
+    /// `edit_entry` and `restore_entry_from_history` per the
+    /// configured policy — there's no separate `trim_entry_history`
+    /// surface needed.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn set_history_max_items(&self, max: i32) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        kdbx.set_history_max_items(max);
+        Ok(())
+    }
+
+    /// Set the per-entry history-snapshot byte-budget cap
+    /// (`<HistoryMaxSize>`). Negative values mean unlimited.
+    /// Truncation runs automatically on `edit_entry` and
+    /// `restore_entry_from_history` per the configured policy.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn set_history_max_size(&self, max: i64) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        kdbx.set_history_max_size(max);
+        Ok(())
+    }
+
     // -------------------------------------------------------------------
     // Meta readers
     // -------------------------------------------------------------------
@@ -1010,6 +1043,30 @@ impl Vault {
         let guard = self.inner.lock().expect("Vault mutex poisoned");
         let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
         Ok(kdbx.vault().meta.default_username.clone())
+    }
+
+    /// Read the per-entry history-snapshot count cap
+    /// (`<HistoryMaxItems>`). Negative values mean unlimited.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn history_max_items(&self) -> Result<i32, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        Ok(kdbx.vault().meta.history_max_items)
+    }
+
+    /// Read the per-entry history-snapshot byte-budget cap
+    /// (`<HistoryMaxSize>`). Negative values mean unlimited.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn history_max_size(&self) -> Result<i64, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        Ok(kdbx.vault().meta.history_max_size)
     }
 
     /// Read the recycle-bin group's UUID, if the vault has one

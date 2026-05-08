@@ -496,6 +496,58 @@ fn set_color_passes_non_canonical_strings_through() {
 }
 
 // =======================================================================
+// History-trim policy (slice 4A PR 4)
+//
+// Wraps Kdbx::set_history_max_items / set_history_max_size with paired
+// readers. Truncation runs automatically inside edit_entry per the
+// configured policy; no separate trim_entry_history surface.
+// =======================================================================
+
+#[test]
+fn history_max_items_round_trips_through_save() {
+    let vault = open_basic();
+    vault
+        .set_history_max_items(5)
+        .expect("set history_max_items");
+    assert_eq!(vault.history_max_items().expect("read"), 5);
+
+    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    assert_eq!(reopened.history_max_items().expect("read after reopen"), 5);
+}
+
+#[test]
+fn history_max_size_round_trips_through_save() {
+    let vault = open_basic();
+    let target = 12_345_678_i64;
+    vault
+        .set_history_max_size(target)
+        .expect("set history_max_size");
+    assert_eq!(vault.history_max_size().expect("read"), target);
+
+    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    assert_eq!(
+        reopened.history_max_size().expect("read after reopen"),
+        target
+    );
+}
+
+#[test]
+fn history_max_items_negative_means_unlimited() {
+    // keepass-core convention: negative values disable the cap.
+    // Pass-through verification — facade doesn't gatekeep.
+    let vault = open_basic();
+    vault.set_history_max_items(-1).expect("set");
+    assert_eq!(vault.history_max_items().expect("read"), -1);
+}
+
+#[test]
+fn history_max_size_negative_means_unlimited() {
+    let vault = open_basic();
+    vault.set_history_max_size(-1).expect("set");
+    assert_eq!(vault.history_max_size().expect("read"), -1);
+}
+
+// =======================================================================
 // Custom icons
 // =======================================================================
 
@@ -578,6 +630,16 @@ fn slice6_methods_return_locked_after_lock() {
         vault.clear_group_custom_icon(some_group.clone()),
         Err(VaultError::Locked)
     ));
+    assert!(matches!(
+        vault.set_history_max_items(10),
+        Err(VaultError::Locked)
+    ));
+    assert!(matches!(
+        vault.set_history_max_size(1024),
+        Err(VaultError::Locked)
+    ));
+    assert!(matches!(vault.history_max_items(), Err(VaultError::Locked)));
+    assert!(matches!(vault.history_max_size(), Err(VaultError::Locked)));
     assert!(matches!(
         vault.recycle_entry(BOGUS.to_owned()),
         Err(VaultError::Locked)
