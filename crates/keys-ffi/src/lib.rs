@@ -17,8 +17,8 @@ mod portable;
 mod vault;
 
 pub use dto::{
-    CustomField, Entry, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch, HistoryRecord,
-    ProtectedField,
+    AutoType, AutoTypeAssociation, CustomField, Entry, EntryCreate, EntryPatch, EntrySummary,
+    Group, GroupPatch, HistoryRecord, ProtectedField,
 };
 pub use error::VaultError;
 pub use merge::{

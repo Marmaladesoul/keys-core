@@ -333,6 +333,38 @@ impl EntryCreate {
 /// during apply (the read DTO surfaces protected fields too, but this
 /// write surface ignores them). An unprotected-list replacement never
 /// touches the entry's protected fields.
+///
+/// ## Editor-field surface (slice 4A)
+///
+/// `icon_id`, `custom_icon_uuid`, `foreground_color`, `background_color`,
+/// `override_url`, `expires`, `expiry_time_ms`, and `auto_type` round-trip
+/// the equivalent KDBX entry-level XML elements. All carry single-`Option`
+/// "set or leave alone" semantics:
+///
+/// - **Colour / override-URL fields** (`foreground_color`, `background_color`,
+///   `override_url`) follow the read-side empty-string-as-default
+///   convention. `None` leaves the field alone; `Some("")` clears the
+///   per-entry value (client falls back to its default); `Some("#rrggbb")`
+///   sets it explicitly.
+/// - **Truly nullable fields** (`custom_icon_uuid`, `expiry_time_ms`)
+///   can only be SET via this patch. To CLEAR them, call the named
+///   methods [`crate::Vault::clear_entry_custom_icon`] /
+///   [`crate::Vault::clear_entry_expiry`] — those are the only ways to
+///   round-trip the source-XML "no element" representation through the
+///   FFI boundary cleanly. The patch shape stays homogeneous (single
+///   `Option<T>` everywhere) at the cost of a separate clear call per
+///   nullable field, which is the rarer of the two operations.
+/// - **Expiry is set-only via `expiry_time_ms`.** Setting `Some(ms)`
+///   enables `expires` and stamps the deadline together (matching the
+///   upstream `Entry`'s coupled-state semantics). To CLEAR expiry,
+///   call [`crate::Vault::clear_entry_expiry`]; the patch shape
+///   doesn't expose a `expires: Option<bool>` field because the rare
+///   uncoupled states (expires=true with no time, or expires=false
+///   with stale time) only arise from third-party writers and aren't
+///   states the Keys app should produce.
+/// - **`auto_type`** replaces the whole `<AutoType>` block in one shot.
+///   Per-association edits are uncommon; whole-block replacement matches
+///   how slice-2's read path consumes the value.
 #[derive(uniffi::Record, Debug, Clone)]
 #[non_exhaustive]
 pub struct EntryPatch {
@@ -342,6 +374,33 @@ pub struct EntryPatch {
     pub notes: Option<String>,
     pub tags: Option<Vec<String>>,
     pub custom_fields: Option<Vec<CustomField>>,
+    /// `None` leaves alone; `Some(id)` sets the built-in icon index.
+    pub icon_id: Option<u32>,
+    /// `None` leaves alone; `Some(uuid)` points at a custom-icon-table
+    /// entry. To clear (return to a built-in icon), call
+    /// [`crate::Vault::clear_entry_custom_icon`].
+    pub custom_icon_uuid: Option<String>,
+    /// `None` leaves alone. `Some("")` clears the per-entry colour
+    /// (client falls back to its default — matches read-side
+    /// empty-string convention). `Some("#rrggbb")` sets explicitly.
+    pub foreground_color: Option<String>,
+    /// `None` leaves alone. `Some("")` clears the per-entry colour
+    /// (client falls back to its default). `Some("#rrggbb")` sets
+    /// explicitly.
+    pub background_color: Option<String>,
+    /// `None` leaves alone. `Some("")` clears the override (entry's
+    /// `URL` opens via the client default). `Some(value)` sets a
+    /// per-entry URL-scheme override.
+    pub override_url: Option<String>,
+    /// `None` leaves alone; `Some(ms)` sets the deadline AND enables
+    /// `expires` together (the upstream `Entry::set_expiry` API
+    /// couples them — there's no granular split). To CLEAR expiry,
+    /// call [`crate::Vault::clear_entry_expiry`].
+    pub expiry_time_ms: Option<i64>,
+    /// `None` leaves alone; `Some(at)` replaces the `<AutoType>`
+    /// block outright (per-association merge isn't a slice-4 goal —
+    /// dogfooding can flag if it's needed).
+    pub auto_type: Option<AutoType>,
 }
 
 impl EntryPatch {
@@ -358,6 +417,13 @@ impl EntryPatch {
             notes: None,
             tags: None,
             custom_fields: None,
+            icon_id: None,
+            custom_icon_uuid: None,
+            foreground_color: None,
+            background_color: None,
+            override_url: None,
+            expiry_time_ms: None,
+            auto_type: None,
         }
     }
 }
@@ -422,7 +488,41 @@ pub struct AutoTypeAssociation {
     pub keystroke_sequence: String,
 }
 
+impl AutoTypeAssociation {
+    /// Construct a per-window override. Required because the type
+    /// is `#[non_exhaustive]` (no struct-literal construction
+    /// outside the crate).
+    #[must_use]
+    pub fn new(window: impl Into<String>, keystroke_sequence: impl Into<String>) -> Self {
+        Self {
+            window: window.into(),
+            keystroke_sequence: keystroke_sequence.into(),
+        }
+    }
+}
+
+impl Default for AutoType {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            data_transfer_obfuscation: 0,
+            default_sequence: String::new(),
+            associations: Vec::new(),
+        }
+    }
+}
+
 impl AutoType {
+    /// Construct a fresh `AutoType` block — defaults: enabled, no
+    /// obfuscation, no default sequence, no per-window associations.
+    /// Required because the type is `#[non_exhaustive]` (no struct-
+    /// literal construction outside the crate); callers mutate the
+    /// fields they care about after construction.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub(crate) fn from_auto_type(at: &keepass_core::model::AutoType) -> Self {
         Self {
             enabled: at.enabled,
@@ -437,6 +537,26 @@ impl AutoType {
                 })
                 .collect(),
         }
+    }
+
+    /// Convert an FFI `AutoType` into the model's. Used by
+    /// [`crate::Vault::update_entry`] when applying an `auto_type`
+    /// patch field. Goes through `AutoType::new()` because the model
+    /// type is `#[non_exhaustive]` (no struct-literal construction
+    /// outside the crate). Consumes `self` to avoid cloning the
+    /// association strings — the patch's `auto_type` value is owned
+    /// and discarded after apply, so consuming is the right shape.
+    pub(crate) fn into_auto_type(self) -> keepass_core::model::AutoType {
+        let mut at = keepass_core::model::AutoType::new();
+        at.enabled = self.enabled;
+        at.data_transfer_obfuscation = self.data_transfer_obfuscation;
+        at.default_sequence = self.default_sequence;
+        at.associations = self
+            .associations
+            .into_iter()
+            .map(|a| keepass_core::model::AutoTypeAssociation::new(a.window, a.keystroke_sequence))
+            .collect();
+        at
     }
 }
 

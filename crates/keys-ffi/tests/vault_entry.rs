@@ -7,7 +7,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use keys_ffi::{CustomField, EntryCreate, EntryPatch, Vault, VaultError};
+use keys_ffi::{
+    AutoType, AutoTypeAssociation, CustomField, EntryCreate, EntryPatch, Vault, VaultError,
+};
 use tempfile::NamedTempFile;
 
 fn fixture(rel: &str) -> String {
@@ -465,7 +467,251 @@ fn entry_methods_return_locked_after_lock() {
         Err(VaultError::Locked)
     ));
     assert!(matches!(
-        vault.move_entry(entry_uuid, group),
+        vault.move_entry(entry_uuid.clone(), group),
         Err(VaultError::Locked)
     ));
+    assert!(matches!(
+        vault.clear_entry_custom_icon(entry_uuid.clone()),
+        Err(VaultError::Locked)
+    ));
+    assert!(matches!(
+        vault.clear_entry_expiry(entry_uuid),
+        Err(VaultError::Locked)
+    ));
+}
+
+// -----------------------------------------------------------------------
+// EntryPatch editor-field surface (slice 4A)
+//
+// All eight new fields use single-`Option<T>` set-or-leave-alone
+// semantics. The two genuinely-nullable fields (`custom_icon_uuid`,
+// `expiry_time_ms`) have named clear methods on `Vault` for the
+// clear-to-nil case; see the dedicated tests below.
+// -----------------------------------------------------------------------
+
+#[test]
+fn update_icon_id_sets_value_and_round_trips() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    let mut patch = empty_patch();
+    patch.icon_id = Some(42);
+    vault
+        .update_entry(entry_uuid.clone(), patch)
+        .expect("update");
+    assert_eq!(vault.get_entry(entry_uuid.clone()).unwrap().icon_id, 42);
+
+    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    assert_eq!(reopened.get_entry(entry_uuid).unwrap().icon_id, 42);
+}
+
+#[test]
+fn update_custom_icon_uuid_sets_value() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+    // Register a custom icon so the patch has a valid target.
+    let icon_uuid = vault.add_custom_icon(vec![1, 2, 3, 4]).expect("icon");
+
+    let mut patch = empty_patch();
+    patch.custom_icon_uuid = Some(icon_uuid.clone());
+    vault
+        .update_entry(entry_uuid.clone(), patch)
+        .expect("update");
+    assert_eq!(
+        vault.get_entry(entry_uuid).unwrap().custom_icon_uuid,
+        Some(icon_uuid)
+    );
+}
+
+#[test]
+fn clear_entry_custom_icon_returns_to_none() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+    let icon_uuid = vault.add_custom_icon(vec![1, 2, 3, 4]).expect("icon");
+
+    // First set, then clear via the named method.
+    let mut patch = empty_patch();
+    patch.custom_icon_uuid = Some(icon_uuid);
+    vault.update_entry(entry_uuid.clone(), patch).unwrap();
+    assert!(
+        vault
+            .get_entry(entry_uuid.clone())
+            .unwrap()
+            .custom_icon_uuid
+            .is_some()
+    );
+
+    vault
+        .clear_entry_custom_icon(entry_uuid.clone())
+        .expect("clear");
+    assert!(
+        vault
+            .get_entry(entry_uuid)
+            .unwrap()
+            .custom_icon_uuid
+            .is_none()
+    );
+}
+
+#[test]
+fn update_colour_fields_set_and_clear_via_empty_string() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    // Set colours.
+    let mut patch = empty_patch();
+    patch.foreground_color = Some("#ff0000".to_owned());
+    patch.background_color = Some("#0000ff".to_owned());
+    vault.update_entry(entry_uuid.clone(), patch).unwrap();
+    let after_set = vault.get_entry(entry_uuid.clone()).unwrap();
+    assert_eq!(after_set.foreground_color, "#ff0000");
+    assert_eq!(after_set.background_color, "#0000ff");
+
+    // Clear colours via empty string (read-side empty-string-as-default).
+    let mut clear_patch = empty_patch();
+    clear_patch.foreground_color = Some(String::new());
+    clear_patch.background_color = Some(String::new());
+    vault.update_entry(entry_uuid.clone(), clear_patch).unwrap();
+    let after_clear = vault.get_entry(entry_uuid).unwrap();
+    assert_eq!(after_clear.foreground_color, "");
+    assert_eq!(after_clear.background_color, "");
+}
+
+#[test]
+fn update_override_url_sets_and_clears_via_empty_string() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    let mut set_patch = empty_patch();
+    set_patch.override_url = Some("cmd://open {URL}".to_owned());
+    vault.update_entry(entry_uuid.clone(), set_patch).unwrap();
+    assert_eq!(
+        vault.get_entry(entry_uuid.clone()).unwrap().override_url,
+        "cmd://open {URL}"
+    );
+
+    let mut clear_patch = empty_patch();
+    clear_patch.override_url = Some(String::new());
+    vault.update_entry(entry_uuid.clone(), clear_patch).unwrap();
+    assert_eq!(vault.get_entry(entry_uuid).unwrap().override_url, "");
+}
+
+#[test]
+fn update_expiry_time_ms_enables_expires_and_round_trips() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    // Some plausible future timestamp: 2030-01-01T00:00:00Z = 1893456000000ms.
+    let target_ms: i64 = 1_893_456_000_000;
+    let mut patch = empty_patch();
+    patch.expiry_time_ms = Some(target_ms);
+    vault.update_entry(entry_uuid.clone(), patch).unwrap();
+
+    let after = vault.get_entry(entry_uuid.clone()).unwrap();
+    assert!(after.expires, "expires flag should auto-enable");
+    assert_eq!(after.expiry_time_ms, Some(target_ms));
+
+    // Round-trip through save.
+    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let after_reopen = reopened.get_entry(entry_uuid).unwrap();
+    assert!(after_reopen.expires);
+    assert_eq!(after_reopen.expiry_time_ms, Some(target_ms));
+}
+
+#[test]
+fn clear_entry_expiry_clears_both_flag_and_time() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    // First enable expiry.
+    let mut patch = empty_patch();
+    patch.expiry_time_ms = Some(1_893_456_000_000);
+    vault.update_entry(entry_uuid.clone(), patch).unwrap();
+    assert!(vault.get_entry(entry_uuid.clone()).unwrap().expires);
+
+    vault.clear_entry_expiry(entry_uuid.clone()).expect("clear");
+    let cleared = vault.get_entry(entry_uuid).unwrap();
+    assert!(!cleared.expires, "expires flag should clear");
+    assert_eq!(cleared.expiry_time_ms, None, "time should clear");
+}
+
+#[test]
+fn update_auto_type_replaces_whole_block() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    let mut new_at = AutoType::new();
+    new_at.default_sequence = "{USERNAME}{TAB}{PASSWORD}{ENTER}".to_owned();
+    new_at
+        .associations
+        .push(AutoTypeAssociation::new("Firefox - *", "{PASSWORD}{ENTER}"));
+    let mut patch = empty_patch();
+    patch.auto_type = Some(new_at);
+    vault.update_entry(entry_uuid.clone(), patch).unwrap();
+
+    let after = vault.entry_auto_type(entry_uuid).expect("read at");
+    assert!(after.enabled);
+    assert_eq!(after.default_sequence, "{USERNAME}{TAB}{PASSWORD}{ENTER}");
+    assert_eq!(after.associations.len(), 1);
+    assert_eq!(after.associations[0].window, "Firefox - *");
+    assert_eq!(
+        after.associations[0].keystroke_sequence,
+        "{PASSWORD}{ENTER}"
+    );
+}
+
+#[test]
+fn update_with_none_editor_fields_leaves_existing_values_alone() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    // Establish baseline: set an icon + colour + expiry.
+    let mut seed = empty_patch();
+    seed.icon_id = Some(7);
+    seed.foreground_color = Some("#abcdef".to_owned());
+    seed.expiry_time_ms = Some(1_893_456_000_000);
+    vault.update_entry(entry_uuid.clone(), seed).unwrap();
+
+    // Apply a patch that only changes the title.
+    let mut titled = empty_patch();
+    titled.title = Some("New Title".to_owned());
+    vault.update_entry(entry_uuid.clone(), titled).unwrap();
+
+    // Editor fields preserved.
+    let after = vault.get_entry(entry_uuid).unwrap();
+    assert_eq!(after.title, "New Title");
+    assert_eq!(after.icon_id, 7);
+    assert_eq!(after.foreground_color, "#abcdef");
+    assert!(after.expires);
+    assert_eq!(after.expiry_time_ms, Some(1_893_456_000_000));
+}
+
+#[test]
+fn clear_entry_custom_icon_with_bogus_uuid_returns_not_found() {
+    let vault = open_basic();
+    let err = vault
+        .clear_entry_custom_icon("00000000-0000-0000-0000-000000000000".to_owned())
+        .expect_err("bogus uuid");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
+fn clear_entry_expiry_with_bogus_uuid_returns_not_found() {
+    let vault = open_basic();
+    let err = vault
+        .clear_entry_expiry("00000000-0000-0000-0000-000000000000".to_owned())
+        .expect_err("bogus uuid");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
+fn update_with_bogus_custom_icon_uuid_returns_not_found() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+    let mut patch = empty_patch();
+    patch.custom_icon_uuid = Some("not-a-uuid".to_owned());
+    let err = vault
+        .update_entry(entry_uuid, patch)
+        .expect_err("malformed uuid");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
 }

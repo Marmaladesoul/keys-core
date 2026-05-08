@@ -14,6 +14,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, TimeZone, Utc};
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{
@@ -472,6 +473,19 @@ impl Vault {
             None
         };
 
+        // Resolve the custom-icon UUID outside the edit closure so a
+        // malformed patch surfaces as `VaultError::InvalidUuid` rather
+        // than panicking inside the editor closure.
+        let custom_icon_uuid = match patch.custom_icon_uuid.as_ref() {
+            Some(s) => Some(parse_icon_uuid(s)?),
+            None => None,
+        };
+        // Decode the expiry timestamp once for the same reason.
+        let expiry_dt: Option<DateTime<Utc>> = match patch.expiry_time_ms {
+            Some(ms) => Some(timestamp_ms_to_utc(ms)?),
+            None => None,
+        };
+
         kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
             if let Some(t) = patch.title {
                 editor.set_title(t);
@@ -500,6 +514,38 @@ impl Vault {
                 for cf in new_list.into_iter().filter(|c| !c.is_protected) {
                     editor.set_custom_field(cf.name, CustomFieldValue::Plain(cf.value));
                 }
+            }
+            // Editor-field surface (slice 4A): all single-`Option`
+            // semantics — `None` = leave alone, `Some(v)` = set.
+            // The colour / override-URL fields treat `Some("")` as
+            // "clear to client default" per the read-side empty-
+            // string convention; the entry editor's setters take a
+            // `String` directly so the empty case round-trips
+            // without a separate clear path.
+            if let Some(id) = patch.icon_id {
+                editor.set_icon_id(id);
+            }
+            if patch.custom_icon_uuid.is_some() {
+                editor.set_custom_icon(custom_icon_uuid);
+            }
+            if let Some(c) = patch.foreground_color {
+                editor.set_foreground_color(c);
+            }
+            if let Some(c) = patch.background_color {
+                editor.set_background_color(c);
+            }
+            if let Some(u) = patch.override_url {
+                editor.set_override_url(u);
+            }
+            // Expiry: `Some(ms)` sets the deadline AND enables the
+            // expires flag together (mirrors keepass-core's
+            // `set_expiry(Option<DateTime>)` API). Clearing expiry
+            // is the `Vault::clear_entry_expiry` named-method path.
+            if let Some(at) = expiry_dt {
+                editor.set_expiry(Some(at));
+            }
+            if let Some(at) = patch.auto_type {
+                editor.set_auto_type(at.into_auto_type());
             }
         })
         .map_err(model_err_to_vault_err)?;
@@ -541,6 +587,60 @@ impl Vault {
         let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
         let target = parse_entry_id(&uuid)?;
         kdbx.touch_entry(target).map_err(model_err_to_vault_err)
+    }
+
+    /// Clear an entry's `custom_icon_uuid`, returning it to a
+    /// built-in icon. The patch shape on
+    /// [`crate::dto::EntryPatch::custom_icon_uuid`] is set-only
+    /// (single `Option<String>`); this is the named clear path that
+    /// preserves the homogeneous patch surface without nested
+    /// `Option<Option<String>>` ergonomics. See `#R32` / `#I70`.
+    ///
+    /// Equivalent to `editor.set_custom_icon(None)` inside an
+    /// `edit_entry` closure with `HistoryPolicy::Snapshot`.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match an entry.
+    pub fn clear_entry_custom_icon(&self, uuid: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&uuid)?;
+        kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
+            editor.set_custom_icon(None);
+        })
+        .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::EntryModified { uuid: uuid.clone() });
+        Ok(())
+    }
+
+    /// Clear an entry's expiry **completely** — disables the
+    /// `expires` flag and removes the stored deadline together. The
+    /// patch shape exposes only `expiry_time_ms: Option<i64>` (set
+    /// the deadline; implies enabled); this is the named clear path
+    /// for the coupled-clear case so the patch surface stays
+    /// homogeneous. See `#R32` / `#I70`.
+    ///
+    /// Equivalent to `editor.set_expiry(None)` inside an
+    /// `edit_entry` closure with `HistoryPolicy::Snapshot`.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match an entry.
+    pub fn clear_entry_expiry(&self, uuid: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&uuid)?;
+        kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
+            editor.set_expiry(None);
+        })
+        .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::EntryModified { uuid: uuid.clone() });
+        Ok(())
     }
 
     /// Move an entry to `new_group_uuid`. A move to the entry's
@@ -1529,6 +1629,24 @@ fn parse_entry_id(s: &str) -> Result<EntryId, VaultError> {
     Uuid::parse_str(s)
         .map(EntryId)
         .map_err(|_| VaultError::NotFound)
+}
+
+/// Parse a custom-icon UUID string. Same shape as `parse_entry_id` /
+/// `parse_group_id` — `NotFound` on malformed input matches the
+/// downstream `set_custom_icon` semantics (referencing a non-existent
+/// custom-icon UUID is a no-op on the model side).
+fn parse_icon_uuid(s: &str) -> Result<Uuid, VaultError> {
+    Uuid::parse_str(s).map_err(|_| VaultError::NotFound)
+}
+
+/// Convert Unix-epoch milliseconds into a `DateTime<Utc>`. Returns
+/// [`VaultError::NotFound`] for out-of-range values rather than
+/// panicking — same shape as the UUID parsers above (a malformed
+/// patch surfaces as a clean error to the caller).
+fn timestamp_ms_to_utc(ms: i64) -> Result<DateTime<Utc>, VaultError> {
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .ok_or(VaultError::NotFound)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
