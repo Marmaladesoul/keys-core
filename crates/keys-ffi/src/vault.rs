@@ -1103,6 +1103,90 @@ impl Vault {
         Ok(bin.data.clone())
     }
 
+    /// Attach a binary to an entry. The vault's binary pool dedups by
+    /// SHA-256: identical bytes attached to two different entries
+    /// share a single pool slot. The pool entry is created (or
+    /// reused) at the end of `edit_entry`; refcount-based GC drops
+    /// orphans on save. The attachment is added unprotected — the
+    /// upstream `Entry::attach` API takes a `protected` flag too,
+    /// but slice-2 / slice-4 frontends always read attachments via
+    /// `entry_attachment_bytes` which doesn't distinguish protection
+    /// status, so the FFI exposes only the unprotected path. Add a
+    /// `protected` parameter in a follow-up if a frontend ever needs
+    /// it.
+    ///
+    /// Replacing an existing attachment with the same `name` is
+    /// idempotent: the existing reference is replaced and the old
+    /// pool entry GC'd if no other entry references it.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an entry.
+    pub fn add_entry_attachment(
+        &self,
+        entry_uuid: String,
+        name: String,
+        bytes: Vec<u8>,
+    ) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
+            // Idempotent by name: detach any existing attachment
+            // with the same name first so the FFI surface always
+            // represents "this entry has at most one attachment
+            // called X." The upstream `attach` API doesn't dedup
+            // by name (KDBX permits duplicate names by spec), but
+            // frontend semantics expect "attach replaces same-
+            // named existing." Both attachments reference the same
+            // pool slot via SHA-256 dedup at the pool level, so
+            // the saved bytes are unchanged either way; this is
+            // a per-entry name uniqueness contract.
+            let _ = editor.detach(&name);
+            editor.attach(name, bytes, /* protected = */ false);
+        })
+        .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::EntryModified { uuid: entry_uuid });
+        Ok(())
+    }
+
+    /// Remove an entry attachment by filename. Returns `true` if a
+    /// matching attachment was removed, `false` if the entry had no
+    /// such attachment (which is **not** an error — UI flows that
+    /// race a "delete attachment" click against another edit can
+    /// surface this without forcing the host to call another method
+    /// to check first).
+    ///
+    /// Pool GC: the binary the detached attachment pointed at stays
+    /// alive if another entry still references it; otherwise it's
+    /// dropped at the end of `edit_entry` by refcount.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an entry.
+    pub fn remove_entry_attachment(
+        &self,
+        entry_uuid: String,
+        name: String,
+    ) -> Result<bool, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let mut removed = false;
+        kdbx.edit_entry(target, HistoryPolicy::Snapshot, |editor| {
+            removed = editor.detach(&name);
+        })
+        .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        if removed {
+            self.fire(&VaultChange::EntryModified { uuid: entry_uuid });
+        }
+        Ok(removed)
+    }
+
     // -------------------------------------------------------------------
     // Auto-type
     // -------------------------------------------------------------------

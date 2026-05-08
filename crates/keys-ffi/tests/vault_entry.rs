@@ -440,6 +440,169 @@ fn move_entry_with_bogus_destination_returns_not_found() {
 }
 
 // -----------------------------------------------------------------------
+// Attachment mutators (slice 4A PR 3)
+//
+// `add_entry_attachment` / `remove_entry_attachment` wrap upstream
+// `EntryEditor::attach` / `detach`. The vault's binary pool
+// auto-dedups by SHA-256 and GC's orphans at the end of `edit_entry`.
+// -----------------------------------------------------------------------
+
+#[test]
+fn add_entry_attachment_appears_in_list() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    vault
+        .add_entry_attachment(
+            entry_uuid.clone(),
+            "notes.txt".to_owned(),
+            b"hello world".to_vec(),
+        )
+        .expect("attach");
+
+    let list = vault.entry_attachments(entry_uuid).expect("list");
+    let added = list
+        .iter()
+        .find(|a| a.name == "notes.txt")
+        .expect("present");
+    assert_eq!(added.size_bytes, "hello world".len() as u64);
+}
+
+#[test]
+fn add_entry_attachment_round_trips_through_save() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+    let payload = b"persistent attachment bytes".to_vec();
+
+    vault
+        .add_entry_attachment(
+            entry_uuid.clone(),
+            "persist.bin".to_owned(),
+            payload.clone(),
+        )
+        .expect("attach");
+
+    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let bytes = reopened
+        .entry_attachment_bytes(entry_uuid, "persist.bin".to_owned())
+        .expect("read after reopen");
+    assert_eq!(bytes, payload);
+}
+
+#[test]
+fn remove_entry_attachment_returns_true_on_hit_false_on_miss() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    vault
+        .add_entry_attachment(entry_uuid.clone(), "doomed.txt".to_owned(), vec![1, 2, 3])
+        .unwrap();
+
+    let removed = vault
+        .remove_entry_attachment(entry_uuid.clone(), "doomed.txt".to_owned())
+        .expect("remove");
+    assert!(removed, "first removal hits");
+
+    let missed = vault
+        .remove_entry_attachment(entry_uuid.clone(), "doomed.txt".to_owned())
+        .expect("remove (already gone)");
+    assert!(!missed, "second removal returns false (no error)");
+
+    let after = vault.entry_attachments(entry_uuid).unwrap();
+    assert!(after.iter().all(|a| a.name != "doomed.txt"));
+}
+
+#[test]
+fn add_entry_attachment_dedups_identical_payload_across_two_entries() {
+    // Pool dedup: identical bytes attached to two different entries
+    // share a single pool slot. Verifying via SHA-256 in the
+    // attachment-list metadata — equal-byte attachments produce
+    // equal hashes.
+    let vault = open_basic();
+    let summaries = vault.list_entries(None).expect("list");
+    let a = summaries[0].uuid.clone();
+    let b = summaries
+        .iter()
+        .find(|e| e.uuid != a)
+        .expect("at least two entries")
+        .uuid
+        .clone();
+
+    let payload = b"shared payload bytes".to_vec();
+    vault
+        .add_entry_attachment(a.clone(), "shared.bin".to_owned(), payload.clone())
+        .unwrap();
+    vault
+        .add_entry_attachment(b.clone(), "shared.bin".to_owned(), payload)
+        .unwrap();
+
+    let list_a = vault.entry_attachments(a).unwrap();
+    let list_b = vault.entry_attachments(b).unwrap();
+    let sha_a = &list_a
+        .iter()
+        .find(|x| x.name == "shared.bin")
+        .unwrap()
+        .sha256_hex;
+    let sha_b = &list_b
+        .iter()
+        .find(|x| x.name == "shared.bin")
+        .unwrap()
+        .sha256_hex;
+    assert_eq!(sha_a, sha_b, "identical payloads produce identical SHA");
+}
+
+#[test]
+fn add_entry_attachment_replaces_same_named_existing() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    vault
+        .add_entry_attachment(entry_uuid.clone(), "doc.txt".to_owned(), b"v1".to_vec())
+        .unwrap();
+    vault
+        .add_entry_attachment(
+            entry_uuid.clone(),
+            "doc.txt".to_owned(),
+            b"v2-replaced".to_vec(),
+        )
+        .unwrap();
+
+    let bytes = vault
+        .entry_attachment_bytes(entry_uuid.clone(), "doc.txt".to_owned())
+        .unwrap();
+    assert_eq!(bytes, b"v2-replaced");
+
+    let list = vault.entry_attachments(entry_uuid).unwrap();
+    let count = list.iter().filter(|a| a.name == "doc.txt").count();
+    assert_eq!(count, 1, "name dedup keeps a single entry on the entry");
+}
+
+#[test]
+fn add_entry_attachment_with_bogus_uuid_returns_not_found() {
+    let vault = open_basic();
+    let err = vault
+        .add_entry_attachment(
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+            "x.txt".to_owned(),
+            vec![1, 2, 3],
+        )
+        .expect_err("bogus uuid");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
+fn remove_entry_attachment_with_bogus_uuid_returns_not_found() {
+    let vault = open_basic();
+    let err = vault
+        .remove_entry_attachment(
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+            "x.txt".to_owned(),
+        )
+        .expect_err("bogus uuid");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+// -----------------------------------------------------------------------
 // locked-after-lock
 // -----------------------------------------------------------------------
 
@@ -475,7 +638,15 @@ fn entry_methods_return_locked_after_lock() {
         Err(VaultError::Locked)
     ));
     assert!(matches!(
-        vault.clear_entry_expiry(entry_uuid),
+        vault.clear_entry_expiry(entry_uuid.clone()),
+        Err(VaultError::Locked)
+    ));
+    assert!(matches!(
+        vault.add_entry_attachment(entry_uuid.clone(), "x.txt".to_owned(), vec![1, 2, 3]),
+        Err(VaultError::Locked)
+    ));
+    assert!(matches!(
+        vault.remove_entry_attachment(entry_uuid, "x.txt".to_owned()),
         Err(VaultError::Locked)
     ));
 }
