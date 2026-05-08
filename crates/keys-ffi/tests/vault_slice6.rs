@@ -122,6 +122,140 @@ fn update_group_sparse_patch() {
     assert_eq!(g.name, "Personal (renamed)");
 }
 
+// -----------------------------------------------------------------------
+// GroupPatch icon-field surface (slice 4A PR 2)
+//
+// Mirrors the `EntryPatch` icon-field shape: built-in `icon_id` is set
+// via the patch (single `Option<u32>`); `custom_icon_uuid` is set via
+// the patch and cleared via `Vault::clear_group_custom_icon`.
+// -----------------------------------------------------------------------
+
+#[test]
+fn update_group_icon_id_sets_value_and_round_trips() {
+    let vault = open_basic();
+    let target = group_uuid(&vault, "Personal");
+
+    let mut patch = GroupPatch::empty();
+    patch.icon_id = Some(48);
+    vault.update_group(target.clone(), patch).expect("update");
+    let g = vault
+        .list_groups()
+        .unwrap()
+        .into_iter()
+        .find(|g| g.uuid == target)
+        .unwrap();
+    assert_eq!(g.icon_id, 48);
+
+    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let g2 = reopened
+        .list_groups()
+        .unwrap()
+        .into_iter()
+        .find(|g| g.uuid == target)
+        .unwrap();
+    assert_eq!(g2.icon_id, 48);
+}
+
+#[test]
+fn update_group_custom_icon_uuid_sets_value() {
+    let vault = open_basic();
+    let target = group_uuid(&vault, "Personal");
+    let icon_uuid = vault.add_custom_icon(vec![1, 2, 3, 4]).expect("icon");
+
+    let mut patch = GroupPatch::empty();
+    patch.custom_icon_uuid = Some(icon_uuid.clone());
+    vault.update_group(target.clone(), patch).expect("update");
+
+    let g = vault
+        .list_groups()
+        .unwrap()
+        .into_iter()
+        .find(|g| g.uuid == target)
+        .unwrap();
+    assert_eq!(g.custom_icon_uuid, Some(icon_uuid));
+}
+
+#[test]
+fn clear_group_custom_icon_returns_to_none() {
+    let vault = open_basic();
+    let target = group_uuid(&vault, "Personal");
+    let icon_uuid = vault.add_custom_icon(vec![1, 2, 3, 4]).expect("icon");
+
+    let mut patch = GroupPatch::empty();
+    patch.custom_icon_uuid = Some(icon_uuid);
+    vault.update_group(target.clone(), patch).unwrap();
+    assert!(
+        vault
+            .list_groups()
+            .unwrap()
+            .iter()
+            .find(|g| g.uuid == target)
+            .unwrap()
+            .custom_icon_uuid
+            .is_some()
+    );
+
+    vault
+        .clear_group_custom_icon(target.clone())
+        .expect("clear");
+    assert!(
+        vault
+            .list_groups()
+            .unwrap()
+            .iter()
+            .find(|g| g.uuid == target)
+            .unwrap()
+            .custom_icon_uuid
+            .is_none()
+    );
+}
+
+#[test]
+fn update_group_with_none_icon_fields_leaves_existing_alone() {
+    let vault = open_basic();
+    let target = group_uuid(&vault, "Personal");
+
+    // Seed an icon.
+    let mut seed = GroupPatch::empty();
+    seed.icon_id = Some(42);
+    vault.update_group(target.clone(), seed).unwrap();
+
+    // Patch only the name; icon should survive.
+    let mut renamed = GroupPatch::empty();
+    renamed.name = Some("Renamed".to_owned());
+    vault.update_group(target.clone(), renamed).unwrap();
+
+    let g = vault
+        .list_groups()
+        .unwrap()
+        .into_iter()
+        .find(|g| g.uuid == target)
+        .unwrap();
+    assert_eq!(g.name, "Renamed");
+    assert_eq!(g.icon_id, 42);
+}
+
+#[test]
+fn clear_group_custom_icon_with_bogus_uuid_returns_not_found() {
+    let vault = open_basic();
+    let err = vault
+        .clear_group_custom_icon(BOGUS.to_owned())
+        .expect_err("bogus uuid");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
+fn update_group_with_bogus_custom_icon_uuid_returns_not_found() {
+    let vault = open_basic();
+    let target = group_uuid(&vault, "Personal");
+    let mut patch = GroupPatch::empty();
+    patch.custom_icon_uuid = Some("not-a-uuid".to_owned());
+    let err = vault
+        .update_group(target, patch)
+        .expect_err("malformed uuid");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
 #[test]
 fn delete_group_removes_it_and_persists() {
     let vault = open_basic();
@@ -438,6 +572,10 @@ fn slice6_methods_return_locked_after_lock() {
     ));
     assert!(matches!(
         vault.move_group(some_group.clone(), some_group.clone()),
+        Err(VaultError::Locked)
+    ));
+    assert!(matches!(
+        vault.clear_group_custom_icon(some_group.clone()),
         Err(VaultError::Locked)
     ));
     assert!(matches!(

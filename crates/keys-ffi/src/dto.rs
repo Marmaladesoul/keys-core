@@ -431,14 +431,23 @@ impl EntryPatch {
 /// Sparse patch for [`crate::Vault::update_group`].
 ///
 /// Same `Option<T>` semantics as [`EntryPatch`] — `None` leaves the
-/// field alone; `Some(value)` replaces it. Only the fields the macOS
-/// surface uses today; richer setters (icon, expanded, auto-type)
+/// field alone; `Some(value)` replaces it. Group icons follow the
+/// same shape as entry icons: built-in `icon_id` is non-nullable,
+/// `custom_icon_uuid` is set-only via the patch with a named clear
+/// method on `Vault` (`clear_group_custom_icon`) for the rare
+/// clear-to-nil case. Richer setters (expanded, auto-type config)
 /// land in a follow-up if a frontend needs them.
 #[derive(uniffi::Record, Debug, Clone)]
 #[non_exhaustive]
 pub struct GroupPatch {
     pub name: Option<String>,
     pub notes: Option<String>,
+    /// `None` leaves alone; `Some(id)` sets the built-in icon index.
+    pub icon_id: Option<u32>,
+    /// `None` leaves alone; `Some(uuid)` points at a custom-icon-table
+    /// entry. To clear (return to a built-in icon), call
+    /// [`crate::Vault::clear_group_custom_icon`].
+    pub custom_icon_uuid: Option<String>,
 }
 
 impl GroupPatch {
@@ -450,6 +459,8 @@ impl GroupPatch {
         Self {
             name: None,
             notes: None,
+            icon_id: None,
+            custom_icon_uuid: None,
         }
     }
 }

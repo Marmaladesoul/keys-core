@@ -712,6 +712,13 @@ impl Vault {
         let mut guard = self.inner.lock().expect("Vault mutex poisoned");
         let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
         let target = parse_group_id(&uuid)?;
+        // Decode the custom-icon UUID outside the edit closure so a
+        // malformed patch surfaces as `VaultError::NotFound` rather
+        // than panicking inside the editor closure.
+        let custom_icon_uuid = match patch.custom_icon_uuid.as_ref() {
+            Some(s) => Some(parse_icon_uuid(s)?),
+            None => None,
+        };
         kdbx.edit_group(target, |editor| {
             if let Some(n) = patch.name {
                 editor.set_name(n);
@@ -719,6 +726,40 @@ impl Vault {
             if let Some(n) = patch.notes {
                 editor.set_notes(n);
             }
+            if let Some(id) = patch.icon_id {
+                editor.set_icon_id(id);
+            }
+            if patch.custom_icon_uuid.is_some() {
+                editor.set_custom_icon(custom_icon_uuid);
+            }
+        })
+        .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::GroupChanged { uuid });
+        Ok(())
+    }
+
+    /// Clear a group's `custom_icon_uuid`, returning it to a built-in
+    /// icon. Mirrors [`Self::clear_entry_custom_icon`] for the group
+    /// surface — patch shape on
+    /// [`crate::dto::GroupPatch::custom_icon_uuid`] is set-only;
+    /// this is the named clear path so the patch surface stays
+    /// homogeneous without nested `Option<Option<String>>`
+    /// ergonomics.
+    ///
+    /// Equivalent to `editor.set_custom_icon(None)` inside an
+    /// `edit_group` closure.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match a group.
+    pub fn clear_group_custom_icon(&self, uuid: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_group_id(&uuid)?;
+        kdbx.edit_group(target, |editor| {
+            editor.set_custom_icon(None);
         })
         .map_err(model_err_to_vault_err)?;
         drop(guard);
