@@ -15,7 +15,7 @@
 
 use chrono::{DateTime, Utc};
 use keepass_core::model::{
-    CustomField as KcCustomField, Entry as KcEntry, Group as KcGroup, GroupId,
+    Binary as KcBinary, CustomField as KcCustomField, Entry as KcEntry, Group as KcGroup, GroupId,
 };
 
 /// KDBX canonical key for the always-protected password field.
@@ -591,29 +591,62 @@ pub struct EntryAttachment {
     pub sha256_hex: String,
 }
 
-/// A single entry-history snapshot — the no-plaintext summary
-/// returned from `entry_history`.
+/// A single entry-history snapshot — the full read surface of an
+/// historical entry version, sans plaintext for protected fields.
 ///
-/// `protected_field_names` carries the **names** of every protected
-/// field present on this snapshot ("Password" plus any protected
-/// custom-field keys). Plaintext values stay inside the vault until
-/// the snapshot is restored via `restore_entry_from_history` and then
-/// revealed via `reveal_field`.
+/// Plaintext for protected fields stays inside the vault until the
+/// snapshot is restored via `restore_entry_from_history` and then
+/// revealed via `reveal_field`. `custom_fields` surfaces protected
+/// fields as elements with `is_protected = true` and `value` empty,
+/// matching the convention used on [`Entry::custom_fields`].
+/// `protected_field_names` is retained as a convenience for callers
+/// that just want a quick name list without filtering `custom_fields`.
 ///
 /// **Ordering.** `entry_history` returns records in keepass-core's
 /// on-disk order, oldest first. Frontends rendering "newest first"
 /// reverse the list themselves.
+///
+/// **Shape parity with [`Entry`].** This record mirrors `Entry`'s
+/// fields except `uuid` (snapshots inherit the parent entry's UUID)
+/// and `group_uuid` (history snapshots don't carry group context).
+/// `attachments` resolves names + sizes + hashes through the vault's
+/// binary pool at call time, identical to [`Entry`]'s attachment
+/// projection — payload bytes are fetched via
+/// [`crate::Vault::entry_attachment_bytes`] only when needed.
 #[derive(uniffi::Record, Debug, Clone)]
 #[non_exhaustive]
 pub struct HistoryRecord {
-    pub modified_ms: i64,
     pub title: String,
     pub username: String,
+    pub url: String,
+    pub notes: String,
+    pub tags: Vec<String>,
+    /// Every user-defined custom field on the snapshot, in source
+    /// XML declaration order. Same shape as [`Entry::custom_fields`]:
+    /// protected fields appear with `is_protected = true` and empty
+    /// `value`.
+    pub custom_fields: Vec<CustomField>,
+    pub attachments: Vec<EntryAttachment>,
+    pub created_ms: i64,
+    pub modified_ms: i64,
+    pub last_access_ms: i64,
+    pub icon_id: u32,
+    pub custom_icon_uuid: Option<String>,
+    pub foreground_color: String,
+    pub background_color: String,
+    pub override_url: String,
+    pub expires: bool,
+    pub expiry_time_ms: Option<i64>,
+    pub auto_type: AutoType,
+    /// Names of every protected field on this snapshot — `Password`
+    /// plus any protected custom-field keys. Convenience accessor;
+    /// equivalent to filtering `custom_fields` for `is_protected` and
+    /// prepending `Password`.
     pub protected_field_names: Vec<String>,
 }
 
 impl HistoryRecord {
-    pub(crate) fn from_entry(snapshot: &KcEntry) -> Self {
+    pub(crate) fn from_entry(snapshot: &KcEntry, binaries: &[KcBinary]) -> Self {
         let mut names = vec![PASSWORD_FIELD_NAME.to_owned()];
         names.extend(
             snapshot
@@ -622,10 +655,52 @@ impl HistoryRecord {
                 .filter(|c| c.protected)
                 .map(|c| c.key.clone()),
         );
+
+        let custom_fields: Vec<CustomField> = snapshot
+            .custom_fields
+            .iter()
+            .cloned()
+            .map(CustomField::from)
+            .collect();
+
+        // Resolve attachments through the vault's binary pool. Out-of-
+        // range refs (corrupt vault) are skipped — history snapshots
+        // are read-only display surface; surfacing an error here would
+        // block the whole history list for an issue the user can't act
+        // on. Same conservative posture as [`Entry`]'s skip-empty-name
+        // filter.
+        let attachments: Vec<EntryAttachment> = snapshot
+            .attachments
+            .iter()
+            .filter_map(|att| {
+                let bin = binaries.get(att.ref_id as usize)?;
+                Some(EntryAttachment {
+                    name: att.name.clone(),
+                    size_bytes: bin.data.len() as u64,
+                    sha256_hex: crate::vault::sha256_hex(&bin.data),
+                })
+            })
+            .collect();
+
         Self {
-            modified_ms: ts_ms(snapshot.times.last_modification_time),
             title: snapshot.title.clone(),
             username: snapshot.username.clone(),
+            url: snapshot.url.clone(),
+            notes: snapshot.notes.clone(),
+            tags: snapshot.tags.clone(),
+            custom_fields,
+            attachments,
+            created_ms: ts_ms(snapshot.times.creation_time),
+            modified_ms: ts_ms(snapshot.times.last_modification_time),
+            last_access_ms: ts_ms(snapshot.times.last_access_time),
+            icon_id: snapshot.icon_id,
+            custom_icon_uuid: snapshot.custom_icon_uuid.map(|u| u.to_string()),
+            foreground_color: snapshot.foreground_color.clone(),
+            background_color: snapshot.background_color.clone(),
+            override_url: snapshot.override_url.clone(),
+            expires: snapshot.times.expires,
+            expiry_time_ms: snapshot.times.expiry_time.map(|t| t.timestamp_millis()),
+            auto_type: AutoType::from_auto_type(&snapshot.auto_type),
             protected_field_names: names,
         }
     }

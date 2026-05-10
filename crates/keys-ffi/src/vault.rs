@@ -1457,11 +1457,13 @@ impl Vault {
         let guard = self.inner.lock().expect("Vault mutex poisoned");
         let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
         let target = parse_entry_id(&entry_uuid)?;
-        let (_g, entry) = find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+        let vault = kdbx.vault();
+        let (_g, entry) = find_entry(&vault.root, target).ok_or(VaultError::NotFound)?;
+        let binaries = vault.binaries.as_slice();
         Ok(entry
             .history
             .iter()
-            .map(HistoryRecord::from_entry)
+            .map(|snap| HistoryRecord::from_entry(snap, binaries))
             .collect())
     }
 
@@ -1831,7 +1833,7 @@ fn timestamp_ms_to_utc(ms: i64) -> Result<DateTime<Utc>, VaultError> {
         .ok_or(VaultError::NotFound)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);

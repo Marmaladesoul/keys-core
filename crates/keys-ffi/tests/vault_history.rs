@@ -141,6 +141,89 @@ fn delete_history_out_of_range_returns_index_out_of_range() {
 }
 
 #[test]
+fn history_record_surfaces_full_entry_shape() {
+    // Slice 8B — HistoryRecord enrichment. Each snapshot now mirrors
+    // Entry's read surface (sans uuid/group_uuid/password plaintext).
+    // Mutate a richly-populated entry; the pre-mutation snapshot
+    // should carry the full pre-mutation field set.
+    let vault = open_basic();
+    let summaries = vault.list_entries(None).expect("list");
+    let uuid = summaries[0].uuid.clone();
+
+    // Seed: populate URL, notes, tags, a non-protected custom field.
+    let mut seed = EntryPatch::empty();
+    seed.url = Some("https://pre-edit.example".to_owned());
+    seed.notes = Some("snapshot-test pre-edit notes".to_owned());
+    seed.tags = Some(vec!["alpha".to_owned(), "beta".to_owned()]);
+    seed.custom_fields = Some(vec![keys_ffi::CustomField::new(
+        "ProjectCode",
+        "PRE-EDIT-VALUE",
+    )]);
+    vault.update_entry(uuid.clone(), seed).expect("seed update");
+
+    // Mutate so the seed-state is pushed into history.
+    let mut bump = EntryPatch::empty();
+    bump.title = Some("post-edit title".to_owned());
+    vault.update_entry(uuid.clone(), bump).expect("bump");
+
+    let history = vault.entry_history(uuid).expect("history");
+    let snap = history.last().expect("at least one snapshot");
+
+    assert_eq!(snap.url, "https://pre-edit.example");
+    assert_eq!(snap.notes, "snapshot-test pre-edit notes");
+    assert_eq!(snap.tags, vec!["alpha".to_owned(), "beta".to_owned()]);
+    let project = snap
+        .custom_fields
+        .iter()
+        .find(|f| f.name == "ProjectCode")
+        .expect("custom field present on snapshot");
+    assert!(!project.is_protected);
+    assert_eq!(project.value, "PRE-EDIT-VALUE");
+
+    // created_ms is preserved across snapshots; last_access_ms exposed.
+    assert!(snap.created_ms > 0);
+    assert!(snap.modified_ms > 0);
+}
+
+#[test]
+fn history_record_protected_custom_field_carries_no_plaintext() {
+    // Slice 8B — a protected custom field on the snapshot should
+    // surface with `is_protected = true` and an empty `value`. Plain-
+    // text never crosses the FFI boundary at history-list time.
+    let vault = open_basic();
+    let summaries = vault.list_entries(None).expect("list");
+    let uuid = summaries[0].uuid.clone();
+
+    // Seed: add a protected custom field via setProtectedField (the
+    // canonical path; updateEntry's CustomField list excludes
+    // protected by design).
+    vault
+        .set_protected_field(
+            uuid.clone(),
+            "Recovery".to_owned(),
+            "secret-recovery-code".to_owned(),
+        )
+        .expect("set protected");
+
+    // Mutate so the seed state is in history.
+    let mut bump = EntryPatch::empty();
+    bump.title = Some("post-protected-seed".to_owned());
+    vault.update_entry(uuid.clone(), bump).expect("bump");
+
+    let history = vault.entry_history(uuid).expect("history");
+    let snap = history.last().expect("snapshot");
+
+    let recovery = snap
+        .custom_fields
+        .iter()
+        .find(|f| f.name == "Recovery")
+        .expect("protected custom field present");
+    assert!(recovery.is_protected);
+    assert_eq!(recovery.value, "", "no plaintext at history-list time");
+    assert!(snap.protected_field_names.contains(&"Recovery".to_owned()));
+}
+
+#[test]
 fn history_methods_return_locked_after_lock() {
     let vault = open_basic();
     let uuid = seed_history(&vault, 1);
