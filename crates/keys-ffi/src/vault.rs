@@ -94,6 +94,72 @@ impl Vault {
         }))
     }
 
+    /// Create a fresh KDBX4 vault at `path`, encrypted with `password`,
+    /// titled `database_name`. The path is written atomically (sibling
+    /// tempfile + `rename(2)`); if the file already exists, it's
+    /// overwritten. Returns an unlocked `Vault` handle ready for
+    /// mutations or immediate use.
+    ///
+    /// Defaults are baked in upstream
+    /// ([`keepass_core::kdbx::Kdbx::<Unlocked>::create_empty_v4`]):
+    /// AES-256-CBC outer cipher, Argon2d KDF (2 iter × 64 `MiB` × 8
+    /// threads — matches contemporary `KeePass` / `KeePassXC` defaults),
+    /// `GZip` compression, `ChaCha20` inner stream, random seeds +
+    /// salts + inner-stream key from `OsRng`. The cost is one full Argon2
+    /// round at create-time (~1s on contemporary hardware at these
+    /// settings); `password` is wrapped in a [`SecretString`]
+    /// immediately and dropped after the KDF call.
+    ///
+    /// Companion to [`Self::new`] for frontends that need to create a
+    /// new vault file on first launch / "new vault" UI flows. The
+    /// resulting vault opens via [`Self::new`] (verified by the
+    /// upstream round-trip tests).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Io`] if the path's parent directory is missing or
+    /// the write fails. [`VaultError::WrongKey`] for any crypto-class
+    /// failure during the initial save (effectively impossible at the
+    /// defaults baked in upstream — surfaced as a typed error rather
+    /// than a panic).
+    #[uniffi::constructor]
+    pub fn create_empty(
+        path: String,
+        password: String,
+        database_name: String,
+    ) -> Result<Arc<Self>, VaultError> {
+        let path_buf = PathBuf::from(&path);
+        let secret = SecretString::from(password);
+        let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
+
+        // Build the unlocked vault, derive the transformed key against
+        // the freshly-generated KDF params.
+        let kdbx =
+            Kdbx::<keepass_core::kdbx::Unlocked>::create_empty_v4(&composite, database_name)?;
+
+        // Initial save via the same atomic-write pattern as `Self::save`.
+        let bytes = kdbx.save_to_bytes()?;
+        let parent = path_buf.parent().ok_or_else(|| {
+            VaultError::Io("create_empty path has no parent directory".to_owned())
+        })?;
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(parent).map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.write_all(&bytes)
+            .map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.flush().map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.as_file_mut()
+            .sync_all()
+            .map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.persist(&path_buf)
+            .map_err(|e| VaultError::Io(e.error.to_string()))?;
+
+        Ok(Arc::new(Self {
+            inner: Mutex::new(Some(kdbx)),
+            path: path_buf,
+            observer: Mutex::new(None),
+        }))
+    }
+
     /// Drop the unlocked vault state. Idempotent — locking an
     /// already-locked vault is `Ok(())`. `SwiftUI`'s auto-timer,
     /// explicit, and on-quit lock paths can all fire without
