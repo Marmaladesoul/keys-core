@@ -276,6 +276,56 @@ impl Vault {
             .ok_or(VaultError::FieldNotFound)
     }
 
+    /// Reveal the plaintext of a single protected field on a
+    /// historical snapshot, without first restoring the snapshot.
+    ///
+    /// `history_index` is the snapshot's position in the `Vec`
+    /// returned by [`Self::entry_history`] (oldest-first). `field_name`
+    /// follows the same canonical-KDBX-key convention as
+    /// [`Self::reveal_field`] — `"Password"` for the structural slot
+    /// or the verbatim key of any protected custom field.
+    ///
+    /// Same SE / plaintext-as-String contract as [`Self::reveal_field`]
+    /// — no upstream caching, caller responsible for prompt discard.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if no entry matches `entry_uuid`.
+    /// [`VaultError::IndexOutOfRange`] if `history_index` is
+    /// beyond the snapshot list's bounds.
+    /// [`VaultError::FieldNotFound`] if the snapshot has no
+    /// protected field by `field_name` (passing the key of an
+    /// unprotected custom field also yields `FieldNotFound` —
+    /// unprotected values are reachable via [`Self::entry_history`]'s
+    /// returned `HistoryRecord`).
+    pub fn reveal_history_field(
+        &self,
+        entry_uuid: String,
+        history_index: u32,
+        field_name: String,
+    ) -> Result<String, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let (_group_id, entry) =
+            find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+        let snapshot = entry
+            .history
+            .get(history_index as usize)
+            .ok_or(VaultError::IndexOutOfRange)?;
+
+        if field_name == PASSWORD_FIELD_NAME {
+            return Ok(snapshot.password.clone());
+        }
+        snapshot
+            .custom_fields
+            .iter()
+            .find(|c| c.protected && c.key == field_name)
+            .map(|c| c.value.clone())
+            .ok_or(VaultError::FieldNotFound)
+    }
+
     /// Sparse patch of a single protected field. Set-or-insert
     /// semantics: if no field with that name exists, one is created;
     /// otherwise the existing field's value is replaced and its
@@ -1148,6 +1198,53 @@ impl Vault {
         let target = parse_entry_id(&entry_uuid)?;
         let (_, entry) = find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
         let att = entry
+            .attachments
+            .iter()
+            .find(|a| a.name == name)
+            .ok_or(VaultError::NotFound)?;
+        let bin = kdbx
+            .vault()
+            .binaries
+            .get(att.ref_id as usize)
+            .ok_or(VaultError::NotFound)?;
+        Ok(bin.data.clone())
+    }
+
+    /// Fetch the decoded payload bytes of a named attachment on a
+    /// historical snapshot, without first restoring the snapshot.
+    ///
+    /// `history_index` is the snapshot's position in the `Vec`
+    /// returned by [`Self::entry_history`] (oldest-first). `name` is
+    /// the user-visible filename from the snapshot's attachment list
+    /// (also surfaced on `HistoryRecord.attachments` per slice 8B).
+    /// If a snapshot has multiple attachments with the same name
+    /// (KDBX permits it; clients rarely produce it), the first match
+    /// in `<Binary>` order wins.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an
+    /// entry, no attachment by `name` exists on the snapshot, or the
+    /// attachment's `ref_id` is out of range for the vault's binary
+    /// pool.
+    /// [`VaultError::IndexOutOfRange`] if `history_index` is
+    /// beyond the snapshot list's bounds.
+    pub fn entry_history_attachment_bytes(
+        &self,
+        entry_uuid: String,
+        history_index: u32,
+        name: String,
+    ) -> Result<Vec<u8>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let (_, entry) = find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+        let snapshot = entry
+            .history
+            .get(history_index as usize)
+            .ok_or(VaultError::IndexOutOfRange)?;
+        let att = snapshot
             .attachments
             .iter()
             .find(|a| a.name == name)

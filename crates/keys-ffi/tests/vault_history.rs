@@ -1,6 +1,8 @@
 //! Integration tests for slice 8 — history viewing, restore, and
 //! delete-at-index.
 
+#![allow(clippy::cast_possible_truncation)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -237,7 +239,177 @@ fn history_methods_return_locked_after_lock() {
         Err(VaultError::Locked)
     ));
     assert!(matches!(
-        vault.delete_history_at(uuid, 0),
+        vault.delete_history_at(uuid.clone(), 0),
         Err(VaultError::Locked)
     ));
+    assert!(matches!(
+        vault.reveal_history_field(uuid.clone(), 0, "Password".to_owned()),
+        Err(VaultError::Locked)
+    ));
+    assert!(matches!(
+        vault.entry_history_attachment_bytes(uuid, 0, "any".to_owned()),
+        Err(VaultError::Locked)
+    ));
+}
+
+// MARK: - Slice 8C-tail: reveal_history_field + entry_history_attachment_bytes
+
+#[test]
+fn reveal_history_field_returns_pre_edit_password() {
+    // Slice 8C-tail — no-restore reveal of a historical protected
+    // field. Seed: change the password; the pre-edit password is
+    // captured in history[0].
+    let vault = open_basic();
+    let summaries = vault.list_entries(None).expect("list");
+    let uuid = summaries[0].uuid.clone();
+
+    vault
+        .set_protected_field(
+            uuid.clone(),
+            "Password".to_owned(),
+            "history-era-password".to_owned(),
+        )
+        .expect("seed pre-edit password");
+
+    vault
+        .set_protected_field(
+            uuid.clone(),
+            "Password".to_owned(),
+            "current-password".to_owned(),
+        )
+        .expect("bump to current password");
+
+    let history = vault.entry_history(uuid.clone()).expect("history");
+    let pre_edit_index = (history.len() - 1) as u32;
+
+    let revealed = vault
+        .reveal_history_field(uuid, pre_edit_index, "Password".to_owned())
+        .expect("reveal historical password");
+    assert_eq!(revealed, "history-era-password");
+}
+
+#[test]
+fn reveal_history_field_returns_pre_edit_protected_custom_field() {
+    let vault = open_basic();
+    let summaries = vault.list_entries(None).expect("list");
+    let uuid = summaries[0].uuid.clone();
+
+    vault
+        .set_protected_field(
+            uuid.clone(),
+            "Recovery".to_owned(),
+            "old-recovery-code".to_owned(),
+        )
+        .expect("seed recovery");
+
+    // Mutate via update_entry so the seed-state snapshot lands in history.
+    let mut bump = EntryPatch::empty();
+    bump.title = Some("bump for snapshot".to_owned());
+    vault.update_entry(uuid.clone(), bump).expect("bump");
+
+    vault
+        .set_protected_field(
+            uuid.clone(),
+            "Recovery".to_owned(),
+            "new-recovery-code".to_owned(),
+        )
+        .expect("rotate recovery");
+
+    let history = vault.entry_history(uuid.clone()).expect("history");
+    // The earliest snapshot bearing "Recovery" is where we seeded it.
+    let snapshot_index = history
+        .iter()
+        .position(|h| h.protected_field_names.contains(&"Recovery".to_owned()))
+        .expect("snapshot with recovery present") as u32;
+
+    let revealed = vault
+        .reveal_history_field(uuid, snapshot_index, "Recovery".to_owned())
+        .expect("reveal historical recovery");
+    assert_eq!(revealed, "old-recovery-code");
+}
+
+#[test]
+fn reveal_history_field_unknown_field_returns_field_not_found() {
+    let vault = open_basic();
+    let uuid = seed_history(&vault, 1);
+    let err = vault
+        .reveal_history_field(uuid, 0, "Nonexistent".to_owned())
+        .expect_err("unknown field");
+    assert!(matches!(err, VaultError::FieldNotFound), "got {err:?}");
+}
+
+#[test]
+fn reveal_history_field_out_of_range_returns_index_out_of_range() {
+    let vault = open_basic();
+    let uuid = seed_history(&vault, 1);
+    let err = vault
+        .reveal_history_field(uuid, 999, "Password".to_owned())
+        .expect_err("out of range");
+    assert!(matches!(err, VaultError::IndexOutOfRange), "got {err:?}");
+}
+
+#[test]
+fn entry_history_attachment_bytes_returns_pre_edit_payload() {
+    // Seed: attach payload B0 named "doc.txt"; snapshot via patch
+    // mutation; replace attachment with payload B1 under same name.
+    // Historical fetch returns B0; current returns B1.
+    let vault = open_basic();
+    let summaries = vault.list_entries(None).expect("list");
+    let uuid = summaries[0].uuid.clone();
+
+    let b0: Vec<u8> = b"historical-payload-v0".to_vec();
+    let b1: Vec<u8> = b"current-payload-v1".to_vec();
+
+    vault
+        .add_entry_attachment(uuid.clone(), "doc.txt".to_owned(), b0.clone())
+        .expect("seed b0");
+
+    // Snapshot the seed state via a benign mutation.
+    let mut bump = EntryPatch::empty();
+    bump.title = Some("snapshot pivot".to_owned());
+    vault.update_entry(uuid.clone(), bump).expect("bump");
+
+    // Replace the attachment payload (add_entry_attachment is
+    // idempotent-by-name).
+    vault
+        .add_entry_attachment(uuid.clone(), "doc.txt".to_owned(), b1.clone())
+        .expect("replace with b1");
+
+    // Current path returns the new bytes.
+    let current = vault
+        .entry_attachment_bytes(uuid.clone(), "doc.txt".to_owned())
+        .expect("current bytes");
+    assert_eq!(current, b1);
+
+    // Historical path returns the seeded bytes.
+    let history = vault.entry_history(uuid.clone()).expect("history");
+    let pre_edit_index = history
+        .iter()
+        .position(|h| h.attachments.iter().any(|a| a.name == "doc.txt"))
+        .expect("snapshot with attachment present") as u32;
+
+    let historical = vault
+        .entry_history_attachment_bytes(uuid, pre_edit_index, "doc.txt".to_owned())
+        .expect("historical bytes");
+    assert_eq!(historical, b0);
+}
+
+#[test]
+fn entry_history_attachment_bytes_unknown_name_returns_not_found() {
+    let vault = open_basic();
+    let uuid = seed_history(&vault, 1);
+    let err = vault
+        .entry_history_attachment_bytes(uuid, 0, "missing.txt".to_owned())
+        .expect_err("unknown name");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
+fn entry_history_attachment_bytes_out_of_range_returns_index_out_of_range() {
+    let vault = open_basic();
+    let uuid = seed_history(&vault, 1);
+    let err = vault
+        .entry_history_attachment_bytes(uuid, 999, "any".to_owned())
+        .expect_err("out of range");
+    assert!(matches!(err, VaultError::IndexOutOfRange), "got {err:?}");
 }
