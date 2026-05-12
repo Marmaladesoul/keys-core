@@ -948,6 +948,41 @@ impl Vault {
         Ok(())
     }
 
+    /// Move `group_uuid` under `new_parent_uuid`, inserting at
+    /// `position` among the destination's existing children.
+    /// Out-of-range positions clamp to the end (matches typical drag-
+    /// and-drop reorder UIs). Same-parent moves act as sibling
+    /// reorders relative to the post-removal list.
+    ///
+    /// Thin pass-through to keepass-core's
+    /// [`Kdbx::move_group_to_position`]; same bookkeeping
+    /// (`previous_parent_group`, `location_changed`) and error
+    /// semantics (`CannotDeleteRoot`, `GroupNotFound`, `CircularMove`)
+    /// as [`Self::move_group`].
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if either `group_uuid` or
+    /// `new_parent_uuid` doesn't resolve, or the move would create
+    /// a cycle.
+    pub fn move_group_to_position(
+        &self,
+        group_uuid: String,
+        new_parent_uuid: String,
+        position: u32,
+    ) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_group_id(&group_uuid)?;
+        let new_parent = parse_group_id(&new_parent_uuid)?;
+        kdbx.move_group_to_position(target, new_parent, position as usize)
+            .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        self.fire(&VaultChange::GroupChanged { uuid: group_uuid });
+        Ok(())
+    }
+
     // -------------------------------------------------------------------
     // Recycle bin (slice 6)
     // -------------------------------------------------------------------
@@ -1282,6 +1317,48 @@ impl Vault {
             .into_iter()
             .map(|g| g.id.0.to_string())
             .collect())
+    }
+
+    /// Every entry across every group, depth-first from the root, as
+    /// the full [`Entry`] read DTO (protected fields appear with
+    /// `value: None` — reveal via [`Self::reveal_field`]). Recycled
+    /// entries are included verbatim; recycle-bin filtering is the
+    /// frontend's job via [`Self::recycle_bin_enabled`] +
+    /// [`Self::recycle_bin_group_uuid`].
+    ///
+    /// Mirror of keepass-core's `Vault::all_entries`, projected
+    /// through the FFI `Entry` shape so each record carries its
+    /// `group_uuid`. The thin shape returned by
+    /// [`Self::list_entries`] (None) is `EntrySummary`; this is the
+    /// full record, suitable as a flat replacement for downstream
+    /// `database.allEntries` mirrors.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn all_entries(&self) -> Result<Vec<Entry>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let mut out = Vec::new();
+        walk_entries(&kdbx.vault().root, &mut |group_id, entry| {
+            out.push(Entry::from_entry(entry, group_id));
+        });
+        Ok(out)
+    }
+
+    /// Read the meta-level recycle-bin enabled flag. Independent of
+    /// [`Self::recycle_bin_group_uuid`] — KDBX vaults can have a
+    /// recycle bin configured-but-disabled, or enabled-but-pointing-
+    /// at-no-group (in which case soft-delete creates one on first
+    /// use). Mirrors keepass-core's `Vault::recycle_bin_enabled`.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn recycle_bin_enabled(&self) -> Result<bool, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        Ok(kdbx.vault().recycle_bin_enabled())
     }
 
     // -------------------------------------------------------------------
