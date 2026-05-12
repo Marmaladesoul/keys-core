@@ -1848,6 +1848,34 @@ impl Vault {
         }
     }
 
+    /// Trim the entry's history list to the current vault-wide
+    /// `history_max_items` / `history_max_size` policy. Returns the
+    /// number of snapshots removed.
+    ///
+    /// Trimming is a bookkeeping operation: the live entry's
+    /// `last_modification_time` is **not** stamped, and
+    /// `meta.settings_changed` is **not** touched. Mirrors
+    /// [`keepass_core::Kdbx::trim_entry_history`].
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `entry_uuid` doesn't match an
+    /// entry.
+    pub fn trim_entry_history(&self, entry_uuid: String) -> Result<u32, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&entry_uuid)?;
+        let removed = kdbx
+            .trim_entry_history(target)
+            .map_err(model_err_to_vault_err)?;
+        drop(guard);
+        if removed > 0 {
+            self.fire(&VaultChange::EntryModified { uuid: entry_uuid });
+        }
+        Ok(removed)
+    }
+
     /// Snapshot the entry plus all its history, attachments, and
     /// referenced custom icons into an opaque carrier suitable for
     /// import into a different vault.

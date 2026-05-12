@@ -414,3 +414,47 @@ fn entry_history_attachment_bytes_out_of_range_returns_index_out_of_range() {
         .expect_err("out of range");
     assert!(matches!(err, VaultError::IndexOutOfRange), "got {err:?}");
 }
+
+// MARK: - Slice 8I-F-B: trim_entry_history
+
+#[test]
+fn vault_trim_entry_history_applies_current_limits() {
+    let vault = open_basic();
+    // Seed plenty of history snapshots, then tighten the max-items
+    // policy so trimming has work to do.
+    let uuid = seed_history(&vault, 6);
+    let before = vault.entry_history(uuid.clone()).expect("history").len();
+    assert!(before >= 6, "seeded {before} snapshots");
+
+    vault.set_history_max_items(2).expect("set max items");
+
+    let removed = vault.trim_entry_history(uuid.clone()).expect("trim");
+    assert!(removed > 0, "expected to trim something, got 0");
+
+    let after = vault.entry_history(uuid).expect("history").len();
+    assert_eq!(after, 2, "history capped at new max_items");
+    assert_eq!(
+        after + removed as usize,
+        before,
+        "removed count matches delta"
+    );
+}
+
+#[test]
+fn vault_trim_entry_history_returns_zero_when_within_limits() {
+    let vault = open_basic();
+    let uuid = seed_history(&vault, 2);
+    // Default max_items on the fixture is generous; 2 snapshots is
+    // comfortably under it. Sanity-check, then trim — expect zero.
+    let max = vault.history_max_items().expect("max items");
+    assert!(
+        !(0..=2).contains(&max),
+        "fixture max_items={max}, test assumes headroom"
+    );
+
+    let removed = vault.trim_entry_history(uuid.clone()).expect("trim");
+    assert_eq!(removed, 0);
+
+    let after = vault.entry_history(uuid).expect("history").len();
+    assert_eq!(after, 2, "history untouched when within limits");
+}
