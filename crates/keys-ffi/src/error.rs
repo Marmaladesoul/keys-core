@@ -82,6 +82,19 @@ pub enum VaultError {
     /// resolution-validation failures, not entry-lookup misses.
     #[error("merge resolution invalid: {0}")]
     Merge(String),
+
+    /// A [`crate::VaultFieldProtector`] wrap or unwrap call failed.
+    /// Surfaced from [`crate::Vault::new`] (wrap at unlock), from
+    /// reveal-side accessors (`reveal_field`,
+    /// `reveal_history_field`), and from save (unwrap before
+    /// re-encrypt). The string carries the upstream protector's
+    /// supplied detail.
+    ///
+    /// Distinct from [`Self::WrongKey`] so frontends can distinguish
+    /// "Secure Enclave unavailable" from "wrong password" without
+    /// stringly-matching the message.
+    #[error("field protector failed: {0}")]
+    Protector(String),
 }
 
 /// Map a [`ModelError`] from any mutation call onto [`VaultError`].
@@ -112,6 +125,7 @@ impl From<keepass_core::Error> for VaultError {
             keepass_core::Error::Format(
                 FormatError::BadSignature1 | FormatError::BadSignature2,
             ) => Self::Format,
+            keepass_core::Error::Protector(e) => Self::Protector(e.to_string()),
             _ => Self::WrongKey,
         }
     }

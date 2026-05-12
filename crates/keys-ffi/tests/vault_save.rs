@@ -28,6 +28,7 @@ fn open_basic_in_temp() -> (Arc<Vault>, TempDir) {
     let vault = Vault::new(
         dest.to_string_lossy().into_owned(),
         "test-basic-002".to_owned(),
+        None,
     )
     .expect("open");
     (vault, dir)
@@ -50,6 +51,7 @@ fn save_to_bytes_round_trips_through_in_memory_reopen() {
     let reopened = Vault::new(
         path.to_string_lossy().into_owned(),
         "test-basic-002".to_owned(),
+        None,
     )
     .expect("reopen save_to_bytes output");
     assert_eq!(
@@ -70,7 +72,7 @@ fn save_writes_to_constructor_path_and_reopens() {
 
     vault.save().expect("save");
 
-    let reopened = Vault::new(path, "test-basic-002".to_owned()).expect("reopen");
+    let reopened = Vault::new(path, "test-basic-002".to_owned(), None).expect("reopen");
     assert_eq!(reopened.list_entries(None).unwrap().len(), count_before);
 }
 
@@ -91,7 +93,7 @@ fn save_preserves_recent_mutations() {
         .expect("create");
     vault.save().expect("save");
 
-    let reopened = Vault::new(path, "test-basic-002".to_owned()).expect("reopen");
+    let reopened = Vault::new(path, "test-basic-002".to_owned(), None).expect("reopen");
     assert!(
         reopened
             .list_entries(None)
@@ -114,7 +116,8 @@ fn rekey_then_save_then_reopen_with_new_password() {
     vault.rekey("new-master-pw".to_owned()).expect("rekey");
     vault.save().expect("save after rekey");
 
-    let reopened = Vault::new(path, "new-master-pw".to_owned()).expect("reopen with new password");
+    let reopened =
+        Vault::new(path, "new-master-pw".to_owned(), None).expect("reopen with new password");
     assert!(!reopened.is_locked());
 }
 
@@ -126,7 +129,7 @@ fn rekey_then_save_old_password_returns_wrong_key() {
     vault.rekey("rotated".to_owned()).expect("rekey");
     vault.save().expect("save after rekey");
 
-    let err = Vault::new(path, "test-basic-002".to_owned())
+    let err = Vault::new(path, "test-basic-002".to_owned(), None)
         .expect_err("old password should fail after rekey+save");
     assert!(matches!(err, VaultError::WrongKey), "got {err:?}");
 }
@@ -138,7 +141,7 @@ fn rekey_without_save_leaves_disk_unchanged() {
 
     vault.rekey("new".to_owned()).expect("rekey in memory");
     // No save() — disk still has the original key.
-    let reopened = Vault::new(path, "test-basic-002".to_owned())
+    let reopened = Vault::new(path, "test-basic-002".to_owned(), None)
         .expect("on-disk vault still uses original password");
     assert!(!reopened.is_locked());
 }

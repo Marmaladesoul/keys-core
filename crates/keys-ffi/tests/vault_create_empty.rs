@@ -26,6 +26,7 @@ fn create_empty_writes_file_and_reopens_with_same_password() {
         path.clone(),
         "hunter2".to_owned(),
         "My Test Vault".to_owned(),
+        None,
     )
     .expect("create_empty");
 
@@ -36,7 +37,7 @@ fn create_empty_writes_file_and_reopens_with_same_password() {
     );
 
     // Reopen via the standard path.
-    let reopened = Vault::new(path, "hunter2".to_owned()).expect("reopen");
+    let reopened = Vault::new(path, "hunter2".to_owned(), None).expect("reopen");
     let summaries = reopened.list_entries(None).expect("list");
     assert!(summaries.is_empty(), "fresh vault has no entries");
     let groups = reopened.list_groups().expect("list groups");
@@ -54,10 +55,11 @@ fn create_empty_wrong_password_after_reopen_rejects() {
         path.clone(),
         "correct-password".to_owned(),
         "Vault".to_owned(),
+        None,
     )
     .expect("create_empty");
 
-    let result = Vault::new(path, "wrong-password".to_owned());
+    let result = Vault::new(path, "wrong-password".to_owned(), None);
     assert!(matches!(result, Err(VaultError::WrongKey)));
 }
 
@@ -66,7 +68,7 @@ fn create_empty_accepts_mutations_then_persists_on_save() {
     let dir = TempDir::new().expect("tempdir");
     let path = fresh_path(&dir, "test.kdbx");
 
-    let vault = Vault::create_empty(path.clone(), "pw".to_owned(), "Vault".to_owned())
+    let vault = Vault::create_empty(path.clone(), "pw".to_owned(), "Vault".to_owned(), None)
         .expect("create_empty");
 
     // Add an entry, save, reopen.
@@ -77,7 +79,7 @@ fn create_empty_accepts_mutations_then_persists_on_save() {
     vault.save().expect("save");
 
     // Reopen — entry should survive.
-    let reopened = Vault::new(path, "pw".to_owned()).expect("reopen");
+    let reopened = Vault::new(path, "pw".to_owned(), None).expect("reopen");
     let summaries = reopened.list_entries(None).expect("list");
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].title, "Sample");
@@ -88,6 +90,6 @@ fn create_empty_io_error_on_missing_parent_directory() {
     // Path whose parent doesn't exist — should surface as a typed Io error
     // rather than panic.
     let path = "/nonexistent-parent-dir-for-keys-test/foo.kdbx".to_owned();
-    let result = Vault::create_empty(path, "pw".to_owned(), "Vault".to_owned());
+    let result = Vault::create_empty(path, "pw".to_owned(), "Vault".to_owned(), None);
     assert!(matches!(result, Err(VaultError::Io(_))));
 }

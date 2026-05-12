@@ -14,6 +14,7 @@ mod error;
 mod merge;
 mod observer;
 mod portable;
+mod protector;
 mod vault;
 
 pub use dto::{
@@ -28,6 +29,7 @@ pub use merge::{
 };
 pub use observer::{VaultChange, VaultObserver};
 pub use portable::PortableEntry;
+pub use protector::{VaultFieldProtector, VaultProtectorError};
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();

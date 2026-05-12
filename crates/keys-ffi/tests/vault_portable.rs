@@ -19,6 +19,7 @@ fn open_basic() -> Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
         "test-basic-002".to_owned(),
+        None,
     )
     .expect("open basic")
 }
@@ -27,6 +28,7 @@ fn open_custom() -> Arc<Vault> {
     Vault::new(
         fixture("pykeepass/custom-fields.kdbx"),
         "test-custom-104".to_owned(),
+        None,
     )
     .expect("open custom-fields")
 }
@@ -101,6 +103,7 @@ fn portable_carrier_is_single_use() {
     let dst2 = Vault::new(
         fixture("keepassxc/kdbx3-deep-groups.kdbx"),
         "test-deep-006".to_owned(),
+        None,
     )
     .expect("open deep-groups");
 

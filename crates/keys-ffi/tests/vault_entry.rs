@@ -25,6 +25,7 @@ fn open_basic() -> Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
         "test-basic-002".to_owned(),
+        None,
     )
     .expect("kdbx3-basic should open")
 }
@@ -33,6 +34,7 @@ fn open_custom() -> Arc<Vault> {
     Vault::new(
         fixture("pykeepass/custom-fields.kdbx"),
         "test-custom-104".to_owned(),
+        None,
     )
     .expect("custom-fields fixture should open")
 }
@@ -63,7 +65,7 @@ fn save_and_reopen(vault: &Vault, password: &str) -> (Arc<Vault>, NamedTempFile)
     tmp.write_all(&bytes).expect("write");
     tmp.flush().expect("flush");
     let path = tmp.path().to_string_lossy().into_owned();
-    let reopened = Vault::new(path, password.to_owned()).expect("reopen");
+    let reopened = Vault::new(path, password.to_owned(), None).expect("reopen");
     (reopened, tmp)
 }
 

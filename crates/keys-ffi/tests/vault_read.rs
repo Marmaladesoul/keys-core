@@ -17,6 +17,7 @@ fn open_basic() -> std::sync::Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
         "test-basic-002".to_owned(),
+        None,
     )
     .expect("kdbx3-basic should open")
 }
@@ -160,6 +161,7 @@ fn custom_fields_pass_through_keepass_core_order_without_resegregating() {
     let vault = Vault::new(
         fixture("pykeepass/custom-fields.kdbx"),
         "test-custom-104".to_owned(),
+        None,
     )
     .expect("custom-fields fixture should open");
     let summaries = vault.list_entries(None).expect("list");
@@ -192,6 +194,7 @@ fn protected_custom_fields_carry_is_protected_flag() {
     let vault = Vault::new(
         fixture("pykeepass/custom-fields.kdbx"),
         "test-custom-104".to_owned(),
+        None,
     )
     .expect("custom-fields fixture should open");
     let summaries = vault.list_entries(None).expect("list");
@@ -283,6 +286,7 @@ fn open_editor_fields() -> std::sync::Arc<Vault> {
     Vault::new(
         fixture("pykeepass/editor-fields.kdbx"),
         "test-editor-107".to_owned(),
+        None,
     )
     .expect("editor-fields fixture should open")
 }
@@ -336,6 +340,7 @@ fn open_kdbx4_attachments() -> std::sync::Arc<Vault> {
     Vault::new(
         fixture("kdbxweb/kdbx4-attachments.kdbx"),
         "test-keeweb-202".to_owned(),
+        None,
     )
     .expect("kdbx4-attachments fixture should open")
 }
@@ -445,6 +450,7 @@ fn entry_attachments_kdbx3_round_trips_via_meta_binaries() {
     let vault = Vault::new(
         fixture("keepassxc/kdbx3-attachments.kdbx"),
         "test-att-004".to_owned(),
+        None,
     )
     .expect("kdbx3-attachments should open");
     let uuid = entry_uuid_by_title(&vault, "Key Attachment");
@@ -473,6 +479,7 @@ fn entry_attachment_bytes_kdbx3_round_trips() {
     let vault = Vault::new(
         fixture("keepassxc/kdbx3-attachments.kdbx"),
         "test-att-004".to_owned(),
+        None,
     )
     .expect("kdbx3-attachments should open");
     let uuid = entry_uuid_by_title(&vault, "Key Attachment");
@@ -576,6 +583,7 @@ fn database_name_round_trips_from_fixture() {
     let vault = Vault::new(
         fixture("kdbxweb/kdbx4-basic.kdbx"),
         "test-keeweb-201".to_owned(),
+        None,
     )
     .expect("kdbxweb basic should open");
     assert_eq!(
@@ -603,6 +611,7 @@ fn recycle_bin_group_uuid_present_when_fixture_has_one() {
     let vault = Vault::new(
         fixture("pykeepass/recycle.kdbx"),
         "test-recycle-102".to_owned(),
+        None,
     )
     .expect("recycle fixture should open");
     let bin = vault.recycle_bin_group_uuid().expect("readable");

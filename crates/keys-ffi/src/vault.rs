@@ -32,6 +32,7 @@ use crate::error::{VaultError, model_err_to_vault_err};
 use crate::merge::{MergeOutcome, ResolutionFfi, resolution_ffi_to_km};
 use crate::observer::{VaultChange, VaultObserver};
 use crate::portable::PortableEntry;
+use crate::protector::{VaultFieldProtector, bridge as bridge_protector};
 
 /// An opened KDBX vault.
 ///
@@ -82,11 +83,18 @@ impl Vault {
     /// [`VaultError::WrongKey`] for any other failure (wrong password,
     /// corrupt vault, malformed inner XML).
     #[uniffi::constructor]
-    pub fn new(path: String, password: String) -> Result<Arc<Self>, VaultError> {
+    pub fn new(
+        path: String,
+        password: String,
+        field_protector: Option<Arc<dyn VaultFieldProtector>>,
+    ) -> Result<Arc<Self>, VaultError> {
         let path_buf = PathBuf::from(&path);
         let secret = SecretString::from(password);
         let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
-        let kdbx = Kdbx::open(&path_buf)?.read_header()?.unlock(&composite)?;
+        let bridged = bridge_protector(field_protector);
+        let kdbx = Kdbx::open(&path_buf)?
+            .read_header()?
+            .unlock_with_protector(&composite, bridged)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(Some(kdbx)),
             path: path_buf,
@@ -127,15 +135,20 @@ impl Vault {
         path: String,
         password: String,
         database_name: String,
+        field_protector: Option<Arc<dyn VaultFieldProtector>>,
     ) -> Result<Arc<Self>, VaultError> {
         let path_buf = PathBuf::from(&path);
         let secret = SecretString::from(password);
         let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
+        let bridged = bridge_protector(field_protector);
 
         // Build the unlocked vault, derive the transformed key against
         // the freshly-generated KDF params.
-        let kdbx =
-            Kdbx::<keepass_core::kdbx::Unlocked>::create_empty_v4(&composite, database_name)?;
+        let kdbx = Kdbx::<keepass_core::kdbx::Unlocked>::create_empty_v4_with_protector(
+            &composite,
+            database_name,
+            bridged,
+        )?;
 
         // Initial save via the same atomic-write pattern as `Self::save`.
         let bytes = kdbx.save_to_bytes()?;
@@ -332,13 +345,21 @@ impl Vault {
             find_entry(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
 
         if field_name == PASSWORD_FIELD_NAME {
-            return Ok(entry.password.clone());
+            // Goes through the protector when one is installed;
+            // returns the in-model plaintext otherwise.
+            return Ok(kdbx.reveal_password(target)?);
         }
-        entry
+        // Confirm the field exists and is protected before delegating;
+        // matches the legacy `FieldNotFound` posture (unprotected
+        // custom fields are reachable via `get_entry`).
+        let protected_exists = entry
             .custom_fields
             .iter()
-            .find(|c| c.protected && c.key == field_name)
-            .map(|c| c.value.clone())
+            .any(|c| c.protected && c.key == field_name);
+        if !protected_exists {
+            return Err(VaultError::FieldNotFound);
+        }
+        kdbx.reveal_custom_field(target, &field_name)?
             .ok_or(VaultError::FieldNotFound)
     }
 

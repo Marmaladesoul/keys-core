@@ -21,6 +21,7 @@ fn open_basic() -> Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
         "test-basic-002".to_owned(),
+        None,
     )
     .expect("open")
 }

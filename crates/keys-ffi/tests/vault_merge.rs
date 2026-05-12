@@ -34,7 +34,12 @@ fn open_basic_in_temp() -> (Arc<Vault>, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let dest = dir.path().join("basic.kdbx");
     fs::copy(fixture("keepassxc/kdbx3-basic.kdbx"), &dest).expect("copy fixture");
-    let vault = Vault::new(dest.to_string_lossy().into_owned(), PASSWORD.to_owned()).expect("open");
+    let vault = Vault::new(
+        dest.to_string_lossy().into_owned(),
+        PASSWORD.to_owned(),
+        None,
+    )
+    .expect("open");
     (vault, dir)
 }
 
@@ -61,8 +66,8 @@ fn make_pair() -> (Arc<Vault>, TempDir, Arc<Vault>, TempDir) {
     let remote_path = remote.path();
     drop(local);
     drop(remote);
-    let local = Vault::new(local_path, PASSWORD.to_owned()).expect("reopen local");
-    let remote = Vault::new(remote_path, PASSWORD.to_owned()).expect("reopen remote");
+    let local = Vault::new(local_path, PASSWORD.to_owned(), None).expect("reopen local");
+    let remote = Vault::new(remote_path, PASSWORD.to_owned(), None).expect("reopen remote");
     (local, ldir, remote, rdir)
 }
 

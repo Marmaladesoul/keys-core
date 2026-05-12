@@ -18,6 +18,7 @@ fn open_basic() -> Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
         "test-basic-002".to_owned(),
+        None,
     )
     .expect("open")
 }
@@ -189,6 +190,7 @@ fn save_fires_saved() {
     let vault = Vault::new(
         dest.to_string_lossy().into_owned(),
         "test-basic-002".to_owned(),
+        None,
     )
     .unwrap();
     let recorder = make_recorder(&vault);
