@@ -1221,6 +1221,69 @@ impl Vault {
         Ok(kdbx.vault().meta.recycle_bin_uuid.map(|g| g.0.to_string()))
     }
 
+    /// Borrow the raw bytes for the custom icon identified by `uuid`,
+    /// returning `Ok(None)` when no such icon is in the vault's pool.
+    /// Bytes are opaque (typically PNG, but format-defined by whatever
+    /// client wrote them) — callers are responsible for image decoding.
+    ///
+    /// Thin pass-through to keepass-core's `Vault::custom_icon`; copies
+    /// the borrowed slice into an owned `Vec<u8>` for the FFI boundary.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` is not a valid UUID string.
+    pub fn custom_icon_image(&self, uuid: String) -> Result<Option<Vec<u8>>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let icon_uuid = parse_icon_uuid(&uuid)?;
+        Ok(kdbx.vault().custom_icon(icon_uuid).map(<[u8]>::to_vec))
+    }
+
+    /// Return the UUID of the group that directly contains `child_uuid`,
+    /// or `Ok(None)` if `child_uuid` is the root or doesn't match any
+    /// group. Mirrors keepass-core's `Vault::group_parent`.
+    ///
+    /// O(N) in the total group count — the model doesn't store parent
+    /// links, so this walks the tree from the root.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `child_uuid` isn't a valid UUID.
+    pub fn group_parent_uuid(&self, child_uuid: String) -> Result<Option<String>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let child = parse_group_id(&child_uuid)?;
+        Ok(kdbx.vault().group_parent(child).map(|g| g.0.to_string()))
+    }
+
+    /// Every descendant of `group_uuid`, depth-first, as UUID strings.
+    /// `group_uuid` itself is **not** included. Useful for validating a
+    /// candidate group move (the destination must not be a descendant
+    /// of the moved group) or enumerating refs across a whole subtree.
+    ///
+    /// Returns UUIDs only — to materialise each `Group`, follow up with
+    /// [`Self::list_groups`] (or a per-UUID accessor in future). Keeps
+    /// the FFI surface lean and matches `Self::list_groups`.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `group_uuid` isn't a valid UUID or
+    /// doesn't match a group in the vault.
+    pub fn all_subgroup_uuids(&self, group_uuid: String) -> Result<Vec<String>, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let target = parse_group_id(&group_uuid)?;
+        let group = find_group(&kdbx.vault().root, target).ok_or(VaultError::NotFound)?;
+        Ok(group
+            .all_subgroups()
+            .into_iter()
+            .map(|g| g.id.0.to_string())
+            .collect())
+    }
+
     // -------------------------------------------------------------------
     // Attachments
     // -------------------------------------------------------------------
