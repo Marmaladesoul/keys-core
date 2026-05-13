@@ -126,6 +126,21 @@ fn touch_entry_fires_no_event() {
 }
 
 #[test]
+fn clear_entry_last_access_fires_no_event() {
+    let vault = open_basic();
+    let uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+    vault.touch_entry(uuid.clone()).expect("touch");
+    let recorder = make_recorder(&vault);
+
+    vault.clear_entry_last_access(uuid).expect("clear");
+
+    assert!(
+        recorder.snapshot().is_empty(),
+        "clear_entry_last_access is silent — symmetric inverse of touch_entry",
+    );
+}
+
+#[test]
 fn move_entry_fires_entry_modified() {
     let vault = open_basic();
     let uuid = vault.list_entries(None).unwrap()[0].uuid.clone();

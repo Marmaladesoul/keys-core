@@ -860,6 +860,41 @@ fn update_with_none_editor_fields_leaves_existing_values_alone() {
 }
 
 #[test]
+fn clear_entry_last_access_returns_field_to_none() {
+    let vault = open_basic();
+    let entry_uuid = vault.list_entries(None).unwrap()[0].uuid.clone();
+
+    // Touch first so we have a non-zero last_access stamp to clear.
+    vault.touch_entry(entry_uuid.clone()).expect("touch");
+    let before = vault.get_entry(entry_uuid.clone()).expect("get");
+    assert!(
+        before.last_access_ms > 0,
+        "touch should have stamped last_access"
+    );
+    let mod_before = before.last_modified_ms;
+
+    vault
+        .clear_entry_last_access(entry_uuid.clone())
+        .expect("clear");
+    let after = vault.get_entry(entry_uuid).expect("get");
+
+    assert_eq!(after.last_access_ms, 0, "clear should zero last_access");
+    assert_eq!(
+        after.last_modified_ms, mod_before,
+        "clear must not advance last_modified",
+    );
+}
+
+#[test]
+fn clear_entry_last_access_with_bogus_uuid_returns_not_found() {
+    let vault = open_basic();
+    let err = vault
+        .clear_entry_last_access("00000000-0000-0000-0000-000000000000".to_owned())
+        .expect_err("bogus uuid");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
 fn clear_entry_custom_icon_with_bogus_uuid_returns_not_found() {
     let vault = open_basic();
     let err = vault

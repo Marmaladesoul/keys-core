@@ -726,6 +726,30 @@ impl Vault {
         kdbx.touch_entry(target).map_err(model_err_to_vault_err)
     }
 
+    /// Clear an entry's `last_access_time`, returning the field to
+    /// `None`. Intended for the Keys-app menu action that wipes a
+    /// stale last-access stamp (e.g. after `AutoFill` touched an entry
+    /// that shouldn't have shown up in recents).
+    ///
+    /// Thin wrapper over [`keepass_core::Kdbx::clear_entry_last_access`]
+    /// — the symmetric inverse of [`Self::touch_entry`], with the
+    /// same no-side-effects contract: no `last_modification_time`
+    /// bump, no history snapshot, no `Meta::settings_changed` stamp,
+    /// no binary-pool GC, and (matching `touch_entry`) no observer
+    /// event.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `uuid` doesn't match an entry.
+    pub fn clear_entry_last_access(&self, uuid: String) -> Result<(), VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let target = parse_entry_id(&uuid)?;
+        kdbx.clear_entry_last_access(target)
+            .map_err(model_err_to_vault_err)
+    }
+
     /// Clear an entry's `custom_icon_uuid`, returning it to a
     /// built-in icon. The patch shape on
     /// [`crate::dto::EntryPatch::custom_icon_uuid`] is set-only
