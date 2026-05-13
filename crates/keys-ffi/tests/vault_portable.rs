@@ -162,3 +162,75 @@ fn portable_methods_return_locked_after_lock() {
         Err(VaultError::Locked)
     ));
 }
+
+// ---------------------------------------------------------------------
+// import_entry_with_uuid (FFI bridge for keepass-core PR #136)
+// ---------------------------------------------------------------------
+
+#[test]
+fn import_entry_with_uuid_restores_caller_supplied_uuid() {
+    let src = open_basic();
+    let dst = open_basic();
+
+    // Pick an existing entry from src and capture its UUID.
+    let original_uuid = src.list_entries(None).unwrap()[0].uuid.clone();
+    let portable = src.export_entry(original_uuid.clone()).expect("export");
+
+    // Both vaults opened the same fixture, so the UUID is live in dst
+    // too. Delete it first to free the UUID — the matching tombstone
+    // is what import_entry_with_uuid clears as part of the operation.
+    dst.delete_entry(original_uuid.clone())
+        .expect("delete dst-side");
+
+    let restored = dst
+        .import_entry_with_uuid(portable, root_uuid(&dst), original_uuid.clone())
+        .expect("import with uuid");
+    assert_eq!(restored, original_uuid, "method must return target_uuid");
+
+    let got = dst.get_entry(original_uuid.clone()).expect("get entry");
+    assert_eq!(got.uuid, original_uuid);
+}
+
+#[test]
+fn import_entry_with_uuid_bogus_target_returns_not_found() {
+    let src = open_basic();
+    let dst = open_basic();
+    let original_uuid = src.list_entries(None).unwrap()[0].uuid.clone();
+    let portable = src.export_entry(original_uuid).expect("export");
+
+    let err = dst
+        .import_entry_with_uuid(portable, root_uuid(&dst), "not-a-uuid".to_owned())
+        .expect_err("bogus target uuid");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
+fn import_entry_with_uuid_bogus_group_returns_not_found() {
+    let src = open_basic();
+    let dst = open_basic();
+    let original_uuid = src.list_entries(None).unwrap()[0].uuid.clone();
+    let portable = src.export_entry(original_uuid.clone()).expect("export");
+
+    let err = dst
+        .import_entry_with_uuid(
+            portable,
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+            original_uuid,
+        )
+        .expect_err("bogus group");
+    assert!(matches!(err, VaultError::NotFound), "got {err:?}");
+}
+
+#[test]
+fn import_entry_with_uuid_returns_locked_after_lock() {
+    let src = open_basic();
+    let dst = open_basic();
+    let original_uuid = src.list_entries(None).unwrap()[0].uuid.clone();
+    let portable = src.export_entry(original_uuid.clone()).expect("export");
+
+    dst.lock().expect("lock");
+    let err = dst
+        .import_entry_with_uuid(portable, root_uuid(&open_basic()), original_uuid)
+        .expect_err("locked");
+    assert!(matches!(err, VaultError::Locked), "got {err:?}");
+}

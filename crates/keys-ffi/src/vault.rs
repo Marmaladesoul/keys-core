@@ -2051,6 +2051,57 @@ impl Vault {
         Ok(new_uuid)
     }
 
+    /// Insert a previously-exported entry under `group_uuid`, restored
+    /// to live with the caller-supplied `target_uuid` rather than a
+    /// freshly-minted one. Intended for **cross-vault move-undo**:
+    /// the forward move bounces the entry through a new UUID; undoing
+    /// it through plain [`Self::import_entry`] would mint *another*
+    /// new UUID, so external references pinned to the pre-move UUID
+    /// (`AutoFill` record identifiers, bookmarks, links) break across
+    /// the round-trip. This variant lets undo restore the original
+    /// identity directly.
+    ///
+    /// Tombstones in the destination vault matching `target_uuid` are
+    /// cleared as part of the import; without this step, a downstream
+    /// merge against another vault would consume the tombstone and
+    /// re-delete the freshly-restored entry. See
+    /// [`keepass_core::kdbx::Kdbx::import_entry_with_uuid`] for the
+    /// underlying semantics.
+    ///
+    /// **The carrier is consumed by this call**, same as
+    /// [`Self::import_entry`]. Fires `EntryModified` for `target_uuid`.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    /// [`VaultError::NotFound`] if `group_uuid` doesn't match a group,
+    /// if `target_uuid` doesn't parse as a UUID, if `portable` has
+    /// already been imported, **or** if `target_uuid` is already in
+    /// use as a live entry in the destination vault (keepass-core's
+    /// `DuplicateUuid` collapses to `NotFound` at the FFI boundary
+    /// today; the destination is untouched on this failure).
+    pub fn import_entry_with_uuid(
+        &self,
+        portable: Arc<PortableEntry>,
+        group_uuid: String,
+        target_uuid: String,
+    ) -> Result<String, VaultError> {
+        let mut guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
+        let parent = parse_group_id(&group_uuid)?;
+        let target = parse_entry_id(&target_uuid)?;
+        let inner = portable.take()?;
+        let new_id = kdbx
+            .import_entry_with_uuid(parent, inner, target)
+            .map_err(model_err_to_vault_err)?;
+        let new_uuid = new_id.0.to_string();
+        drop(guard);
+        self.fire(&VaultChange::EntryModified {
+            uuid: new_uuid.clone(),
+        });
+        Ok(new_uuid)
+    }
+
     // -------------------------------------------------------------------
     // External merge (slice 7.5a)
     // -------------------------------------------------------------------
