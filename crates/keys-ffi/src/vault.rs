@@ -25,8 +25,8 @@ use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
 use crate::dto::{
-    AutoType, Entry, EntryAttachment, EntryCreate, EntryPatch, EntrySummary, Group, GroupPatch,
-    HistoryRecord, PASSWORD_FIELD_NAME,
+    AttachmentPoolStats, AutoType, Entry, EntryAttachment, EntryCreate, EntryPatch, EntrySummary,
+    Group, GroupPatch, HistoryRecord, PASSWORD_FIELD_NAME,
 };
 use crate::error::{VaultError, model_err_to_vault_err};
 use crate::merge::{MergeOutcome, ResolutionFfi, resolution_ffi_to_km};
@@ -1265,6 +1265,99 @@ impl Vault {
         Ok(kdbx.vault().meta.history_max_size)
     }
 
+    /// The `<Generator>` string from `Meta` — identifies the writer
+    /// that produced the file (e.g. `KeePassXC`, `KeePass2`). Used by
+    /// the Keys-app Info tab to show "what wrote this file".
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn generator(&self) -> Result<String, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        Ok(kdbx.vault().meta.generator.clone())
+    }
+
+    /// Display string for the outer cipher — `"AES-256-CBC"`,
+    /// `"ChaCha20"`, or `"Unknown"` for a cipher UUID this build
+    /// doesn't recognise.
+    ///
+    /// Read-only; the cipher is fixed at vault-creation time and not
+    /// mutable via this surface today (keepass-core's `replace_vault`
+    /// is the closest equivalent and Keys-app doesn't expose it).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn cipher_display(&self) -> Result<String, VaultError> {
+        use keepass_core::format::KnownCipher;
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let label = match kdbx.outer_header().cipher_id.well_known() {
+            Some(KnownCipher::Aes256Cbc) => "AES-256-CBC",
+            Some(KnownCipher::ChaCha20) => "ChaCha20",
+            _ => "Unknown",
+        };
+        Ok(label.to_owned())
+    }
+
+    /// Display string for the KDF parameters, formatted on a single
+    /// line for the Keys-app Info tab. Examples:
+    ///
+    /// - `"Argon2id (64 MB · 2 iter · 4 threads)"`
+    /// - `"Argon2d (64 MB · 1 iter · 2 threads)"`
+    /// - `"AES-KDF (6,000,000 rounds)"`
+    /// - `"Unknown KDF"` for unparseable or absent blobs (KDBX3 with
+    ///   no parsed `VarDictionary`).
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn kdf_display(&self) -> Result<String, VaultError> {
+        use keepass_core::format::KdfParams;
+        use keepass_core::format::var_dictionary::VarDictionary;
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let header = kdbx.outer_header();
+
+        // KDBX3 stores AES-KDF rounds + seed in their own outer-header
+        // fields, not in `KdfParameters`. KDBX4 stores everything in the
+        // VarDictionary blob. Cover both shapes so the row is meaningful
+        // on a v3 vault too.
+        if let Some(blob) = header.kdf_parameters.as_ref() {
+            if let Ok(dict) = VarDictionary::parse(blob)
+                && let Ok(params) = KdfParams::from_var_dictionary(&dict)
+            {
+                return Ok(format_kdf_params(&params));
+            }
+        }
+        if let Some(rounds) = header.transform_rounds {
+            let formatted = format_with_thousands(rounds);
+            return Ok(format!("AES-KDF ({formatted} rounds)"));
+        }
+        Ok("Unknown KDF".to_owned())
+    }
+
+    /// Summary stats for the vault's binary pool (attachments + any
+    /// embedded images). Each unique payload contributes one to
+    /// [`AttachmentPoolStats::count`] and one copy of its bytes to
+    /// `total_bytes` — keepass-core content-deduplicates the pool at
+    /// import time, so two entries referencing the same file pay for
+    /// one row, not two.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::Locked`] if the vault has been locked.
+    pub fn attachment_pool_stats(&self) -> Result<AttachmentPoolStats, VaultError> {
+        let guard = self.inner.lock().expect("Vault mutex poisoned");
+        let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
+        let pool = &kdbx.vault().binaries;
+        Ok(AttachmentPoolStats {
+            count: u32::try_from(pool.len()).unwrap_or(u32::MAX),
+            total_bytes: pool.iter().map(|b| b.data.len() as u64).sum(),
+        })
+    }
+
     /// Read the recycle-bin group's UUID, if the vault has one
     /// configured. `Ok(None)` means no recycle bin is set; this is
     /// independent of `recycle_bin_enabled` — KDBX vaults can have a
@@ -2262,4 +2355,50 @@ fn entry_matches(entry: &KcEntry, needle: &str) -> bool {
         return true;
     }
     entry.tags.iter().any(|t| t.to_lowercase().contains(needle))
+}
+
+/// Format a parsed [`keepass_core::format::KdfParams`] as a single-line
+/// display string. Argon2 variants render as
+/// `"<name> (<mib> MB · <iter> iter · <threads> threads)"`; AES-KDF as
+/// `"AES-KDF (<rounds> rounds)"` with thousands separators.
+fn format_kdf_params(params: &keepass_core::format::KdfParams) -> String {
+    use keepass_core::format::{Argon2Variant, KdfParams};
+    match params {
+        KdfParams::AesKdf { rounds, .. } => {
+            let formatted = format_with_thousands(*rounds);
+            format!("AES-KDF ({formatted} rounds)")
+        }
+        KdfParams::Argon2 {
+            variant,
+            memory_bytes,
+            iterations,
+            parallelism,
+            ..
+        } => {
+            let name = match variant {
+                Argon2Variant::Argon2d => "Argon2d",
+                Argon2Variant::Argon2id => "Argon2id",
+                _ => "Argon2",
+            };
+            let mib = memory_bytes / (1024 * 1024);
+            format!("{name} ({mib} MB \u{00B7} {iterations} iter \u{00B7} {parallelism} threads)")
+        }
+        _ => "Unknown KDF".to_owned(),
+    }
+}
+
+/// Format an integer with comma thousands separators, e.g. 6000000 → "6,000,000".
+/// Used by [`Vault::kdf_display`]'s AES-KDF branch where the round count is
+/// always a large integer.
+fn format_with_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*ch as char);
+    }
+    out
 }

@@ -726,3 +726,18 @@ fn opt_string(s: &str) -> Option<String> {
 fn ts_ms(t: Option<DateTime<Utc>>) -> i64 {
     t.map_or(0, |dt| dt.timestamp_millis())
 }
+
+/// Summary statistics for the vault's binary (attachment) pool.
+///
+/// Counts and bytes are over the *unique* binaries in the pool — every
+/// `Binary` is content-hash-deduped at import time by keepass-core, so
+/// two entries referencing the same payload contribute one row of
+/// `count` and one copy of `total_bytes`.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct AttachmentPoolStats {
+    /// Number of distinct binaries in the pool.
+    pub count: u32,
+    /// Sum of `data.len()` across every pool row, in bytes.
+    pub total_bytes: u64,
+}

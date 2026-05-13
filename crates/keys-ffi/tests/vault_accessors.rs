@@ -28,6 +28,15 @@ fn open_custom_icons() -> std::sync::Arc<Vault> {
     .expect("custom-icons fixture should open")
 }
 
+fn open_basic() -> std::sync::Arc<Vault> {
+    Vault::new(
+        fixture("keepassxc/kdbx3-basic.kdbx"),
+        "test-basic-002".to_owned(),
+        None,
+    )
+    .expect("basic fixture should open")
+}
+
 fn open_deep_groups() -> std::sync::Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-deep-groups.kdbx"),
@@ -366,4 +375,68 @@ fn move_group_to_position_to_new_parent_with_index() {
         vec![c0, mover, c1, c2],
         "cross-parent move should insert at the requested index",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Info-tab accessors (todo 080): generator / cipher / kdf / attachment-pool stats
+// ---------------------------------------------------------------------------
+
+#[test]
+fn generator_returns_string_from_meta() {
+    let vault = open_basic();
+    let g = vault.generator().expect("generator");
+    // KeePassXC fixtures carry "KeePassXC" as the generator string.
+    assert!(
+        g.contains("KeePass"),
+        "generator should mention KeePass, got {g:?}"
+    );
+}
+
+#[test]
+fn cipher_display_recognises_aes() {
+    let vault = open_basic();
+    let c = vault.cipher_display().expect("cipher");
+    // kdbx3-basic uses AES-256.
+    assert_eq!(c, "AES-256-CBC");
+}
+
+#[test]
+fn kdf_display_formats_argon2_or_aes_kdf() {
+    let vault = open_basic();
+    let k = vault.kdf_display().expect("kdf");
+    // Either an Argon2 or AES-KDF formatted line — both contain "("
+    // followed by the parameter list.
+    assert!(
+        k.contains("Argon2") || k.contains("AES-KDF"),
+        "kdf_display should name a known KDF, got {k:?}"
+    );
+    assert!(
+        k.contains('('),
+        "should carry parenthesised params, got {k:?}"
+    );
+}
+
+#[test]
+fn attachment_pool_stats_counts_unique_binaries() {
+    let vault = open_basic();
+    let stats = vault.attachment_pool_stats().expect("stats");
+    // kdbx3-basic has no attachments; smoke just confirms the call works.
+    assert_eq!(
+        stats.total_bytes, 0,
+        "basic fixture has no attachments; total_bytes should be zero",
+    );
+    assert_eq!(stats.count, 0);
+}
+
+#[test]
+fn accessors_return_locked_after_lock() {
+    let vault = open_basic();
+    vault.lock().expect("lock");
+    assert!(matches!(vault.generator(), Err(VaultError::Locked)));
+    assert!(matches!(vault.cipher_display(), Err(VaultError::Locked)));
+    assert!(matches!(vault.kdf_display(), Err(VaultError::Locked)));
+    assert!(matches!(
+        vault.attachment_pool_stats(),
+        Err(VaultError::Locked)
+    ));
 }
