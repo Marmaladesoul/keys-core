@@ -112,6 +112,7 @@ pub(crate) fn model_err_to_vault_err(err: ModelError) -> VaultError {
         | ModelError::CircularMove { .. }
         | ModelError::DuplicateUuid(_) => VaultError::NotFound,
         ModelError::HistoryIndexOutOfRange { .. } => VaultError::IndexOutOfRange,
+        ModelError::Protector(e) => VaultError::Protector(e.to_string()),
         other => {
             panic!("unmapped keepass_core::model::ModelError variant in keys-ffi facade: {other:?}")
         }
