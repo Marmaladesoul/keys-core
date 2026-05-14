@@ -23,9 +23,10 @@ pub use dto::{
 };
 pub use error::VaultError;
 pub use merge::{
+    AttachmentChoiceFfi, AttachmentChoiceKindFfi, AttachmentDeltaFfi, AttachmentDeltaKindFfi,
     ConflictSideFfi, DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, DeleteEditConflictFfi,
-    EntryConflictFfi, EntryFieldChoiceFfi, FieldChoiceFfi, FieldDeltaFfi, FieldDeltaKindFfi,
-    MergeOutcome, MergeSummary, ResolutionFfi,
+    EntryAttachmentChoiceFfi, EntryConflictFfi, EntryFieldChoiceFfi, FieldChoiceFfi, FieldDeltaFfi,
+    FieldDeltaKindFfi, MergeOutcome, MergeSummary, ResolutionFfi,
 };
 pub use observer::{VaultChange, VaultObserver};
 pub use portable::PortableEntry;

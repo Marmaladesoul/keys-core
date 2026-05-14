@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use keys_ffi::{
-    ConflictSideFfi, DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, EntryCreate,
+    AttachmentChoiceFfi, AttachmentChoiceKindFfi, AttachmentDeltaKindFfi, ConflictSideFfi,
+    DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, EntryAttachmentChoiceFfi, EntryCreate,
     EntryFieldChoiceFfi, EntryPatch, FieldChoiceFfi, FieldDeltaKindFfi, ResolutionFfi, Vault,
     VaultChange, VaultError, VaultObserver,
 };
@@ -456,6 +457,7 @@ fn apply_merge_outcome_entry_conflict_keep_local() {
     let resolution = ResolutionFfi::new(
         vec![entry_field_choice(&target, "Title", ConflictSideFfi::Local)],
         Vec::new(),
+        Vec::new(),
     );
     local
         .apply_merge_outcome(outcome, resolution)
@@ -486,6 +488,7 @@ fn apply_merge_outcome_entry_conflict_keep_remote() {
             "Title",
             ConflictSideFfi::Remote,
         )],
+        Vec::new(),
         Vec::new(),
     );
     local
@@ -522,6 +525,7 @@ fn apply_merge_outcome_entry_conflict_per_field_split() {
             ],
         )],
         Vec::new(),
+        Vec::new(),
     );
     local
         .apply_merge_outcome(outcome, resolution)
@@ -548,6 +552,7 @@ fn apply_merge_outcome_delete_edit_keep_local() {
         .expect("merge");
     let resolution = ResolutionFfi::new(
         Vec::new(),
+        Vec::new(),
         vec![delete_edit_choice(&target, DeleteEditChoiceFfi::KeepLocal)],
     );
     local
@@ -573,6 +578,7 @@ fn apply_merge_outcome_delete_edit_accept_remote_delete() {
         .merge_external(remote.path(), PASSWORD.to_owned())
         .expect("merge");
     let resolution = ResolutionFfi::new(
+        Vec::new(),
         Vec::new(),
         vec![delete_edit_choice(
             &target,
@@ -693,6 +699,7 @@ fn apply_merge_outcome_unknown_field_in_resolution_yields_merge_error() {
             ConflictSideFfi::Local,
         )],
         Vec::new(),
+        Vec::new(),
     );
     let err = local
         .apply_merge_outcome(outcome, resolution)
@@ -724,3 +731,197 @@ fn apply_merge_outcome_locked_vault_yields_locked_without_consuming() {
     let summary = outcome.summary().expect("summary still works");
     assert_eq!(summary.disk_only_count, 1);
 }
+
+// =======================================================================
+// Attachment-conflict surface (mirrors upstream B4 work)
+// =======================================================================
+
+/// Both sides edit the same-named attachment with different bytes →
+/// `BothDiffer` delta surfaces on `EntryConflictFfi.attachment_deltas`,
+/// and the caller can resolve via `entry_attachment_choices`.
+#[test]
+fn merge_external_attachment_both_differ_surfaces_delta() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    // Seed a shared attachment + save both sides so the LCA-bearing
+    // history record carries the same bytes on both pools.
+    local
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"v0".to_vec())
+        .expect("local seed attach");
+    remote
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"v0".to_vec())
+        .expect("remote seed attach");
+    local.save().expect("local seed save");
+    remote.save().expect("remote seed save");
+
+    // Each side then edits the attachment to its own bytes.
+    local
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"L".to_vec())
+        .expect("local edit attach");
+    remote
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"R".to_vec())
+        .expect("remote edit attach");
+    remote.save().expect("remote edit save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    let conflicts = outcome.entry_conflicts().expect("conflicts");
+    assert_eq!(conflicts.len(), 1, "expected one entry conflict");
+    let c = &conflicts[0];
+    assert_eq!(c.attachment_deltas.len(), 1, "{:?}", c.attachment_deltas);
+    let delta = &c.attachment_deltas[0];
+    assert_eq!(delta.name, "note.txt");
+    assert_eq!(delta.kind, AttachmentDeltaKindFfi::BothDiffer);
+    assert!(delta.local_sha256_hex.is_some());
+    assert!(delta.remote_sha256_hex.is_some());
+    assert_ne!(delta.local_sha256_hex, delta.remote_sha256_hex);
+    assert_eq!(delta.local_size_bytes, Some(1));
+    assert_eq!(delta.remote_size_bytes, Some(1));
+
+    // Resolve KeepRemote and apply.
+    let resolution = ResolutionFfi::new(
+        Vec::new(),
+        vec![EntryAttachmentChoiceFfi::new(
+            target.clone(),
+            vec![AttachmentChoiceFfi::new(
+                "note.txt",
+                AttachmentChoiceKindFfi::KeepRemote,
+            )],
+        )],
+        Vec::new(),
+    );
+    local
+        .apply_merge_outcome(outcome, resolution)
+        .expect("apply");
+
+    let bytes = local
+        .entry_attachment_bytes(target, "note.txt".into())
+        .expect("read attachment");
+    assert_eq!(bytes, b"R");
+}
+
+/// `KeepBoth` resolution renames the remote-side attachment using
+/// the merge crate's default pattern (`<stem> (remote).<ext>`).
+#[test]
+fn apply_merge_outcome_attachment_keep_both_renames_remote() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    local
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"v0".to_vec())
+        .expect("local seed");
+    remote
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"v0".to_vec())
+        .expect("remote seed");
+    local.save().expect("local seed save");
+    remote.save().expect("remote seed save");
+
+    local
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"L-edit".to_vec())
+        .expect("local edit");
+    remote
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"R-edit".to_vec())
+        .expect("remote edit");
+    remote.save().expect("remote edit save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    let resolution = ResolutionFfi::new(
+        Vec::new(),
+        vec![EntryAttachmentChoiceFfi::new(
+            target.clone(),
+            vec![AttachmentChoiceFfi::new(
+                "note.txt",
+                AttachmentChoiceKindFfi::KeepBoth {
+                    rename_override: None,
+                },
+            )],
+        )],
+        Vec::new(),
+    );
+    local
+        .apply_merge_outcome(outcome, resolution)
+        .expect("apply");
+
+    let local_bytes = local
+        .entry_attachment_bytes(target.clone(), "note.txt".into())
+        .expect("local attachment");
+    assert_eq!(local_bytes, b"L-edit");
+    let remote_bytes = local
+        .entry_attachment_bytes(target, "note (remote).txt".into())
+        .expect("remote attachment under default rename");
+    assert_eq!(remote_bytes, b"R-edit");
+}
+
+/// Caller-supplied `rename_override` pins the renamed slot for the
+/// remote-side attachment.
+#[test]
+fn apply_merge_outcome_attachment_keep_both_with_override_uses_caller_name() {
+    let (local, _ldir, remote, _rdir) = make_pair();
+    let target = first_entry_uuid(&local);
+
+    local
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"v0".to_vec())
+        .expect("local seed");
+    remote
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"v0".to_vec())
+        .expect("remote seed");
+    local.save().expect("local seed save");
+    remote.save().expect("remote seed save");
+
+    local
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"L".to_vec())
+        .expect("local edit");
+    remote
+        .add_entry_attachment(target.clone(), "note.txt".into(), b"R".to_vec())
+        .expect("remote edit");
+    remote.save().expect("remote edit save");
+
+    let outcome = local
+        .merge_external(remote.path(), PASSWORD.to_owned())
+        .expect("merge");
+    let resolution = ResolutionFfi::new(
+        Vec::new(),
+        vec![EntryAttachmentChoiceFfi::new(
+            target.clone(),
+            vec![AttachmentChoiceFfi::new(
+                "note.txt",
+                AttachmentChoiceKindFfi::KeepBoth {
+                    rename_override: Some("note-from-laptop.txt".into()),
+                },
+            )],
+        )],
+        Vec::new(),
+    );
+    local
+        .apply_merge_outcome(outcome, resolution)
+        .expect("apply");
+
+    assert_eq!(
+        local
+            .entry_attachment_bytes(target.clone(), "note.txt".into())
+            .expect("local"),
+        b"L",
+    );
+    assert_eq!(
+        local
+            .entry_attachment_bytes(target, "note-from-laptop.txt".into())
+            .expect("remote-renamed"),
+        b"R",
+    );
+}
+
+// Note: the upstream validation that rejects `KeepBoth` for one-sided
+// deltas is exercised in `keepass-merge`'s
+// `tests/attachment_conflict_resolution.rs::keep_both_rejected_for_one_sided_delta`.
+// The keys-ffi marshalling layer just passes that error through as
+// `VaultError::Merge`. Constructing a `LocalOnly` / `RemoteOnly`
+// conflict from the FFI's `make_pair` infrastructure is awkward —
+// the LCA walker needs both sides' history to agree on the attachment
+// at a point in time, which the per-side mtime drift in
+// `add_entry_attachment` doesn't naturally produce. The pure-Rust
+// upstream tests use in-memory vault construction to set this up
+// cleanly; duplicating that here would just retest upstream.

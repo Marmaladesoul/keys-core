@@ -50,6 +50,7 @@ use std::sync::Mutex;
 
 use keepass_core::model::{EntryId, Group as KcGroup, GroupId, Vault as KcVault};
 use keepass_merge::{
+    AttachmentChoice as KmAttachmentChoice, AttachmentDeltaKind as KmAttachmentDeltaKind,
     ConflictSide as KmConflictSide, DeleteEditChoice as KmDeleteEditChoice,
     FieldDeltaKind as KmFieldDeltaKind, MergeOutcome as KmOutcome, Resolution as KmResolution,
 };
@@ -176,6 +177,18 @@ impl MergeOutcome {
                         kind: FieldDeltaKindFfi::from(d.kind),
                     })
                     .collect(),
+                attachment_deltas: conflict
+                    .attachment_deltas
+                    .iter()
+                    .map(|d| AttachmentDeltaFfi {
+                        name: d.name.clone(),
+                        kind: AttachmentDeltaKindFfi::from(d.kind),
+                        local_sha256_hex: d.local_sha256.map(hex_encode),
+                        remote_sha256_hex: d.remote_sha256.map(hex_encode),
+                        local_size_bytes: d.local_size,
+                        remote_size_bytes: d.remote_size,
+                    })
+                    .collect(),
             });
         }
         Ok(out)
@@ -244,6 +257,68 @@ pub struct EntryConflictFfi {
     pub local: Entry,
     pub remote: Entry,
     pub field_deltas: Vec<FieldDeltaFfi>,
+    /// Attachment-level conflicts that need caller resolution. Each
+    /// delta carries enough metadata (size + SHA-256 prefix per side)
+    /// for the resolver UI to render rows without dereferencing the
+    /// binary pool. Auto-resolvable attachment merges (byte-identical,
+    /// or 3-way classifier has a clear winner) ride through the
+    /// auto-merge path and don't appear here.
+    pub attachment_deltas: Vec<AttachmentDeltaFfi>,
+}
+
+/// Per-attachment difference between the two sides of an
+/// [`EntryConflictFfi`]. Mirrors [`keepass_merge::AttachmentDelta`].
+///
+/// `local_sha256_hex` / `remote_sha256_hex` are hex-encoded so the
+/// FFI surface is `Option<String>` (uniffi handles fixed-size byte
+/// arrays awkwardly across the boundary). Bindings can render the
+/// first 8 chars for a "did the bytes change?" affordance.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct AttachmentDeltaFfi {
+    pub name: String,
+    pub kind: AttachmentDeltaKindFfi,
+    pub local_sha256_hex: Option<String>,
+    pub remote_sha256_hex: Option<String>,
+    pub local_size_bytes: Option<u64>,
+    pub remote_size_bytes: Option<u64>,
+}
+
+/// Classification of an [`AttachmentDeltaFfi`] by which side(s) hold
+/// the attachment.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AttachmentDeltaKindFfi {
+    /// Only on local; ancestor differed (or absent), so not auto-
+    /// resolvable.
+    LocalOnly,
+    /// Only on remote; ancestor differed (or absent).
+    RemoteOnly,
+    /// Both sides hold it but the bytes differ; ancestor doesn't
+    /// match either side cleanly.
+    BothDiffer,
+}
+
+impl From<KmAttachmentDeltaKind> for AttachmentDeltaKindFfi {
+    fn from(k: KmAttachmentDeltaKind) -> Self {
+        match k {
+            KmAttachmentDeltaKind::LocalOnly => Self::LocalOnly,
+            KmAttachmentDeltaKind::RemoteOnly => Self::RemoteOnly,
+            KmAttachmentDeltaKind::BothDiffer => Self::BothDiffer,
+            other => panic!(
+                "unmapped keepass_merge::AttachmentDeltaKind variant in keys-ffi facade: {other:?}"
+            ),
+        }
+    }
+}
+
+fn hex_encode(bytes: [u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        write!(&mut s, "{b:02x}").expect("writing to a String never fails");
+    }
+    s
 }
 
 /// Per-field difference between the two sides of an
@@ -315,9 +390,14 @@ pub struct DeleteEditConflictFfi {
 #[derive(uniffi::Record, Debug, Clone)]
 #[non_exhaustive]
 pub struct ResolutionFfi {
-    /// One entry per [`EntryConflictFfi`]. Inner `field_choices` has
-    /// one entry per field key in the conflict's `field_deltas`.
+    /// One entry per [`EntryConflictFfi`] with a non-empty
+    /// `field_deltas`. Inner `field_choices` has one entry per field
+    /// key in that conflict's `field_deltas`.
     pub entry_field_choices: Vec<EntryFieldChoiceFfi>,
+    /// One entry per [`EntryConflictFfi`] with a non-empty
+    /// `attachment_deltas`. Inner `attachment_choices` has one entry
+    /// per attachment name in that conflict's `attachment_deltas`.
+    pub entry_attachment_choices: Vec<EntryAttachmentChoiceFfi>,
     /// One entry per [`DeleteEditConflictFfi`].
     pub delete_edit_choices: Vec<DeleteEditChoiceEntryFfi>,
 }
@@ -327,7 +407,7 @@ impl ResolutionFfi {
     /// conflicts. Mirrors `EntryPatch::empty` / `GroupPatch::empty`.
     #[must_use]
     pub fn empty() -> Self {
-        Self::new(Vec::new(), Vec::new())
+        Self::new(Vec::new(), Vec::new(), Vec::new())
     }
 
     /// Construct a resolution from caller-built choice lists.
@@ -337,10 +417,12 @@ impl ResolutionFfi {
     #[must_use]
     pub fn new(
         entry_field_choices: Vec<EntryFieldChoiceFfi>,
+        entry_attachment_choices: Vec<EntryAttachmentChoiceFfi>,
         delete_edit_choices: Vec<DeleteEditChoiceEntryFfi>,
     ) -> Self {
         Self {
             entry_field_choices,
+            entry_attachment_choices,
             delete_edit_choices,
         }
     }
@@ -367,6 +449,33 @@ impl FieldChoiceFfi {
         Self {
             key: key.into(),
             side,
+        }
+    }
+}
+
+impl EntryAttachmentChoiceFfi {
+    /// Construct an entry-attachment-choice carrier. Required
+    /// because `#[non_exhaustive]` blocks struct-literal construction
+    /// outside the crate.
+    #[must_use]
+    pub fn new(
+        entry_uuid: impl Into<String>,
+        attachment_choices: Vec<AttachmentChoiceFfi>,
+    ) -> Self {
+        Self {
+            entry_uuid: entry_uuid.into(),
+            attachment_choices,
+        }
+    }
+}
+
+impl AttachmentChoiceFfi {
+    /// Construct a per-attachment choice carrier.
+    #[must_use]
+    pub fn new(name: impl Into<String>, choice: AttachmentChoiceKindFfi) -> Self {
+        Self {
+            name: name.into(),
+            choice,
         }
     }
 }
@@ -398,6 +507,65 @@ pub struct EntryFieldChoiceFfi {
 pub struct FieldChoiceFfi {
     pub key: String,
     pub side: ConflictSideFfi,
+}
+
+/// Per-entry attachment-resolution carrier. One element per
+/// [`EntryConflictFfi`] with a non-empty `attachment_deltas`.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct EntryAttachmentChoiceFfi {
+    pub entry_uuid: String,
+    pub attachment_choices: Vec<AttachmentChoiceFfi>,
+}
+
+/// Per-attachment choice inside an [`EntryAttachmentChoiceFfi`].
+/// `name` matches the corresponding [`AttachmentDeltaFfi::name`].
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct AttachmentChoiceFfi {
+    pub name: String,
+    pub choice: AttachmentChoiceKindFfi,
+}
+
+/// Caller's choice for a single conflicting attachment. Mirrors
+/// [`keepass_merge::AttachmentChoice`].
+///
+/// `KeepBoth` is validation-rejected by the merge crate for any
+/// non-`BothDiffer` delta — the absent side has no bytes to keep.
+/// The optional `keep_both_rename_override` lets the caller pin the
+/// renamed slot for the remote-side attachment in a `KeepBoth`
+/// outcome; `None` falls through to the merge crate's default
+/// pattern (`"<stem> (remote).<ext>"`, with counter suffix on
+/// collision).
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AttachmentChoiceKindFfi {
+    /// Take local's bytes (or, for `RemoteOnly`, accept local's
+    /// absent state — drop the attachment).
+    KeepLocal,
+    /// Take remote's bytes (or, for `LocalOnly`, accept remote's
+    /// absent state — drop the attachment).
+    KeepRemote,
+    /// Both sides edited; keep both, renaming the remote-side one.
+    /// Only valid for `BothDiffer` deltas; any other kind is rejected
+    /// at apply time.
+    KeepBoth {
+        /// Override the default rename pattern; `None` uses the
+        /// `"<stem> (remote).<ext>"` default.
+        rename_override: Option<String>,
+    },
+}
+
+impl From<AttachmentChoiceKindFfi> for KmAttachmentChoice {
+    fn from(c: AttachmentChoiceKindFfi) -> Self {
+        match c {
+            AttachmentChoiceKindFfi::KeepLocal => Self::KeepLocal,
+            AttachmentChoiceKindFfi::KeepRemote => Self::KeepRemote,
+            AttachmentChoiceKindFfi::KeepBoth { rename_override } => {
+                Self::KeepBoth { rename_override }
+            }
+        }
+    }
 }
 
 /// Per-entry resolution for one [`DeleteEditConflictFfi`].
@@ -455,6 +623,15 @@ pub(crate) fn resolution_ffi_to_km(resolution: &ResolutionFfi) -> Result<KmResol
             inner.insert(fc.key.clone(), fc.side.into());
         }
     }
+    let mut entry_attachment_choices: HashMap<EntryId, HashMap<String, KmAttachmentChoice>> =
+        HashMap::new();
+    for eac in &resolution.entry_attachment_choices {
+        let id = parse_entry_id(&eac.entry_uuid)?;
+        let inner = entry_attachment_choices.entry(id).or_default();
+        for ac in &eac.attachment_choices {
+            inner.insert(ac.name.clone(), ac.choice.clone().into());
+        }
+    }
     let mut delete_edit_choices: HashMap<EntryId, KmDeleteEditChoice> = HashMap::new();
     for dec in &resolution.delete_edit_choices {
         let id = parse_entry_id(&dec.entry_uuid)?;
@@ -463,6 +640,7 @@ pub(crate) fn resolution_ffi_to_km(resolution: &ResolutionFfi) -> Result<KmResol
 
     let mut r = KmResolution::default();
     r.entry_field_choices = entry_field_choices;
+    r.entry_attachment_choices = entry_attachment_choices;
     r.delete_edit_choices = delete_edit_choices;
     Ok(r)
 }

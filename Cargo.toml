@@ -19,3 +19,15 @@ unsafe_code = "deny"  # not "forbid" — uniffi-generated code may need unsafe i
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
+
+# Dep crates compiled with full optimisation even in dev builds so the
+# AES + Argon2 KDF passes used by keepass-core test fixtures complete
+# in seconds rather than tens of minutes. Mirrors the same setting in
+# `KeepassCore/Cargo.toml`. Without this, every `cargo test` against a
+# real `.kdbx` fixture spins for ages on the unlock step — the `aes`
+# crate's aarch64 hardware intrinsics aren't selected at opt-level=0,
+# and the fixtures use realistic KDF iteration counts.
+# Our own crates stay at the default debug opt-level so info stays rich
+# for stepping through merge / FFI logic.
+[profile.dev.package."*"]
+opt-level = 3
