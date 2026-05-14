@@ -731,7 +731,7 @@ impl Vault {
     /// stale last-access stamp (e.g. after `AutoFill` touched an entry
     /// that shouldn't have shown up in recents).
     ///
-    /// Thin wrapper over [`keepass_core::Kdbx::clear_entry_last_access`]
+    /// Thin wrapper over [`keepass_core::kdbx::Kdbx::clear_entry_last_access`]
     /// — the symmetric inverse of [`Self::touch_entry`], with the
     /// same no-side-effects contract: no `last_modification_time`
     /// bump, no history snapshot, no `Meta::settings_changed` stamp,
@@ -953,7 +953,7 @@ impl Vault {
     /// Move a group under `new_parent_uuid`. A move that would make
     /// the group a descendant of itself fails through the
     /// `CircularMove → NotFound` mapping in
-    /// [`crate::error::model_err_to_vault_err`].
+    /// `model_err_to_vault_err`.
     ///
     /// # Errors
     ///
@@ -1340,7 +1340,7 @@ impl Vault {
 
     /// Summary stats for the vault's binary pool (attachments + any
     /// embedded images). Each unique payload contributes one to
-    /// [`AttachmentPoolStats::count`] and one copy of its bytes to
+    /// `count` and one copy of its bytes to
     /// `total_bytes` — keepass-core content-deduplicates the pool at
     /// import time, so two entries referencing the same file pay for
     /// one row, not two.
@@ -1972,7 +1972,7 @@ impl Vault {
     /// Trimming is a bookkeeping operation: the live entry's
     /// `last_modification_time` is **not** stamped, and
     /// `meta.settings_changed` is **not** touched. Mirrors
-    /// [`keepass_core::Kdbx::trim_entry_history`].
+    /// [`keepass_core::kdbx::Kdbx::trim_entry_history`].
     ///
     /// # Errors
     ///

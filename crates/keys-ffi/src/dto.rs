@@ -93,7 +93,7 @@ pub struct Entry {
     /// one Password per entry; surfacing it as a singleton here makes
     /// that constraint explicit rather than masquerading inside a
     /// `Vec`. Reveal plaintext via [`crate::Vault::reveal_field`] with
-    /// [`PASSWORD_FIELD_NAME`].
+    /// the field name `"Password"`.
     pub password_field: ProtectedField,
     pub created_ms: i64,
     pub last_modified_ms: i64,

@@ -70,3 +70,7 @@ jobs:
       - name: test
         working-directory: KeysCore
         run: cargo test --workspace --all-features --no-fail-fast
+
+      - name: doc
+        working-directory: KeysCore
+        run: cargo doc --workspace --no-deps --all-features
