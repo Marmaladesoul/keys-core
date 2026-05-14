@@ -2139,10 +2139,20 @@ impl Vault {
     ) -> Result<Arc<MergeOutcome>, VaultError> {
         // Lock-check first so a locked self short-circuits before we
         // burn crypto work unlocking the other side.
+        //
+        // The local clone goes through `vault_with_unwrapped_protected`
+        // rather than `vault().clone()` so any protected-field
+        // plaintext wrapped out by the FieldProtector (Secure Enclave
+        // on macOS) is spliced back into the clone before the merger
+        // sees it. The remote side is opened below without a
+        // protector, so its protected slots already carry plaintext;
+        // matching the local side keeps the comparator symmetric.
+        // Without this step the merger flags every protected custom
+        // field as a conflict (empty-vs-plaintext per side).
         let local_vault = {
             let guard = self.inner.lock().expect("Vault mutex poisoned");
             let kdbx = guard.as_ref().ok_or(VaultError::Locked)?;
-            kdbx.vault().clone()
+            kdbx.vault_with_unwrapped_protected()?
         };
 
         let other_path_buf = PathBuf::from(&other_path);

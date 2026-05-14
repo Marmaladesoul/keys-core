@@ -44,6 +44,9 @@
 // structurally-impossible mutex-poisoning panic on every method would be
 // more noise than signal — same posture as `vault.rs`.
 #![allow(clippy::missing_panics_doc)]
+// uniffi-exported methods take owned `String` even when they only borrow
+// internally — matches the FFI shape and the convention in `vault.rs`.
+#![allow(clippy::needless_pass_by_value)]
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -233,6 +236,79 @@ impl MergeOutcome {
         }
         Ok(out)
     }
+
+    /// Reveal a single field's plaintext from the local-side snapshot
+    /// taken at merge time. Drives the conflict-resolver UI's
+    /// hover-to-reveal affordance on protected slots without forcing
+    /// every plaintext to cross the FFI eagerly.
+    ///
+    /// `field_name` is `"Password"` for the structural password slot,
+    /// or the custom-field key for any other slot (protected or not).
+    /// Returns the empty string when the field is absent on this side
+    /// — protected slots that exist but hold no value also return the
+    /// empty string, matching the in-model representation.
+    ///
+    /// The local snapshot is built by [`crate::Vault::merge_external`]
+    /// via `vault_with_unwrapped_protected`, so every protected slot
+    /// already carries plaintext when the merge runs. This accessor
+    /// is therefore a pure lookup — no protector round-trip.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::NotFound`] if the carrier has been consumed, if
+    /// `entry_uuid` is not a well-formed UUID, or if no entry matches
+    /// — matching the parse-error collapse posture in the rest of
+    /// keys-ffi.
+    pub fn reveal_local_field(
+        &self,
+        entry_uuid: String,
+        field_name: String,
+    ) -> Result<String, VaultError> {
+        let guard = self.local.lock().expect("MergeOutcome mutex poisoned");
+        let vault = guard.as_ref().ok_or(VaultError::NotFound)?;
+        reveal_field_in(vault, &entry_uuid, &field_name)
+    }
+
+    /// Counterpart to [`Self::reveal_local_field`] against the
+    /// remote-side snapshot. The remote vault was opened without a
+    /// `FieldProtector`, so protected slots already carry plaintext in
+    /// the model directly — no unwrap needed.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::reveal_local_field`].
+    pub fn reveal_remote_field(
+        &self,
+        entry_uuid: String,
+        field_name: String,
+    ) -> Result<String, VaultError> {
+        let guard = self.remote.lock().expect("MergeOutcome mutex poisoned");
+        let vault = guard.as_ref().ok_or(VaultError::NotFound)?;
+        reveal_field_in(vault, &entry_uuid, &field_name)
+    }
+}
+
+/// Look up `field_name`'s plaintext on entry `entry_uuid` inside
+/// `vault`. Shared helper for the two reveal accessors above; both
+/// vault snapshots carry plaintext on protected slots by construction
+/// at merge time (local: `vault_with_unwrapped_protected`; remote:
+/// opened without a protector).
+fn reveal_field_in(
+    vault: &KcVault,
+    entry_uuid: &str,
+    field_name: &str,
+) -> Result<String, VaultError> {
+    let id = EntryId(Uuid::parse_str(entry_uuid).map_err(|_| VaultError::NotFound)?);
+    let entry = find_entry_in(&vault.root, id).ok_or(VaultError::NotFound)?;
+    if field_name == "Password" {
+        return Ok(entry.password.clone());
+    }
+    Ok(entry
+        .custom_fields
+        .iter()
+        .find(|c| c.key == field_name)
+        .map(|c| c.value.clone())
+        .unwrap_or_default())
 }
 
 /// Bucket counts for a [`MergeOutcome`]. See
