@@ -458,6 +458,7 @@ fn apply_merge_outcome_entry_conflict_keep_local() {
         vec![entry_field_choice(&target, "Title", ConflictSideFfi::Local)],
         Vec::new(),
         Vec::new(),
+        Vec::new(),
     );
     local
         .apply_merge_outcome(outcome, resolution)
@@ -488,6 +489,7 @@ fn apply_merge_outcome_entry_conflict_keep_remote() {
             "Title",
             ConflictSideFfi::Remote,
         )],
+        Vec::new(),
         Vec::new(),
         Vec::new(),
     );
@@ -526,6 +528,7 @@ fn apply_merge_outcome_entry_conflict_per_field_split() {
         )],
         Vec::new(),
         Vec::new(),
+        Vec::new(),
     );
     local
         .apply_merge_outcome(outcome, resolution)
@@ -553,6 +556,7 @@ fn apply_merge_outcome_delete_edit_keep_local() {
     let resolution = ResolutionFfi::new(
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         vec![delete_edit_choice(&target, DeleteEditChoiceFfi::KeepLocal)],
     );
     local
@@ -578,6 +582,7 @@ fn apply_merge_outcome_delete_edit_accept_remote_delete() {
         .merge_external(remote.path(), PASSWORD.to_owned())
         .expect("merge");
     let resolution = ResolutionFfi::new(
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         vec![delete_edit_choice(
@@ -700,6 +705,7 @@ fn apply_merge_outcome_unknown_field_in_resolution_yields_merge_error() {
         )],
         Vec::new(),
         Vec::new(),
+        Vec::new(),
     );
     let err = local
         .apply_merge_outcome(outcome, resolution)
@@ -791,6 +797,7 @@ fn merge_external_attachment_both_differ_surfaces_delta() {
             )],
         )],
         Vec::new(),
+        Vec::new(),
     );
     local
         .apply_merge_outcome(outcome, resolution)
@@ -840,6 +847,7 @@ fn apply_merge_outcome_attachment_keep_both_renames_remote() {
                 },
             )],
         )],
+        Vec::new(),
         Vec::new(),
     );
     local
@@ -894,6 +902,7 @@ fn apply_merge_outcome_attachment_keep_both_with_override_uses_caller_name() {
                 },
             )],
         )],
+        Vec::new(),
         Vec::new(),
     );
     local

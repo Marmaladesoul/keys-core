@@ -25,8 +25,9 @@ pub use error::VaultError;
 pub use merge::{
     AttachmentChoiceFfi, AttachmentChoiceKindFfi, AttachmentDeltaFfi, AttachmentDeltaKindFfi,
     ConflictSideFfi, DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, DeleteEditConflictFfi,
-    EntryAttachmentChoiceFfi, EntryConflictFfi, EntryFieldChoiceFfi, FieldChoiceFfi, FieldDeltaFfi,
-    FieldDeltaKindFfi, MergeOutcome, MergeSummary, ResolutionFfi,
+    EntryAttachmentChoiceFfi, EntryConflictFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi,
+    FieldChoiceFfi, FieldDeltaFfi, FieldDeltaKindFfi, IconDeltaFfi, MergeOutcome, MergeSummary,
+    ResolutionFfi,
 };
 pub use observer::{VaultChange, VaultObserver};
 pub use portable::PortableEntry;

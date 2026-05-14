@@ -189,6 +189,10 @@ impl MergeOutcome {
                         remote_size_bytes: d.remote_size,
                     })
                     .collect(),
+                icon_delta: conflict.icon_delta.as_ref().map(|d| IconDeltaFfi {
+                    local_custom_icon_uuid: d.local_custom_icon_uuid.map(|u| u.to_string()),
+                    remote_custom_icon_uuid: d.remote_custom_icon_uuid.map(|u| u.to_string()),
+                }),
             });
         }
         Ok(out)
@@ -264,6 +268,28 @@ pub struct EntryConflictFfi {
     /// or 3-way classifier has a clear winner) ride through the
     /// auto-merge path and don't appear here.
     pub attachment_deltas: Vec<AttachmentDeltaFfi>,
+    /// Icon-level conflict when the two sides have a visible
+    /// `custom_icon_uuid` divergence the merge classifier couldn't
+    /// auto-resolve against the LCA. `None` when icons match or the
+    /// classifier picked a winner (in which case the entry routes
+    /// through the auto-merge buckets instead). Mirrors
+    /// `keepass_merge::EntryConflict::icon_delta`.
+    pub icon_delta: Option<IconDeltaFfi>,
+}
+
+/// Per-entry icon difference between the two sides of an
+/// [`EntryConflictFfi`]. Mirrors `keepass_merge::IconDelta`.
+///
+/// `local_custom_icon_uuid` / `remote_custom_icon_uuid` are the
+/// custom-icon UUIDs at conflict time, or `None` when that side has
+/// no custom icon set. The Swift resolver UI renders each side's
+/// icon preview from these UUIDs (looking up in `Meta::custom_icons`)
+/// and offers a keep-local / keep-remote toggle.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct IconDeltaFfi {
+    pub local_custom_icon_uuid: Option<String>,
+    pub remote_custom_icon_uuid: Option<String>,
 }
 
 /// Per-attachment difference between the two sides of an
@@ -398,6 +424,8 @@ pub struct ResolutionFfi {
     /// `attachment_deltas`. Inner `attachment_choices` has one entry
     /// per attachment name in that conflict's `attachment_deltas`.
     pub entry_attachment_choices: Vec<EntryAttachmentChoiceFfi>,
+    /// One entry per [`EntryConflictFfi`] with `icon_delta.is_some()`.
+    pub entry_icon_choices: Vec<EntryIconChoiceFfi>,
     /// One entry per [`DeleteEditConflictFfi`].
     pub delete_edit_choices: Vec<DeleteEditChoiceEntryFfi>,
 }
@@ -407,7 +435,7 @@ impl ResolutionFfi {
     /// conflicts. Mirrors `EntryPatch::empty` / `GroupPatch::empty`.
     #[must_use]
     pub fn empty() -> Self {
-        Self::new(Vec::new(), Vec::new(), Vec::new())
+        Self::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
     }
 
     /// Construct a resolution from caller-built choice lists.
@@ -418,12 +446,27 @@ impl ResolutionFfi {
     pub fn new(
         entry_field_choices: Vec<EntryFieldChoiceFfi>,
         entry_attachment_choices: Vec<EntryAttachmentChoiceFfi>,
+        entry_icon_choices: Vec<EntryIconChoiceFfi>,
         delete_edit_choices: Vec<DeleteEditChoiceEntryFfi>,
     ) -> Self {
         Self {
             entry_field_choices,
             entry_attachment_choices,
+            entry_icon_choices,
             delete_edit_choices,
+        }
+    }
+}
+
+impl EntryIconChoiceFfi {
+    /// Construct an entry-icon-choice carrier. Required because
+    /// `#[non_exhaustive]` blocks struct-literal construction outside
+    /// the crate.
+    #[must_use]
+    pub fn new(entry_uuid: impl Into<String>, side: ConflictSideFfi) -> Self {
+        Self {
+            entry_uuid: entry_uuid.into(),
+            side,
         }
     }
 }
@@ -525,6 +568,15 @@ pub struct EntryAttachmentChoiceFfi {
 pub struct AttachmentChoiceFfi {
     pub name: String,
     pub choice: AttachmentChoiceKindFfi,
+}
+
+/// Per-entry icon choice carrier. One element per [`EntryConflictFfi`]
+/// with `icon_delta.is_some()`.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct EntryIconChoiceFfi {
+    pub entry_uuid: String,
+    pub side: ConflictSideFfi,
 }
 
 /// Caller's choice for a single conflicting attachment. Mirrors
@@ -632,6 +684,11 @@ pub(crate) fn resolution_ffi_to_km(resolution: &ResolutionFfi) -> Result<KmResol
             inner.insert(ac.name.clone(), ac.choice.clone().into());
         }
     }
+    let mut entry_icon_choices: HashMap<EntryId, KmConflictSide> = HashMap::new();
+    for eic in &resolution.entry_icon_choices {
+        let id = parse_entry_id(&eic.entry_uuid)?;
+        entry_icon_choices.insert(id, eic.side.into());
+    }
     let mut delete_edit_choices: HashMap<EntryId, KmDeleteEditChoice> = HashMap::new();
     for dec in &resolution.delete_edit_choices {
         let id = parse_entry_id(&dec.entry_uuid)?;
@@ -641,6 +698,7 @@ pub(crate) fn resolution_ffi_to_km(resolution: &ResolutionFfi) -> Result<KmResol
     let mut r = KmResolution::default();
     r.entry_field_choices = entry_field_choices;
     r.entry_attachment_choices = entry_attachment_choices;
+    r.entry_icon_choices = entry_icon_choices;
     r.delete_edit_choices = delete_edit_choices;
     Ok(r)
 }
