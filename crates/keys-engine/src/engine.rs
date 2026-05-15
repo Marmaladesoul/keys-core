@@ -480,59 +480,75 @@ impl Engine {
     /// Reveal the cleartext password for an entry.
     ///
     /// Fetches the wrapped blob from `entry_protected`, asks the
-    /// field-protector callback for the session key, and AES-GCM-opens
-    /// in process. The result lives in a [`SecretString`] so it zeroes
-    /// on drop.
+    /// field-protector callback for a fresh session key, and
+    /// AES-GCM-opens in process. The result lives in a [`SecretString`]
+    /// so it zeroes on drop.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::Sqlite`] for query failure, plus future
-    /// reveal-specific variants (missing field, AEAD failure) added in
-    /// task 3.4.
+    /// - [`EngineError::NotFound`] (`entity = "password"`) if the entry
+    ///   has no `entry_protected` Password row.
+    /// - [`EngineError::Reveal`] for session-key acquisition failure or
+    ///   AES-GCM unwrap failure.
+    /// - [`EngineError::Sqlite`] for query failure.
     pub fn reveal_password(&self, uuid: Uuid) -> Result<SecretString, EngineError> {
-        let _ = (uuid, &self.conn);
-        unimplemented!("task 3.4")
+        crate::reveal::reveal_password(&self.conn, &*self.field_protector, uuid)
     }
 
     /// Reveal the cleartext value of a custom field on an entry.
     ///
     /// Symmetric with [`Engine::reveal_password`] but for arbitrary
-    /// named fields recorded in `entry_protected`. Non-protected
-    /// custom fields are also served here for surface uniformity.
+    /// named protected fields recorded in `entry_protected`. Asking for
+    /// `field_name = "Password"` is allowed — it routes through the
+    /// same row [`Engine::reveal_password`] reads, so the two are
+    /// equivalent for that name; [`Engine::reveal_password`] stays as
+    /// the canonical entry point.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::Sqlite`] for query failure, plus future
-    /// reveal-specific variants added in task 3.4.
+    /// - [`EngineError::NotFound`] (`entity = "custom_field"`) if no
+    ///   `entry_protected` row matches `(uuid, field_name)`.
+    /// - [`EngineError::Reveal`] for session-key acquisition failure or
+    ///   AES-GCM unwrap failure.
+    /// - [`EngineError::Sqlite`] for query failure.
     pub fn reveal_custom_field(
         &self,
         uuid: Uuid,
         field_name: &str,
     ) -> Result<SecretString, EngineError> {
-        let _ = (uuid, field_name, &self.conn);
-        unimplemented!("task 3.4")
+        crate::reveal::reveal_custom_field(&self.conn, &*self.field_protector, uuid, field_name)
     }
 
-    /// Reveal the cleartext value of a custom field in a historic
-    /// snapshot of an entry.
+    /// Reveal the cleartext value of a field in a historic snapshot of
+    /// an entry.
     ///
-    /// `history_index` selects the snapshot per
-    /// [`HistoricEntry::history_index`]; `field_name` is one of the
-    /// names exposed in [`HistoricEntry::custom_field_names`] (or
-    /// `"Password"` for the historic password).
+    /// **Asymmetric with the live-reveal paths.** History snapshots
+    /// are stored as plaintext JSON inside `entry_history.snapshot_json`
+    /// (the surrounding `SQLite` file is `SQLCipher`-encrypted at rest,
+    /// which gives the same trust posture as a per-row AES-GCM wrap
+    /// would). This method therefore does **not** call into the
+    /// [`keepass_core::protector::FieldProtector`];
+    /// it deserialises the snapshot JSON and reads the named field
+    /// directly.
+    ///
+    /// `field_name = "Password"` reads the historic password;
+    /// any other name reads from the snapshot's `custom_fields` map.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::Sqlite`] for query failure, plus future
-    /// reveal-specific variants added in task 3.4.
+    /// - [`EngineError::NotFound`] (`entity = "history_snapshot"` or
+    ///   `"history_field"`) if the snapshot or named field is missing.
+    /// - [`EngineError::Reveal`] wrapping
+    ///   [`RevealError::Json`](crate::RevealError::Json) if the
+    ///   `snapshot_json` is malformed.
+    /// - [`EngineError::Sqlite`] for query failure.
     pub fn reveal_history_field(
         &self,
         uuid: Uuid,
         history_index: u32,
         field_name: &str,
     ) -> Result<SecretString, EngineError> {
-        let _ = (uuid, history_index, field_name, &self.conn);
-        unimplemented!("task 3.4")
+        crate::reveal::reveal_history_field(&self.conn, uuid, history_index, field_name)
     }
 
     /// Fetch the bytes of an entry attachment by attachment name.

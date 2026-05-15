@@ -37,17 +37,16 @@
 
 use std::collections::HashMap;
 
-use aes_gcm::Aes256Gcm;
-use aes_gcm::aead::{Aead, KeyInit};
 use chrono::{DateTime, TimeZone, Utc};
 use keepass_core::model::{
     Attachment, Binary, CustomField, Entry, EntryId, Group, GroupId, Timestamps, Vault,
 };
-use keepass_core::protector::{FieldProtector, SessionKey};
+use keepass_core::protector::FieldProtector;
 use rusqlite::Connection;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::crypto::unwrap_with_session_key;
 use crate::error::{EngineError, ProjectionError};
 
 /// Canonical KDBX field name for an entry's password slot — must match
@@ -562,22 +561,6 @@ fn build_times(
     t.expiry_time = expires_at.and_then(ms_to_dt);
     t.expires = expires_at.is_some();
     t
-}
-
-/// AES-256-GCM open — inverse of [`crate::ingest::wrap_with_session_key`].
-///
-/// Wire format: `nonce(12) || ciphertext || tag(16)`. We can't reuse
-/// `keepass_core::protector::open_with_key` because it's `pub(crate)`;
-/// implementing the open here matches the same wire shape the ingest
-/// side wrote.
-fn unwrap_with_session_key(session_key: &SessionKey, wrapped: &[u8]) -> Result<Vec<u8>, String> {
-    if wrapped.len() < 12 + 16 {
-        return Err("wrapped blob too short".into());
-    }
-    let (nonce_bytes, ciphertext) = wrapped.split_at(12);
-    let cipher = Aes256Gcm::new_from_slice(session_key.as_bytes()).map_err(|e| e.to_string())?;
-    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-    cipher.decrypt(nonce, ciphertext).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

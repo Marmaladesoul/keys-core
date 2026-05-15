@@ -88,6 +88,25 @@ pub enum EngineError {
     #[error("projection failed: {0}")]
     Projection(#[from] ProjectionError),
 
+    /// A reveal-pass failure — see [`RevealError`] for the specific
+    /// failure mode.
+    #[error("reveal failed: {0}")]
+    Reveal(#[from] RevealError),
+
+    /// The requested entity (entry, field, history snapshot, …) does
+    /// not exist. Used by reveal paths and other lookup methods that
+    /// have a "not found" failure mode distinct from a SQL-level error.
+    ///
+    /// `entity` is a short static label like `"password"`,
+    /// `"custom_field"`, `"history_snapshot"`, or `"history_field"`
+    /// — useful for telemetry / debug messages but not intended as a
+    /// machine-readable taxonomy.
+    #[error("not found: {entity}")]
+    NotFound {
+        /// Short static label naming the missing entity kind.
+        entity: &'static str,
+    },
+
     /// `keepass-core`'s
     /// [`save_to_bytes`](keepass_core::kdbx::Kdbx::save_to_bytes)
     /// rejected the spliced vault — e.g. KDBX3 was asked for a
@@ -129,6 +148,36 @@ pub enum ProjectionError {
     /// `entry_history.snapshot_json`. Surfaces a producer mismatch
     /// (a foreign writer emitted a different shape) or genuine
     /// corruption.
+    #[error("history snapshot deserialisation failed: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// Errors surfaced specifically by the reveal methods on
+/// [`crate::Engine`] — [`crate::Engine::reveal_password`],
+/// [`crate::Engine::reveal_custom_field`], and
+/// [`crate::Engine::reveal_history_field`].
+///
+/// Lookup failures (no matching row) surface as
+/// [`EngineError::NotFound`] rather than a variant on this enum, mirroring
+/// the broader engine convention that "missing entity" is a query-shape
+/// concern distinct from a crypto / decode failure.
+#[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
+pub enum RevealError {
+    /// The configured [`keepass_core::protector::FieldProtector`] could
+    /// not produce the session key needed to unwrap the protected blob.
+    #[error("session key unavailable: {0}")]
+    SessionKey(String),
+
+    /// AES-GCM open of the protected blob failed — either the wire
+    /// shape is wrong, the tag doesn't verify, or the plaintext wasn't
+    /// valid UTF-8.
+    #[error("protected field unwrap failed: {0}")]
+    Unwrap(String),
+
+    /// `serde_json` failed to deserialise a history snapshot. Same
+    /// producer-mismatch / corruption story as
+    /// [`ProjectionError::Json`].
     #[error("history snapshot deserialisation failed: {0}")]
     Json(#[from] serde_json::Error),
 }
