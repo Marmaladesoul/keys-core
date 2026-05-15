@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/keys-engine",
     "crates/keys-ffi",
     "crates/uniffi-bindgen-swift",
 ]

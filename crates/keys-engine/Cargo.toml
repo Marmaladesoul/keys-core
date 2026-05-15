@@ -1,0 +1,16 @@
+[package]
+name = "keys-engine"
+description = "SQLCipher-backed query and mutation engine for the Keys password manager. Mirrors KDBX state into a local SQLCipher database and serves reads from there; KDBX is the sync substrate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+keepass-core = { path = "../../../KeepassCore/crates/keepass-core" }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
