@@ -5,6 +5,7 @@ pub mod key_provider;
 pub mod migrations;
 pub mod model;
 pub mod predicate;
+pub mod strength;
 
 pub use engine::Engine;
 pub use error::EngineError;
@@ -16,3 +17,4 @@ pub use model::{
     Pagination, StrengthBucket,
 };
 pub use predicate::Predicate;
+pub use strength::{Strength, strength};

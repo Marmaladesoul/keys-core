@@ -19,6 +19,7 @@ use crate::fingerprint;
 use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
 use crate::model::{EntryFull, EntrySummary, GroupNode, HistoricEntry, Pagination};
+use crate::strength::{self, Strength};
 
 /// `SQLCipher`-backed `SQLite` engine handle.
 ///
@@ -107,6 +108,17 @@ impl Engine {
     #[must_use]
     pub fn fingerprint(&self, plaintext: &[u8]) -> [u8; 32] {
         fingerprint::fingerprint(&self.fingerprint_key, plaintext)
+    }
+
+    /// Estimate the strength of a password.
+    ///
+    /// Pure function — no engine state is touched. Exposed as a method
+    /// for API symmetry with [`Engine::fingerprint`] so callers can
+    /// drive both off a single handle. See [`crate::strength()`] for the
+    /// algorithm.
+    #[must_use]
+    pub fn strength(&self, password: &str) -> Strength {
+        strength::strength(password)
     }
 
     /// Close the underlying connection, finalising any pending work.
