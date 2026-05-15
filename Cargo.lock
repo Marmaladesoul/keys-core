@@ -735,6 +735,8 @@ version = "0.0.0"
 dependencies = [
  "keepass-core",
  "rusqlite",
+ "thiserror 2.0.18",
+ "zeroize",
 ]
 
 [[package]]
@@ -744,6 +746,7 @@ dependencies = [
  "chrono",
  "keepass-core",
  "keepass-merge",
+ "keys-engine",
  "secrecy",
  "sha2",
  "tempfile",

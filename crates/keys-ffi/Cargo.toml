@@ -18,6 +18,7 @@ workspace = true
 # Path deps during Phase 2 — flip to crates.io once keepass-core v0.1 ships.
 keepass-core = { path = "../../../KeepassCore/crates/keepass-core" }
 keepass-merge = { path = "../../../KeepassCore/crates/keepass-merge" }
+keys-engine = { path = "../keys-engine" }
 
 # uniffi 0.28, proc-macro path. No build.rs needed — `setup_scaffolding!()`
 # emits everything inline. The Swift bindgen ships as a separate

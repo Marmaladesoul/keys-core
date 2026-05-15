@@ -9,6 +9,7 @@
 //! guarantee for external consumers — hence this crate remains
 //! closed-source and is deliberately not published to crates.io.
 
+mod db_key_provider;
 mod dto;
 mod error;
 mod merge;
@@ -17,6 +18,7 @@ mod portable;
 mod protector;
 mod vault;
 
+pub use db_key_provider::{VaultDbKeyProvider, VaultDbKeyProviderError};
 pub use dto::{
     AutoType, AutoTypeAssociation, CustomField, Entry, EntryCreate, EntryPatch, EntrySummary,
     Group, GroupPatch, HistoryRecord, ProtectedField,
