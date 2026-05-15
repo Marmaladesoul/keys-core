@@ -7,6 +7,9 @@
 //! convenience method can't silently drift from the canonical
 //! implementation.
 
+use std::sync::Arc;
+
+use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError};
 
 #[derive(Debug)]
@@ -18,11 +21,24 @@ impl KeyProvider for FixedKey {
     }
 }
 
+#[derive(Debug)]
+struct TestProtector([u8; 32]);
+
+impl FieldProtector for TestProtector {
+    fn acquire_session_key(&self) -> Result<SessionKey, ProtectorError> {
+        Ok(SessionKey::from_bytes(self.0))
+    }
+}
+
+fn protector() -> Arc<dyn FieldProtector> {
+    Arc::new(TestProtector([0x5a; 32]))
+}
+
 #[test]
 fn engine_strength_method_matches_module_strength() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.db");
-    let engine = Engine::open(&path, &FixedKey([0x88; 32])).expect("open");
+    let engine = Engine::open(&path, &FixedKey([0x88; 32]), protector()).expect("open");
 
     for input in [
         "",

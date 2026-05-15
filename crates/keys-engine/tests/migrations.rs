@@ -5,6 +5,9 @@
 //! [`Engine::open`] runs migrations end-to-end against an
 //! SQLCipher-encrypted file.
 
+use std::sync::Arc;
+
+use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::migrations::{self, MIGRATIONS, MigrationError};
 use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError};
 use rusqlite::{Connection, params};
@@ -16,6 +19,19 @@ impl KeyProvider for FixedKey {
     fn acquire_db_key(&self) -> Result<DbKey, KeyProviderError> {
         Ok(DbKey::from_bytes(self.0))
     }
+}
+
+#[derive(Debug)]
+struct TestProtector([u8; 32]);
+
+impl FieldProtector for TestProtector {
+    fn acquire_session_key(&self) -> Result<SessionKey, ProtectorError> {
+        Ok(SessionKey::from_bytes(self.0))
+    }
+}
+
+fn protector() -> Arc<dyn FieldProtector> {
+    Arc::new(TestProtector([0x5a; 32]))
 }
 
 /// Tables, indices, triggers and the FTS5 virtual table we expect
@@ -214,7 +230,7 @@ fn engine_open_applies_migrations() {
     let path = dir.path().join("keys.db");
     let key = FixedKey([0x33; 32]);
 
-    let engine = Engine::open(&path, &key).expect("open fresh");
+    let engine = Engine::open(&path, &key, protector()).expect("open fresh");
     engine.close().expect("close");
 
     // Reopen and verify the schema is present via a direct rusqlite
@@ -249,9 +265,18 @@ fn engine_open_idempotent_on_existing() {
     let path = dir.path().join("keys.db");
     let key = FixedKey([0x77; 32]);
 
-    Engine::open(&path, &key).expect("first").close().unwrap();
-    Engine::open(&path, &key).expect("second").close().unwrap();
-    Engine::open(&path, &key).expect("third").close().unwrap();
+    Engine::open(&path, &key, protector())
+        .expect("first")
+        .close()
+        .unwrap();
+    Engine::open(&path, &key, protector())
+        .expect("second")
+        .close()
+        .unwrap();
+    Engine::open(&path, &key, protector())
+        .expect("third")
+        .close()
+        .unwrap();
 
     let raw = Connection::open(&path).expect("raw open");
     raw.execute_batch(

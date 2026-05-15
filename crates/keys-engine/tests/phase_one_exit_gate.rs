@@ -9,10 +9,26 @@
 
 use std::fmt::Write as _;
 
+use std::sync::Arc;
+
+use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::migrations::MIGRATIONS;
 use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError};
 use rand::RngCore;
 use rusqlite::{Connection, params};
+
+#[derive(Debug)]
+struct TestProtector([u8; 32]);
+
+impl FieldProtector for TestProtector {
+    fn acquire_session_key(&self) -> Result<SessionKey, ProtectorError> {
+        Ok(SessionKey::from_bytes(self.0))
+    }
+}
+
+fn protector() -> Arc<dyn FieldProtector> {
+    Arc::new(TestProtector([0x5a; 32]))
+}
 
 /// Test-only `KeyProvider` that hands out a fixed 32-byte key.
 ///
@@ -63,7 +79,7 @@ fn phase_one_exit_gate_full_lifecycle() {
     let provider = FixedKeyProvider(key_bytes);
 
     // 1. Open fresh — file does not exist yet. Migrations run.
-    let engine = Engine::open(&path, &provider).expect("open fresh");
+    let engine = Engine::open(&path, &provider, protector()).expect("open fresh");
 
     // 2. Sanity-check the schema version got bumped to MIGRATIONS' max.
     //    We can't see inside the engine, so close + peek via raw conn.
@@ -95,7 +111,7 @@ fn phase_one_exit_gate_full_lifecycle() {
     }
 
     // 4. Reopen with the SAME key. Must succeed (no WrongKey).
-    let engine = Engine::open(&path, &provider).expect("reopen with same key");
+    let engine = Engine::open(&path, &provider, protector()).expect("reopen with same key");
     engine.close().expect("close after reopen");
 
     // 5. Final raw peek — confirm the row we wrote survived the
@@ -123,7 +139,7 @@ fn phase_one_exit_gate_full_lifecycle_with_fts() {
     let provider = FixedKeyProvider(key_bytes);
 
     // Fresh open + migrations.
-    Engine::open(&path, &provider)
+    Engine::open(&path, &provider, protector())
         .expect("open fresh")
         .close()
         .expect("close after fresh open");
@@ -151,7 +167,7 @@ fn phase_one_exit_gate_full_lifecycle_with_fts() {
 
     // Reopen the engine, then verify FTS query still finds the entry —
     // proving migrations + triggers stay coherent across close/reopen.
-    Engine::open(&path, &provider)
+    Engine::open(&path, &provider, protector())
         .expect("reopen with same key")
         .close()
         .expect("close after reopen");

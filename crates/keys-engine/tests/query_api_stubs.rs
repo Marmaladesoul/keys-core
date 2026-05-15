@@ -7,6 +7,9 @@
 //! lines up against `Engine::open`, the model types, and `Pagination`
 //! the way a frontend will call them.
 
+use std::sync::Arc;
+
+use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError, Pagination};
 use uuid::Uuid;
 
@@ -19,6 +22,19 @@ impl KeyProvider for FixedKey {
     }
 }
 
+#[derive(Debug)]
+struct TestProtector([u8; 32]);
+
+impl FieldProtector for TestProtector {
+    fn acquire_session_key(&self) -> Result<SessionKey, ProtectorError> {
+        Ok(SessionKey::from_bytes(self.0))
+    }
+}
+
+fn protector() -> Arc<dyn FieldProtector> {
+    Arc::new(TestProtector([0x5a; 32]))
+}
+
 #[test]
 #[ignore = "stubs panic with unimplemented!('task 3.1'); implementation lands in Phase 3"]
 fn list_entries_stub_panics_with_task_marker() {
@@ -26,7 +42,7 @@ fn list_entries_stub_panics_with_task_marker() {
     let path = dir.path().join("keys.db");
     let key = FixedKey([0x42; 32]);
 
-    let engine = Engine::open(&path, &key).expect("open");
+    let engine = Engine::open(&path, &key, protector()).expect("open");
 
     // Should panic with "not implemented: task 3.1".
     let _ = engine.list_entries(None, Pagination::all());

@@ -8,7 +8,10 @@
 //! built-in PBKDF2 key derivation.
 
 use std::path::Path;
+use std::sync::Arc;
 
+use keepass_core::kdbx::{Kdbx, Unlocked};
+use keepass_core::protector::FieldProtector;
 use rusqlite::{Connection, OpenFlags};
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -16,6 +19,7 @@ use zeroize::Zeroizing;
 
 use crate::error::EngineError;
 use crate::fingerprint;
+use crate::ingest;
 use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
 use crate::model::{EntryFull, EntrySummary, GroupNode, HistoricEntry, Pagination};
@@ -37,6 +41,16 @@ pub struct Engine {
     /// `setting` table under the `fingerprint_key` row, and reloaded
     /// on every subsequent open. Zeroed on drop.
     fingerprint_key: Zeroizing<[u8; 32]>,
+    /// Session-key provider used by ingest (and the future reveal /
+    /// mutation paths) to AES-GCM-wrap protected field plaintexts
+    /// before they land in `entry_protected.wrapped_blob`.
+    ///
+    /// Same trait that `keepass-core::Kdbx::open` takes, so a single
+    /// frontend-side implementation can drive both the in-memory
+    /// kdbx wrap layer and the engine's persisted wrap. Stored as
+    /// `Arc<dyn FieldProtector>` because the trait is also held by
+    /// the unlocked Kdbx and by future per-thread reveal paths.
+    field_protector: Arc<dyn FieldProtector>,
 }
 
 impl Engine {
@@ -57,7 +71,11 @@ impl Engine {
     ///   the existing database.
     /// - [`EngineError::Sqlite`] for any other rusqlite-level failure.
     /// - [`EngineError::Io`] currently unused on this path but reserved.
-    pub fn open(path: &Path, key_provider: &dyn KeyProvider) -> Result<Self, EngineError> {
+    pub fn open(
+        path: &Path,
+        key_provider: &dyn KeyProvider,
+        field_protector: Arc<dyn FieldProtector>,
+    ) -> Result<Self, EngineError> {
         let key = key_provider.acquire_db_key()?;
 
         let mut conn = Connection::open_with_flags(
@@ -94,7 +112,46 @@ impl Engine {
         Ok(Self {
             conn,
             fingerprint_key,
+            field_protector,
         })
+    }
+
+    /// Replace this engine's vault tables with the contents of `kdbx`.
+    ///
+    /// Walks groups → entries → history → attachments, `INSERTing` rows
+    /// in a single transaction. Computes the strength bucket, entropy
+    /// estimate, and HMAC fingerprint of every entry's password.
+    /// AES-GCM-wraps every protected field plaintext under a session
+    /// key fetched from this engine's [`FieldProtector`] and writes the
+    /// blob to `entry_protected`. Splits the entry's tag list into
+    /// distinct rows in `tag` / `entry_tag`. Content-addresses
+    /// attachment bytes via SHA-256 into `attachment_blob`.
+    ///
+    /// Idempotent: the pre-walk step `DELETE`s every vault row, so a
+    /// re-ingest produces the same final state regardless of what was
+    /// there before. Schema (tables, indices, triggers, settings) is
+    /// preserved.
+    ///
+    /// Phase 2.4 / 2.5 will land the reverse direction (projection +
+    /// serialise). Mutation semantics — adding / editing / deleting a
+    /// single entry without rewriting the whole table — are Phase 4.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Ingest`] wrapping an
+    ///   [`crate::IngestError::Kdbx`] if the kdbx side refuses to
+    ///   expose plaintext-protected vault contents.
+    /// - [`EngineError::Ingest`] wrapping an
+    ///   [`crate::IngestError::Wrap`] /
+    ///   [`crate::IngestError::SessionKey`] if the wrap pass fails.
+    /// - [`EngineError::Sqlite`] for transaction / INSERT failures.
+    pub fn ingest_from_kdbx(&mut self, kdbx: &Kdbx<Unlocked>) -> Result<(), EngineError> {
+        ingest::ingest(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            kdbx,
+        )
     }
 
     /// HMAC-SHA-256 a plaintext under this vault's persistent

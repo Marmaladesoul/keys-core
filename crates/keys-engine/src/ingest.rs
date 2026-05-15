@@ -1,0 +1,586 @@
+//! `KDBX` → `SQLite` ingest path.
+//!
+//! Walks an unlocked [`Kdbx`] in-memory tree and INSERTs the entire
+//! contents into the engine's `SQLite` mirror in a single transaction.
+//! Idempotent: every call DELETEs the vault tables before writing, so
+//! re-ingest produces the same final state regardless of what was
+//! there. Schema (migrations, settings) is preserved.
+//!
+//! Subsequent tasks (Phase 2.4 projection, 2.5 serialise) close the
+//! round-trip. Mutation semantics — single-row edits without rewriting
+//! every table — land in Phase 4.
+
+use std::collections::HashMap;
+
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chrono::{DateTime, Utc};
+use keepass_core::kdbx::{Kdbx, Unlocked};
+use keepass_core::model::{Entry, Group, GroupId, Vault};
+use keepass_core::protector::{FieldProtector, SessionKey};
+use rusqlite::{Connection, params};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::error::{EngineError, IngestError};
+use crate::fingerprint;
+use crate::strength;
+
+/// Canonical KDBX field name for an entry's password slot.
+///
+/// Used both as the `field_name` value for `entry_protected` rows
+/// carrying the canonical password and as the historic-snapshot JSON
+/// key.
+const PASSWORD_FIELD: &str = "Password";
+
+/// Top-level ingest entry point. Holds a single transaction across the
+/// entire walk so a failure rolls back cleanly.
+pub(crate) fn ingest(
+    conn: &mut Connection,
+    fingerprint_key: &[u8; 32],
+    protector: &dyn FieldProtector,
+    kdbx: &Kdbx<Unlocked>,
+) -> Result<(), EngineError> {
+    // Unwrap the in-memory wrap layer once: every Entry from this
+    // Vault carries plaintext in `password` and `custom_fields[i].value`
+    // for the duration of the call. Drop it as soon as the walk is
+    // done.
+    let vault = kdbx
+        .vault_with_unwrapped_protected()
+        .map_err(|e| EngineError::Ingest(IngestError::Kdbx(e.to_string())))?;
+
+    // One session-key fetch per ingest call. Same discipline as the
+    // keepass-core wrap pass.
+    let session_key = protector
+        .acquire_session_key()
+        .map_err(|e| EngineError::Ingest(IngestError::SessionKey(e.to_string())))?;
+
+    let recycle_bin_uuid = vault.meta.recycle_bin_uuid;
+
+    let tx = conn.transaction()?;
+    clear_vault_tables(&tx)?;
+
+    // Walk groups first so entries' FK references resolve.
+    walk_groups(&tx, &vault.root, None, recycle_bin_uuid)?;
+
+    // Index the binary pool by ref_id so attachment lookups are O(1).
+    // KDBX `ref_id` is the index into `Vault::binaries`.
+    let binaries: Vec<&[u8]> = vault.binaries.iter().map(|b| b.data.as_slice()).collect();
+
+    walk_entries(
+        &tx,
+        &vault,
+        &vault.root,
+        recycle_bin_uuid,
+        false,
+        fingerprint_key,
+        &session_key,
+        &binaries,
+    )?;
+
+    tx.commit()?;
+    drop(vault);
+    Ok(())
+}
+
+/// `DELETE FROM` every vault-content table. Schema and migration rows
+/// stay. Order respects foreign-key references — children before
+/// parents.
+fn clear_vault_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Child tables first.
+    conn.execute("DELETE FROM entry_tag", [])?;
+    conn.execute("DELETE FROM entry_attachment", [])?;
+    conn.execute("DELETE FROM entry_history", [])?;
+    conn.execute("DELETE FROM entry_protected", [])?;
+    conn.execute("DELETE FROM entry", [])?;
+    conn.execute("DELETE FROM tag", [])?;
+    conn.execute("DELETE FROM attachment_blob", [])?;
+    // Group goes last; entries FK to it.
+    conn.execute("DELETE FROM \"group\"", [])?;
+    Ok(())
+}
+
+/// Recursive group walk. `parent_uuid = None` for the root group.
+fn walk_groups(
+    conn: &Connection,
+    group: &Group,
+    parent_uuid: Option<Uuid>,
+    recycle_bin_uuid: Option<GroupId>,
+) -> Result<(), rusqlite::Error> {
+    let uuid_str = group.id.0.to_string();
+    let parent_str = parent_uuid.as_ref().map(Uuid::to_string);
+    let is_recycle_bin = recycle_bin_uuid.is_some_and(|rb| rb == group.id);
+
+    conn.execute(
+        "INSERT INTO \"group\" (\
+            uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
+            created_at, modified_at, expires_at, is_recycle_bin\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            uuid_str,
+            parent_str,
+            group.name,
+            i64::from(group.icon_id),
+            group.custom_icon_uuid.map(|u| u.to_string()),
+            group.notes,
+            dt_to_ms(group.times.creation_time),
+            dt_to_ms(group.times.last_modification_time),
+            expiry_ms(&group.times),
+            i64::from(is_recycle_bin),
+        ],
+    )?;
+
+    for child in &group.groups {
+        walk_groups(conn, child, Some(group.id.0), recycle_bin_uuid)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_entries(
+    conn: &Connection,
+    vault: &Vault,
+    group: &Group,
+    recycle_bin_uuid: Option<GroupId>,
+    is_under_recycle_bin: bool,
+    fingerprint_key: &[u8; 32],
+    session_key: &SessionKey,
+    binaries: &[&[u8]],
+) -> Result<(), EngineError> {
+    let group_is_recycle_bin = recycle_bin_uuid.is_some_and(|rb| rb == group.id);
+    let in_recycle_bin = is_under_recycle_bin || group_is_recycle_bin;
+
+    for entry in &group.entries {
+        insert_entry(
+            conn,
+            vault,
+            entry,
+            group.id,
+            in_recycle_bin,
+            fingerprint_key,
+            session_key,
+            binaries,
+        )?;
+    }
+
+    for child in &group.groups {
+        walk_entries(
+            conn,
+            vault,
+            child,
+            recycle_bin_uuid,
+            in_recycle_bin,
+            fingerprint_key,
+            session_key,
+            binaries,
+        )?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn insert_entry(
+    conn: &Connection,
+    vault: &Vault,
+    entry: &Entry,
+    group_id: GroupId,
+    is_recycled: bool,
+    fingerprint_key: &[u8; 32],
+    session_key: &SessionKey,
+    binaries: &[&[u8]],
+) -> Result<(), EngineError> {
+    let entry_uuid = entry.id.0.to_string();
+    let group_uuid = group_id.0.to_string();
+
+    // Pull canonical Password plaintext off the entry. Empty string
+    // when the entry has no password (KDBX models that as the empty
+    // value, so we keep that semantics through to SQLite).
+    let password_plain = entry.password.as_bytes();
+    let strength_result = strength::strength(&entry.password);
+    let bucket = strength_result.bucket as u8;
+    let entropy = strength_result.entropy_bits;
+    let pw_fingerprint: [u8; 32] = if entry.password.is_empty() {
+        // No password → no meaningful fingerprint. Leaving the column
+        // NULL preserves "duplicate detection ignores empty passwords",
+        // which matches the Swift StrengthCache behaviour.
+        [0u8; 32]
+    } else {
+        fingerprint::fingerprint(fingerprint_key, password_plain)
+    };
+    let pw_fingerprint_param: Option<&[u8]> = if entry.password.is_empty() {
+        None
+    } else {
+        Some(&pw_fingerprint)
+    };
+
+    let url_host = parse_host(&entry.url);
+
+    let created_at = dt_to_ms_required(entry.times.creation_time);
+    let modified_at = dt_to_ms_required(entry.times.last_modification_time);
+    let accessed_at = dt_to_ms_required(entry.times.last_access_time);
+    // `last_used_at` doesn't have a dedicated KDBX field. The
+    // accessed-time on an entry is the closest proxy — clients update
+    // it on AutoFill / copy-password — so we mirror that into
+    // `last_used_at` whenever it's non-default. A zero / missing
+    // accessed-time means "never used" → NULL column.
+    let last_used_at: Option<i64> = entry.times.last_access_time.map(|d| d.timestamp_millis());
+
+    conn.execute(
+        "INSERT INTO entry (\
+            uuid, group_uuid, title, username, url, url_host, notes, \
+            icon_index, icon_custom_uuid, created_at, modified_at, \
+            accessed_at, last_used_at, expires_at, \
+            password_strength_bucket, password_entropy, password_fingerprint, \
+            is_recycled\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        params![
+            entry_uuid,
+            group_uuid,
+            entry.title,
+            entry.username,
+            entry.url,
+            url_host,
+            entry.notes,
+            i64::from(entry.icon_id),
+            entry.custom_icon_uuid.map(|u| u.to_string()),
+            created_at,
+            modified_at,
+            accessed_at,
+            last_used_at,
+            expiry_ms(&entry.times),
+            i64::from(bucket),
+            entropy,
+            pw_fingerprint_param,
+            i64::from(is_recycled),
+        ],
+    )?;
+
+    // Canonical Password slot. Always written (even empty) so the
+    // reveal path has a deterministic row to look up.
+    let wrapped_password = wrap_with_session_key(session_key, password_plain)
+        .map_err(|e| EngineError::Ingest(IngestError::Wrap(e)))?;
+    conn.execute(
+        "INSERT INTO entry_protected (entry_uuid, field_name, wrapped_blob) \
+         VALUES (?1, ?2, ?3)",
+        params![entry_uuid, PASSWORD_FIELD, wrapped_password],
+    )?;
+
+    // Custom fields. Protected ones go into entry_protected; the rest
+    // are deferred for v1 (see ingest module doc — there's no
+    // entry_custom_field table yet, so non-protected custom fields are
+    // dropped on ingest. Phase 2.5 / 2.4 round-trip property tests
+    // will surface this if it's load-bearing for a real vault.)
+    for cf in &entry.custom_fields {
+        if cf.protected {
+            // Avoid colliding with the canonical Password slot if a
+            // custom field happens to be named "Password" — extremely
+            // unlikely but easy to handle by skipping.
+            if cf.key == PASSWORD_FIELD {
+                continue;
+            }
+            let wrapped = wrap_with_session_key(session_key, cf.value.as_bytes())
+                .map_err(|e| EngineError::Ingest(IngestError::Wrap(e)))?;
+            conn.execute(
+                "INSERT INTO entry_protected (entry_uuid, field_name, wrapped_blob) \
+                 VALUES (?1, ?2, ?3)",
+                params![entry_uuid, cf.key, wrapped],
+            )?;
+        } else {
+            insert_non_protected_custom_field(conn, &entry_uuid, &cf.key, &cf.value)?;
+        }
+    }
+
+    // Tags. `Entry::tags` is already a deduplicated Vec<String> per
+    // the keepass-core decoder; we still trim and skip empties for
+    // safety against hand-rolled vaults.
+    for raw in &entry.tags {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let tag_id = upsert_tag(conn, name)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO entry_tag (entry_uuid, tag_id) VALUES (?1, ?2)",
+            params![entry_uuid, tag_id],
+        )?;
+    }
+
+    // Attachments. Resolve ref_id → bytes via the binary pool index.
+    for att in &entry.attachments {
+        let Some(bytes) = binaries.get(att.ref_id as usize).copied() else {
+            // Dangling ref_id — skip rather than fail. A future audit
+            // task can decide if this should be a hard error.
+            continue;
+        };
+        insert_attachment(conn, &entry_uuid, &att.name, bytes)?;
+    }
+
+    // History snapshots. KDBX stores oldest-first in `Entry::history`
+    // (per the decoder doc); we use the slice index as
+    // `history_index` directly.
+    for (idx, hist) in entry.history.iter().enumerate() {
+        let snapshot = HistorySnapshot::from_entry(hist);
+        let json = serde_json::to_string(&snapshot)
+            .map_err(|e| EngineError::Ingest(IngestError::Json(e)))?;
+        conn.execute(
+            "INSERT INTO entry_history (entry_uuid, history_index, snapshot_json) \
+             VALUES (?1, ?2, ?3)",
+            params![entry_uuid, i64::try_from(idx).unwrap_or(i64::MAX), json],
+        )?;
+    }
+
+    // Suppress unused warnings for vault when history snapshots don't
+    // need to consult the meta — keeps the parameter list a single
+    // shape across future revisions.
+    let _ = vault;
+
+    Ok(())
+}
+
+/// Insert (or no-op) a tag name and return its row id.
+fn upsert_tag(conn: &Connection, name: &str) -> Result<i64, rusqlite::Error> {
+    conn.execute(
+        "INSERT OR IGNORE INTO tag (name) VALUES (?1)",
+        params![name],
+    )?;
+    conn.query_row("SELECT id FROM tag WHERE name = ?1", params![name], |r| {
+        r.get::<_, i64>(0)
+    })
+}
+
+/// Insert an attachment blob (content-addressed by SHA-256) plus its
+/// `entry_attachment` link row.
+fn insert_attachment(
+    conn: &Connection,
+    entry_uuid: &str,
+    attachment_name: &str,
+    bytes: &[u8],
+) -> Result<(), rusqlite::Error> {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let sha = hasher.finalize();
+    let sha_bytes: &[u8] = sha.as_slice();
+    let size_i64 = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+
+    conn.execute(
+        "INSERT OR IGNORE INTO attachment_blob (sha256, bytes, size) VALUES (?1, ?2, ?3)",
+        params![sha_bytes, bytes, size_i64],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO entry_attachment (entry_uuid, attachment_name, blob_sha256) \
+         VALUES (?1, ?2, ?3)",
+        params![entry_uuid, attachment_name, sha_bytes],
+    )?;
+    Ok(())
+}
+
+/// Non-protected custom fields don't have a dedicated table in
+/// migration 0001. They're rare in typical vaults (`KeePassXC`'s UI
+/// nudges users toward protected for sensitive fields, and the
+/// non-protected slot is mostly used by power users for things like
+/// recovery codes, account IDs, etc.). For v1 ingest we **defer**
+/// them: drop on ingest, surface as a known limitation in the round-
+/// trip property test, and decide in Phase 2.4 / 2.5 whether the
+/// projection path needs them re-materialised. If real vaults exercise
+/// this slot, the fix is a clean migration 0002 adding an
+/// `entry_custom_field(entry_uuid, name, value)` table.
+///
+/// Keeping this as a function (rather than inlining the drop) so the
+/// "defer" decision is searchable, and so re-enabling it with a new
+/// migration is a one-line change here.
+#[allow(clippy::unnecessary_wraps)]
+fn insert_non_protected_custom_field(
+    _conn: &Connection,
+    _entry_uuid: &str,
+    _field_name: &str,
+    _value: &str,
+) -> Result<(), rusqlite::Error> {
+    // Deferred. See module doc.
+    Ok(())
+}
+
+/// AES-256-GCM seal `plaintext` under the supplied session key.
+///
+/// Wire format: `nonce(12) || ciphertext || tag(16)`. Matches the
+/// shape produced by `keepass_core::protector::seal_with_key` (which
+/// is `pub(crate)` so we don't reuse it directly), and matches the
+/// expectation documented on `entry_protected.wrapped_blob` in
+/// `schema.md`. The aes-gcm crate's `encrypt` returns
+/// `ciphertext || tag` already concatenated, so we just prepend the
+/// 12-byte random nonce.
+fn wrap_with_session_key(session_key: &SessionKey, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = Aes256Gcm::new_from_slice(session_key.as_bytes()).map_err(|e| e.to_string())?;
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(nonce.len() + ciphertext.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Inverse of [`wrap_with_session_key`] — used by tests to assert the
+/// stored blob is recoverable under the same session key.
+#[cfg(test)]
+pub(crate) fn unwrap_with_session_key(
+    session_key: &SessionKey,
+    wrapped: &[u8],
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    if wrapped.len() < 12 + 16 {
+        return Err("wrapped blob too short".into());
+    }
+    let (nonce_bytes, ciphertext) = wrapped.split_at(12);
+    let cipher = Aes256Gcm::new_from_slice(session_key.as_bytes()).map_err(|e| e.to_string())?;
+    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ciphertext)
+        .map(zeroize::Zeroizing::new)
+        .map_err(|e| e.to_string())
+}
+
+/// Parse the host out of a URL. Lowercased for the indexed
+/// `url_host` column (`AutoFill` lookups are case-insensitive).
+/// Returns the empty string when the input isn't a parseable URL or
+/// has no host — matching the schema's "NOT NULL DEFAULT ''"
+/// expectation rather than introducing a NULL.
+fn parse_host(url: &str) -> String {
+    if url.is_empty() {
+        return String::new();
+    }
+    match url::Url::parse(url) {
+        Ok(parsed) => parsed
+            .host_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+fn dt_to_ms(dt: Option<DateTime<Utc>>) -> i64 {
+    dt.map_or(0, |d| d.timestamp_millis())
+}
+
+fn dt_to_ms_required(dt: Option<DateTime<Utc>>) -> i64 {
+    dt_to_ms(dt)
+}
+
+fn expiry_ms(times: &keepass_core::model::Timestamps) -> Option<i64> {
+    if times.expires {
+        times.expiry_time.map(|d| d.timestamp_millis())
+    } else {
+        None
+    }
+}
+
+/// JSON shape stored in `entry_history.snapshot_json`.
+///
+/// History plaintext is recoverable because we run inside an unwrapped
+/// vault clone for the whole ingest pass. Stored values include
+/// protected-field plaintext, which is acceptable because the
+/// surrounding `SQLite` file is itself `SQLCipher`-encrypted at rest — the
+/// same trust posture as the live `entry_protected` blobs (modulo the
+/// per-row AES-GCM wrap, which Phase 2.5 will revisit if history
+/// reveal needs the same callback discipline as live reveal).
+#[derive(Serialize)]
+struct HistorySnapshot<'a> {
+    title: &'a str,
+    username: &'a str,
+    url: &'a str,
+    notes: &'a str,
+    password: &'a str,
+    tags: &'a [String],
+    created_at: i64,
+    modified_at: i64,
+    accessed_at: i64,
+    expires_at: Option<i64>,
+    custom_fields: HashMap<&'a str, HistoryCustomField<'a>>,
+}
+
+#[derive(Serialize)]
+struct HistoryCustomField<'a> {
+    value: &'a str,
+    protected: bool,
+}
+
+impl<'a> HistorySnapshot<'a> {
+    fn from_entry(entry: &'a Entry) -> Self {
+        let custom_fields = entry
+            .custom_fields
+            .iter()
+            .map(|cf| {
+                (
+                    cf.key.as_str(),
+                    HistoryCustomField {
+                        value: cf.value.as_str(),
+                        protected: cf.protected,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            title: &entry.title,
+            username: &entry.username,
+            url: &entry.url,
+            notes: &entry.notes,
+            password: &entry.password,
+            tags: &entry.tags,
+            created_at: dt_to_ms_required(entry.times.creation_time),
+            modified_at: dt_to_ms_required(entry.times.last_modification_time),
+            accessed_at: dt_to_ms_required(entry.times.last_access_time),
+            expires_at: expiry_ms(&entry.times),
+            custom_fields,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_host_lowercases() {
+        assert_eq!(
+            parse_host("https://Login.Example.COM/path"),
+            "login.example.com"
+        );
+    }
+
+    #[test]
+    fn parse_host_empty_for_unparseable() {
+        assert_eq!(parse_host(""), "");
+        assert_eq!(parse_host("not a url"), "");
+        // Schemeless input is not a URL per RFC 3986; url crate refuses.
+        assert_eq!(parse_host("example.com"), "");
+    }
+
+    #[derive(Debug)]
+    struct FixedSession([u8; 32]);
+    impl FieldProtector for FixedSession {
+        fn acquire_session_key(
+            &self,
+        ) -> Result<SessionKey, keepass_core::protector::ProtectorError> {
+            Ok(SessionKey::from_bytes(self.0))
+        }
+    }
+
+    #[test]
+    fn wrap_unwrap_round_trips() {
+        let p = FixedSession([7u8; 32]);
+        let k = p.acquire_session_key().unwrap();
+        let sealed = wrap_with_session_key(&k, b"hunter2").unwrap();
+        let opened = unwrap_with_session_key(&k, &sealed).unwrap();
+        assert_eq!(opened.as_slice(), b"hunter2");
+    }
+
+    #[test]
+    fn wrap_uses_distinct_nonces() {
+        let p = FixedSession([3u8; 32]);
+        let k = p.acquire_session_key().unwrap();
+        let a = wrap_with_session_key(&k, b"same").unwrap();
+        let b = wrap_with_session_key(&k, b"same").unwrap();
+        assert_ne!(a, b, "AES-GCM nonce must be random per seal");
+    }
+}
