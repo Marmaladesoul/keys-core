@@ -1,4 +1,4 @@
-//! [`VaultFieldProtector`] — the FFI-facing wrap / unwrap trait that
+//! [`VaultFieldProtector`] — the FFI-facing key-provider trait that
 //! foreign code (Swift on the Secure Enclave; C# on DPAPI; etc.)
 //! implements to keep protected-field plaintext out of the in-process
 //! address space.
@@ -9,53 +9,59 @@
 //! upstream trait as a uniffi trait. Adaptation happens via
 //! [`BridgeProtector`] below.
 //!
-//! The trait surface is intentionally minimal: bytes in, bytes out,
-//! plus a flat-stringly error. uniffi's wire shape for trait methods
-//! supports `Vec<u8>` and `Result<Vec<u8>, FlatError>` directly, so no
-//! exotic encoding is needed.
+//! The trait surface is intentionally minimal: a single method that
+//! returns a 32-byte AES-256 key. The frontend does whatever
+//! platform-specific work it needs to materialise the key (e.g.
+//! unwrap a Secure Enclave–wrapped blob via one IPC) and hands the
+//! raw bytes across the FFI. keepass-core does its own AES-GCM
+//! seal/open against the key in-process, with the bytes held briefly
+//! in a `SessionKey` wrapper that zeroes on drop.
+//!
+//! Pre-rewrite (`#R?` — TBC) this trait carried per-field `wrap` /
+//! `unwrap` callbacks. Profiling showed the per-field cross-language
+//! hop + SE IPC dominated unlock and save time (~16 s for an 877-
+//! entry vault). Collapsing to a single key-fetch per pass brings
+//! that into the millisecond range.
 
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use keepass_core::protector::{FieldProtector, ProtectorError as CoreProtectorError};
+use keepass_core::protector::{FieldProtector, ProtectorError as CoreProtectorError, SessionKey};
 
-/// Foreign-implemented wrap / unwrap layer for protected-field
-/// plaintext.
+/// Foreign-implemented session-key provider for protected-field wrap.
 ///
 /// Pass an `Arc<dyn VaultFieldProtector>` to [`crate::Vault::new`] or
 /// [`crate::Vault::create_empty`] to opt in. With a protector
 /// installed, the unlocked vault holds protected-field plaintext only
-/// as wrapped bytes in an internal side table; reveal-side accessors
-/// (`reveal_field`, `reveal_history_field`) unwrap on demand.
+/// as AES-GCM-wrapped bytes in an internal side table; reveal-side
+/// accessors unwrap on demand by re-fetching the key.
 ///
 /// Without a protector (the legacy `None` path), behaviour is
 /// unchanged — protected plaintext lives in `String` fields exactly
 /// as it did before this trait existed.
 ///
-/// Implementations must be `Send + Sync` so the protector can be
-/// shared across threads alongside the unlocked vault. `wrap` and
-/// `unwrap` must round-trip: `unwrap(wrap(x)) == x` for every `x`.
-/// They need not be deterministic — implementations backed by a
-/// per-call random nonce are fine, provided the wrapped output
-/// decodes correctly.
+/// Implementations must be `Send + Sync`. They are expected to do
+/// whatever platform-specific work is needed (e.g. SE IPC) on each
+/// call; this FFI does not cache the returned bytes.
 #[uniffi::export(with_foreign)]
 pub trait VaultFieldProtector: Send + Sync {
-    /// Wrap `plaintext` into an opaque byte blob.
+    /// Return a fresh 32-byte AES-256 session key.
+    ///
+    /// Called once per bulk pass (unlock wrap, save unwrap, conflict
+    /// merge) and once per single-field operation (reveal). Each call
+    /// must produce key bytes equivalent to every other call's output
+    /// (the same logical key) — otherwise wrapped blobs produced by a
+    /// previous call won't open under a later call's key.
+    ///
+    /// The returned `Vec<u8>` MUST be exactly 32 bytes long. Any other
+    /// length surfaces as [`VaultProtectorError::KeyUnavailable`].
     ///
     /// # Errors
     ///
-    /// Returns [`VaultProtectorError::Wrap`] if the underlying key is
-    /// unavailable or the wrap operation otherwise fails.
-    fn wrap(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, VaultProtectorError>;
-
-    /// Unwrap a blob previously produced by [`Self::wrap`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VaultProtectorError::Unwrap`] if the blob is
-    /// malformed, the underlying key is unavailable, or
-    /// authentication fails.
-    fn unwrap(&self, wrapped: Vec<u8>) -> Result<Vec<u8>, VaultProtectorError>;
+    /// Returns [`VaultProtectorError::KeyUnavailable`] if the
+    /// underlying key material can't be produced (e.g. Secure Enclave
+    /// auth failure).
+    fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError>;
 }
 
 /// FFI-facing parallel of `keepass_core::protector::ProtectorError`.
@@ -66,20 +72,15 @@ pub trait VaultFieldProtector: Send + Sync {
 #[uniffi(flat_error)]
 #[non_exhaustive]
 pub enum VaultProtectorError {
-    /// A [`VaultFieldProtector::wrap`] call failed.
-    #[error("field protector wrap failed: {0}")]
-    Wrap(String),
-
-    /// A [`VaultFieldProtector::unwrap`] call failed.
-    #[error("field protector unwrap failed: {0}")]
-    Unwrap(String),
+    /// The implementation could not produce the session key.
+    #[error("field protector key unavailable: {0}")]
+    KeyUnavailable(String),
 }
 
 impl From<VaultProtectorError> for CoreProtectorError {
     fn from(err: VaultProtectorError) -> Self {
         match err {
-            VaultProtectorError::Wrap(msg) => Self::Wrap(msg),
-            VaultProtectorError::Unwrap(msg) => Self::Unwrap(msg),
+            VaultProtectorError::KeyUnavailable(msg) => Self::KeyUnavailable(msg),
         }
     }
 }
@@ -107,12 +108,18 @@ impl Debug for BridgeProtector {
 }
 
 impl FieldProtector for BridgeProtector {
-    fn wrap(&self, plaintext: &[u8]) -> Result<Vec<u8>, CoreProtectorError> {
-        self.inner.wrap(plaintext.to_vec()).map_err(Into::into)
-    }
-
-    fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>, CoreProtectorError> {
-        self.inner.unwrap(wrapped.to_vec()).map_err(Into::into)
+    fn acquire_session_key(&self) -> Result<SessionKey, CoreProtectorError> {
+        let raw = self
+            .inner
+            .acquire_session_key()
+            .map_err(CoreProtectorError::from)?;
+        let bytes: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+            CoreProtectorError::KeyUnavailable(format!(
+                "session key must be 32 bytes; got {}",
+                raw.len()
+            ))
+        })?;
+        Ok(SessionKey::from_bytes(bytes))
     }
 }
 

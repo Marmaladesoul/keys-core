@@ -28,44 +28,33 @@ use tempfile::{NamedTempFile, TempDir};
 
 const PASSWORD_FIELD: &str = "Password";
 
-/// Test-only protector: XOR each byte with a fixed key, prepended
-/// with a magic marker to make wrapped vs plaintext visually
-/// distinct.
+/// Test-only protector: returns a fixed 32-byte session key. The
+/// in-memory wrap layer (AES-GCM) lives inside keepass-core; the
+/// test just needs to hand it a key.
 #[derive(Debug)]
 struct XorProtector {
+    /// The byte the legacy XOR test used as its wrap key. Reused
+    /// here as a seed for the 32-byte key so the test names stay
+    /// recognisable and each test instance still produces a
+    /// distinct session key.
     key: u8,
 }
 
-const WRAP_MARKER: &[u8] = b"FFI-WRP|";
-
 impl VaultFieldProtector for XorProtector {
-    fn wrap(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, VaultProtectorError> {
-        let mut out = Vec::with_capacity(plaintext.len() + WRAP_MARKER.len());
-        out.extend_from_slice(WRAP_MARKER);
-        out.extend(plaintext.iter().map(|b| b ^ self.key));
-        Ok(out)
-    }
-    fn unwrap(&self, wrapped: Vec<u8>) -> Result<Vec<u8>, VaultProtectorError> {
-        if !wrapped.starts_with(WRAP_MARKER) {
-            return Err(VaultProtectorError::Unwrap("missing magic marker".into()));
-        }
-        let body = &wrapped[WRAP_MARKER.len()..];
-        Ok(body.iter().map(|b| b ^ self.key).collect())
+    fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
+        Ok(vec![self.key; 32])
     }
 }
 
-/// Protector whose `wrap` always fails. Drives the
+/// Protector whose `acquire_session_key` always fails. Drives the
 /// `VaultError::Protector` propagation test.
 #[derive(Debug)]
 struct FailingWrapProtector;
 
 impl VaultFieldProtector for FailingWrapProtector {
-    fn wrap(&self, _: Vec<u8>) -> Result<Vec<u8>, VaultProtectorError> {
-        Err(VaultProtectorError::Wrap("synthetic wrap failure".into()))
-    }
-    fn unwrap(&self, _: Vec<u8>) -> Result<Vec<u8>, VaultProtectorError> {
-        Err(VaultProtectorError::Unwrap(
-            "not reachable in these tests".into(),
+    fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
+        Err(VaultProtectorError::KeyUnavailable(
+            "synthetic key-unavailable failure".into(),
         ))
     }
 }
@@ -440,7 +429,7 @@ fn vault_protector_error_propagates() {
     match err {
         VaultError::Protector(msg) => {
             assert!(
-                msg.contains("synthetic wrap failure"),
+                msg.contains("synthetic key-unavailable failure"),
                 "protector error must carry the implementation-supplied detail; got: {msg}"
             );
         }
