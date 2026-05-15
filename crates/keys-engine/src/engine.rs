@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::error::EngineError;
 use crate::key_provider::{DbKey, KeyProvider};
+use crate::migrations;
 
 /// `SQLCipher`-backed `SQLite` engine handle.
 ///
@@ -47,14 +48,7 @@ impl Engine {
     pub fn open(path: &Path, key_provider: &dyn KeyProvider) -> Result<Self, EngineError> {
         let key = key_provider.acquire_db_key()?;
 
-        // Note whether the file pre-existed. For a brand-new file we
-        // need to force SQLCipher to write its encrypted header so the
-        // chosen key is actually bound to the file — without a write,
-        // a fresh 0-byte file holds no header and any key would appear
-        // to "work" on the next open.
-        let preexisted = path.exists();
-
-        let conn = Connection::open_with_flags(
+        let mut conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
@@ -62,28 +56,28 @@ impl Engine {
         apply_key(&conn, &key)?;
         drop(key);
 
-        if preexisted {
-            // Existing file: sanity-query `sqlite_master`. Wrong key →
-            // SQLITE_NOTADB the moment SQLCipher tries to decrypt the
-            // first page.
-            match conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
-                row.get::<_, i64>(0)
-            }) {
-                Ok(_) => Ok(Self { conn }),
-                Err(err) if is_wrong_key(&err) => Err(EngineError::WrongKey),
-                Err(err) => Err(EngineError::Sqlite(err)),
-            }
-        } else {
-            // Brand-new file: force a page write so the encrypted
-            // header is committed under the supplied key. We use
-            // `user_version` as a cheap, schema-free header sentinel
-            // (and reserve `schema_version` — a real table — for the
-            // migration framework that lands in task 1.4). Setting it
-            // to 1 (any non-default value) forces the write; subsequent
-            // opens will run the existing-file path above.
-            conn.execute_batch("PRAGMA user_version = 1")?;
-            Ok(Self { conn })
+        // Sanity-query `sqlite_master`. On an existing file with a
+        // wrong key, `SQLCipher` returns `SQLITE_NOTADB` the moment it
+        // tries to decrypt the first page. On a brand-new file the
+        // master table is empty but legible — no error — and the run
+        // through `apply_pending` below performs the first page write
+        // that binds the chosen key to the file's encrypted header.
+        match conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        }) {
+            Ok(_) => {}
+            Err(err) if is_wrong_key(&err) => return Err(EngineError::WrongKey),
+            Err(err) => return Err(EngineError::Sqlite(err)),
         }
+
+        // Enforce declared foreign-key constraints. SQLite ships with
+        // FK enforcement OFF by default for legacy reasons; the engine
+        // unconditionally opts in.
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+
+        migrations::apply_pending(&mut conn)?;
+
+        Ok(Self { conn })
     }
 
     /// Close the underlying connection, finalising any pending work.

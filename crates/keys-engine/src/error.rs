@@ -1,6 +1,7 @@
 //! Error type for [`Engine`](crate::Engine) operations.
 
 use crate::key_provider::KeyProviderError;
+use crate::migrations::MigrationError;
 
 /// Errors surfaced by the engine.
 #[derive(thiserror::Error, Debug)]
@@ -25,4 +26,9 @@ pub enum EngineError {
     /// signal.
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+
+    /// A schema-migration error: the migration runner failed, or the
+    /// database is at a schema version this binary doesn't know.
+    #[error("migration error: {0}")]
+    Migration(#[from] MigrationError),
 }
