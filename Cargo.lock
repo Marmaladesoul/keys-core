@@ -735,8 +735,12 @@ version = "0.0.0"
 dependencies = [
  "keepass-core",
  "rusqlite",
+ "secrecy",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "uuid",
  "zeroize",
 ]
 
@@ -1420,6 +1424,7 @@ checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

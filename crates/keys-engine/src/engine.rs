@@ -10,11 +10,14 @@
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
+use secrecy::SecretString;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::EngineError;
 use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
+use crate::model::{EntryFull, EntrySummary, GroupNode, HistoricEntry, Pagination};
 
 /// `SQLCipher`-backed `SQLite` engine handle.
 ///
@@ -95,6 +98,216 @@ impl Engine {
         self.conn
             .close()
             .map_err(|(_, err)| EngineError::Sqlite(err))
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Query API — Phase 1 task 1.5 stubs.
+    //
+    // Type signatures are stable from this point. Bodies land in
+    // Phase 3 tasks 3.1–3.8. See `docs/query-surface.md` for the full
+    // surface description and per-method semantics.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// List entries, optionally filtered to a single group.
+    ///
+    /// `group = None` → all entries globally; `Some(uuid)` → entries
+    /// whose `group_uuid` equals the supplied UUID. Results are
+    /// paginated via `page`. Ordering is by `modified_at DESC` (most
+    /// recently modified first); callers wanting other orderings get
+    /// them via smart folders or later sort-aware variants.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn list_entries(
+        &self,
+        group: Option<Uuid>,
+        page: Pagination,
+    ) -> Result<Vec<EntrySummary>, EngineError> {
+        let _ = (group, page, &self.conn);
+        unimplemented!("task 3.1")
+    }
+
+    /// Fetch a full entry by UUID.
+    ///
+    /// Returns `Ok(None)` if no entry with the given UUID exists.
+    /// Returns `Ok(Some(_))` for both live and recycle-bin entries;
+    /// `is_recycled` discriminates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn entry(&self, uuid: Uuid) -> Result<Option<EntryFull>, EngineError> {
+        let _ = (uuid, &self.conn);
+        unimplemented!("task 3.1")
+    }
+
+    /// Count entries, optionally filtered to a single group.
+    ///
+    /// `group = None` → total entry count; `Some(uuid)` → count of
+    /// direct children of that group.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn entry_count(&self, group: Option<Uuid>) -> Result<u64, EngineError> {
+        let _ = (group, &self.conn);
+        unimplemented!("task 3.1")
+    }
+
+    /// Return the full group tree as a flat list.
+    ///
+    /// Tree shape is reconstructed by the caller from each
+    /// [`GroupNode`]'s `parent_uuid` reference; the root group has
+    /// `parent_uuid = None`. No ordering guarantee within siblings —
+    /// callers sort by name or stored position as needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn group_tree(&self) -> Result<Vec<GroupNode>, EngineError> {
+        let _ = &self.conn;
+        unimplemented!("task 3.2")
+    }
+
+    /// Full-text search across title / username / URL / notes.
+    ///
+    /// Backed by the FTS5 virtual table built in migration 0001.
+    /// Results are ranked by FTS5 relevance, paginated by `page`.
+    /// Tag substring matching is **not** part of this method — that
+    /// gets a separate path that falls back to `LIKE` joins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn search(&self, query: &str, page: Pagination) -> Result<Vec<EntrySummary>, EngineError> {
+        let _ = (query, page, &self.conn);
+        unimplemented!("task 3.3")
+    }
+
+    /// Evaluate a smart folder and return its matching entries.
+    ///
+    /// Compiles the folder's [`crate::predicate::Predicate`] to SQL
+    /// (Phase 3.6) and runs it. Non-evaluable folders (those that
+    /// contain an unknown predicate variant) return
+    /// [`EngineError::Sqlite`]-wrapped failure today; a dedicated
+    /// `NotEvaluable` error variant lands with task 3.9.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure or non-evaluable
+    /// folder.
+    pub fn smart_folder_entries(
+        &self,
+        folder_id: i64,
+        page: Pagination,
+    ) -> Result<Vec<EntrySummary>, EngineError> {
+        let _ = (folder_id, page, &self.conn);
+        unimplemented!("task 3.8")
+    }
+
+    /// Count entries matching a smart folder.
+    ///
+    /// Same evaluation rules as [`Engine::smart_folder_entries`]; cheaper
+    /// than fetching rows when the caller only needs the badge count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure or non-evaluable
+    /// folder.
+    pub fn smart_folder_count(&self, folder_id: i64) -> Result<u64, EngineError> {
+        let _ = (folder_id, &self.conn);
+        unimplemented!("task 3.8")
+    }
+
+    /// Reveal the cleartext password for an entry.
+    ///
+    /// Fetches the wrapped blob from `entry_protected`, asks the
+    /// field-protector callback for the session key, and AES-GCM-opens
+    /// in process. The result lives in a [`SecretString`] so it zeroes
+    /// on drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] for query failure, plus future
+    /// reveal-specific variants (missing field, AEAD failure) added in
+    /// task 3.4.
+    pub fn reveal_password(&self, uuid: Uuid) -> Result<SecretString, EngineError> {
+        let _ = (uuid, &self.conn);
+        unimplemented!("task 3.4")
+    }
+
+    /// Reveal the cleartext value of a custom field on an entry.
+    ///
+    /// Symmetric with [`Engine::reveal_password`] but for arbitrary
+    /// named fields recorded in `entry_protected`. Non-protected
+    /// custom fields are also served here for surface uniformity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] for query failure, plus future
+    /// reveal-specific variants added in task 3.4.
+    pub fn reveal_custom_field(
+        &self,
+        uuid: Uuid,
+        field_name: &str,
+    ) -> Result<SecretString, EngineError> {
+        let _ = (uuid, field_name, &self.conn);
+        unimplemented!("task 3.4")
+    }
+
+    /// Reveal the cleartext value of a custom field in a historic
+    /// snapshot of an entry.
+    ///
+    /// `history_index` selects the snapshot per
+    /// [`HistoricEntry::history_index`]; `field_name` is one of the
+    /// names exposed in [`HistoricEntry::custom_field_names`] (or
+    /// `"Password"` for the historic password).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] for query failure, plus future
+    /// reveal-specific variants added in task 3.4.
+    pub fn reveal_history_field(
+        &self,
+        uuid: Uuid,
+        history_index: u32,
+        field_name: &str,
+    ) -> Result<SecretString, EngineError> {
+        let _ = (uuid, history_index, field_name, &self.conn);
+        unimplemented!("task 3.4")
+    }
+
+    /// Fetch the bytes of an entry attachment by attachment name.
+    ///
+    /// Returns the raw blob from `attachment_blob` joined through
+    /// `entry_attachment`. Conceptually a query method, so it lands in
+    /// 3.1 alongside the rest of the entry-surface implementation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] for query failure.
+    pub fn attachment_bytes(
+        &self,
+        uuid: Uuid,
+        attachment_name: &str,
+    ) -> Result<Vec<u8>, EngineError> {
+        let _ = (uuid, attachment_name, &self.conn);
+        unimplemented!("task 3.1")
+    }
+
+    /// Return the historical snapshots of an entry.
+    ///
+    /// Ordered oldest-first (`history_index` ascending). Empty vector
+    /// for entries with no history. Protected field values not included;
+    /// fetch via [`Engine::reveal_history_field`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] for query failure.
+    pub fn history(&self, uuid: Uuid) -> Result<Vec<HistoricEntry>, EngineError> {
+        let _ = (uuid, &self.conn);
+        unimplemented!("task 3.1")
     }
 }
 

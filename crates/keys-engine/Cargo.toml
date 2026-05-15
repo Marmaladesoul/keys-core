@@ -14,7 +14,11 @@ workspace = true
 [dependencies]
 keepass-core = { path = "../../../KeepassCore/crates/keepass-core" }
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
