@@ -9,6 +9,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::protector::FieldProtector;
@@ -255,6 +256,53 @@ impl Engine {
     /// the signature after a successful atomic write.
     pub(crate) fn set_last_self_write(&mut self, signature: SelfWriteSignature) {
         self.last_self_write = Some(signature);
+    }
+
+    /// One-shot: did `(observed_mtime, observed_size)` come from our own
+    /// most recent [`Engine::save_to_kdbx`]?
+    ///
+    /// Returns `true` and clears the stored signature if it matches
+    /// exactly. Returns `false` (and leaves state unchanged) if there's
+    /// no signature stored, or if either component diverges.
+    ///
+    /// Intended for the Phase 4 file-watcher integration: when the
+    /// watcher fires on a change to the KDBX path, it stats the file
+    /// and asks "was that me?". If yes, the spurious external-change
+    /// notification is suppressed. If no, the watcher proceeds with
+    /// the merge / reload flow.
+    ///
+    /// Equality on [`SystemTime`] is exact (no fuzzy comparison). The
+    /// signature is captured immediately post-rename via
+    /// [`std::fs::Metadata::modified`]; a watcher that stats with the
+    /// same call should observe bit-identical timestamps. Any precision
+    /// mismatch (e.g. watcher truncates to seconds while engine keeps
+    /// nanoseconds) is a bug we want to surface, not paper over with a
+    /// tolerance window.
+    ///
+    /// Unlike the Swift counterpart (`consumePendingSelfWriteSignature`
+    /// on `DatabaseDocument`), this method takes the pre-observed
+    /// `(mtime, size)` directly rather than re-statting the file — the
+    /// caller already has the stat result from its watcher event, so we
+    /// avoid a redundant syscall and the API stays IO-free. Also note
+    /// no 5-second TTL: the Swift version clears the signature on a
+    /// timer to bound the race window; the Rust side leaves TTL
+    /// (if needed) to the caller, since the engine has no async
+    /// runtime to schedule the clear on.
+    pub fn consume_self_write_signature(
+        &mut self,
+        observed_mtime: SystemTime,
+        observed_size: u64,
+    ) -> bool {
+        let expected = SelfWriteSignature {
+            mtime: observed_mtime,
+            size: observed_size,
+        };
+        if self.last_self_write == Some(expected) {
+            self.last_self_write = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// HMAC-SHA-256 a plaintext under this vault's persistent
