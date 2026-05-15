@@ -22,6 +22,7 @@ secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
 thiserror = "2"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
@@ -29,4 +30,3 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 rand = "0.8"
-tempfile = "3"

@@ -24,6 +24,7 @@ use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
 use crate::model::{EntryFull, EntrySummary, GroupNode, HistoricEntry, Pagination};
 use crate::projection;
+use crate::save::{self, SelfWriteSignature};
 use crate::strength::{self, Strength};
 
 /// `SQLCipher`-backed `SQLite` engine handle.
@@ -52,6 +53,11 @@ pub struct Engine {
     /// `Arc<dyn FieldProtector>` because the trait is also held by
     /// the unlocked Kdbx and by future per-thread reveal paths.
     field_protector: Arc<dyn FieldProtector>,
+    /// `(mtime, size)` of the most recent KDBX file written by
+    /// [`Engine::save_to_kdbx`], or `None` if this engine has never
+    /// written one. Consumed in task 2.6 by the watcher integration to
+    /// distinguish our own writes from foreign edits.
+    last_self_write: Option<SelfWriteSignature>,
 }
 
 impl Engine {
@@ -114,6 +120,7 @@ impl Engine {
             conn,
             fingerprint_key,
             field_protector,
+            last_self_write: None,
         })
     }
 
@@ -193,6 +200,61 @@ impl Engine {
     /// - [`EngineError::Sqlite`] for `SELECT` failures.
     pub fn project_to_vault(&self) -> Result<keepass_core::model::Vault, EngineError> {
         projection::project(&self.conn, &*self.field_protector)
+    }
+
+    /// Project the engine's `SQLite` mirror into a fresh
+    /// [`keepass_core::model::Vault`], splice it into `kdbx`,
+    /// re-encrypt under `kdbx`'s existing crypto envelope, and
+    /// atomically write the resulting bytes to `path`.
+    ///
+    /// Records the post-write `(mtime, size)` on `self` as a
+    /// [`SelfWriteSignature`], readable via
+    /// [`Engine::last_self_write`]. Task 2.6 lands the consumer that
+    /// matches an observed change against this signature so the
+    /// watcher can suppress fires from our own writes.
+    ///
+    /// ## Meta preservation
+    ///
+    /// The v1 schema persists only two fields of
+    /// [`keepass_core::model::Meta`] (the recycle-bin pair); every
+    /// other field — `database_name`, `custom_icons`, `custom_data`,
+    /// `unknown_xml`, etc. — is taken from the live `kdbx` handle and
+    /// carried forward verbatim onto the projected vault before the
+    /// splice. Tombstones (`deleted_objects`) get the same treatment.
+    ///
+    /// ## Atomic write
+    ///
+    /// Bytes are written to a sibling tempfile, flushed and
+    /// `sync_all`'d, then `rename(2)`'d over `path`. The parent
+    /// directory is then `sync_all`'d on a best-effort basis to make
+    /// the directory entry durable.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Projection`] if projection fails.
+    /// - [`EngineError::Serialise`] if `keepass-core`'s `save_to_bytes`
+    ///   rejects the spliced vault.
+    /// - [`EngineError::Io`] for tempfile creation / write / rename /
+    ///   stat failures.
+    pub fn save_to_kdbx(
+        &mut self,
+        path: &Path,
+        kdbx: &mut Kdbx<Unlocked>,
+    ) -> Result<(), EngineError> {
+        save::save(self, path, kdbx)
+    }
+
+    /// The `(mtime, size)` of the most recent KDBX file this engine
+    /// wrote, or `None` if no save has happened yet on this handle.
+    #[must_use]
+    pub fn last_self_write(&self) -> Option<SelfWriteSignature> {
+        self.last_self_write
+    }
+
+    /// Crate-internal setter used by [`crate::save::save`] to record
+    /// the signature after a successful atomic write.
+    pub(crate) fn set_last_self_write(&mut self, signature: SelfWriteSignature) {
+        self.last_self_write = Some(signature);
     }
 
     /// HMAC-SHA-256 a plaintext under this vault's persistent

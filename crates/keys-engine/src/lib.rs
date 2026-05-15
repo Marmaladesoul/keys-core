@@ -7,6 +7,7 @@ pub mod migrations;
 pub mod model;
 pub mod predicate;
 pub mod projection;
+pub mod save;
 pub mod strength;
 
 pub use engine::Engine;
@@ -19,4 +20,5 @@ pub use model::{
     Pagination, StrengthBucket,
 };
 pub use predicate::Predicate;
+pub use save::SelfWriteSignature;
 pub use strength::{Strength, strength};

@@ -87,6 +87,16 @@ pub enum EngineError {
     /// specific failure mode.
     #[error("projection failed: {0}")]
     Projection(#[from] ProjectionError),
+
+    /// `keepass-core`'s
+    /// [`save_to_bytes`](keepass_core::kdbx::Kdbx::save_to_bytes)
+    /// rejected the spliced vault — e.g. KDBX3 was asked for a
+    /// KDBX4-only cipher, the inner-header parameters are missing, or
+    /// the outer cipher isn't supported by the writer. Surfaces as a
+    /// stringified message because [`keepass_core::Error`] isn't
+    /// re-exported in a `From`-friendly shape.
+    #[error("kdbx serialise failed: {0}")]
+    Serialise(String),
 }
 
 /// Errors surfaced specifically by [`crate::Engine::project_to_vault`].
