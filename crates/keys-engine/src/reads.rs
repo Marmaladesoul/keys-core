@@ -37,7 +37,8 @@ use uuid::Uuid;
 
 use crate::error::EngineError;
 use crate::model::{
-    AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, IconRef, Pagination, StrengthBucket,
+    AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, GroupNode, IconRef, Pagination,
+    StrengthBucket,
 };
 
 /// SQL fragment listing the columns `EntrySummary` needs, plus the
@@ -151,6 +152,43 @@ pub(crate) fn entry(conn: &Connection, uuid: Uuid) -> Result<Option<EntryFull>, 
         attachments,
         history_count,
     }))
+}
+
+/// Return the full group tree as a flat list, ordered so the root
+/// group (NULL `parent_uuid`) comes first, then siblings alphabetically
+/// by name.
+///
+/// `entry_count_direct` counts entries whose `group_uuid` matches the
+/// row, with one wrinkle: for the recycle bin group itself we **do**
+/// include recycled entries in the count (otherwise it would always
+/// read 0, which hides what's in the bin). Regular groups exclude
+/// recycled entries — those live in the recycle bin's count instead.
+pub(crate) fn group_tree(conn: &Connection) -> Result<Vec<GroupNode>, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT uuid, parent_uuid, name, icon_index, icon_custom_uuid, is_recycle_bin, \
+                (SELECT COUNT(*) FROM entry \
+                 WHERE entry.group_uuid = \"group\".uuid \
+                   AND (entry.is_recycled = 0 OR \"group\".is_recycle_bin = 1)) \
+                    AS entry_count_direct \
+         FROM \"group\" \
+         ORDER BY (parent_uuid IS NOT NULL), name ASC, uuid ASC",
+    )?;
+
+    let rows = stmt
+        .query_map([], |r| {
+            let count_i64: i64 = r.get(6)?;
+            Ok(GroupNode {
+                uuid: parse_uuid_col(r, 0)?,
+                parent_uuid: parse_optional_uuid_col(r, 1)?,
+                name: r.get(2)?,
+                icon: icon_ref_from(r.get(3)?, parse_optional_uuid_col(r, 4)?),
+                is_recycle_bin: r.get::<_, i64>(5)? != 0,
+                entry_count_direct: u32::try_from(count_i64).unwrap_or(u32::MAX),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(rows)
 }
 
 pub(crate) fn entry_count(conn: &Connection, group: Option<Uuid>) -> Result<u64, EngineError> {

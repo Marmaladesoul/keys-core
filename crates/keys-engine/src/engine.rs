@@ -402,15 +402,21 @@ impl Engine {
     ///
     /// Tree shape is reconstructed by the caller from each
     /// [`GroupNode`]'s `parent_uuid` reference; the root group has
-    /// `parent_uuid = None`. No ordering guarantee within siblings —
-    /// callers sort by name or stored position as needed.
+    /// `parent_uuid = None`. Rows are ordered root-first then
+    /// alphabetically by name (with `uuid` as a deterministic tie
+    /// breaker), so callers can rely on a stable iteration order
+    /// across runs of the same vault.
+    ///
+    /// `entry_count_direct` counts entries directly in each group.
+    /// Regular groups exclude recycled entries; the recycle bin group
+    /// itself includes its contents (so the bin's count is the number
+    /// of items the user could empty).
     ///
     /// # Errors
     ///
     /// Returns [`EngineError::Sqlite`] on query failure.
     pub fn group_tree(&self) -> Result<Vec<GroupNode>, EngineError> {
-        let _ = &self.conn;
-        unimplemented!("task 3.2")
+        crate::reads::group_tree(&self.conn)
     }
 
     /// Full-text search across title / username / URL / notes.
