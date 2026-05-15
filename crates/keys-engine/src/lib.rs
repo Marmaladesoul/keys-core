@@ -7,6 +7,7 @@ pub mod migrations;
 pub mod model;
 pub mod predicate;
 pub mod projection;
+pub mod reads;
 pub mod save;
 pub mod strength;
 

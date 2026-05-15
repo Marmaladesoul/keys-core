@@ -370,8 +370,7 @@ impl Engine {
         group: Option<Uuid>,
         page: Pagination,
     ) -> Result<Vec<EntrySummary>, EngineError> {
-        let _ = (group, page, &self.conn);
-        unimplemented!("task 3.1")
+        crate::reads::list_entries(&self.conn, group, page)
     }
 
     /// Fetch a full entry by UUID.
@@ -384,8 +383,7 @@ impl Engine {
     ///
     /// Returns [`EngineError::Sqlite`] on query failure.
     pub fn entry(&self, uuid: Uuid) -> Result<Option<EntryFull>, EngineError> {
-        let _ = (uuid, &self.conn);
-        unimplemented!("task 3.1")
+        crate::reads::entry(&self.conn, uuid)
     }
 
     /// Count entries, optionally filtered to a single group.
@@ -397,8 +395,7 @@ impl Engine {
     ///
     /// Returns [`EngineError::Sqlite`] on query failure.
     pub fn entry_count(&self, group: Option<Uuid>) -> Result<u64, EngineError> {
-        let _ = (group, &self.conn);
-        unimplemented!("task 3.1")
+        crate::reads::entry_count(&self.conn, group)
     }
 
     /// Return the full group tree as a flat list.

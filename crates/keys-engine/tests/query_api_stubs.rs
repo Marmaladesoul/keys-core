@@ -36,18 +36,20 @@ fn protector() -> Arc<dyn FieldProtector> {
 }
 
 #[test]
-#[ignore = "stubs panic with unimplemented!('task 3.1'); implementation lands in Phase 3"]
-fn list_entries_stub_panics_with_task_marker() {
+fn list_entries_on_fresh_engine_returns_empty() {
+    // Task 3.1 has landed: `list_entries` no longer panics. A freshly
+    // opened engine has no entries, so all-rows pagination returns an
+    // empty Vec rather than the previous `unimplemented!()` panic.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.db");
     let key = FixedKey([0x42; 32]);
 
     let engine = Engine::open(&path, &key, protector()).expect("open");
 
-    // Should panic with "not implemented: task 3.1".
-    let _ = engine.list_entries(None, Pagination::all());
-
-    unreachable!("list_entries stub must panic before returning");
+    let rows = engine
+        .list_entries(None, Pagination::all())
+        .expect("list_entries");
+    assert!(rows.is_empty());
 }
 
 #[test]
