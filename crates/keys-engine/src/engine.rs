@@ -419,19 +419,27 @@ impl Engine {
         crate::reads::group_tree(&self.conn)
     }
 
-    /// Full-text search across title / username / URL / notes.
+    /// Full-text search across title / username / URL / notes, with
+    /// a tag-substring fallback.
     ///
     /// Backed by the FTS5 virtual table built in migration 0001.
-    /// Results are ranked by FTS5 relevance, paginated by `page`.
-    /// Tag substring matching is **not** part of this method — that
-    /// gets a separate path that falls back to `LIKE` joins.
+    /// Primary hits are ranked by FTS5's `bm25` (lower = more
+    /// relevant); a `UNION ALL` of `tag.name LIKE %query%` matches
+    /// (de-duplicated against the FTS bucket) is appended after,
+    /// alphabetised by title. Results are paginated by `page`.
+    ///
+    /// Empty / whitespace-only queries return an empty Vec without
+    /// touching the database.
+    ///
+    /// FTS5 special characters in the query are handled by wrapping
+    /// the input in a quoted phrase when needed — see
+    /// `escape_fts5_query` in the `reads` module for details.
     ///
     /// # Errors
     ///
     /// Returns [`EngineError::Sqlite`] on query failure.
     pub fn search(&self, query: &str, page: Pagination) -> Result<Vec<EntrySummary>, EngineError> {
-        let _ = (query, page, &self.conn);
-        unimplemented!("task 3.3")
+        crate::reads::search(&self.conn, query, page)
     }
 
     /// Evaluate a smart folder and return its matching entries.

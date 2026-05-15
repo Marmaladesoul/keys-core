@@ -191,6 +191,126 @@ pub(crate) fn group_tree(conn: &Connection) -> Result<Vec<GroupNode>, EngineErro
     Ok(rows)
 }
 
+/// Full-text search across `entry_fts`, with a tag-substring fallback
+/// merged via `UNION ALL`.
+///
+/// # Ranking
+///
+/// Primary FTS5 hits are ordered by `bm25(entry_fts)` ascending (lower
+/// is more relevant). Tag-fallback hits land after the FTS hits and
+/// are alphabetised by title (deterministic, no relevance signal
+/// because tag substring match is binary). The ordering is achieved
+/// with a synthetic `bucket` column (0 = FTS hit, 1 = tag fallback)
+/// then `rank ASC, title ASC, uuid ASC`.
+///
+/// # Deduplication
+///
+/// An entry that matches both FTS and the tag fallback appears only
+/// in its FTS bucket — the tag fallback excludes any rowid already
+/// in the FTS match set.
+///
+/// # Empty query
+///
+/// Empty / whitespace-only queries return an empty Vec without
+/// touching the database. FTS5 raises a syntax error on empty
+/// `MATCH` strings.
+///
+/// # Sanitisation
+///
+/// User input is run through [`escape_fts5_query`] — if the string
+/// contains any FTS5-special character (`"`, `*`, `:`, `^`, `(`, `)`)
+/// we wrap the whole thing in a quoted phrase so it tokenises
+/// literally and never trips a syntax error. Plain word(s) pass
+/// through, so users can still use FTS5's `word*` prefix and
+/// implicit-AND-of-tokens semantics.
+pub(crate) fn search(
+    conn: &Connection,
+    query: &str,
+    page: Pagination,
+) -> Result<Vec<EntrySummary>, EngineError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let fts_query = escape_fts5_query(trimmed);
+    let tag_like = format!("%{}%", escape_like(trimmed));
+    let (limit, offset) = clamp_page(page);
+
+    // The CTE `fts_hits` captures rowids matched by FTS5 (so the tag
+    // fallback can exclude them) along with their bm25 ranks.
+    //
+    // Bucket 0 = FTS hit (ranked by bm25 asc).
+    // Bucket 1 = tag-only hit (alphabetised by title).
+    let sql = format!(
+        "WITH fts_hits AS ( \
+             SELECT rowid AS rid, bm25(entry_fts) AS rank \
+             FROM entry_fts WHERE entry_fts MATCH ?1 \
+         ), \
+         tag_hits AS ( \
+             SELECT DISTINCT entry.rowid AS rid \
+             FROM entry \
+             JOIN entry_tag et ON et.entry_uuid = entry.uuid \
+             JOIN tag t       ON t.id = et.tag_id \
+             WHERE t.name LIKE ?2 ESCAPE '\\' \
+               AND entry.rowid NOT IN (SELECT rid FROM fts_hits) \
+         ), \
+         hits AS ( \
+             SELECT rid, 0 AS bucket, rank FROM fts_hits \
+             UNION ALL \
+             SELECT rid, 1 AS bucket, 0.0 AS rank FROM tag_hits \
+         ) \
+         SELECT {SUMMARY_COLUMNS} \
+         FROM entry \
+         JOIN hits ON hits.rid = entry.rowid \
+         ORDER BY hits.bucket ASC, hits.rank ASC, entry.title ASC, entry.uuid ASC \
+         LIMIT ?3 OFFSET ?4"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![fts_query, tag_like, limit, offset], row_to_summary)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Escape user input for use as an FTS5 `MATCH` argument.
+///
+/// FTS5's query grammar treats a wide range of ASCII punctuation as
+/// syntax (`"`, `*`, `:`, `^`, `(`, `)`, `-`, `+`, `@`, and others
+/// flagged by its tokenizer). Rather than enumerate the full set and
+/// hope FTS5 doesn't grow more, we take the conservative line: if
+/// the query is *anything other than* alphanumerics, spaces, and the
+/// ASCII underscore, wrap it as a quoted phrase. Plain word(s) pass
+/// through verbatim so users keep FTS5's implicit-AND and
+/// prefix-search (`word*`) semantics.
+///
+/// Embedded `"` characters are doubled per FTS5's escape rule.
+pub(crate) fn escape_fts5_query(query: &str) -> String {
+    let safe = query
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == ' ' || c == '_');
+    if safe {
+        query.to_string()
+    } else {
+        let escaped = query.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    }
+}
+
+/// Escape a string for use in a `LIKE` pattern with `ESCAPE '\\'`.
+/// `%` and `_` are LIKE-wildcards; `\` is the chosen escape character.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub(crate) fn entry_count(conn: &Connection, group: Option<Uuid>) -> Result<u64, EngineError> {
     let count: i64 = if let Some(uuid) = group {
         conn.query_row(
@@ -407,6 +527,33 @@ mod tests {
             Some(StrengthBucket::VeryStrong)
         );
         assert_eq!(strength_bucket_from_i64(99), None);
+    }
+
+    #[test]
+    fn escape_fts5_query_passes_plain_words_through() {
+        assert_eq!(escape_fts5_query("banking"), "banking");
+        assert_eq!(escape_fts5_query("two words"), "two words");
+        assert_eq!(escape_fts5_query("with_underscore"), "with_underscore");
+    }
+
+    #[test]
+    fn escape_fts5_query_quotes_anything_with_punctuation() {
+        assert_eq!(escape_fts5_query("user@example"), "\"user@example\"");
+        assert_eq!(escape_fts5_query("a:b"), "\"a:b\"");
+        assert_eq!(escape_fts5_query("(x)"), "\"(x)\"");
+        assert_eq!(escape_fts5_query("prefix*"), "\"prefix*\"");
+        assert_eq!(
+            escape_fts5_query("he said \"hi\""),
+            "\"he said \"\"hi\"\"\""
+        );
+    }
+
+    #[test]
+    fn escape_like_escapes_wildcards() {
+        assert_eq!(escape_like("plain"), "plain");
+        assert_eq!(escape_like("50%"), "50\\%");
+        assert_eq!(escape_like("a_b"), "a\\_b");
+        assert_eq!(escape_like("c\\d"), "c\\\\d");
     }
 
     #[test]
