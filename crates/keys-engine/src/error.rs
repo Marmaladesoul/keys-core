@@ -82,4 +82,43 @@ pub enum EngineError {
     /// failure mode.
     #[error("ingest failed: {0}")]
     Ingest(#[from] IngestError),
+
+    /// A projection-pass failure — see [`ProjectionError`] for the
+    /// specific failure mode.
+    #[error("projection failed: {0}")]
+    Projection(#[from] ProjectionError),
+}
+
+/// Errors surfaced specifically by [`crate::Engine::project_to_vault`].
+///
+/// Projection is mostly a fan of `SELECT`s + an AES-GCM unwrap pass;
+/// failure modes outside the `SQLite` layer fall into this enum.
+#[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
+pub enum ProjectionError {
+    /// The configured [`keepass_core::protector::FieldProtector`] could
+    /// not produce the session key needed to unwrap protected fields.
+    #[error("session key unavailable: {0}")]
+    SessionKey(String),
+
+    /// AES-GCM open of a protected field blob failed under the
+    /// supplied session key — either the wire shape is wrong, the tag
+    /// doesn't verify, or the plaintext wasn't valid UTF-8.
+    #[error("protected field unwrap failed: {0}")]
+    Unwrap(String),
+
+    /// A persisted shape violates an invariant we rely on (no root
+    /// group, multiple root groups, attachment hash with wrong width,
+    /// parent uuid that doesn't resolve, …). Means either a corrupt
+    /// `SQLite` file or a producer that doesn't match this crate's
+    /// ingest path.
+    #[error("schema invariant violated: {0}")]
+    SchemaInvariant(String),
+
+    /// `serde_json` failed to deserialise a row from
+    /// `entry_history.snapshot_json`. Surfaces a producer mismatch
+    /// (a foreign writer emitted a different shape) or genuine
+    /// corruption.
+    #[error("history snapshot deserialisation failed: {0}")]
+    Json(#[from] serde_json::Error),
 }

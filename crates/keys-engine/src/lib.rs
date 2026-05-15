@@ -6,10 +6,11 @@ pub mod key_provider;
 pub mod migrations;
 pub mod model;
 pub mod predicate;
+pub mod projection;
 pub mod strength;
 
 pub use engine::Engine;
-pub use error::{EngineError, IngestError};
+pub use error::{EngineError, IngestError, ProjectionError};
 pub use fingerprint::fingerprint;
 pub use key_provider::{DbKey, KeyProvider, KeyProviderError};
 pub use migrations::MigrationError;

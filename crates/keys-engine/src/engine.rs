@@ -23,6 +23,7 @@ use crate::ingest;
 use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
 use crate::model::{EntryFull, EntrySummary, GroupNode, HistoricEntry, Pagination};
+use crate::projection;
 use crate::strength::{self, Strength};
 
 /// `SQLCipher`-backed `SQLite` engine handle.
@@ -152,6 +153,46 @@ impl Engine {
             &*self.field_protector,
             kdbx,
         )
+    }
+
+    /// Project this engine's `SQLite` mirror back into a
+    /// [`keepass_core::model::Vault`].
+    ///
+    /// Inverse of [`Engine::ingest_from_kdbx`]. Reads every group,
+    /// entry, protected-field blob, attachment, tag, and history
+    /// snapshot row inside a single read transaction; AES-GCM-unwraps
+    /// protected blobs under this engine's
+    /// [`keepass_core::protector::FieldProtector`] so the returned
+    /// [`keepass_core::model::Vault`] carries plaintext on
+    /// [`Entry::password`](keepass_core::model::Entry::password) and on
+    /// each protected
+    /// [`CustomField::value`](keepass_core::model::CustomField::value).
+    /// That's the shape the upcoming serialise path (task 2.5)
+    /// consumes, and the shape round-trip property tests (task 2.7)
+    /// compare against.
+    ///
+    /// The projected vault carries no per-vault metadata beyond
+    /// `recycle_bin_uuid` / `recycle_bin_enabled` — `Meta` fields like
+    /// `database_name`, `generator`, `custom_icons`, etc. are not
+    /// persisted in the v1 schema. The serialise path is responsible
+    /// for re-applying them from a separate source (the live `Kdbx`
+    /// handle's meta block).
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Projection`] wrapping
+    ///   [`crate::ProjectionError::Unwrap`] if a protected blob fails
+    ///   AES-GCM open under the session key.
+    /// - [`EngineError::Projection`] wrapping
+    ///   [`crate::ProjectionError::SessionKey`] if the protector
+    ///   refuses to release a session key.
+    /// - [`EngineError::Projection`] wrapping
+    ///   [`crate::ProjectionError::SchemaInvariant`] if the persisted
+    ///   shape violates an invariant the projection relies on (e.g.
+    ///   no root group).
+    /// - [`EngineError::Sqlite`] for `SELECT` failures.
+    pub fn project_to_vault(&self) -> Result<keepass_core::model::Vault, EngineError> {
+        projection::project(&self.conn, &*self.field_protector)
     }
 
     /// HMAC-SHA-256 a plaintext under this vault's persistent

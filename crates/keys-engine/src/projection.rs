@@ -1,0 +1,601 @@
+//! `SQLite` → `Vault` projection — the reverse of [`crate::ingest`].
+//!
+//! Reconstructs a [`keepass_core::model::Vault`] from the engine's
+//! `SQLite` mirror. Used by the upcoming serialise path (task 2.5) and
+//! by the round-trip property tests (task 2.7). Read-only: every query
+//! runs inside a single immediate transaction so the projected vault
+//! reflects a consistent point-in-time snapshot, but nothing is
+//! written.
+//!
+//! Mapping invariants (must stay in lock-step with
+//! [`crate::ingest`]):
+//!
+//! * Groups round-trip via `(uuid, parent_uuid)`; the root group is the
+//!   single row with `parent_uuid IS NULL`.
+//! * Entries attach to their `group_uuid` parent.
+//! * `entry_protected.field_name = 'Password'` becomes
+//!   [`keepass_core::model::Entry::password`] (plaintext).
+//! * Other `entry_protected` rows become protected
+//!   [`keepass_core::model::CustomField`]s with `protected = true`.
+//! * `entry_history.snapshot_json` is the
+//!   `crate::ingest::HistorySnapshot` shape; we deserialise back into a
+//!   plaintext [`Entry`] used as a history record.
+//! * Attachments materialise as fresh [`Vault::binaries`] entries — one
+//!   per unique SHA-256, with `Attachment::ref_id` pointing into the
+//!   new pool. The original `Binary::protected` flag is **not**
+//!   preserved (the schema has no column for it); we project everything
+//!   as `protected = false`, which matches `KeePassXC`'s default for
+//!   non-encrypted attachment payloads.
+//! * `entry.url_host` is engine-internal (an indexed lookup column);
+//!   it does **not** surface on the projected vault.
+//! * `entry.is_recycled` is implied by group membership in the
+//!   projection — entries inside (or under) the recycle-bin group are
+//!   recycled. The column is read for cross-checks in tests but not
+//!   set on the model.
+//! * Non-protected custom fields are not in the v1 schema (see ingest
+//!   module doc); the projection has nothing to do for them.
+
+use std::collections::HashMap;
+
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{Aead, KeyInit};
+use chrono::{DateTime, TimeZone, Utc};
+use keepass_core::model::{
+    Attachment, Binary, CustomField, Entry, EntryId, Group, GroupId, Timestamps, Vault,
+};
+use keepass_core::protector::{FieldProtector, SessionKey};
+use rusqlite::Connection;
+use serde::Deserialize;
+use uuid::Uuid;
+
+use crate::error::{EngineError, ProjectionError};
+
+/// Canonical KDBX field name for an entry's password slot — must match
+/// [`crate::ingest`]'s constant of the same name.
+const PASSWORD_FIELD: &str = "Password";
+
+/// Top-level projection entry point. Runs every read inside a single
+/// immediate transaction so the snapshot is consistent.
+pub(crate) fn project(
+    conn: &Connection,
+    protector: &dyn FieldProtector,
+) -> Result<Vault, EngineError> {
+    let session_key = protector
+        .acquire_session_key()
+        .map_err(|e| EngineError::Projection(ProjectionError::SessionKey(e.to_string())))?;
+
+    // Read-only — we don't open a transaction. SQLite serialises
+    // statements per-connection so individual reads see a consistent
+    // page state, and the engine holds the only handle. If we ever
+    // grow concurrent writers we'll want a deferred read transaction
+    // here; for now any added ceremony is dead weight.
+
+    // 1. Groups: load all rows, build a tree.
+    let group_rows = load_group_rows(conn)?;
+    let (mut root, recycle_bin_uuid) = build_group_tree(group_rows)?;
+
+    // 2. Entries: load every entry row with its derived columns.
+    let entry_rows = load_entry_rows(conn)?;
+
+    // 3. Side tables: protected blobs, attachments (joined with blobs),
+    //    tags (joined), history snapshots. Batch one query per table.
+    let protected = load_protected(conn)?;
+    let attachments = load_attachments(conn)?;
+    let tags = load_tags(conn)?;
+    let history = load_history(conn)?;
+
+    // 4. Materialise the binary pool. We assign a fresh ref_id per
+    //    distinct attachment blob, populated lazily as we walk entries
+    //    so the pool order is deterministic relative to walk order.
+    let mut binary_pool: Vec<Binary> = Vec::new();
+    let mut sha_to_ref: HashMap<[u8; 32], u32> = HashMap::new();
+
+    // 5. Assemble entries with their side-table data attached, keyed by
+    //    group_uuid so we can hang them off the tree in step 6.
+    let mut entries_by_group: HashMap<Uuid, Vec<Entry>> = HashMap::new();
+    for row in entry_rows {
+        let entry_uuid = row.uuid;
+        let mut entry = build_entry_from_row(&row);
+
+        // Protected fields.
+        if let Some(rows) = protected.get(&entry_uuid) {
+            for (field_name, wrapped) in rows {
+                let plaintext = unwrap_with_session_key(&session_key, wrapped).map_err(|e| {
+                    EngineError::Projection(ProjectionError::Unwrap(format!(
+                        "entry {entry_uuid} field {field_name}: {e}",
+                    )))
+                })?;
+                let plaintext_str = String::from_utf8(plaintext).map_err(|e| {
+                    EngineError::Projection(ProjectionError::Unwrap(format!(
+                        "entry {entry_uuid} field {field_name}: non-utf8 plaintext: {e}",
+                    )))
+                })?;
+                if field_name == PASSWORD_FIELD {
+                    entry.password = plaintext_str;
+                } else {
+                    entry.custom_fields.push(CustomField::new(
+                        field_name.clone(),
+                        plaintext_str,
+                        true,
+                    ));
+                }
+            }
+        }
+
+        // Attachments → bind into the binary pool.
+        if let Some(rows) = attachments.get(&entry_uuid) {
+            for att in rows {
+                let ref_id = if let Some(id) = sha_to_ref.get(&att.sha256) {
+                    *id
+                } else {
+                    let id = u32::try_from(binary_pool.len()).map_err(|_| {
+                        EngineError::Projection(ProjectionError::SchemaInvariant(
+                            "binary pool exceeded u32::MAX".into(),
+                        ))
+                    })?;
+                    binary_pool.push(Binary::new(att.bytes.clone(), false));
+                    sha_to_ref.insert(att.sha256, id);
+                    id
+                };
+                entry
+                    .attachments
+                    .push(Attachment::new(att.name.clone(), ref_id));
+            }
+        }
+
+        // Tags.
+        if let Some(rows) = tags.get(&entry_uuid) {
+            entry.tags.clone_from(rows);
+        }
+
+        // History.
+        if let Some(rows) = history.get(&entry_uuid) {
+            // rows is sorted oldest-first by history_index.
+            for snap in rows {
+                entry.history.push(snapshot_to_entry(entry_uuid, snap));
+            }
+        }
+
+        entries_by_group
+            .entry(row.group_uuid)
+            .or_default()
+            .push(entry);
+    }
+
+    attach_entries_to_tree(&mut root, &mut entries_by_group);
+
+    let mut vault = Vault::empty(root.id);
+    vault.root = root;
+    vault.binaries = binary_pool;
+    vault.meta.recycle_bin_uuid = recycle_bin_uuid;
+    vault.meta.recycle_bin_enabled = recycle_bin_uuid.is_some();
+
+    Ok(vault)
+}
+
+// ───────────────────────── group tree ─────────────────────────
+
+struct GroupRow {
+    uuid: Uuid,
+    parent_uuid: Option<Uuid>,
+    name: String,
+    icon_index: Option<i64>,
+    icon_custom_uuid: Option<Uuid>,
+    notes: String,
+    created_at: i64,
+    modified_at: i64,
+    expires_at: Option<i64>,
+    is_recycle_bin: bool,
+}
+
+fn load_group_rows(conn: &Connection) -> Result<Vec<GroupRow>, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
+                created_at, modified_at, expires_at, is_recycle_bin FROM \"group\"",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(GroupRow {
+                uuid: parse_uuid_col(row, 0)?,
+                parent_uuid: row
+                    .get::<_, Option<String>>(1)?
+                    .map(|s| Uuid::parse_str(&s))
+                    .transpose()
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                name: row.get(2)?,
+                icon_index: row.get(3)?,
+                icon_custom_uuid: row
+                    .get::<_, Option<String>>(4)?
+                    .map(|s| Uuid::parse_str(&s))
+                    .transpose()
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                notes: row.get(5)?,
+                created_at: row.get(6)?,
+                modified_at: row.get(7)?,
+                expires_at: row.get(8)?,
+                is_recycle_bin: row.get::<_, i64>(9)? != 0,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Assemble groups into a tree. Returns `(root, recycle_bin_uuid)`.
+fn build_group_tree(rows: Vec<GroupRow>) -> Result<(Group, Option<GroupId>), EngineError> {
+    // Identify the root: parent_uuid IS NULL.
+    let mut by_uuid: HashMap<Uuid, GroupRow> = HashMap::new();
+    let mut children_of: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    let mut root_uuid: Option<Uuid> = None;
+    let mut recycle_bin_uuid: Option<Uuid> = None;
+
+    for row in rows {
+        if row.is_recycle_bin {
+            recycle_bin_uuid = Some(row.uuid);
+        }
+        match row.parent_uuid {
+            None => {
+                if let Some(existing) = root_uuid {
+                    return Err(EngineError::Projection(ProjectionError::SchemaInvariant(
+                        format!("multiple root groups: {existing} and {}", row.uuid),
+                    )));
+                }
+                root_uuid = Some(row.uuid);
+            }
+            Some(p) => {
+                children_of.entry(p).or_default().push(row.uuid);
+            }
+        }
+        by_uuid.insert(row.uuid, row);
+    }
+
+    let root_uuid = root_uuid.ok_or_else(|| {
+        EngineError::Projection(ProjectionError::SchemaInvariant(
+            "no root group (no row with parent_uuid NULL)".into(),
+        ))
+    })?;
+
+    let root = build_subtree(root_uuid, &mut by_uuid, &children_of)?;
+    Ok((root, recycle_bin_uuid.map(GroupId)))
+}
+
+fn build_subtree(
+    uuid: Uuid,
+    by_uuid: &mut HashMap<Uuid, GroupRow>,
+    children_of: &HashMap<Uuid, Vec<Uuid>>,
+) -> Result<Group, EngineError> {
+    let row = by_uuid.remove(&uuid).ok_or_else(|| {
+        EngineError::Projection(ProjectionError::SchemaInvariant(format!(
+            "group {uuid} referenced as parent but no row found",
+        )))
+    })?;
+    let mut group = Group::empty(GroupId(row.uuid));
+    group.name = row.name;
+    group.notes = row.notes;
+    group.icon_id = row.icon_index.map_or(0, |i| u32::try_from(i).unwrap_or(0));
+    group.custom_icon_uuid = row.icon_custom_uuid;
+    group.times = build_times(
+        row.created_at,
+        row.modified_at,
+        row.modified_at,
+        row.expires_at,
+    );
+
+    if let Some(child_ids) = children_of.get(&uuid) {
+        for child_uuid in child_ids {
+            group
+                .groups
+                .push(build_subtree(*child_uuid, by_uuid, children_of)?);
+        }
+    }
+    Ok(group)
+}
+
+fn attach_entries_to_tree(group: &mut Group, entries_by_group: &mut HashMap<Uuid, Vec<Entry>>) {
+    if let Some(es) = entries_by_group.remove(&group.id.0) {
+        group.entries = es;
+    }
+    for child in &mut group.groups {
+        attach_entries_to_tree(child, entries_by_group);
+    }
+}
+
+// ───────────────────────── entries ─────────────────────────
+
+struct EntryRow {
+    uuid: Uuid,
+    group_uuid: Uuid,
+    title: String,
+    username: String,
+    url: String,
+    notes: String,
+    icon_index: Option<i64>,
+    icon_custom_uuid: Option<Uuid>,
+    created_at: i64,
+    modified_at: i64,
+    accessed_at: i64,
+    expires_at: Option<i64>,
+}
+
+fn load_entry_rows(conn: &Connection) -> Result<Vec<EntryRow>, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT uuid, group_uuid, title, username, url, notes, \
+                icon_index, icon_custom_uuid, \
+                created_at, modified_at, accessed_at, expires_at \
+         FROM entry",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(EntryRow {
+                uuid: parse_uuid_col(row, 0)?,
+                group_uuid: parse_uuid_col(row, 1)?,
+                title: row.get(2)?,
+                username: row.get(3)?,
+                url: row.get(4)?,
+                notes: row.get(5)?,
+                icon_index: row.get(6)?,
+                icon_custom_uuid: row
+                    .get::<_, Option<String>>(7)?
+                    .map(|s| Uuid::parse_str(&s))
+                    .transpose()
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
+                created_at: row.get(8)?,
+                modified_at: row.get(9)?,
+                accessed_at: row.get(10)?,
+                expires_at: row.get(11)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn build_entry_from_row(row: &EntryRow) -> Entry {
+    let mut entry = Entry::empty(EntryId(row.uuid));
+    entry.title.clone_from(&row.title);
+    entry.username.clone_from(&row.username);
+    entry.url.clone_from(&row.url);
+    entry.notes.clone_from(&row.notes);
+    entry.icon_id = row.icon_index.map_or(0, |i| u32::try_from(i).unwrap_or(0));
+    entry.custom_icon_uuid = row.icon_custom_uuid;
+    entry.times = build_times(
+        row.created_at,
+        row.modified_at,
+        row.accessed_at,
+        row.expires_at,
+    );
+    entry
+}
+
+// ───────────────────────── side tables ─────────────────────────
+
+type ProtectedRows = HashMap<Uuid, Vec<(String, Vec<u8>)>>;
+
+fn load_protected(conn: &Connection) -> Result<ProtectedRows, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT entry_uuid, field_name, wrapped_blob FROM entry_protected ORDER BY entry_uuid, field_name",
+    )?;
+    let mut out: HashMap<Uuid, Vec<(String, Vec<u8>)>> = HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            parse_uuid_col(row, 0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    for r in rows {
+        let (uuid, name, blob) = r?;
+        out.entry(uuid).or_default().push((name, blob));
+    }
+    Ok(out)
+}
+
+struct AttachmentRow {
+    name: String,
+    sha256: [u8; 32],
+    bytes: Vec<u8>,
+}
+
+fn load_attachments(conn: &Connection) -> Result<HashMap<Uuid, Vec<AttachmentRow>>, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT ea.entry_uuid, ea.attachment_name, ea.blob_sha256, ab.bytes \
+         FROM entry_attachment ea \
+         JOIN attachment_blob ab ON ab.sha256 = ea.blob_sha256 \
+         ORDER BY ea.entry_uuid, ea.attachment_name",
+    )?;
+    let mut out: HashMap<Uuid, Vec<AttachmentRow>> = HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        let entry_uuid = parse_uuid_col(row, 0)?;
+        let name: String = row.get(1)?;
+        let sha_bytes: Vec<u8> = row.get(2)?;
+        let bytes: Vec<u8> = row.get(3)?;
+        Ok((entry_uuid, name, sha_bytes, bytes))
+    })?;
+    for r in rows {
+        let (entry_uuid, name, sha_vec, bytes) = r?;
+        let sha: [u8; 32] = sha_vec.as_slice().try_into().map_err(|_| {
+            EngineError::Projection(ProjectionError::SchemaInvariant(format!(
+                "attachment_blob.sha256 not 32 bytes for entry {entry_uuid}",
+            )))
+        })?;
+        out.entry(entry_uuid).or_default().push(AttachmentRow {
+            name,
+            sha256: sha,
+            bytes,
+        });
+    }
+    Ok(out)
+}
+
+fn load_tags(conn: &Connection) -> Result<HashMap<Uuid, Vec<String>>, EngineError> {
+    // Order by tag.name so projection is deterministic. Ingest doesn't
+    // promise to preserve original tag order; sorted alphabetical is
+    // the only stable choice that survives upsert ordering.
+    let mut stmt = conn.prepare(
+        "SELECT et.entry_uuid, t.name FROM entry_tag et \
+         JOIN tag t ON t.id = et.tag_id \
+         ORDER BY et.entry_uuid, t.name",
+    )?;
+    let mut out: HashMap<Uuid, Vec<String>> = HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((parse_uuid_col(row, 0)?, row.get::<_, String>(1)?))
+    })?;
+    for r in rows {
+        let (uuid, name) = r?;
+        out.entry(uuid).or_default().push(name);
+    }
+    Ok(out)
+}
+
+fn load_history(conn: &Connection) -> Result<HashMap<Uuid, Vec<HistorySnapshot>>, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT entry_uuid, snapshot_json FROM entry_history ORDER BY entry_uuid, history_index",
+    )?;
+    let mut out: HashMap<Uuid, Vec<HistorySnapshot>> = HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((parse_uuid_col(row, 0)?, row.get::<_, String>(1)?))
+    })?;
+    for r in rows {
+        let (uuid, json) = r?;
+        let snap: HistorySnapshot = serde_json::from_str(&json)
+            .map_err(|e| EngineError::Projection(ProjectionError::Json(e)))?;
+        out.entry(uuid).or_default().push(snap);
+    }
+    Ok(out)
+}
+
+// ───────────────────────── history shape ─────────────────────────
+
+/// Deserialise side of the shape written by
+/// `crate::ingest::HistorySnapshot`.
+#[derive(Deserialize)]
+struct HistorySnapshot {
+    title: String,
+    username: String,
+    url: String,
+    notes: String,
+    password: String,
+    tags: Vec<String>,
+    created_at: i64,
+    modified_at: i64,
+    accessed_at: i64,
+    expires_at: Option<i64>,
+    custom_fields: HashMap<String, HistoryCustomField>,
+}
+
+#[derive(Deserialize)]
+struct HistoryCustomField {
+    value: String,
+    protected: bool,
+}
+
+fn snapshot_to_entry(entry_uuid: Uuid, snap: &HistorySnapshot) -> Entry {
+    // History snapshots reuse the live entry's uuid in KeePass — they
+    // are *prior versions of the same record*, not new records — so
+    // we propagate the same UUID into the snapshot Entry.
+    let mut e = Entry::empty(EntryId(entry_uuid));
+    e.title.clone_from(&snap.title);
+    e.username.clone_from(&snap.username);
+    e.url.clone_from(&snap.url);
+    e.notes.clone_from(&snap.notes);
+    e.password.clone_from(&snap.password);
+    e.tags.clone_from(&snap.tags);
+    e.times = build_times(
+        snap.created_at,
+        snap.modified_at,
+        snap.accessed_at,
+        snap.expires_at,
+    );
+    for (k, v) in &snap.custom_fields {
+        e.custom_fields
+            .push(CustomField::new(k.clone(), v.value.clone(), v.protected));
+    }
+    // History entries themselves carry no nested history, no
+    // attachments — those aren't part of the snapshot JSON.
+    e
+}
+
+// ───────────────────────── helpers ─────────────────────────
+
+fn parse_uuid_col(row: &rusqlite::Row<'_>, idx: usize) -> Result<Uuid, rusqlite::Error> {
+    let s: String = row.get(idx)?;
+    Uuid::parse_str(&s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+fn ms_to_dt(ms: i64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_millis_opt(ms).single()
+}
+
+/// Build a [`Timestamps`] from the columns we persist. Schema-wise
+/// `created_at` and `modified_at` are NOT NULL — we mirror their value
+/// straight into `Some(...)`. The `expires` bool is `true` iff
+/// `expires_at` is `Some`. `last_access_time` mirrors `accessed_at`.
+/// `location_changed` is not persisted; left `None`.
+fn build_times(
+    created_at: i64,
+    modified_at: i64,
+    accessed_at: i64,
+    expires_at: Option<i64>,
+) -> Timestamps {
+    let mut t = Timestamps::default();
+    t.creation_time = ms_to_dt(created_at);
+    t.last_modification_time = ms_to_dt(modified_at);
+    t.last_access_time = ms_to_dt(accessed_at);
+    t.expiry_time = expires_at.and_then(ms_to_dt);
+    t.expires = expires_at.is_some();
+    t
+}
+
+/// AES-256-GCM open — inverse of [`crate::ingest::wrap_with_session_key`].
+///
+/// Wire format: `nonce(12) || ciphertext || tag(16)`. We can't reuse
+/// `keepass_core::protector::open_with_key` because it's `pub(crate)`;
+/// implementing the open here matches the same wire shape the ingest
+/// side wrote.
+fn unwrap_with_session_key(session_key: &SessionKey, wrapped: &[u8]) -> Result<Vec<u8>, String> {
+    if wrapped.len() < 12 + 16 {
+        return Err("wrapped blob too short".into());
+    }
+    let (nonce_bytes, ciphertext) = wrapped.split_at(12);
+    let cipher = Aes256Gcm::new_from_slice(session_key.as_bytes()).map_err(|e| e.to_string())?;
+    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
+    cipher.decrypt(nonce, ciphertext).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_times_marks_expires_when_expires_at_set() {
+        let t = build_times(1_000, 2_000, 3_000, Some(4_000));
+        assert!(t.expires);
+        assert_eq!(t.expiry_time, ms_to_dt(4_000));
+        assert_eq!(t.creation_time, ms_to_dt(1_000));
+    }
+
+    #[test]
+    fn build_times_marks_no_expiry_when_none() {
+        let t = build_times(1_000, 2_000, 3_000, None);
+        assert!(!t.expires);
+        assert!(t.expiry_time.is_none());
+    }
+}
