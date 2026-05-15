@@ -733,12 +733,15 @@ dependencies = [
 name = "keys-engine"
 version = "0.0.0"
 dependencies = [
+ "getrandom 0.2.17",
+ "hmac",
  "keepass-core",
  "rand",
  "rusqlite",
  "secrecy",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "uuid",

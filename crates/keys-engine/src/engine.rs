@@ -15,6 +15,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::EngineError;
+use crate::fingerprint;
 use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
 use crate::model::{EntryFull, EntrySummary, GroupNode, HistoricEntry, Pagination};
@@ -28,6 +29,13 @@ use crate::model::{EntryFull, EntrySummary, GroupNode, HistoricEntry, Pagination
 #[derive(Debug)]
 pub struct Engine {
     conn: Connection,
+    /// Per-vault HMAC key used to derive
+    /// [`entry.password_fingerprint`](crate::fingerprint::fingerprint)
+    /// values for duplicate-password detection. Generated on first
+    /// open, persisted (encrypted at rest by `SQLCipher`) in the
+    /// `setting` table under the `fingerprint_key` row, and reloaded
+    /// on every subsequent open. Zeroed on drop.
+    fingerprint_key: Zeroizing<[u8; 32]>,
 }
 
 impl Engine {
@@ -80,7 +88,25 @@ impl Engine {
 
         migrations::apply_pending(&mut conn)?;
 
-        Ok(Self { conn })
+        let fingerprint_key = ensure_fingerprint_key(&mut conn)?;
+
+        Ok(Self {
+            conn,
+            fingerprint_key,
+        })
+    }
+
+    /// HMAC-SHA-256 a plaintext under this vault's persistent
+    /// fingerprint key.
+    ///
+    /// The returned 32 bytes are deterministic for a given (vault,
+    /// plaintext) pair across reopens, but differ across vaults
+    /// because each vault has its own random fingerprint key. Intended
+    /// for populating the `entry.password_fingerprint` column and for
+    /// duplicate-password queries.
+    #[must_use]
+    pub fn fingerprint(&self, plaintext: &[u8]) -> [u8; 32] {
+        fingerprint::fingerprint(&self.fingerprint_key, plaintext)
     }
 
     /// Close the underlying connection, finalising any pending work.
@@ -343,6 +369,62 @@ fn hex_encode(bytes: &[u8; 32]) -> Zeroizing<String> {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Load the per-vault fingerprint key from `setting`, generating and
+/// persisting a fresh 32-byte random key if no row exists.
+///
+/// The key is stored in `setting.value` as a 32-byte BLOB. Encryption
+/// at rest is provided by `SQLCipher`'s page-level encryption — no
+/// extra layer is applied to the row itself.
+///
+/// # Errors
+///
+/// - [`EngineError::Random`] if the OS RNG fails on a first-open path.
+/// - [`EngineError::Sqlite`] for read/write failures, or if a row
+///   exists but its value isn't 32 bytes (indicates corruption).
+fn ensure_fingerprint_key(conn: &mut Connection) -> Result<Zeroizing<[u8; 32]>, EngineError> {
+    let existing: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT value FROM setting WHERE key = 'fingerprint_key'",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+
+    if let Some(bytes) = existing {
+        let mut buf = Zeroizing::new([0u8; 32]);
+        if bytes.len() != 32 {
+            // Corrupt / wrong-shape row. Surface as a SQLite-flavoured
+            // error rather than panicking. A dedicated variant could
+            // land later once we have a story for recovery.
+            return Err(EngineError::Sqlite(
+                rusqlite::Error::IntegralValueOutOfRange(
+                    0,
+                    i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+                ),
+            ));
+        }
+        buf.copy_from_slice(&bytes);
+        // Best-effort wipe of the rusqlite-allocated buffer.
+        let mut bytes = bytes;
+        bytes.fill(0);
+        return Ok(buf);
+    }
+
+    let mut buf = Zeroizing::new([0u8; 32]);
+    getrandom::getrandom(buf.as_mut_slice())?;
+
+    conn.execute(
+        "INSERT INTO setting(key, value) VALUES ('fingerprint_key', ?1)",
+        rusqlite::params![&buf[..]],
+    )?;
+
+    Ok(buf)
 }
 
 /// Recognise `SQLCipher`'s wrong-key signal.

@@ -31,4 +31,11 @@ pub enum EngineError {
     /// database is at a schema version this binary doesn't know.
     #[error("migration error: {0}")]
     Migration(#[from] MigrationError),
+
+    /// The OS RNG refused to produce randomness while the engine was
+    /// trying to seed the per-vault fingerprint key. This is a hard
+    /// failure on every platform we ship to and should be treated as
+    /// fatal by callers.
+    #[error("os rng failed: {0}")]
+    Random(#[from] getrandom::Error),
 }
