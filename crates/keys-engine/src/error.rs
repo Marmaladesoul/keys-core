@@ -1,0 +1,28 @@
+//! Error type for [`Engine`](crate::Engine) operations.
+
+use crate::key_provider::KeyProviderError;
+
+/// Errors surfaced by the engine.
+#[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
+pub enum EngineError {
+    /// The supplied key did not decrypt the database. `SQLCipher` reports
+    /// this as `SQLITE_NOTADB` ("file is not a database") on the first
+    /// query that touches the encrypted header.
+    #[error("wrong database key — supplied key does not decrypt this database")]
+    WrongKey,
+
+    /// The [`KeyProvider`](crate::KeyProvider) failed to materialise the
+    /// database key.
+    #[error("db key provider failed: {0}")]
+    KeyProvider(#[from] KeyProviderError),
+
+    /// An I/O error occurred (e.g. creating the parent directory).
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// A SQLite-level error from `rusqlite` that isn't a wrong-key
+    /// signal.
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+}

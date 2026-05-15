@@ -735,6 +735,7 @@ version = "0.0.0"
 dependencies = [
  "keepass-core",
  "rusqlite",
+ "tempfile",
  "thiserror 2.0.18",
  "zeroize",
 ]
