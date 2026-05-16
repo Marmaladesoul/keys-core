@@ -6,6 +6,7 @@ pub mod key_provider;
 pub mod meta;
 pub mod migrations;
 pub mod model;
+pub mod mutations;
 pub mod predicate;
 pub mod predicate_builtin;
 pub mod predicate_sql;
@@ -22,8 +23,9 @@ pub use fingerprint::fingerprint;
 pub use key_provider::{DbKey, KeyProvider, KeyProviderError};
 pub use migrations::MigrationError;
 pub use model::{
-    AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, GroupNode, HistoricEntry, IconRef,
-    Pagination, SmartFolder, StrengthBucket,
+    AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, EntryUpdate, GroupNode, GroupUpdate,
+    HistoricEntry, IconRef, NewCustomField, NewEntryFields, NewGroupFields, Pagination,
+    SmartFolder, StrengthBucket,
 };
 pub use predicate::Predicate;
 pub use predicate_builtin::{

@@ -13,6 +13,7 @@
 //! All timestamps are `i64` milliseconds since the Unix epoch (UTC), per
 //! the schema doc's "timestamp convention" section.
 
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -282,6 +283,104 @@ pub struct SmartFolder {
     pub created_at: i64,
     /// Last-modified timestamp, ms since Unix epoch.
     pub modified_at: i64,
+}
+
+/// Initial value of a single custom field on a freshly-created entry.
+///
+/// Mirrors the keepass-core `CustomField` shape but takes a
+/// [`SecretString`] for the value when `protected = true`. Non-protected
+/// custom fields carry a plain `String` to keep call sites readable —
+/// the engine never wraps non-protected values, so a `SecretString` for
+/// them would be misleading ceremony.
+#[derive(Debug)]
+pub struct NewCustomField {
+    /// Field name as it will appear in KDBX.
+    pub name: String,
+    /// Plaintext value. For `protected = true` this lands AES-GCM-sealed
+    /// in `entry_protected`; for `protected = false` it lands as-is in
+    /// `entry_custom_field`.
+    pub value: SecretString,
+    /// `true` → `entry_protected`; `false` → `entry_custom_field`.
+    pub protected: bool,
+}
+
+/// Field values for [`crate::Engine::create_entry`].
+///
+/// All fields are mandatory because the engine refuses to invent
+/// defaults silently. Pass empty strings for empty slots. The canonical
+/// `Password` slot lives in `password`; protected custom fields go in
+/// `custom_fields` with `protected = true`.
+#[derive(Debug)]
+pub struct NewEntryFields {
+    /// Entry title.
+    pub title: String,
+    /// Username field.
+    pub username: String,
+    /// URL field (raw, as the user enters it).
+    pub url: String,
+    /// Notes field (plaintext).
+    pub notes: String,
+    /// Canonical Password slot. Stored AES-GCM-sealed in
+    /// `entry_protected` under `field_name = "Password"`.
+    pub password: SecretString,
+    /// Icon reference.
+    pub icon: IconRef,
+    /// Custom fields. Protected entries land in `entry_protected`;
+    /// non-protected in `entry_custom_field`.
+    pub custom_fields: Vec<NewCustomField>,
+    /// Tags. Deduplicated and trimmed by the engine before insert.
+    pub tags: Vec<String>,
+}
+
+/// Patch shape for [`crate::Engine::update_entry`].
+///
+/// Every field is `Option<T>`. `None` means "leave alone"; `Some(value)`
+/// means "set to this value". Clearing a string field to empty is
+/// expressed as `Some(String::new())`. A richer
+/// `Patch<T> { Keep, Set(T), Clear }` enum is not warranted today — none
+/// of the entry columns distinguish "empty" from "absent".
+#[derive(Debug, Default)]
+pub struct EntryUpdate {
+    /// New title.
+    pub title: Option<String>,
+    /// New username.
+    pub username: Option<String>,
+    /// New URL. Triggers `url_host` recomputation.
+    pub url: Option<String>,
+    /// New notes.
+    pub notes: Option<String>,
+    /// New password. Triggers strength / entropy / fingerprint
+    /// recomputation and re-wrapping of the canonical Password slot.
+    pub password: Option<SecretString>,
+    /// New icon.
+    pub icon: Option<IconRef>,
+    /// New expiry. `Some(None)` clears expiry; `Some(Some(ms))` sets;
+    /// `None` leaves alone.
+    pub expires_at: Option<Option<i64>>,
+}
+
+/// Field values for [`crate::Engine::create_group`].
+#[derive(Debug)]
+pub struct NewGroupFields {
+    /// Display name.
+    pub name: String,
+    /// Notes.
+    pub notes: String,
+    /// Icon reference.
+    pub icon: IconRef,
+}
+
+/// Patch shape for [`crate::Engine::update_group`].
+#[derive(Debug, Default)]
+pub struct GroupUpdate {
+    /// New display name.
+    pub name: Option<String>,
+    /// New notes.
+    pub notes: Option<String>,
+    /// New icon.
+    pub icon: Option<IconRef>,
+    /// New expiry. `Some(None)` clears; `Some(Some(ms))` sets.
+    pub expires_at: Option<Option<i64>>,
 }
 
 #[cfg(test)]

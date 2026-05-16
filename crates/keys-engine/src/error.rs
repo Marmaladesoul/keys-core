@@ -125,6 +125,23 @@ pub enum EngineError {
     /// silently returning an empty or partial result.
     #[error("predicate is not evaluable by this binary")]
     NotEvaluable,
+
+    /// A protected-field wrap failed during a mutation. AES-GCM seal
+    /// rejected the call, typically because the session-key provider
+    /// produced a key of the wrong length or the AEAD primitive itself
+    /// errored.
+    #[error("protected field wrap failed: {0}")]
+    Wrap(String),
+
+    /// The session-key provider refused to release a session key while
+    /// a mutation needed to (un)wrap a protected blob.
+    #[error("session key unavailable: {0}")]
+    SessionKey(String),
+
+    /// A group move would create a cycle (the new parent is the group
+    /// itself, or one of its descendants).
+    #[error("group move would create a cycle")]
+    CycleDetected,
 }
 
 /// Errors surfaced specifically by [`crate::Engine::project_to_vault`].

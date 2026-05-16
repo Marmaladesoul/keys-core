@@ -23,7 +23,11 @@ use crate::fingerprint;
 use crate::ingest;
 use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
-use crate::model::{EntryFull, EntrySummary, GroupNode, HistoricEntry, Pagination, SmartFolder};
+use crate::model::{
+    EntryFull, EntrySummary, EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, NewEntryFields,
+    NewGroupFields, Pagination, SmartFolder,
+};
+use crate::mutations;
 use crate::predicate::Predicate;
 use crate::projection;
 use crate::save::{self, SelfWriteSignature};
@@ -870,6 +874,337 @@ impl Engine {
     ) -> Result<Vec<u8>, EngineError> {
         let _ = (uuid, attachment_name, &self.conn);
         unimplemented!("task 3.1")
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Mutation API — Phase 4 task 4.1.
+    //
+    // Every mutation runs inside a single transaction, refreshes the
+    // relevant `modified_at`, and maintains derived columns. Event
+    // emission lands in task 4.3; for now each method leaves a
+    // `// TODO 4.3:` comment at the post-commit emission point.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Create a new entry in `group_uuid`. Returns the new entry's
+    /// freshly-generated UUID.
+    ///
+    /// `created_at`, `modified_at`, and `accessed_at` are all set to the
+    /// current wall-clock time. The canonical Password slot is
+    /// AES-GCM-sealed under a fresh session key from the configured
+    /// [`FieldProtector`] and stored in `entry_protected`. Protected
+    /// custom fields take the same path; non-protected ones land in
+    /// `entry_custom_field`. Tags are trimmed + de-duplicated before
+    /// insert.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`) if no group with
+    ///   `group_uuid` exists.
+    /// - [`EngineError::Wrap`] / [`EngineError::SessionKey`] on wrap
+    ///   failure.
+    /// - [`EngineError::Sqlite`] on insert failure.
+    pub fn create_entry(
+        &mut self,
+        group_uuid: Uuid,
+        fields: NewEntryFields,
+    ) -> Result<Uuid, EngineError> {
+        let result = mutations::create_entry(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            group_uuid,
+            fields,
+        )?;
+        // TODO 4.3: emit ChangeEvent::EntriesAdded(vec![result]).
+        Ok(result)
+    }
+
+    /// Update an existing entry. Each field of `update` is `Option`:
+    /// `None` leaves it alone, `Some(value)` writes it.
+    ///
+    /// Setting `password` re-wraps the canonical Password slot and
+    /// refreshes `password_strength_bucket`, `password_entropy`, and
+    /// `password_fingerprint`. Setting `url` refreshes `url_host`.
+    /// `modified_at` is always bumped to now.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
+    /// - [`EngineError::Wrap`] / [`EngineError::SessionKey`] on wrap
+    ///   failure (only when `password` is updated).
+    /// - [`EngineError::Sqlite`] on update failure.
+    pub fn update_entry(&mut self, uuid: Uuid, update: EntryUpdate) -> Result<(), EngineError> {
+        mutations::update_entry(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            uuid,
+            update,
+        )?;
+        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Soft-delete an entry: set `is_recycled = 1` and move to the
+    /// recycle bin group (if one exists).
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
+    /// - [`EngineError::Sqlite`] on update failure.
+    pub fn recycle_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
+        mutations::recycle_entry(&mut self.conn, uuid)?;
+        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Restore a recycled entry: clear `is_recycled`. The group does
+    /// not move — callers decide whether to move it elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
+    /// - [`EngineError::Sqlite`] on update failure.
+    pub fn restore_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
+        mutations::restore_entry(&mut self.conn, uuid)?;
+        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Hard-delete an entry. Cascades remove all `entry_protected`,
+    /// `entry_attachment`, `entry_custom_field`, `entry_history`, and
+    /// `entry_tag` rows (per schema FK `ON DELETE CASCADE`).
+    /// Attachment blobs in `attachment_blob` are content-addressed and
+    /// shared; they're not garbage-collected here.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
+    /// - [`EngineError::Sqlite`] on delete failure.
+    pub fn delete_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
+        mutations::delete_entry(&mut self.conn, uuid)?;
+        // TODO 4.3: emit ChangeEvent::EntriesRemoved(vec![uuid]).
+        Ok(())
+    }
+
+    /// Move an entry to a different group.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"` or `"group"`).
+    /// - [`EngineError::Sqlite`] on update failure.
+    pub fn move_entry(&mut self, uuid: Uuid, new_group_uuid: Uuid) -> Result<(), EngineError> {
+        mutations::move_entry(&mut self.conn, uuid, new_group_uuid)?;
+        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Set the value of a protected field (canonical `Password` slot
+    /// or a named protected custom field). UPSERTs `entry_protected`.
+    /// When `field_name == "Password"`, refreshes strength / entropy /
+    /// fingerprint columns.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`).
+    /// - [`EngineError::Wrap`] / [`EngineError::SessionKey`].
+    pub fn set_protected_field(
+        &mut self,
+        uuid: Uuid,
+        field_name: &str,
+        plaintext: SecretString,
+    ) -> Result<(), EngineError> {
+        mutations::set_protected_field(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            uuid,
+            field_name,
+            plaintext,
+        )?;
+        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Set the value of a non-protected custom field. UPSERTs
+    /// `entry_custom_field`.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`).
+    /// - [`EngineError::Sqlite`].
+    pub fn set_non_protected_custom_field(
+        &mut self,
+        uuid: Uuid,
+        field_name: &str,
+        value: &str,
+    ) -> Result<(), EngineError> {
+        mutations::set_non_protected_custom_field(&mut self.conn, uuid, field_name, value)?;
+        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Remove a custom field by name. Deletes from whichever of
+    /// `entry_protected` / `entry_custom_field` the field lives in.
+    /// No error if the field doesn't exist (idempotent removal).
+    ///
+    /// Refuses to delete the canonical `Password` slot — that would
+    /// leave reveal callers with no row to read.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches,
+    ///   or `entity = "custom_field"` if `field_name == "Password"`.
+    /// - [`EngineError::Sqlite`].
+    pub fn remove_custom_field(&mut self, uuid: Uuid, field_name: &str) -> Result<(), EngineError> {
+        mutations::remove_custom_field(&mut self.conn, uuid, field_name)?;
+        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Replace the entry's tags wholesale. Inputs are trimmed and
+    /// de-duplicated.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`).
+    /// - [`EngineError::Sqlite`].
+    pub fn set_tags(&mut self, uuid: Uuid, tags: Vec<String>) -> Result<(), EngineError> {
+        mutations::set_tags(&mut self.conn, uuid, tags)?;
+        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Attach a file. Bytes are SHA-256 hashed and stored
+    /// content-addressed in `attachment_blob`; the link row in
+    /// `entry_attachment` upserts on `(entry_uuid, attachment_name)`.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`).
+    /// - [`EngineError::Sqlite`].
+    pub fn attach_file(
+        &mut self,
+        uuid: Uuid,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), EngineError> {
+        mutations::attach_file(&mut self.conn, uuid, name, bytes)?;
+        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Remove an attachment by name. The underlying `attachment_blob`
+    /// row is left in place (content-addressed and potentially shared).
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`).
+    /// - [`EngineError::Sqlite`].
+    pub fn remove_attachment(&mut self, uuid: Uuid, name: &str) -> Result<(), EngineError> {
+        mutations::remove_attachment(&mut self.conn, uuid, name)?;
+        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Create a new group under `parent_uuid`. Returns the new uuid.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`) if the parent
+    ///   doesn't exist.
+    /// - [`EngineError::Sqlite`].
+    pub fn create_group(
+        &mut self,
+        parent_uuid: Uuid,
+        fields: NewGroupFields,
+    ) -> Result<Uuid, EngineError> {
+        let uuid = mutations::create_group(&mut self.conn, parent_uuid, fields)?;
+        // TODO 4.3: emit ChangeEvent::GroupsAdded(vec![uuid]).
+        Ok(uuid)
+    }
+
+    /// Update an existing group. Patch shape: `None` leaves alone,
+    /// `Some(value)` writes.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`).
+    /// - [`EngineError::Sqlite`].
+    pub fn update_group(&mut self, uuid: Uuid, update: GroupUpdate) -> Result<(), EngineError> {
+        mutations::update_group(&mut self.conn, uuid, update)?;
+        // TODO 4.3: emit ChangeEvent::GroupsUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Soft-recycle a group: move it under the database's recycle bin
+    /// group. KDBX UX is "move, not delete"; this matches that.
+    ///
+    /// If no recycle-bin group exists, returns
+    /// [`EngineError::NotFound`] (`entity = "recycle_bin"`). The engine
+    /// deliberately does not auto-create a bin — that's a frontend
+    /// decision. Callers wanting hard removal use [`Engine::delete_group`].
+    ///
+    /// Direct child entries of this group are not touched; they're
+    /// implicitly recycled by virtue of having a recycled ancestor.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"` or
+    ///   `"recycle_bin"`).
+    /// - [`EngineError::CycleDetected`] if the caller passes the bin's
+    ///   own uuid.
+    /// - [`EngineError::Sqlite`].
+    pub fn recycle_group(&mut self, uuid: Uuid) -> Result<(), EngineError> {
+        mutations::recycle_group(&mut self.conn, uuid)?;
+        // TODO 4.3: emit ChangeEvent::GroupsUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Restore a recycled group by moving it to `new_parent_uuid`.
+    /// KDBX itself doesn't track the original location, so the caller
+    /// supplies the destination.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`).
+    /// - [`EngineError::CycleDetected`] if the destination is the group
+    ///   itself or a descendant.
+    /// - [`EngineError::Sqlite`].
+    pub fn restore_group(&mut self, uuid: Uuid, new_parent_uuid: Uuid) -> Result<(), EngineError> {
+        mutations::restore_group(&mut self.conn, uuid, new_parent_uuid)?;
+        // TODO 4.3: emit ChangeEvent::GroupsUpdated(vec![uuid]).
+        Ok(())
+    }
+
+    /// Hard-delete a group and every descendant group + entry.
+    ///
+    /// The schema does not declare `ON DELETE CASCADE` on the group
+    /// self-FK or on `entry.group_uuid`, so the engine walks the
+    /// subtree itself. Entry child tables cascade off `entry`.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`).
+    /// - [`EngineError::Sqlite`].
+    pub fn delete_group(&mut self, uuid: Uuid) -> Result<(), EngineError> {
+        mutations::delete_group(&mut self.conn, uuid)?;
+        // TODO 4.3: emit ChangeEvent::GroupsRemoved(vec![uuid]).
+        Ok(())
+    }
+
+    /// Move a group to a new parent. Rejects cycles: the new parent
+    /// cannot be the group itself or any descendant.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`).
+    /// - [`EngineError::CycleDetected`].
+    /// - [`EngineError::Sqlite`].
+    pub fn move_group(&mut self, uuid: Uuid, new_parent_uuid: Uuid) -> Result<(), EngineError> {
+        mutations::move_group(&mut self.conn, uuid, new_parent_uuid)?;
+        // TODO 4.3: emit ChangeEvent::GroupsUpdated(vec![uuid]).
+        Ok(())
     }
 
     /// Return the historical snapshots of an entry.
