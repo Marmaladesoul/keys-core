@@ -36,11 +36,11 @@ pub use engine_observer::{
     VaultDataChangeObserver,
 };
 pub use engine_types::{
-    AttachmentRef as EngineAttachmentRef, CustomFieldRef as EngineCustomFieldRef,
-    EngineEntrySummary, EntryFull, EntryUpdate as EngineEntryUpdate, GroupNode,
-    GroupUpdate as EngineGroupUpdate, HistoricEntry, IconRef, MergeResult, MergeStats,
-    NewCustomField, NewEntryFields, NewGroupFields, Page, Predicate, SmartFolder, StrengthBucket,
-    VaultState,
+    AttachmentRef as EngineAttachmentRef, ConflictPayloadFfi,
+    CustomFieldRef as EngineCustomFieldRef, EngineEntrySummary, EntryFull,
+    EntryUpdate as EngineEntryUpdate, GroupNode, GroupUpdate as EngineGroupUpdate, HistoricEntry,
+    IconRef, MergeResult, MergeStats, NewCustomField, NewEntryFields, NewGroupFields, Page,
+    Predicate, SmartFolder, StrengthBucket, VaultState,
 };
 pub use error::VaultError;
 pub use merge::{

@@ -165,6 +165,22 @@ pub struct ConflictPayload {
     pub delete_edit_conflicts: Vec<keepass_core::model::EntryId>,
 }
 
+/// Parent [`keepass_core::model::GroupId`] of one entry as observed
+/// on each side of a stashed conflict.
+///
+/// Produced by
+/// [`crate::Engine::pending_conflict_parent_groups`]. `None` on a
+/// side means the entry isn't reachable through any known group on
+/// that side — typically an in-flight group-tree change where one
+/// side has tombstoned the entry's parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryParentGroups {
+    /// Parent on the local-side projection at reconcile time.
+    pub local: Option<keepass_core::model::GroupId>,
+    /// Parent on the remote-side (disk) projection at reconcile time.
+    pub remote: Option<keepass_core::model::GroupId>,
+}
+
 /// Receives [`ChangeEvent`]s from an [`crate::Engine`].
 ///
 /// Implementations must be `Send + Sync` because the engine holds the

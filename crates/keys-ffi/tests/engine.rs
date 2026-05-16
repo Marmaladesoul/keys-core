@@ -495,3 +495,159 @@ async fn engine_conflict_resolution_apply_not_found() {
         "got {err:?}",
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn engine_pending_conflict_peek_then_apply() {
+    use keepass_core::CompositeKey;
+    use keepass_core::kdbx::Kdbx;
+    use keepass_core::model::{EntryId, HistoryPolicy};
+    use keys_ffi::{
+        ConflictSideFfi, DeleteEditChoiceEntryFfi, EngineEntryUpdate, EntryAttachmentChoiceFfi,
+        EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, MergeResult, ResolutionFfi,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    seed_kdbx(&kdbx_path);
+    let engine = open_fresh_engine(&db_path);
+
+    // Ingest + first save to set the common ancestor.
+    engine
+        .ingest_from_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("ingest");
+    engine
+        .save_to_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("save");
+
+    // Grab the seed entry's uuid via the projection.
+    let summaries = engine
+        .list_entries(
+            None,
+            Page {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .expect("entries");
+    let target = summaries
+        .iter()
+        .find(|e| e.title == "acme")
+        .expect("seed entry present")
+        .clone();
+
+    // Local edit: change the title.
+    engine
+        .update_entry(
+            target.uuid.clone(),
+            EngineEntryUpdate {
+                title: Some("local-title".into()),
+                ..Default::default()
+            },
+        )
+        .expect("local update");
+
+    // Disk edit: open the kdbx independently and change the same entry's title.
+    let composite = CompositeKey::from_password(KDBX_PASSWORD.as_bytes());
+    let mut disk_kdbx = Kdbx::open(&kdbx_path)
+        .expect("open kdbx")
+        .read_header()
+        .expect("header")
+        .unlock(&composite)
+        .expect("unlock");
+    let uuid = uuid::Uuid::parse_str(&target.uuid).expect("parse uuid");
+    disk_kdbx
+        .edit_entry(EntryId(uuid), HistoryPolicy::Snapshot, |e| {
+            e.set_title("disk-title");
+        })
+        .expect("disk edit");
+    let bytes = disk_kdbx.save_to_bytes().expect("save bytes");
+    std::fs::write(&kdbx_path, &bytes).expect("write");
+
+    // Reconcile — expect a conflict.
+    let result = engine
+        .reconcile_with_disk(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("reconcile");
+    let conflict_id = match result {
+        MergeResult::Conflict { id } => id,
+        other => panic!("expected Conflict, got {other:?}"),
+    };
+
+    // FFI peek — twice, same shape.
+    let first = engine
+        .pending_conflict(conflict_id)
+        .expect("peek ok")
+        .expect("payload present");
+    assert_eq!(first.id, conflict_id);
+    assert_eq!(first.entry_conflicts.len(), 1, "single entry in conflict");
+    let entry_conflict = &first.entry_conflicts[0];
+    assert_eq!(entry_conflict.entry_uuid, target.uuid);
+    assert_eq!(entry_conflict.local.title, "local-title");
+    assert_eq!(entry_conflict.remote.title, "disk-title");
+    assert!(
+        entry_conflict.field_deltas.iter().any(|d| d.key == "Title"),
+        "Title delta present in {:?}",
+        entry_conflict.field_deltas,
+    );
+
+    let second = engine
+        .pending_conflict(conflict_id)
+        .expect("peek again ok")
+        .expect("payload still present");
+    assert_eq!(
+        second.entry_conflicts.len(),
+        first.entry_conflicts.len(),
+        "peek is idempotent",
+    );
+
+    // Build a resolution: take remote on Title.
+    let resolution = ResolutionFfi::new(
+        vec![EntryFieldChoiceFfi::new(
+            target.uuid.clone(),
+            vec![FieldChoiceFfi::new("Title", ConflictSideFfi::Remote)],
+        )],
+        Vec::<EntryAttachmentChoiceFfi>::new(),
+        Vec::<EntryIconChoiceFfi>::new(),
+        Vec::<DeleteEditChoiceEntryFfi>::new(),
+    );
+
+    engine
+        .apply_conflict_resolution(conflict_id, resolution)
+        .await
+        .expect("apply");
+
+    // Peek now returns None.
+    assert!(
+        engine
+            .pending_conflict(conflict_id)
+            .expect("peek ok")
+            .is_none(),
+        "peek returns None once apply has consumed the stash",
+    );
+
+    // And the entry's title flipped to the remote side.
+    let after = engine.entry(target.uuid).expect("entry").expect("present");
+    assert_eq!(after.title, "disk-title");
+}
+
+#[test]
+fn engine_pending_conflict_unknown_id_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let engine = open_fresh_engine(&db_path);
+    let res = engine.pending_conflict(424_242).expect("call ok");
+    assert!(res.is_none(), "unknown id returns None");
+}

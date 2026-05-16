@@ -101,12 +101,16 @@ pub(crate) fn apply_conflict_resolution(
     resolution: &Resolution,
 ) -> Result<(), EngineError> {
     // 1. Consume the stash. A second call with the same id falls
-    //    through to NotFound.
+    //    through to NotFound. Also drop the peek-side payload mirror
+    //    so [`Engine::pending_conflict`] starts returning `None` —
+    //    even if the apply walk below fails, the context is gone
+    //    (see this fn's type-level doc on irrevocable consumption).
     let ctx = engine
         .take_pending_conflict_context(id)
         .ok_or(EngineError::NotFound {
             entity: "conflict_payload",
         })?;
+    engine.discard_pending_conflict_payload(id);
 
     let PendingConflictContext {
         payload: _,

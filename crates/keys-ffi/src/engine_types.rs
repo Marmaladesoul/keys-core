@@ -692,10 +692,10 @@ fn secs_to_duration(secs: i64) -> Duration {
 /// Outcome of a successful [`crate::Engine::reconcile_with_disk`] call.
 ///
 /// `Conflict` carries the synthetic id only — the full payload is
-/// fetched separately via `Engine::take_pending_conflict` (when 5.x
-/// extends the accessor surface — not in this PR).
-/// This matches the maintainer's 2026-05-16 "big payload = opaque id + accessor"
-/// decision.
+/// fetched separately via [`crate::Engine::pending_conflict`], which
+/// gives the resolver UI a peek-only view of the stashed payload
+/// keyed by id. Matches the maintainer's 2026-05-16 "big payload = opaque id +
+/// accessor" decision.
 #[derive(uniffi::Enum, Debug, Clone)]
 pub enum MergeResult {
     NoChange,
@@ -746,6 +746,35 @@ impl From<eng::MergeStats> for MergeStats {
             groups_moved: s.groups_moved as u64,
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// ConflictPayload — peek-only mirror of [`keys_engine::ConflictPayload`]
+// ────────────────────────────────────────────────────────────────────────
+
+/// Wire-friendly mirror of [`keys_engine::ConflictPayload`].
+///
+/// Produced by [`crate::Engine::pending_conflict`] as a peek-only
+/// snapshot of the stash. The frontend renders the resolver UI from
+/// these records, then calls [`crate::Engine::apply_conflict_resolution`]
+/// with the matching `id` and a caller-built
+/// [`crate::ResolutionFfi`] to land the merge.
+///
+/// `entry_conflicts` and `delete_edit_conflicts` reuse the slice-7.5
+/// [`crate::EntryConflictFfi`] / [`crate::DeleteEditConflictFfi`]
+/// shapes — same field deltas, same parent-group resolution
+/// (local-side wins on disagreement; either side fills in if the
+/// other can't find the entry).
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct ConflictPayloadFfi {
+    /// Synthetic id — echo back to
+    /// [`crate::Engine::apply_conflict_resolution`].
+    pub id: i64,
+    /// Per-entry field / attachment / icon conflicts.
+    pub entry_conflicts: Vec<crate::merge::EntryConflictFfi>,
+    /// Per-entry delete-vs-edit conflicts.
+    pub delete_edit_conflicts: Vec<crate::merge::DeleteEditConflictFfi>,
 }
 
 // ────────────────────────────────────────────────────────────────────────

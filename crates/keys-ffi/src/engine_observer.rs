@@ -8,10 +8,10 @@
 //!
 //! Big payloads (the full `ConflictPayload`) cross by opaque id —
 //! [`ChangeEvent::ConflictDetected`] carries the id; the frontend
-//! fetches richer detail via a future `Engine::take_pending_conflict`
-//! (when 5.x extends the accessor surface) or directly via
-//! `apply_conflict_resolution`. Matches the maintainer's 2026-05-16
-//! "big payload = opaque id + accessor" decision.
+//! fetches richer detail via [`crate::Engine::pending_conflict`]
+//! (peek-only) and later hands a resolution back to
+//! [`crate::Engine::apply_conflict_resolution`]. Matches the maintainer's
+//! 2026-05-16 "big payload = opaque id + accessor" decision.
 
 use std::sync::Arc;
 

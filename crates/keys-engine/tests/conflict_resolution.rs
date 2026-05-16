@@ -702,3 +702,65 @@ fn apply_resolution_updates_common_ancestor() {
     let on_disk = std::fs::read(&f.kdbx_path).expect("read kdbx");
     assert_eq!(stored, on_disk, "ancestor refreshed to disk bytes");
 }
+
+#[test]
+fn pending_conflict_peek_is_idempotent_until_apply() {
+    let mut f = fixture();
+    let id = drive_title_conflict(&mut f, "local-peek", "disk-peek");
+
+    // Two back-to-back peeks return the same payload — this is a
+    // peek, not a take.
+    let first = f.engine.pending_conflict(id).expect("first peek");
+    let second = f.engine.pending_conflict(id).expect("second peek");
+    assert_eq!(first.id, id);
+    assert_eq!(second.id, id);
+    assert_eq!(first.entry_conflicts.len(), second.entry_conflicts.len());
+    assert_eq!(
+        f.engine.pending_conflict_count_for_test(),
+        1,
+        "peek does not consume",
+    );
+
+    // Apply consumes the matching context AND the peek-side payload.
+    f.engine
+        .apply_conflict_resolution(id, &title_resolution(f.seed_uuid, ConflictSide::Remote))
+        .expect("apply");
+    assert!(
+        f.engine.pending_conflict(id).is_none(),
+        "peek returns None after apply consumed the stash",
+    );
+    assert_eq!(
+        f.engine.pending_conflict_count_for_test(),
+        0,
+        "peek-side stash cleared on apply",
+    );
+}
+
+#[test]
+fn pending_conflict_unknown_id_is_none() {
+    let f = fixture();
+    assert!(
+        f.engine.pending_conflict(424_242).is_none(),
+        "unknown id returns None without panicking",
+    );
+}
+
+#[test]
+fn pending_conflict_parent_groups_covers_every_conflict_entry() {
+    let mut f = fixture();
+    let id = drive_title_conflict(&mut f, "local-parents", "disk-parents");
+
+    let payload = f.engine.pending_conflict(id).expect("payload");
+    let parents = f
+        .engine
+        .pending_conflict_parent_groups(id)
+        .expect("parents");
+    for c in &payload.entry_conflicts {
+        let entry = parents
+            .get(&c.entry_id)
+            .expect("parent entry present for every entry_conflict");
+        // The seed entry is alive on both sides in this fixture.
+        assert!(entry.local.is_some(), "local parent resolved");
+        assert!(entry.remote.is_some(), "remote parent resolved");
+    }
+}

@@ -60,11 +60,14 @@ use crate::engine_error::EngineError;
 use crate::engine_file_watcher::{self, VaultFileWatcher};
 use crate::engine_observer::{BridgeObserver, VaultDataChangeObserver};
 use crate::engine_types::{
-    EngineEntrySummary, EntryFull, EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, IconRef,
-    MergeResult, NewEntryFields, NewGroupFields, Page, Predicate, SmartFolder, VaultState,
-    parse_uuid,
+    ConflictPayloadFfi, EngineEntrySummary, EntryFull, EntryUpdate, GroupNode, GroupUpdate,
+    HistoricEntry, IconRef, MergeResult, NewEntryFields, NewGroupFields, Page, Predicate,
+    SmartFolder, VaultState, parse_uuid,
 };
-use crate::merge::{ResolutionFfi, resolution_ffi_to_km};
+use crate::merge::{
+    AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
+    FieldDeltaFfi, FieldDeltaKindFfi, IconDeltaFfi, ResolutionFfi, resolution_ffi_to_km,
+};
 use crate::protector::{BridgeProtector, VaultFieldProtector};
 
 /// FFI handle to a [`keys_engine::Engine`]. See module docs.
@@ -514,6 +517,29 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.reconcile_with_disk(&path, &composite)?.into()))
     }
 
+    /// Peek the stashed [`ConflictPayloadFfi`] for `id` without
+    /// consuming it.
+    ///
+    /// The frontend calls this after receiving a
+    /// `ChangeEvent::ConflictDetected { id }` observer notification (or
+    /// after a `reconcile_with_disk` call that returned
+    /// `MergeResult::Conflict { id }`) to render the resolver UI. The
+    /// payload is a clone — repeated calls with the same `id` return
+    /// the same data until [`Self::apply_conflict_resolution`]
+    /// consumes the matching context, at which point this returns
+    /// `None` for that id.
+    ///
+    /// Per-side parent group resolution mirrors the slice-7.5
+    /// [`MergeOutcome::entry_conflicts`](crate::merge::MergeOutcome)
+    /// surface: local-side wins on disagreement; either side fills in
+    /// if the other can't find the entry under a known parent
+    /// (in-flight group-tree change). When neither side can find the
+    /// entry — a contract violation we don't expect in practice — the
+    /// parent uuid falls back to the nil UUID.
+    pub fn pending_conflict(&self, id: i64) -> Result<Option<ConflictPayloadFfi>, EngineError> {
+        self.with_engine(|e| Ok(build_conflict_payload_ffi(e, id)))
+    }
+
     /// Apply a user-resolved conflict.
     ///
     /// Marked `async` for symmetry with the other slow ops even though
@@ -566,6 +592,96 @@ impl Engine {
 // engine_types.
 #[allow(dead_code)]
 fn _icon_ref_keepalive(_: IconRef) {}
+
+/// Translate a peek of [`keys_engine::Engine::pending_conflict`] +
+/// [`keys_engine::Engine::pending_conflict_parent_groups`] into the
+/// wire-friendly [`ConflictPayloadFfi`]. `None` propagates from the
+/// engine — either id is unknown or the matching context was already
+/// consumed.
+fn build_conflict_payload_ffi(engine: &eng::Engine, id: i64) -> Option<ConflictPayloadFfi> {
+    use keepass_core::model::GroupId;
+
+    let payload = engine.pending_conflict(id)?;
+    // Both maps are populated atomically by the reconcile path; if the
+    // payload is present, the parent-groups map is too. Defensive
+    // fallback to an empty map keeps the FFI surface total even if a
+    // future engine change drops that invariant.
+    let parents = engine
+        .pending_conflict_parent_groups(id)
+        .unwrap_or_default();
+    let nil_group = GroupId(uuid::Uuid::nil());
+
+    let entry_conflicts = payload
+        .entry_conflicts
+        .iter()
+        .map(|c| {
+            let p = parents.get(&c.entry_id);
+            let local_pid = p.and_then(|p| p.local.or(p.remote)).unwrap_or(nil_group);
+            let remote_pid = p.and_then(|p| p.remote.or(p.local)).unwrap_or(nil_group);
+            EntryConflictFfi {
+                entry_uuid: c.entry_id.0.to_string(),
+                local: crate::dto::Entry::from_entry(&c.local, local_pid),
+                remote: crate::dto::Entry::from_entry(&c.remote, remote_pid),
+                field_deltas: c
+                    .field_deltas
+                    .iter()
+                    .map(|d| FieldDeltaFfi {
+                        key: d.key.clone(),
+                        kind: FieldDeltaKindFfi::from(d.kind),
+                    })
+                    .collect(),
+                attachment_deltas: c
+                    .attachment_deltas
+                    .iter()
+                    .map(|d| AttachmentDeltaFfi {
+                        name: d.name.clone(),
+                        kind: AttachmentDeltaKindFfi::from(d.kind),
+                        local_sha256_hex: d.local_sha256.map(hex_encode_32),
+                        remote_sha256_hex: d.remote_sha256.map(hex_encode_32),
+                        local_size_bytes: d.local_size,
+                        remote_size_bytes: d.remote_size,
+                    })
+                    .collect(),
+                icon_delta: c.icon_delta.as_ref().map(|d| IconDeltaFfi {
+                    local_custom_icon_uuid: d.local_custom_icon_uuid.map(|u| u.to_string()),
+                    remote_custom_icon_uuid: d.remote_custom_icon_uuid.map(|u| u.to_string()),
+                }),
+            }
+        })
+        .collect();
+
+    let delete_edit_conflicts = payload
+        .delete_edit_conflicts
+        .iter()
+        .map(|entry_id| DeleteEditConflictFfi {
+            entry_uuid: entry_id.0.to_string(),
+            // The slice-7.5 [`MergeOutcome`] surface eagerly carries
+            // the local-side entry snapshot here; the engine path
+            // surfaces the uuid only and the frontend pulls the
+            // entry via [`Self::entry`] when it wants title context.
+            // Plumbing the snapshot through would require a third
+            // engine accessor; future work if the resolver UI flow
+            // turns out to need it inline.
+            local: None,
+        })
+        .collect();
+    let _ = nil_group; // silence unused when delete_edit branch is empty.
+
+    Some(ConflictPayloadFfi {
+        id: payload.id,
+        entry_conflicts,
+        delete_edit_conflicts,
+    })
+}
+
+fn hex_encode_32(bytes: [u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        write!(&mut s, "{b:02x}").expect("writing to a String never fails");
+    }
+    s
+}
 
 /// Open the KDBX file at `path`, unlocking under `password`. Pulled out
 /// so the three async-slow-op methods can `spawn_blocking` it without

@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 use crate::error::EngineError;
 use crate::events::{
     ChangeEvent, ConflictPayload, DataChangeObserver, EntryDeletionInfo, EntryMove,
-    GroupDeletionInfo, GroupMove,
+    EntryParentGroups, GroupDeletionInfo, GroupMove,
 };
 use crate::file_watcher::{FileWatcher, FileWatcherEvent, FileWatcherObserver};
 use crate::fingerprint;
@@ -686,13 +686,87 @@ impl Engine {
         self.shared.lock().unwrap().reconcile_trigger = None;
     }
 
-    /// Fetch (and remove) a stashed conflict payload by id. Called
-    /// by task 4.7's `apply_conflict_resolution` once the frontend
-    /// has resolved the conflicts.
-    #[doc(hidden)]
+    /// Peek a stashed conflict payload by `id` without consuming it.
+    ///
+    /// Frontends call this after receiving
+    /// [`ChangeEvent::ConflictDetected`]
+    /// to render the resolver UI, then later call
+    /// [`Self::apply_conflict_resolution`] (which consumes the
+    /// matching context) once the user has picked their per-field /
+    /// per-attachment / per-icon / delete-vs-edit choices.
+    ///
+    /// Repeated calls with the same `id` return the same payload (a
+    /// clone) until `apply_conflict_resolution` succeeds; from that
+    /// point on this returns `None` for that id. A frontend that
+    /// abandons the resolution (e.g. user closes the window) leaves
+    /// the payload in the stash; a fresh
+    /// [`Self::reconcile_with_disk`] produces a new
+    /// [`ConflictPayload`] with a fresh id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine's internal stash `Mutex` is poisoned —
+    /// see [`Self::last_self_write`] for the same caveat. Not
+    /// expected in practice.
     #[must_use]
-    pub fn take_pending_conflict(&self, id: i64) -> Option<ConflictPayload> {
-        self.pending_conflicts.lock().unwrap().remove(&id)
+    pub fn pending_conflict(&self, id: i64) -> Option<ConflictPayload> {
+        self.pending_conflicts.lock().unwrap().get(&id).cloned()
+    }
+
+    /// For a stashed conflict `id`, return the parent
+    /// [`GroupId`](keepass_core::model::GroupId) of every conflict
+    /// entry as observed on each side at reconcile time.
+    ///
+    /// Conflict payloads in [`ConflictPayload::entry_conflicts`] hold
+    /// the raw upstream [`keepass_merge::EntryConflict`], whose
+    /// `local` / `remote` [`keepass_core::model::Entry`]s don't carry
+    /// a parent group reference. The resolver UI needs to know where
+    /// each side placed the entry so it can render the per-side
+    /// "Group" line. The engine has both vaults stashed alongside the
+    /// payload, so we resolve them here once and hand the table back.
+    ///
+    /// `None` if the id is unknown (no stash or already consumed).
+    /// Inside the `Some` branch, the inner `HashMap` is keyed by every
+    /// [`EntryId`](keepass_core::model::EntryId) that appears in
+    /// either [`ConflictPayload::entry_conflicts`] or
+    /// [`ConflictPayload::delete_edit_conflicts`]. The inner
+    /// [`EntryParentGroups`] carries `Option<GroupId>` per side —
+    /// `None` when that side doesn't carry the entry under any known
+    /// parent (an in-flight group-tree change).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine's internal stash `Mutex` is poisoned —
+    /// see [`Self::last_self_write`] for the same caveat. Not
+    /// expected in practice.
+    #[must_use]
+    pub fn pending_conflict_parent_groups(
+        &self,
+        id: i64,
+    ) -> Option<std::collections::HashMap<keepass_core::model::EntryId, EntryParentGroups>> {
+        use keepass_core::model::EntryId;
+        let ctx_guard = self.pending_conflict_contexts.lock().unwrap();
+        let ctx = ctx_guard.get(&id)?;
+        let mut entry_ids: Vec<EntryId> = ctx
+            .payload
+            .entry_conflicts
+            .iter()
+            .map(|c| c.entry_id)
+            .collect();
+        entry_ids.extend(ctx.payload.delete_edit_conflicts.iter().copied());
+        entry_ids.sort_by_key(|e| e.0);
+        entry_ids.dedup();
+        let mut out = std::collections::HashMap::with_capacity(entry_ids.len());
+        for entry_id in entry_ids {
+            out.insert(
+                entry_id,
+                EntryParentGroups {
+                    local: find_entry_parent_group(&ctx.local_vault.root, entry_id),
+                    remote: find_entry_parent_group(&ctx.remote_vault.root, entry_id),
+                },
+            );
+        }
+        Some(out)
     }
 
     /// Test-only: count of currently stashed conflict payloads.
@@ -707,6 +781,14 @@ impl Engine {
     /// into a fresh [`Kdbx::unlock_with_protector`] call.
     pub(crate) fn field_protector_arc(&self) -> Arc<dyn FieldProtector> {
         Arc::clone(&self.field_protector)
+    }
+
+    /// Crate-internal: drop the peek-only [`ConflictPayload`] mirror
+    /// for `id`. Called by `apply_conflict_resolution` so the public
+    /// [`Self::pending_conflict`] surface stops returning the payload
+    /// once the matching context has been consumed.
+    pub(crate) fn discard_pending_conflict_payload(&self, id: i64) {
+        self.pending_conflicts.lock().unwrap().remove(&id);
     }
 
     /// Crate-internal: stash a [`ConflictPayload`] so the eventual
@@ -1820,6 +1902,22 @@ fn is_wrong_key(err: &rusqlite::Error) -> bool {
         err,
         rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::NotADatabase
     )
+}
+
+/// Walk `group` (and its descendants) looking for the parent
+/// [`GroupId`](keepass_core::model::GroupId) of `target`. `None` if
+/// the entry doesn't live anywhere in the subtree.
+fn find_entry_parent_group(
+    group: &keepass_core::model::Group,
+    target: keepass_core::model::EntryId,
+) -> Option<keepass_core::model::GroupId> {
+    if group.entries.iter().any(|e| e.id == target) {
+        return Some(group.id);
+    }
+    group
+        .groups
+        .iter()
+        .find_map(|child| find_entry_parent_group(child, target))
 }
 
 #[cfg(test)]
