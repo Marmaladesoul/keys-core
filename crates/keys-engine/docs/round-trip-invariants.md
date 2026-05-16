@@ -47,7 +47,6 @@ The round-trip test helper doesn't re-check these, because a strict comparison w
 
 | Surface | Loss | Path to fix |
 |---|---|---|
-| Non-protected custom fields | Dropped on ingest. See `ingest.rs::insert_non_protected_custom_field` (currently a no-op). | A future migration `0002_entry_custom_field` adding `entry_custom_field(entry_uuid, name, value)` plus the corresponding insert/select in ingest/projection. Tracked as a Phase 4 design item. |
 | `Meta::recycle_bin_enabled` when `recycle_bin_uuid IS NULL` | Lost — the schema derives `enabled` from "does a bin group exist?". A KDBX file that says "enabled=true, no bin yet" round-trips as "enabled=false". | Persist the flag explicitly in the `setting` table. Cheap, can land alongside the other phase-2 hygiene work. |
 | `Binary::protected` flag | Lost — every attachment projects as `protected = false`. KeePassXC's default for attachments is unprotected, so this matters only for hand-rolled / legacy vaults. | Add a `protected INTEGER NOT NULL DEFAULT 0` column to `attachment_blob` or `entry_attachment`. |
 | Attachment `ref_id` stability | Not preserved across round-trips. Compared by `(name, sha256)` instead. | Not a defect — `ref_id` is an internal index into `Vault::binaries`, not a content identifier. |

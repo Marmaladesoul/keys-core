@@ -36,12 +36,9 @@
 //!   equality helper doesn't re-check them because the projection has no
 //!   notion of them and a strict cross-check would just test
 //!   `kdbx.vault().meta` against itself.
-//! * **Known data loss**: non-protected custom fields are dropped on
-//!   ingest in the v1 schema (documented in `ingest.rs::insert_non_protected_custom_field`).
-//!   The helper therefore compares only **protected** custom fields,
-//!   and the rich fixture deliberately uses protected ones throughout.
-//!   Live history snapshots' non-protected custom fields are preserved
-//!   inside the history JSON column, so those *are* compared.
+//! * Both protected and non-protected custom fields round-trip via
+//!   `entry_protected` and `entry_custom_field` (migration 0002)
+//!   respectively. The helper compares both flavours.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -176,6 +173,12 @@ fn make_rich_vault() -> Kdbx<Unlocked> {
         e.set_custom_field(
             "ApiToken",
             CustomFieldValue::Protected(SecretString::from("tok-0")),
+        );
+        // Non-protected custom field — exercises migration 0002's
+        // `entry_custom_field` table end-to-end.
+        e.set_custom_field(
+            "Website",
+            CustomFieldValue::Plain("https://example.com/recovery".to_string()),
         );
     })
     .expect("edit ids[0]");
@@ -461,27 +464,31 @@ fn compare_entries(
         ));
     }
 
-    // Protected custom fields only — non-protected are dropped on
-    // ingest in the v1 schema. See module doc.
-    let protected_a: Vec<&keepass_core::model::CustomField> =
-        a.custom_fields.iter().filter(|c| c.protected).collect();
-    let protected_b: Vec<&keepass_core::model::CustomField> =
-        b.custom_fields.iter().filter(|c| c.protected).collect();
-    if protected_a.len() != protected_b.len() {
+    // Custom fields — both protected and non-protected (migration 0002).
+    // Compared by name; value compared as Secret-wrapper equality on the
+    // CustomField struct.
+    if a.custom_fields.len() != b.custom_fields.len() {
         return Err(format!(
-            "entry {id} protected custom-field count: {} vs {}",
-            protected_a.len(),
-            protected_b.len()
+            "entry {id} custom-field count: {} vs {}",
+            a.custom_fields.len(),
+            b.custom_fields.len()
         ));
     }
-    for cf_a in &protected_a {
-        let cf_b = protected_b
+    for cf_a in &a.custom_fields {
+        let cf_b = b
+            .custom_fields
             .iter()
             .find(|c| c.key == cf_a.key)
-            .ok_or_else(|| format!("entry {id} protected field {:?} missing", cf_a.key))?;
+            .ok_or_else(|| format!("entry {id} custom field {:?} missing", cf_a.key))?;
+        if cf_a.protected != cf_b.protected {
+            return Err(format!(
+                "entry {id} custom field {:?} protected flag: {} vs {}",
+                cf_a.key, cf_a.protected, cf_b.protected
+            ));
+        }
         if cf_a.value != cf_b.value {
             return Err(format!(
-                "entry {id} protected field {:?} value: {:?} vs {:?}",
+                "entry {id} custom field {:?} value: {:?} vs {:?}",
                 cf_a.key, cf_a.value, cf_b.value
             ));
         }

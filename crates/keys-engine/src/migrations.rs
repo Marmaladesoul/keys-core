@@ -31,11 +31,18 @@ pub struct Migration {
 ///
 /// Order MUST match the `version` field. The last entry's `version` is
 /// the binary's max-known schema version.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_schema",
-    sql: include_str!("migrations/0001_initial_schema.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_schema",
+        sql: include_str!("migrations/0001_initial_schema.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "entry_custom_field",
+        sql: include_str!("migrations/0002_entry_custom_field.sql"),
+    },
+];
 
 /// Errors surfaced by the migration runner.
 #[derive(thiserror::Error, Debug)]

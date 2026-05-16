@@ -41,6 +41,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "group",
     "entry",
     "entry_protected",
+    "entry_custom_field",
     "entry_attachment",
     "entry_history",
     "attachment_blob",
@@ -59,6 +60,7 @@ const EXPECTED_INDICES: &[&str] = &[
     "idx_entry_password_strength_bucket",
     "idx_entry_password_fingerprint",
     "idx_entry_attachment_blob_sha256",
+    "idx_entry_custom_field_entry_uuid",
     "idx_entry_tag_tag_id",
 ];
 

@@ -93,6 +93,7 @@ fn clear_vault_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute("DELETE FROM entry_attachment", [])?;
     conn.execute("DELETE FROM entry_history", [])?;
     conn.execute("DELETE FROM entry_protected", [])?;
+    conn.execute("DELETE FROM entry_custom_field", [])?;
     conn.execute("DELETE FROM entry", [])?;
     conn.execute("DELETE FROM tag", [])?;
     conn.execute("DELETE FROM attachment_blob", [])?;
@@ -267,11 +268,10 @@ fn insert_entry(
         params![entry_uuid, PASSWORD_FIELD, wrapped_password],
     )?;
 
-    // Custom fields. Protected ones go into entry_protected; the rest
-    // are deferred for v1 (see ingest module doc — there's no
-    // entry_custom_field table yet, so non-protected custom fields are
-    // dropped on ingest. Phase 2.5 / 2.4 round-trip property tests
-    // will surface this if it's load-bearing for a real vault.)
+    // Custom fields. Protected ones go into entry_protected; non-
+    // protected ones go into entry_custom_field (migration 0002). A
+    // custom field accidentally named "Password" is dropped rather
+    // than colliding with the canonical Password slot.
     for cf in &entry.custom_fields {
         if cf.protected {
             // Avoid colliding with the canonical Password slot if a
@@ -376,28 +376,21 @@ fn insert_attachment(
     Ok(())
 }
 
-/// Non-protected custom fields don't have a dedicated table in
-/// migration 0001. They're rare in typical vaults (`KeePassXC`'s UI
-/// nudges users toward protected for sensitive fields, and the
-/// non-protected slot is mostly used by power users for things like
-/// recovery codes, account IDs, etc.). For v1 ingest we **defer**
-/// them: drop on ingest, surface as a known limitation in the round-
-/// trip property test, and decide in Phase 2.4 / 2.5 whether the
-/// projection path needs them re-materialised. If real vaults exercise
-/// this slot, the fix is a clean migration 0002 adding an
-/// `entry_custom_field(entry_uuid, name, value)` table.
-///
-/// Keeping this as a function (rather than inlining the drop) so the
-/// "defer" decision is searchable, and so re-enabling it with a new
-/// migration is a one-line change here.
-#[allow(clippy::unnecessary_wraps)]
+/// Persist a single non-protected custom field via the
+/// `entry_custom_field` table (migration 0002). Values are stored as
+/// `TEXT` — the KDBX wire format models custom fields as XML strings,
+/// so TEXT is the natural fit and keeps direct-SQL inspection readable.
 fn insert_non_protected_custom_field(
-    _conn: &Connection,
-    _entry_uuid: &str,
-    _field_name: &str,
-    _value: &str,
+    conn: &Connection,
+    entry_uuid: &str,
+    field_name: &str,
+    value: &str,
 ) -> Result<(), rusqlite::Error> {
-    // Deferred. See module doc.
+    conn.execute(
+        "INSERT INTO entry_custom_field (entry_uuid, field_name, value) \
+         VALUES (?1, ?2, ?3)",
+        params![entry_uuid, field_name, value],
+    )?;
     Ok(())
 }
 

@@ -20,13 +20,13 @@
 //! `i64::MAX` saturate to "no limit", which is consistent with the
 //! `all()` semantics.
 //!
-//! ## Non-protected custom fields
+//! ## Custom fields
 //!
-//! Per [`crate::ingest`] module doc, v1 ingest **drops** non-protected
-//! custom fields (there's no `entry_custom_field` table yet). So when
-//! we build [`EntryFull::custom_fields`], every entry returned is
-//! `is_protected: true`. This will change once migration 0002 lands
-//! the non-protected slot table.
+//! [`EntryFull::custom_fields`] surfaces both flavours: protected slots
+//! (from `entry_protected`, with `is_protected = true`) and
+//! non-protected slots (from `entry_custom_field`, migration 0002,
+//! with `is_protected = false`). The canonical `Password` slot is
+//! filtered out — callers fetch that via `reveal_password`.
 //!
 //! [`Engine`]: crate::Engine
 //! [`Pagination::all()`]: crate::Pagination::all
@@ -403,24 +403,34 @@ fn load_attachments_for(
     Ok(rows)
 }
 
-/// Load custom-field metadata. Only protected slots are persisted in
-/// v1 (see module doc), so every returned `CustomFieldRef` has
-/// `is_protected: true`. We filter out the canonical `Password` slot
-/// since the model exposes that separately via `reveal_password`.
+/// Load custom-field metadata. Returns the union of:
+///
+/// * Protected slots from `entry_protected` (excluding the canonical
+///   `Password` row, which is exposed separately via
+///   `reveal_password`) with `is_protected = true`.
+/// * Non-protected slots from `entry_custom_field` (migration 0002)
+///   with `is_protected = false`.
+///
+/// Results are sorted by name ascending across both sources. Ingest
+/// puts a given field in exactly one of the two tables, so name
+/// collisions across the two are not expected.
 fn load_custom_fields_for(
     conn: &Connection,
     entry_uuid: &str,
 ) -> Result<Vec<CustomFieldRef>, EngineError> {
     let mut stmt = conn.prepare(
-        "SELECT field_name FROM entry_protected \
+        "SELECT field_name, 1 AS is_protected FROM entry_protected \
          WHERE entry_uuid = ?1 AND field_name != 'Password' \
+         UNION ALL \
+         SELECT field_name, 0 AS is_protected FROM entry_custom_field \
+         WHERE entry_uuid = ?1 \
          ORDER BY field_name",
     )?;
     let rows = stmt
         .query_map(params![entry_uuid], |r| {
             Ok(CustomFieldRef {
                 name: r.get(0)?,
-                is_protected: true,
+                is_protected: r.get::<_, i64>(1)? != 0,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

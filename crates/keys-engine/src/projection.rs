@@ -32,8 +32,10 @@
 //!   projection — entries inside (or under) the recycle-bin group are
 //!   recycled. The column is read for cross-checks in tests but not
 //!   set on the model.
-//! * Non-protected custom fields are not in the v1 schema (see ingest
-//!   module doc); the projection has nothing to do for them.
+//! * Non-protected custom fields live in `entry_custom_field`
+//!   (migration 0002). They project back as
+//!   [`keepass_core::model::CustomField`]s with `protected = false`,
+//!   alongside the protected fields recovered from `entry_protected`.
 
 use std::collections::HashMap;
 
@@ -79,6 +81,7 @@ pub(crate) fn project(
     // 3. Side tables: protected blobs, attachments (joined with blobs),
     //    tags (joined), history snapshots. Batch one query per table.
     let protected = load_protected(conn)?;
+    let non_protected = load_non_protected_custom_fields(conn)?;
     let attachments = load_attachments(conn)?;
     let tags = load_tags(conn)?;
     let history = load_history(conn)?;
@@ -118,6 +121,17 @@ pub(crate) fn project(
                         true,
                     ));
                 }
+            }
+        }
+
+        // Non-protected custom fields (migration 0002).
+        if let Some(rows) = non_protected.get(&entry_uuid) {
+            for (field_name, value) in rows {
+                entry.custom_fields.push(CustomField::new(
+                    field_name.clone(),
+                    value.clone(),
+                    false,
+                ));
             }
         }
 
@@ -401,6 +415,30 @@ fn load_protected(conn: &Connection) -> Result<ProtectedRows, EngineError> {
     for r in rows {
         let (uuid, name, blob) = r?;
         out.entry(uuid).or_default().push((name, blob));
+    }
+    Ok(out)
+}
+
+type NonProtectedCustomFieldRows = HashMap<Uuid, Vec<(String, String)>>;
+
+fn load_non_protected_custom_fields(
+    conn: &Connection,
+) -> Result<NonProtectedCustomFieldRows, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT entry_uuid, field_name, value FROM entry_custom_field \
+         ORDER BY entry_uuid, field_name",
+    )?;
+    let mut out: NonProtectedCustomFieldRows = HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            parse_uuid_col(row, 0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for r in rows {
+        let (uuid, name, value) = r?;
+        out.entry(uuid).or_default().push((name, value));
     }
     Ok(out)
 }

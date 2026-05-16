@@ -110,6 +110,23 @@ entry removes its protected payloads, no orphans.
 The blob format is decided by the field-protector implementation
 (Phase 2.3). Schema treats it as opaque.
 
+### `entry_custom_field`
+
+| column      | type | notes                                |
+|-------------|------|--------------------------------------|
+| entry_uuid  | TEXT | FK to `entry(uuid)` ON DELETE CASCADE |
+| field_name  | TEXT | non-protected slot name              |
+| value       | TEXT | plaintext value                      |
+
+Primary key `(entry_uuid, field_name)`. Holds the **non-protected**
+custom fields KDBX entries can carry — protected ones still live in
+`entry_protected` under their AES-GCM wrap. The two tables are
+mutually exclusive on `(entry_uuid, field_name)`. Landed in migration
+0002.
+
+Index: `idx_entry_custom_field_entry_uuid (entry_uuid)` for the
+"all custom fields for entry X" lookup.
+
 ### `entry_attachment`
 
 | column           | type | notes                                       |
