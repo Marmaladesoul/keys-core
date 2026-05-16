@@ -32,13 +32,16 @@
 //! [`Pagination::all()`]: crate::Pagination::all
 //! [`EntryFull::custom_fields`]: crate::EntryFull::custom_fields
 
+use std::collections::HashMap;
+
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::EngineError;
 use crate::model::{
-    AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, GroupNode, IconRef, Pagination,
-    StrengthBucket,
+    AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, GroupNode, HistoricEntry, IconRef,
+    Pagination, StrengthBucket,
 };
 
 /// SQL fragment listing the columns `EntrySummary` needs, plus the
@@ -322,6 +325,98 @@ pub(crate) fn entry_count(conn: &Connection, group: Option<Uuid>) -> Result<u64,
         conn.query_row("SELECT COUNT(*) FROM entry", [], |r| r.get(0))?
     };
     Ok(u64::try_from(count).unwrap_or(0))
+}
+
+/// Return the historical snapshots of an entry, ordered oldest-first.
+///
+/// `EngineError::NotFound { entity: "entry" }` if the entry itself
+/// doesn't exist; `Ok(vec![])` if it exists but has no history rows.
+pub(crate) fn history(conn: &Connection, uuid: Uuid) -> Result<Vec<HistoricEntry>, EngineError> {
+    let uuid_str = uuid.to_string();
+
+    // Distinguish "entry doesn't exist" from "entry exists but has no
+    // history" — the bare history query can't tell us, and the FFI
+    // surface wants a NotFound for the missing-entry case.
+    let entry_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM entry WHERE uuid = ?1",
+            params![uuid_str],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if !entry_exists {
+        return Err(EngineError::NotFound { entity: "entry" });
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT history_index, snapshot_json FROM entry_history \
+         WHERE entry_uuid = ?1 \
+         ORDER BY history_index ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![uuid_str], |r| {
+            let idx: i64 = r.get(0)?;
+            let json: String = r.get(1)?;
+            Ok((idx, json))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut out: Vec<HistoricEntry> = Vec::with_capacity(rows.len());
+    for (idx, json) in rows {
+        let snap: HistorySnapshotRead = serde_json::from_str(&json)
+            .map_err(|e| EngineError::Reveal(crate::error::RevealError::Json(e)))?;
+        let mut custom_field_names: Vec<String> = snap.custom_fields.into_keys().collect();
+        custom_field_names.sort();
+        out.push(HistoricEntry {
+            history_index: u32::try_from(idx).unwrap_or(u32::MAX),
+            title: snap.title,
+            username: snap.username,
+            url: snap.url,
+            modified_at: snap.modified_at,
+            custom_field_names,
+        });
+    }
+    Ok(out)
+}
+
+/// Fetch the raw bytes of a named attachment on an entry.
+///
+/// `EngineError::NotFound { entity: "attachment" }` if no matching
+/// `entry_attachment` row exists — covers both the missing-entry and
+/// missing-attachment-name cases (callers don't need to distinguish).
+pub(crate) fn attachment_bytes(
+    conn: &Connection,
+    uuid: Uuid,
+    attachment_name: &str,
+) -> Result<Vec<u8>, EngineError> {
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT b.bytes FROM entry_attachment a \
+             JOIN attachment_blob b ON b.sha256 = a.blob_sha256 \
+             WHERE a.entry_uuid = ?1 AND a.attachment_name = ?2",
+            params![uuid.to_string(), attachment_name],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    bytes.ok_or(EngineError::NotFound {
+        entity: "attachment",
+    })
+}
+
+/// Deserialise side of the shape written by
+/// `crate::ingest::HistorySnapshot`. Only the fields surfaced through
+/// [`HistoricEntry`] are pulled out; the protected/wrapped values
+/// stay in the JSON and are only touched by
+/// [`crate::reveal::reveal_history_field`].
+#[derive(Deserialize)]
+struct HistorySnapshotRead {
+    title: String,
+    username: String,
+    url: String,
+    modified_at: i64,
+    #[serde(default)]
+    custom_fields: HashMap<String, serde_json::Value>,
 }
 
 // ────────────────────────── helpers ──────────────────────────

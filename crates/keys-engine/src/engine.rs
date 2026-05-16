@@ -1393,14 +1393,16 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::Sqlite`] for query failure.
+    /// - [`EngineError::NotFound`] (`entity = "attachment"`) if no
+    ///   `entry_attachment` row matches the `(uuid, attachment_name)`
+    ///   pair. Covers both the missing-entry and missing-name cases.
+    /// - [`EngineError::Sqlite`] for query failure.
     pub fn attachment_bytes(
         &self,
         uuid: Uuid,
         attachment_name: &str,
     ) -> Result<Vec<u8>, EngineError> {
-        let _ = (uuid, attachment_name, &self.conn);
-        unimplemented!("task 3.1")
+        crate::reads::attachment_bytes(&self.conn, uuid, attachment_name)
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1789,15 +1791,17 @@ impl Engine {
     /// Return the historical snapshots of an entry.
     ///
     /// Ordered oldest-first (`history_index` ascending). Empty vector
-    /// for entries with no history. Protected field values not included;
-    /// fetch via [`Engine::reveal_history_field`].
+    /// for entries that exist but have no history snapshots. Protected
+    /// field values are not included; fetch via
+    /// [`Engine::reveal_history_field`].
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::Sqlite`] for query failure.
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry
+    ///   with that UUID exists.
+    /// - [`EngineError::Sqlite`] for query failure.
     pub fn history(&self, uuid: Uuid) -> Result<Vec<HistoricEntry>, EngineError> {
-        let _ = (uuid, &self.conn);
-        unimplemented!("task 3.1")
+        crate::reads::history(&self.conn, uuid)
     }
 }
 

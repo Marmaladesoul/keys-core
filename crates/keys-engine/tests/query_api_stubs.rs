@@ -1,11 +1,10 @@
-//! Smoke test that the query API stubs compile end-to-end against a
-//! real opened engine.
+//! Smoke test that the query API compiles end-to-end against a real
+//! opened engine.
 //!
-//! Bodies are `unimplemented!("task X.Y")`, so this test is `#[ignore]`d
-//! — running it confirms the panic message points at the right task.
-//! The value is in the *compile* step: it proves the public surface
-//! lines up against `Engine::open`, the model types, and `Pagination`
-//! the way a frontend will call them.
+//! Originally guarded the `unimplemented!()` stubs from task 1.5; now
+//! that the bodies are real, the file's value is in the *compile*
+//! step: it proves the public surface lines up against `Engine::open`,
+//! the model types, and `Pagination` the way a frontend will call them.
 
 use std::sync::Arc;
 
