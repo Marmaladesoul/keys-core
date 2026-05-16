@@ -179,7 +179,7 @@ fn dt(secs: i64) -> chrono::DateTime<chrono::Utc> {
 fn migration_0003_creates_tables() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine_path = dir.path().join("engine.sqlite");
-    Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector())
+    Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None)
         .expect("engine open")
         .close()
         .expect("close");
@@ -205,7 +205,7 @@ fn migration_0003_creates_tables() {
 
 fn ingested_engine(kdbx: &Kdbx<Unlocked>, engine_path: &Path) -> Engine {
     let mut engine =
-        Engine::open(engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("engine open");
+        Engine::open(engine_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("engine open");
     engine.ingest_from_kdbx(kdbx).expect("ingest");
     engine
 }
@@ -539,8 +539,8 @@ fn save_to_kdbx_without_live_handle_preserves_meta() {
 
     // Reopen the engine (in-memory state = none) and synthesise a
     // fresh empty kdbx whose Meta is default.
-    let mut engine =
-        Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("reopen engine");
+    let mut engine = Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None)
+        .expect("reopen engine");
     let mut fresh_kdbx =
         Kdbx::create_empty_v4_with_protector(&composite(), "blank", Some(protector()))
             .expect("fresh kdbx");
@@ -596,8 +596,8 @@ fn save_to_kdbx_without_live_handle_preserves_meta() {
 fn state_is_active_on_fresh_open() {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine_path = dir.path().join("engine.sqlite");
-    let engine =
-        Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("engine open");
+    let engine = Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None)
+        .expect("engine open");
     assert_eq!(engine.state(), VaultState::Active);
 }
 

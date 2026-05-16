@@ -51,7 +51,7 @@ fn engine_with_empty_vault() -> (Engine, Uuid, tempfile::TempDir) {
     let path = dir.path().join("keys.db");
     let kdbx = fresh_kdbx(protector());
     let root_uuid = kdbx.vault().root.id.0;
-    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector()).expect("open");
+    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     (engine, root_uuid, dir)
 }
@@ -699,7 +699,8 @@ fn recycle_group_moves_under_bin() {
     .expect("mark bin");
     drop(raw);
 
-    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector()).expect("reopen");
+    let mut engine =
+        Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("reopen");
     engine.recycle_group(g).expect("recycle");
     let tree = engine.group_tree().expect("tree");
     let g_node = tree.iter().find(|n| n.uuid == g).expect("g");

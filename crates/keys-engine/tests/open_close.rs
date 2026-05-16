@@ -42,19 +42,19 @@ fn open_creates_new_db_file_and_round_trips() {
     let path = dir.path().join("keys.db");
     let key = FixedKey([0x42; 32]);
 
-    let engine = Engine::open(&path, &key, protector()).expect("open new");
+    let engine = Engine::open(&path, &key, protector(), None).expect("open new");
     engine.close().expect("close");
     assert!(path.exists(), "db file should be created");
 
     // Reopen with the same key. Write something, prove round-trip.
-    let engine = Engine::open(&path, &key, protector()).expect("reopen with same key");
+    let engine = Engine::open(&path, &key, protector(), None).expect("reopen with same key");
     // We can't access the connection directly from outside the crate
     // (and shouldn't — 1.5 lands the migration runner). The sanity
     // query in `open` already proves we decrypted the header. Use
     // another sanity round-trip via close + reopen.
     engine.close().expect("close");
 
-    let engine = Engine::open(&path, &key, protector()).expect("reopen again");
+    let engine = Engine::open(&path, &key, protector(), None).expect("reopen again");
     engine.close().expect("close");
 }
 
@@ -64,13 +64,13 @@ fn open_under_wrong_key_returns_wrong_key_error() {
     let path = dir.path().join("keys.db");
 
     let key_a = FixedKey([0xaa; 32]);
-    Engine::open(&path, &key_a, protector())
+    Engine::open(&path, &key_a, protector(), None)
         .expect("create with key A")
         .close()
         .expect("close A");
 
     let key_b = FixedKey([0xbb; 32]);
-    let err = Engine::open(&path, &key_b, protector()).expect_err("wrong key must fail");
+    let err = Engine::open(&path, &key_b, protector(), None).expect_err("wrong key must fail");
     assert!(
         matches!(err, EngineError::WrongKey),
         "expected WrongKey, got {err:?}",
@@ -84,7 +84,7 @@ fn open_creates_new_db_file_when_missing() {
     assert!(!path.exists());
 
     let engine =
-        Engine::open(&path, &FixedKey([0x11; 32]), protector()).expect("open creates file");
+        Engine::open(&path, &FixedKey([0x11; 32]), protector(), None).expect("open creates file");
     engine.close().expect("close");
     assert!(path.exists());
 }
@@ -95,8 +95,8 @@ fn key_provider_error_is_propagated() {
     let path = dir.path().join("keys.db");
     let provider = FailingKey("keychain locked".into());
 
-    let err =
-        Engine::open(&path, &provider, protector()).expect_err("provider failure must surface");
+    let err = Engine::open(&path, &provider, protector(), None)
+        .expect_err("provider failure must surface");
     match err {
         EngineError::KeyProvider(KeyProviderError::KeyUnavailable(msg)) => {
             assert_eq!(msg, "keychain locked");

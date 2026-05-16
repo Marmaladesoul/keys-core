@@ -79,7 +79,7 @@ fn phase_one_exit_gate_full_lifecycle() {
     let provider = FixedKeyProvider(key_bytes);
 
     // 1. Open fresh — file does not exist yet. Migrations run.
-    let engine = Engine::open(&path, &provider, protector()).expect("open fresh");
+    let engine = Engine::open(&path, &provider, protector(), None).expect("open fresh");
 
     // 2. Sanity-check the schema version got bumped to MIGRATIONS' max.
     //    We can't see inside the engine, so close + peek via raw conn.
@@ -111,7 +111,7 @@ fn phase_one_exit_gate_full_lifecycle() {
     }
 
     // 4. Reopen with the SAME key. Must succeed (no WrongKey).
-    let engine = Engine::open(&path, &provider, protector()).expect("reopen with same key");
+    let engine = Engine::open(&path, &provider, protector(), None).expect("reopen with same key");
     engine.close().expect("close after reopen");
 
     // 5. Final raw peek — confirm the row we wrote survived the
@@ -139,7 +139,7 @@ fn phase_one_exit_gate_full_lifecycle_with_fts() {
     let provider = FixedKeyProvider(key_bytes);
 
     // Fresh open + migrations.
-    Engine::open(&path, &provider, protector())
+    Engine::open(&path, &provider, protector(), None)
         .expect("open fresh")
         .close()
         .expect("close after fresh open");
@@ -167,7 +167,7 @@ fn phase_one_exit_gate_full_lifecycle_with_fts() {
 
     // Reopen the engine, then verify FTS query still finds the entry —
     // proving migrations + triggers stay coherent across close/reopen.
-    Engine::open(&path, &provider, protector())
+    Engine::open(&path, &provider, protector(), None)
         .expect("reopen with same key")
         .close()
         .expect("close after reopen");

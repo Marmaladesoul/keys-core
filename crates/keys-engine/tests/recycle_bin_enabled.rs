@@ -89,8 +89,8 @@ fn ingest_persists_enabled_true_with_no_bin_group() {
     assert!(vault.meta.recycle_bin_uuid.is_none(), "no bin group");
     kdbx.replace_vault(vault);
 
-    let mut engine =
-        Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("engine open");
+    let mut engine = Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None)
+        .expect("engine open");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     engine.close().expect("close");
 
@@ -109,8 +109,8 @@ fn ingest_persists_enabled_false() {
     vault.meta.recycle_bin_enabled = false;
     kdbx.replace_vault(vault);
 
-    let mut engine =
-        Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("engine open");
+    let mut engine = Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None)
+        .expect("engine open");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     engine.close().expect("close");
 
@@ -129,7 +129,7 @@ fn projection_reads_enabled_from_setting() {
     let kdbx = fresh_kdbx("setting-direct");
     {
         let mut engine =
-            Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("open");
+            Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open");
         engine.ingest_from_kdbx(&kdbx).expect("ingest");
         engine.close().expect("close");
     }
@@ -143,7 +143,8 @@ fn projection_reads_enabled_from_setting() {
     .expect("upsert setting");
     drop(conn);
 
-    let engine = Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("reopen");
+    let engine =
+        Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("reopen");
     let vault = engine.project_to_vault().expect("project");
     assert!(
         vault.meta.recycle_bin_enabled,
@@ -161,7 +162,7 @@ fn projection_falls_back_when_setting_missing() {
     let kdbx = fresh_kdbx("legacy-fallback");
     {
         let mut engine =
-            Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("open");
+            Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open");
         engine.ingest_from_kdbx(&kdbx).expect("ingest");
         engine.close().expect("close");
     }
@@ -173,7 +174,8 @@ fn projection_falls_back_when_setting_missing() {
     .expect("delete setting row");
     drop(conn);
 
-    let engine = Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("reopen");
+    let engine =
+        Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("reopen");
     let vault = engine.project_to_vault().expect("project");
     // No bin group exists in this fresh vault, so the fallback says `false`.
     assert!(
@@ -203,8 +205,8 @@ fn round_trip_preserves_enabled_true_with_no_bin_group() {
     assert!(kdbx.vault().meta.recycle_bin_uuid.is_none());
 
     // Ingest -> save -> reopen.
-    let mut engine =
-        Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("engine open");
+    let mut engine = Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None)
+        .expect("engine open");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     let mut kdbx_mut = kdbx;
     engine

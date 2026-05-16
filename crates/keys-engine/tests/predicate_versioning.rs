@@ -60,7 +60,8 @@ struct Fixture {
 fn fresh_engine() -> Fixture {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("vault.sqlcipher");
-    let engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector()).expect("open engine");
+    let engine =
+        Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open engine");
     Fixture { _dir: dir, engine }
 }
 

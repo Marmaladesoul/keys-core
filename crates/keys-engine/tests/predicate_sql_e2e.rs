@@ -52,7 +52,7 @@ fn fresh_kdbx() -> Kdbx<Unlocked> {
 }
 
 fn open_engine(path: &std::path::Path) -> Engine {
-    Engine::open(path, &FixedKey(DB_KEY_BYTES), protector()).expect("open engine")
+    Engine::open(path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open engine")
 }
 
 fn set_modified_at(kdbx: &mut Kdbx<Unlocked>, id: keepass_core::model::EntryId, ms: i64) {

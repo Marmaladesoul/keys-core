@@ -49,7 +49,7 @@ fn fresh_kdbx() -> Kdbx<Unlocked> {
 }
 
 fn open_engine(path: &Path) -> Engine {
-    Engine::open(path, &FixedKey(DB_KEY_BYTES), protector()).expect("open engine")
+    Engine::open(path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open engine")
 }
 
 fn vault_with_both_kinds_of_custom_field() -> (Kdbx<Unlocked>, uuid::Uuid) {

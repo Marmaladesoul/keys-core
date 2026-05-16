@@ -1,6 +1,7 @@
 pub mod engine;
 pub mod error;
 pub mod events;
+pub mod file_watcher;
 pub mod fingerprint;
 pub mod ingest;
 pub mod key_provider;
@@ -23,6 +24,9 @@ pub use error::{EngineError, IngestError, ProjectionError, RevealError};
 pub use events::{
     ChangeEvent, ConflictPayload, DataChangeObserver, EntryDeletionInfo, EntryMove,
     GroupDeletionInfo, GroupMove,
+};
+pub use file_watcher::{
+    FileWatcher, FileWatcherError, FileWatcherEvent, FileWatcherObserver, NotifyFileWatcher,
 };
 pub use fingerprint::fingerprint;
 pub use key_provider::{DbKey, KeyProvider, KeyProviderError};

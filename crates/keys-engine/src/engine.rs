@@ -8,7 +8,7 @@
 //! built-in PBKDF2 key derivation.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use keepass_core::kdbx::{Kdbx, Unlocked};
@@ -22,6 +22,7 @@ use crate::error::EngineError;
 use crate::events::{
     ChangeEvent, DataChangeObserver, EntryDeletionInfo, EntryMove, GroupDeletionInfo, GroupMove,
 };
+use crate::file_watcher::{FileWatcher, FileWatcherEvent, FileWatcherObserver};
 use crate::fingerprint;
 use crate::ingest;
 use crate::key_provider::{DbKey, KeyProvider};
@@ -119,20 +120,13 @@ pub struct Engine {
     /// `Arc<dyn FieldProtector>` because the trait is also held by
     /// the unlocked Kdbx and by future per-thread reveal paths.
     field_protector: Arc<dyn FieldProtector>,
-    /// `(mtime, size)` of the most recent KDBX file written by
-    /// [`Engine::save_to_kdbx`], or `None` if this engine has never
-    /// written one. Consumed in task 2.6 by the watcher integration to
-    /// distinguish our own writes from foreign edits.
-    last_self_write: Option<SelfWriteSignature>,
-    /// Current lifecycle / health state. See [`VaultState`].
-    ///
-    /// In this PR the state machine has a single live transition —
-    /// "opened cleanly → `Active`". The `Disconnected` / `ReadOnly` /
-    /// `Error` variants are part of the forward-design surface so
-    /// downstream code (Phase 4 file watcher, future cloud-storage
-    /// providers) can demote the engine without us having to expand
-    /// the public API later.
-    state: VaultState,
+    /// Shared lifecycle / signature state that the optional
+    /// [`FileWatcher`] observer needs read/write access to from another
+    /// thread. The engine reads through this on every call; the file-
+    /// watcher internal observer (when one is wired) takes the lock to
+    /// flip `state` between `Active` and `Disconnected` and to consume
+    /// the self-write signature.
+    shared: Arc<Mutex<EngineShared>>,
     /// Optional change observer. Phase 4.2/4.3 — set via
     /// [`Engine::set_observer`], cleared via [`Engine::clear_observer`].
     /// When `Some`, mutation methods invoke
@@ -141,6 +135,91 @@ pub struct Engine {
     /// (e.g. push to a channel) — a frontend that wants async dispatch
     /// adapts inside its impl.
     observer: Option<Arc<dyn DataChangeObserver>>,
+    /// Optional file watcher. When `Some`, the engine registers an
+    /// internal [`FileWatcherObserver`] on it during
+    /// [`Engine::open`] that translates [`FileWatcherEvent`]s into
+    /// state transitions (and, from task 4.6 onwards, calls to
+    /// `reconcile_with_disk`). Kept on the struct so its lifetime is
+    /// tied to the engine's — dropping the engine drops the watcher.
+    file_watcher: Option<Arc<dyn FileWatcher>>,
+}
+
+/// Shared engine state that's also written from a non-engine thread
+/// (the file watcher's observer callback). Held inside an
+/// `Arc<Mutex<…>>`, with the engine taking the lock for every read /
+/// write. The lock scope is intentionally narrow — no SQL runs under
+/// the lock, only field shuffling — so contention with the file
+/// watcher's brief writes is negligible.
+#[derive(Debug)]
+struct EngineShared {
+    /// Current lifecycle / health state. See [`VaultState`].
+    state: VaultState,
+    /// `(mtime, size)` of the most recent KDBX file written by
+    /// [`Engine::save_to_kdbx`], or `None` if this engine has never
+    /// written one. Consumed by [`Engine::consume_self_write_signature`]
+    /// and by the internal file-watcher observer to distinguish our own
+    /// writes from foreign edits.
+    last_self_write: Option<SelfWriteSignature>,
+    /// Whether the next observed `ContentChanged` event has fired a
+    /// `reconcile_with_disk` call yet. Reserved — task 4.6 will read
+    /// this from the watcher observer. For now we use a debug counter
+    /// only for testing the suppression logic.
+    pending_reconcile_calls: u64,
+}
+
+/// Internal [`FileWatcherObserver`] installed by [`Engine::open`] when a
+/// `FileWatcher` is supplied. Translates file-watcher events into engine
+/// state transitions and (from task 4.6 onwards) reconcile calls.
+///
+/// Self-write filtering happens here (engine-side filter, per the
+/// 2026-05-16 decision): on `ContentChanged`, we stat the file and
+/// compare against the engine's stored
+/// [`SelfWriteSignature`](crate::SelfWriteSignature). If it matches, the
+/// event is suppressed.
+#[derive(Debug)]
+struct EngineFileWatcherObserver {
+    shared: Arc<Mutex<EngineShared>>,
+}
+
+impl FileWatcherObserver for EngineFileWatcherObserver {
+    fn on_event(&self, event: FileWatcherEvent) {
+        match event {
+            FileWatcherEvent::ContentChanged { mtime, size } => {
+                // Engine-side self-write filter. If the watcher reported
+                // the post-event (mtime, size) and it matches our last
+                // self-write signature, this `ContentChanged` is our
+                // own atomic rename — suppress and consume the
+                // signature. Cloud-provider watchers that can't observe
+                // filesystem metadata pass `None`/`None`; in that case
+                // we always proceed (no self-write can have happened on
+                // a cloud-managed file from our process anyway).
+                let mut guard = self.shared.lock().unwrap();
+                if let (Some(mt), Some(sz), Some(sig)) = (mtime, size, guard.last_self_write) {
+                    if mt == sig.mtime && sz == sig.size {
+                        guard.last_self_write = None;
+                        return;
+                    }
+                }
+                // TODO 4.6: call reconcile_with_disk()
+                guard.pending_reconcile_calls += 1;
+            }
+            FileWatcherEvent::Unavailable { reason } => {
+                let mut guard = self.shared.lock().unwrap();
+                guard.state = VaultState::Disconnected {
+                    reason: DisconnectReason::FileUnreadable(reason),
+                };
+            }
+            FileWatcherEvent::Available => {
+                let mut guard = self.shared.lock().unwrap();
+                guard.state = VaultState::Active;
+            }
+            FileWatcherEvent::ConflictMarker { .. } => {
+                // Reserved for future cloud-provider impls. No-op for
+                // now — task 4.6's reconcile path will surface this via
+                // a dedicated ChangeEvent variant.
+            }
+        }
+    }
 }
 
 impl Engine {
@@ -165,6 +244,7 @@ impl Engine {
         path: &Path,
         key_provider: &dyn KeyProvider,
         field_protector: Arc<dyn FieldProtector>,
+        file_watcher: Option<Arc<dyn FileWatcher>>,
     ) -> Result<Self, EngineError> {
         let key = key_provider.acquire_db_key()?;
 
@@ -199,13 +279,30 @@ impl Engine {
 
         let fingerprint_key = ensure_fingerprint_key(&mut conn)?;
 
+        let shared = Arc::new(Mutex::new(EngineShared {
+            state: VaultState::Active,
+            last_self_write: None,
+            pending_reconcile_calls: 0,
+        }));
+
+        // If a file watcher was supplied, register the engine's internal
+        // observer on it now. The observer carries an `Arc` clone of
+        // `shared`, so subsequent state transitions land on this engine's
+        // state machine.
+        if let Some(watcher) = file_watcher.as_ref() {
+            let observer = Arc::new(EngineFileWatcherObserver {
+                shared: Arc::clone(&shared),
+            });
+            watcher.set_observer(Some(observer));
+        }
+
         let engine = Self {
             conn,
             fingerprint_key,
             field_protector,
-            last_self_write: None,
-            state: VaultState::Active,
+            shared,
             observer: None,
+            file_watcher,
         };
         // Note: `VaultUnlocked` is *not* emitted here — no observer is
         // wired yet. Callers that want the event should set an observer
@@ -347,9 +444,16 @@ impl Engine {
 
     /// The `(mtime, size)` of the most recent KDBX file this engine
     /// wrote, or `None` if no save has happened yet on this handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine's internal shared-state `Mutex` is poisoned
+    /// — i.e. another thread (the file-watcher observer callback)
+    /// previously panicked while holding the lock. In normal use this
+    /// cannot happen.
     #[must_use]
     pub fn last_self_write(&self) -> Option<SelfWriteSignature> {
-        self.last_self_write
+        self.shared.lock().unwrap().last_self_write
     }
 
     /// Current lifecycle / health state of this engine.
@@ -360,15 +464,38 @@ impl Engine {
     /// forward-design surface and start being driven from Phase 4
     /// onwards (file-watcher events, explicit lock, unrecoverable
     /// errors).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine's internal shared-state `Mutex` is poisoned
+    /// — see [`Engine::last_self_write`] for the same caveat.
     #[must_use]
     pub fn state(&self) -> VaultState {
-        self.state.clone()
+        self.shared.lock().unwrap().state.clone()
+    }
+
+    /// Borrow the [`FileWatcher`] this engine was opened with, if any.
+    /// Test-only accessor; useful for asserting observer wiring and for
+    /// driving synthetic events from a test-side watcher implementation.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn file_watcher(&self) -> Option<&Arc<dyn FileWatcher>> {
+        self.file_watcher.as_ref()
+    }
+
+    /// Test-only: snapshot of how many `ContentChanged` events made it
+    /// past self-write filtering. Will be replaced by a real
+    /// `reconcile_with_disk` call in task 4.6.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_reconcile_calls_for_test(&self) -> u64 {
+        self.shared.lock().unwrap().pending_reconcile_calls
     }
 
     /// Crate-internal setter used by [`crate::save::save`] to record
     /// the signature after a successful atomic write.
     pub(crate) fn set_last_self_write(&mut self, signature: SelfWriteSignature) {
-        self.last_self_write = Some(signature);
+        self.shared.lock().unwrap().last_self_write = Some(signature);
     }
 
     /// The raw KDBX bytes of the most recent
@@ -446,6 +573,11 @@ impl Engine {
     /// timer to bound the race window; the Rust side leaves TTL
     /// (if needed) to the caller, since the engine has no async
     /// runtime to schedule the clear on.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine's internal shared-state `Mutex` is poisoned
+    /// — see [`Engine::last_self_write`] for the same caveat.
     pub fn consume_self_write_signature(
         &mut self,
         observed_mtime: SystemTime,
@@ -455,8 +587,9 @@ impl Engine {
             mtime: observed_mtime,
             size: observed_size,
         };
-        if self.last_self_write == Some(expected) {
-            self.last_self_write = None;
+        let mut guard = self.shared.lock().unwrap();
+        if guard.last_self_write == Some(expected) {
+            guard.last_self_write = None;
             true
         } else {
             false

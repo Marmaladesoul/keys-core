@@ -275,8 +275,8 @@ fn assert_kdbx_round_trips(kdbx: Kdbx<Unlocked>, label: &str) {
         .expect("source vault unwrap");
 
     // 2. Open the engine.
-    let mut engine =
-        Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("engine open");
+    let mut engine = Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None)
+        .expect("engine open");
 
     // 3. Ingest.
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
@@ -936,8 +936,8 @@ fn round_trip_keepass_core_fixture() {
         .vault_with_unwrapped_protected()
         .expect("source vault unwrap");
 
-    let mut engine =
-        Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector()).expect("engine open");
+    let mut engine = Engine::open(&engine_path, &FixedKey(DB_KEY_BYTES), protector(), None)
+        .expect("engine open");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
 
     let mut kdbx = kdbx;

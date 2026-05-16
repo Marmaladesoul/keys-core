@@ -232,7 +232,7 @@ fn engine_open_applies_migrations() {
     let path = dir.path().join("keys.db");
     let key = FixedKey([0x33; 32]);
 
-    let engine = Engine::open(&path, &key, protector()).expect("open fresh");
+    let engine = Engine::open(&path, &key, protector(), None).expect("open fresh");
     engine.close().expect("close");
 
     // Reopen and verify the schema is present via a direct rusqlite
@@ -267,15 +267,15 @@ fn engine_open_idempotent_on_existing() {
     let path = dir.path().join("keys.db");
     let key = FixedKey([0x77; 32]);
 
-    Engine::open(&path, &key, protector())
+    Engine::open(&path, &key, protector(), None)
         .expect("first")
         .close()
         .unwrap();
-    Engine::open(&path, &key, protector())
+    Engine::open(&path, &key, protector(), None)
         .expect("second")
         .close()
         .unwrap();
-    Engine::open(&path, &key, protector())
+    Engine::open(&path, &key, protector(), None)
         .expect("third")
         .close()
         .unwrap();

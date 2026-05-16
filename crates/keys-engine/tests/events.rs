@@ -50,7 +50,7 @@ fn engine_with_empty_vault() -> (Engine, Uuid, tempfile::TempDir) {
     let path = dir.path().join("keys.db");
     let kdbx = fresh_kdbx(protector());
     let root_uuid = kdbx.vault().root.id.0;
-    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector()).expect("open");
+    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     (engine, root_uuid, dir)
 }
@@ -374,7 +374,8 @@ fn save_to_kdbx_emits_save_completed() {
     let db_path = dir.path().join("keys.db");
     let kdbx_path = dir.path().join("vault.kdbx");
     let mut kdbx = fresh_kdbx(protector());
-    let mut engine = Engine::open(&db_path, &FixedKey(DB_KEY_BYTES), protector()).expect("open");
+    let mut engine =
+        Engine::open(&db_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     let observer = install_observer(&mut engine);
     engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save");
@@ -388,7 +389,7 @@ fn ingest_from_kdbx_emits_bulk_events() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.db");
     let kdbx = build_bulk_kdbx(/* groups */ 5, /* entries */ 10);
-    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector()).expect("open");
+    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open");
     let observer = install_observer(&mut engine);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     let events = observer.snapshot();
@@ -458,7 +459,7 @@ fn emit_happens_after_commit() {
     let path = dir.path().join("keys.db");
     let kdbx = fresh_kdbx(protector());
     let root = kdbx.vault().root.id.0;
-    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector()).expect("open");
+    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
 
     let observer = Arc::new(VerifyObserver {
@@ -493,7 +494,7 @@ fn vault_with_recycle_bin() -> (Engine, Uuid, tempfile::TempDir) {
     vault.meta.recycle_bin_enabled = true;
     let root_uuid = vault.root.id.0;
     kdbx.replace_vault(vault);
-    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector()).expect("open");
+    let mut engine = Engine::open(&path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     (engine, root_uuid, dir)
 }

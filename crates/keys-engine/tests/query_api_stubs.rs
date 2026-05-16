@@ -44,7 +44,7 @@ fn list_entries_on_fresh_engine_returns_empty() {
     let path = dir.path().join("keys.db");
     let key = FixedKey([0x42; 32]);
 
-    let engine = Engine::open(&path, &key, protector()).expect("open");
+    let engine = Engine::open(&path, &key, protector(), None).expect("open");
 
     let rows = engine
         .list_entries(None, Pagination::all())

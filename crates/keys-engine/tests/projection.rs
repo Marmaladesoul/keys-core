@@ -48,7 +48,7 @@ fn fresh_kdbx(protector: Arc<dyn FieldProtector>) -> Kdbx<Unlocked> {
 }
 
 fn open_engine(path: &std::path::Path) -> Engine {
-    Engine::open(path, &FixedKey(DB_KEY_BYTES), protector()).expect("open engine")
+    Engine::open(path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open engine")
 }
 
 /// Round-trip `kdbx → ingest → project` and return the projected

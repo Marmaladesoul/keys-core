@@ -71,7 +71,7 @@ fn first_open_generates_fingerprint_key() {
     let path = dir.path().join("keys.db");
     let key_bytes = [0x11; 32];
 
-    Engine::open(&path, &FixedKey(key_bytes), protector())
+    Engine::open(&path, &FixedKey(key_bytes), protector(), None)
         .expect("open")
         .close()
         .expect("close");
@@ -91,7 +91,7 @@ fn fingerprint_key_persists_across_reopen() {
     let path = dir.path().join("keys.db");
     let key_bytes = [0x22; 32];
 
-    Engine::open(&path, &FixedKey(key_bytes), protector())
+    Engine::open(&path, &FixedKey(key_bytes), protector(), None)
         .expect("first open")
         .close()
         .expect("close");
@@ -101,7 +101,7 @@ fn fingerprint_key_persists_across_reopen() {
         read_fingerprint_key_row(&raw)
     };
 
-    Engine::open(&path, &FixedKey(key_bytes), protector())
+    Engine::open(&path, &FixedKey(key_bytes), protector(), None)
         .expect("reopen")
         .close()
         .expect("close");
@@ -121,7 +121,7 @@ fn fingerprint_key_persists_across_reopen() {
 fn fingerprint_is_deterministic_within_session() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.db");
-    let engine = Engine::open(&path, &FixedKey([0x33; 32]), protector()).expect("open");
+    let engine = Engine::open(&path, &FixedKey([0x33; 32]), protector(), None).expect("open");
 
     let a = engine.fingerprint(b"hunter2");
     let b = engine.fingerprint(b"hunter2");
@@ -136,14 +136,15 @@ fn fingerprint_is_stable_across_reopen() {
     let key_bytes = [0x44; 32];
 
     let first = {
-        let engine = Engine::open(&path, &FixedKey(key_bytes), protector()).expect("first open");
+        let engine =
+            Engine::open(&path, &FixedKey(key_bytes), protector(), None).expect("first open");
         let fp = engine.fingerprint(b"correct horse battery staple");
         engine.close().expect("close");
         fp
     };
 
     let second = {
-        let engine = Engine::open(&path, &FixedKey(key_bytes), protector()).expect("reopen");
+        let engine = Engine::open(&path, &FixedKey(key_bytes), protector(), None).expect("reopen");
         let fp = engine.fingerprint(b"correct horse battery staple");
         engine.close().expect("close");
         fp
@@ -156,7 +157,7 @@ fn fingerprint_is_stable_across_reopen() {
 fn fingerprint_differs_for_different_plaintexts() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.db");
-    let engine = Engine::open(&path, &FixedKey([0x55; 32]), protector()).expect("open");
+    let engine = Engine::open(&path, &FixedKey([0x55; 32]), protector(), None).expect("open");
 
     let a = engine.fingerprint(b"alpha");
     let b = engine.fingerprint(b"beta");
@@ -174,8 +175,8 @@ fn fingerprint_differs_across_different_vaults() {
     // Distinct SQLCipher keys for the two vaults — the fingerprint
     // keys are still independent regardless, but using different DB
     // keys keeps this test honest about the "different vault" framing.
-    let engine_a = Engine::open(&path_a, &FixedKey([0x66; 32]), protector()).expect("open a");
-    let engine_b = Engine::open(&path_b, &FixedKey([0x77; 32]), protector()).expect("open b");
+    let engine_a = Engine::open(&path_a, &FixedKey([0x66; 32]), protector(), None).expect("open a");
+    let engine_b = Engine::open(&path_b, &FixedKey([0x77; 32]), protector(), None).expect("open b");
 
     let fp_a = engine_a.fingerprint(b"x");
     let fp_b = engine_b.fingerprint(b"x");

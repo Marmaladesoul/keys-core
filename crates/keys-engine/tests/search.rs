@@ -46,7 +46,7 @@ fn fresh_kdbx() -> Kdbx<Unlocked> {
 }
 
 fn open_engine(path: &std::path::Path) -> Engine {
-    Engine::open(path, &FixedKey(DB_KEY_BYTES), protector()).expect("open engine")
+    Engine::open(path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open engine")
 }
 
 fn engine_with<F>(setup: F) -> (Engine, tempfile::TempDir)

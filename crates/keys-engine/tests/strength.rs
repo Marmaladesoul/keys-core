@@ -38,7 +38,7 @@ fn protector() -> Arc<dyn FieldProtector> {
 fn engine_strength_method_matches_module_strength() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.db");
-    let engine = Engine::open(&path, &FixedKey([0x88; 32]), protector()).expect("open");
+    let engine = Engine::open(&path, &FixedKey([0x88; 32]), protector(), None).expect("open");
 
     for input in [
         "",

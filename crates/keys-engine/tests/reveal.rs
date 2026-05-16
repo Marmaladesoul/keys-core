@@ -78,11 +78,11 @@ fn fresh_kdbx() -> Kdbx<Unlocked> {
 }
 
 fn open_engine(path: &std::path::Path) -> Engine {
-    Engine::open(path, &FixedKey(DB_KEY_BYTES), protector()).expect("open engine")
+    Engine::open(path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open engine")
 }
 
 fn open_engine_with(path: &std::path::Path, p: Arc<dyn FieldProtector>) -> Engine {
-    Engine::open(path, &FixedKey(DB_KEY_BYTES), p).expect("open engine")
+    Engine::open(path, &FixedKey(DB_KEY_BYTES), p, None).expect("open engine")
 }
 
 fn assert_not_found(err: &EngineError, expected_entity: &str) {

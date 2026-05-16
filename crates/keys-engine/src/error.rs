@@ -142,6 +142,12 @@ pub enum EngineError {
     /// itself, or one of its descendants).
     #[error("group move would create a cycle")]
     CycleDetected,
+
+    /// A [`FileWatcher`](crate::FileWatcher) failed to initialise or run.
+    /// Only produced on the explicit `NotifyFileWatcher::new` path; the
+    /// engine itself never instantiates a watcher.
+    #[error("file watcher error: {0}")]
+    FileWatcher(#[from] crate::file_watcher::FileWatcherError),
 }
 
 /// Errors surfaced specifically by [`crate::Engine::project_to_vault`].
