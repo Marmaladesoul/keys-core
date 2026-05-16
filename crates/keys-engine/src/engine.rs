@@ -154,6 +154,18 @@ pub struct Engine {
     /// path (and future async resolution flows) can mutate it
     /// without taking the whole engine lock.
     pending_conflicts: Arc<Mutex<HashMap<i64, ConflictPayload>>>,
+    /// Sibling stash of [`PendingConflictContext`] entries keyed by
+    /// the same id. Holds the merge outcome, both pre-merge vaults,
+    /// the already-unlocked disk [`Kdbx`], and the disk bytes —
+    /// everything `apply_conflict_resolution` (task 4.7) needs to
+    /// drive `keepass_merge::apply_merge` and re-ingest without
+    /// re-running the merge or re-asking the caller for the
+    /// composite key. Kept on a separate stash from
+    /// [`Self::pending_conflicts`] because the context contains
+    /// non-`Clone` types ([`Kdbx<Unlocked>`]) that the public payload
+    /// (cloneable, FFI-friendly) deliberately doesn't.
+    pending_conflict_contexts:
+        Arc<Mutex<HashMap<i64, crate::conflict_resolution::PendingConflictContext>>>,
 }
 
 /// Optional callback the frontend installs so the engine's
@@ -356,6 +368,7 @@ impl Engine {
             observer: None,
             file_watcher,
             pending_conflicts: Arc::new(Mutex::new(HashMap::new())),
+            pending_conflict_contexts: Arc::new(Mutex::new(HashMap::new())),
         };
         // Note: `VaultUnlocked` is *not* emitted here — no observer is
         // wired yet. Callers that want the event should set an observer
@@ -703,6 +716,71 @@ impl Engine {
             .lock()
             .unwrap()
             .insert(payload.id, payload);
+    }
+
+    /// Crate-internal: stash the additional context
+    /// [`Engine::apply_conflict_resolution`] needs alongside the
+    /// public [`ConflictPayload`].
+    pub(crate) fn stash_conflict_context(
+        &self,
+        ctx: crate::conflict_resolution::PendingConflictContext,
+    ) {
+        self.pending_conflict_contexts
+            .lock()
+            .unwrap()
+            .insert(ctx.payload.id, ctx);
+    }
+
+    /// Crate-internal: consume the stashed
+    /// [`PendingConflictContext`](crate::conflict_resolution::PendingConflictContext)
+    /// for `id`, returning `None` if no such id is stashed.
+    pub(crate) fn take_pending_conflict_context(
+        &self,
+        id: i64,
+    ) -> Option<crate::conflict_resolution::PendingConflictContext> {
+        self.pending_conflict_contexts.lock().unwrap().remove(&id)
+    }
+
+    /// Apply a user-resolved [`keepass_merge::Resolution`] to a
+    /// previously-stashed conflict.
+    ///
+    /// `id` is the synthetic id from the
+    /// [`crate::events::ChangeEvent::ConflictDetected`] event (and
+    /// the matching [`ConflictPayload::id`] field) that surfaced the
+    /// conflict via [`Engine::reconcile_with_disk`]. `resolution`
+    /// carries the user's per-field, per-attachment, per-icon and
+    /// delete-vs-edit decisions. See the [`keepass_merge::Resolution`]
+    /// docs for the validation contract.
+    ///
+    /// On success the resolved vault has been applied to `SQLite`
+    /// inside a single transaction, the common ancestor has been
+    /// refreshed to the disk bytes the original reconcile observed,
+    /// and a [`crate::events::ChangeEvent::ExternalChangeMerged`]
+    /// event has fired (with an empty conflict residue, since
+    /// resolution clears the stash).
+    ///
+    /// The stash is consumed by this call: a second call with the
+    /// same `id` returns [`EngineError::NotFound`]. A retry needs a
+    /// fresh `reconcile_with_disk` because the caller's mental model
+    /// of the conflict shape may be stale by then.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] if no conflict is stashed under
+    ///   `id` (typo, already-consumed, or evicted by engine drop).
+    /// - [`EngineError::ResolutionMismatch`] if the resolution
+    ///   doesn't cover the stashed conflict's buckets — `keepass-
+    ///   merge`'s read-only validation pass fired before any mutation.
+    /// - [`EngineError::Ingest`] / [`EngineError::Sqlite`] for
+    ///   apply-step failures; `SQLite` rolls back and the engine
+    ///   state is unchanged. The stash is still consumed in this
+    ///   case — see the type-level docs.
+    pub fn apply_conflict_resolution(
+        &mut self,
+        id: i64,
+        resolution: &keepass_merge::Resolution,
+    ) -> Result<(), EngineError> {
+        crate::conflict_resolution::apply_conflict_resolution(self, id, resolution)
     }
 
     /// Crate-internal: re-ingest a merged [`Kdbx`] into `SQLite`.

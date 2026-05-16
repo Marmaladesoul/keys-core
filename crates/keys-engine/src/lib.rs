@@ -1,3 +1,4 @@
+pub mod conflict_resolution;
 pub mod engine;
 pub mod error;
 pub mod events;
@@ -45,5 +46,12 @@ pub use predicate_builtin::{
 };
 pub use predicate_sql::{CompileError, CompiledPredicate, compile as compile_predicate};
 pub use reconcile::{MergeResult, MergeStats};
+// Re-export the keepass-merge resolution surface as the engine's
+// canonical "conflict resolution" carrier. Phase 4 task 4.7 mirrors
+// `keepass-merge`'s shape verbatim — wrapping it would be a layer of
+// noise without adding any meaning.
+pub use keepass_merge::{
+    AttachmentChoice, ConflictSide, DeleteEditChoice, Resolution as ConflictResolution,
+};
 pub use save::SelfWriteSignature;
 pub use strength::{Strength, strength};

@@ -153,6 +153,14 @@ pub(crate) fn reconcile_with_disk(
             delete_edit_conflicts: outcome.delete_edit_conflicts.clone(),
         };
         engine.stash_conflict_payload(payload.clone());
+        engine.stash_conflict_context(crate::conflict_resolution::PendingConflictContext {
+            payload: payload.clone(),
+            outcome,
+            local_vault,
+            remote_vault,
+            disk_kdbx,
+            disk_bytes,
+        });
         engine.emit(ChangeEvent::ConflictDetected(payload.clone()));
         return Ok(MergeResult::Conflict(payload));
     }

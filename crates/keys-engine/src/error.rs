@@ -148,6 +148,18 @@ pub enum EngineError {
     /// engine itself never instantiates a watcher.
     #[error("file watcher error: {0}")]
     FileWatcher(#[from] crate::file_watcher::FileWatcherError),
+
+    /// The caller-supplied [`keepass_merge::Resolution`] passed to
+    /// [`crate::Engine::apply_conflict_resolution`] doesn't line up
+    /// with the stashed [`crate::events::ConflictPayload`]: an unknown
+    /// entry, an unknown field, a missing per-entry decision, or a
+    /// `KeepBoth` on an attachment that isn't `BothDiffer`. The exact
+    /// `keepass-merge` validation message is carried verbatim.
+    #[error("resolution does not match stashed conflict: {reason}")]
+    ResolutionMismatch {
+        /// The validation diagnostic from `keepass-merge`.
+        reason: String,
+    },
 }
 
 /// Errors surfaced specifically by [`crate::Engine::project_to_vault`].
