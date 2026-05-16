@@ -11,6 +11,11 @@
 
 mod db_key_provider;
 mod dto;
+mod engine;
+mod engine_error;
+mod engine_file_watcher;
+mod engine_observer;
+mod engine_types;
 mod error;
 mod merge;
 mod observer;
@@ -22,6 +27,20 @@ pub use db_key_provider::{VaultDbKeyProvider, VaultDbKeyProviderError};
 pub use dto::{
     AutoType, AutoTypeAssociation, CustomField, Entry, EntryCreate, EntryPatch, EntrySummary,
     Group, GroupPatch, HistoryRecord, ProtectedField,
+};
+pub use engine::Engine;
+pub use engine_error::EngineError;
+pub use engine_file_watcher::{FileWatcherEvent, VaultFileWatcher, VaultFileWatcherObserver};
+pub use engine_observer::{
+    ChangeEvent, EntryDeletion, EntryMoveInfo, GroupDeletion, GroupMoveInfo,
+    VaultDataChangeObserver,
+};
+pub use engine_types::{
+    AttachmentRef as EngineAttachmentRef, CustomFieldRef as EngineCustomFieldRef,
+    EngineEntrySummary, EntryFull, EntryUpdate as EngineEntryUpdate, GroupNode,
+    GroupUpdate as EngineGroupUpdate, HistoricEntry, IconRef, MergeResult, MergeStats,
+    NewCustomField, NewEntryFields, NewGroupFields, Page, Predicate, SmartFolder, StrengthBucket,
+    VaultState,
 };
 pub use error::VaultError;
 pub use merge::{

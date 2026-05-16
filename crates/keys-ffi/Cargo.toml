@@ -23,7 +23,12 @@ keys-engine = { path = "../keys-engine" }
 # uniffi 0.28, proc-macro path. No build.rs needed — `setup_scaffolding!()`
 # emits everything inline. The Swift bindgen ships as a separate
 # `uniffi-bindgen-swift` binary; see `bindgen/build-swift.sh`.
-uniffi = { version = "0.28" }
+uniffi = { version = "0.28", features = ["tokio"] }
+# Tokio is needed by uniffi's async dispatch (`async_runtime = "tokio"`)
+# for the engine's slow ops (ingest_from_kdbx, save_to_kdbx,
+# reconcile_with_disk). Multi-thread runtime so a Swift caller can keep
+# the UI thread free while a save runs.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 secrecy = "0.10"
 sha2 = "0.10"
 thiserror = "2"
