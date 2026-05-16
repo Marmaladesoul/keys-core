@@ -23,7 +23,8 @@ use crate::fingerprint;
 use crate::ingest;
 use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
-use crate::model::{EntryFull, EntrySummary, GroupNode, HistoricEntry, Pagination};
+use crate::model::{EntryFull, EntrySummary, GroupNode, HistoricEntry, Pagination, SmartFolder};
+use crate::predicate::Predicate;
 use crate::projection;
 use crate::save::{self, SelfWriteSignature};
 use crate::strength::{self, Strength};
@@ -475,6 +476,96 @@ impl Engine {
     pub fn smart_folder_count(&self, folder_id: i64) -> Result<u64, EngineError> {
         let _ = (folder_id, &self.conn);
         unimplemented!("task 3.8")
+    }
+
+    /// List every smart folder, ordered by row id ascending (i.e.
+    /// insertion order).
+    ///
+    /// Each row's `predicate_json` column is deserialised; an
+    /// unknown discriminator in the stored JSON surfaces as
+    /// [`Predicate::Unknown`] in the returned
+    /// [`SmartFolder::predicate`], and the
+    /// [`SmartFolder::evaluable`] flag mirrors what was written to
+    /// the column (which itself mirrors
+    /// [`Predicate::is_evaluable`](crate::predicate::Predicate::is_evaluable)
+    /// at write time).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure, or a
+    /// `FromSqlConversionFailure`-flavoured variant if a row's JSON
+    /// is malformed for a known predicate variant.
+    pub fn list_smart_folders(&self) -> Result<Vec<SmartFolder>, EngineError> {
+        crate::smart_folder::list_all(&self.conn)
+    }
+
+    /// Fetch a single smart folder by id.
+    ///
+    /// Returns `Ok(None)` if no row with the given id exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure or malformed
+    /// stored predicate JSON.
+    pub fn smart_folder(&self, id: i64) -> Result<Option<SmartFolder>, EngineError> {
+        crate::smart_folder::get_one(&self.conn, id)
+    }
+
+    /// Create a new smart folder; return the assigned row id.
+    ///
+    /// The folder's `evaluable` column is computed from
+    /// [`Predicate::is_evaluable`] at write time — passing a tree
+    /// containing [`Predicate::Unknown`] is legal but the resulting
+    /// row will have `evaluable = false`
+    /// and the upcoming evaluation path (task 3.8) will refuse to
+    /// run it.
+    ///
+    /// `created_at` and `modified_at` are both set to the current
+    /// wall-clock time in ms since the Unix epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on `INSERT` failure or
+    /// predicate JSON serialisation failure (only happens for
+    /// non-finite `EntropyBelow.bits`).
+    pub fn create_smart_folder(
+        &mut self,
+        name: &str,
+        predicate: &Predicate,
+    ) -> Result<i64, EngineError> {
+        crate::smart_folder::create(&mut self.conn, name, predicate)
+    }
+
+    /// Update an existing smart folder's name and predicate.
+    ///
+    /// Rewrites `name`, `predicate_json`, the derived `evaluable`
+    /// flag, and `modified_at`. The `version` and `created_at`
+    /// columns are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "smart_folder"`) if no
+    ///   row with the given id exists.
+    /// - [`EngineError::Sqlite`] on `UPDATE` failure or predicate
+    ///   JSON serialisation failure.
+    pub fn update_smart_folder(
+        &mut self,
+        id: i64,
+        name: &str,
+        predicate: &Predicate,
+    ) -> Result<(), EngineError> {
+        crate::smart_folder::update(&mut self.conn, id, name, predicate)
+    }
+
+    /// Delete a smart folder by id.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "smart_folder"`) if no
+    ///   row with the given id exists.
+    /// - [`EngineError::Sqlite`] on `DELETE` failure.
+    pub fn delete_smart_folder(&mut self, id: i64) -> Result<(), EngineError> {
+        crate::smart_folder::delete(&mut self.conn, id)
     }
 
     /// Reveal the cleartext password for an entry.

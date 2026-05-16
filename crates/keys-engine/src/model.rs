@@ -244,6 +244,46 @@ pub struct HistoricEntry {
     pub custom_field_names: Vec<String>,
 }
 
+/// A persisted smart-folder row from the `smart_folder` table.
+///
+/// Smart folders pair a human-readable [`name`](Self::name) with a
+/// [`Predicate`](crate::predicate::Predicate) tree that describes which
+/// entries the folder should match. The
+/// [`evaluable`](Self::evaluable) flag is precomputed at write time
+/// from
+/// [`Predicate::is_evaluable`](crate::predicate::Predicate::is_evaluable)
+/// so the sidebar UI doesn't have to walk the tree to know whether
+/// running the folder is going to succeed. `version` is the rule-4
+/// emergency escape hatch from the predicate-versioning rules;
+/// defaults to `1` for every folder this binary writes.
+///
+/// Timestamps are `i64` milliseconds since the Unix epoch (UTC), per
+/// the schema doc's "timestamp convention" section.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SmartFolder {
+    /// Row id assigned by `SQLite` on insert.
+    pub id: i64,
+    /// Display name as the user authored it.
+    pub name: String,
+    /// Decoded predicate tree.
+    pub predicate: crate::predicate::Predicate,
+    /// Predicate document version — matches the `version` column on
+    /// the row. New folders are version `1`; rule-4 future
+    /// restructures bump this.
+    pub version: u32,
+    /// Whether this binary can evaluate the folder. Mirrors
+    /// `predicate.is_evaluable()` at write time; persisted to avoid
+    /// re-walking the tree at list time. A `false` value here
+    /// implies the predicate contains at least one
+    /// [`Predicate::Unknown`](crate::predicate::Predicate::Unknown)
+    /// node.
+    pub evaluable: bool,
+    /// Creation timestamp, ms since Unix epoch.
+    pub created_at: i64,
+    /// Last-modified timestamp, ms since Unix epoch.
+    pub modified_at: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,6 +11,7 @@ pub mod projection;
 pub mod reads;
 pub mod reveal;
 pub mod save;
+pub mod smart_folder;
 pub mod strength;
 
 pub use engine::Engine;
@@ -20,7 +21,7 @@ pub use key_provider::{DbKey, KeyProvider, KeyProviderError};
 pub use migrations::MigrationError;
 pub use model::{
     AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, GroupNode, HistoricEntry, IconRef,
-    Pagination, StrengthBucket,
+    Pagination, SmartFolder, StrengthBucket,
 };
 pub use predicate::Predicate;
 pub use save::SelfWriteSignature;
