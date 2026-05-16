@@ -335,7 +335,7 @@ fn insert_entry(
     // (per the decoder doc); we use the slice index as
     // `history_index` directly.
     for (idx, hist) in entry.history.iter().enumerate() {
-        let snapshot = HistorySnapshot::from_entry(hist);
+        let snapshot = HistorySnapshot::from_entry(hist, session_key)?;
         let json = serde_json::to_string(&snapshot)
             .map_err(|e| EngineError::Ingest(IngestError::Json(e)))?;
         conn.execute(
@@ -444,63 +444,97 @@ fn expiry_ms(times: &keepass_core::model::Timestamps) -> Option<i64> {
 
 /// JSON shape stored in `entry_history.snapshot_json`.
 ///
-/// History plaintext is recoverable because we run inside an unwrapped
-/// vault clone for the whole ingest pass. Stored values include
-/// protected-field plaintext, which is acceptable because the
-/// surrounding `SQLite` file is itself `SQLCipher`-encrypted at rest — the
-/// same trust posture as the live `entry_protected` blobs (modulo the
-/// per-row AES-GCM wrap, which Phase 2.5 will revisit if history
-/// reveal needs the same callback discipline as live reveal).
+/// Protected fields (the canonical `password` slot and any custom field
+/// with `protected: true`) are AES-GCM-sealed under the same session
+/// key used for the live `entry_protected.wrapped_blob` rows, then
+/// base64-encoded so the bytes round-trip through `TEXT`. This keeps
+/// history symmetric with live entries — plaintext never appears in
+/// DB-stored JSON. Non-protected custom fields keep their plaintext in
+/// `value`; the `protected` flag tells the reveal/projection side
+/// which interpretation applies.
+///
+/// Wire shape (per snapshot):
+///
+/// ```json
+/// {
+///   "title": "...", "username": "...", "url": "...", "notes": "...",
+///   "password": "<base64(nonce|ct|tag)>",
+///   "tags": [...],
+///   "created_at": ..., "modified_at": ..., "accessed_at": ...,
+///   "expires_at": ...,
+///   "custom_fields": {
+///     "Token":   { "value": "<base64(nonce|ct|tag)>", "protected": true  },
+///     "Website": { "value": "example.com",            "protected": false }
+///   }
+/// }
+/// ```
 #[derive(Serialize)]
 struct HistorySnapshot<'a> {
     title: &'a str,
     username: &'a str,
     url: &'a str,
     notes: &'a str,
-    password: &'a str,
+    /// Base64 of `seal_with_key(session_key, password_plaintext)`.
+    password: String,
     tags: &'a [String],
     created_at: i64,
     modified_at: i64,
     accessed_at: i64,
     expires_at: Option<i64>,
-    custom_fields: HashMap<&'a str, HistoryCustomField<'a>>,
+    custom_fields: HashMap<&'a str, HistoryCustomField>,
 }
 
 #[derive(Serialize)]
-struct HistoryCustomField<'a> {
-    value: &'a str,
+struct HistoryCustomField {
+    /// For `protected = true`, base64 of `seal_with_key(...)`; for
+    /// `protected = false`, the plaintext value.
+    value: String,
     protected: bool,
 }
 
 impl<'a> HistorySnapshot<'a> {
-    fn from_entry(entry: &'a Entry) -> Self {
-        let custom_fields = entry
-            .custom_fields
-            .iter()
-            .map(|cf| {
-                (
-                    cf.key.as_str(),
-                    HistoryCustomField {
-                        value: cf.value.as_str(),
-                        protected: cf.protected,
-                    },
-                )
-            })
-            .collect();
-        Self {
+    fn from_entry(entry: &'a Entry, session_key: &SessionKey) -> Result<Self, EngineError> {
+        let mut custom_fields: HashMap<&'a str, HistoryCustomField> = HashMap::new();
+        for cf in &entry.custom_fields {
+            let value = if cf.protected {
+                let wrapped = seal_with_key(session_key, cf.value.as_bytes())
+                    .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
+                b64_encode(&wrapped)
+            } else {
+                cf.value.clone()
+            };
+            custom_fields.insert(
+                cf.key.as_str(),
+                HistoryCustomField {
+                    value,
+                    protected: cf.protected,
+                },
+            );
+        }
+        let wrapped_password = seal_with_key(session_key, entry.password.as_bytes())
+            .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
+        Ok(Self {
             title: &entry.title,
             username: &entry.username,
             url: &entry.url,
             notes: &entry.notes,
-            password: &entry.password,
+            password: b64_encode(&wrapped_password),
             tags: &entry.tags,
             created_at: dt_to_ms_required(entry.times.creation_time),
             modified_at: dt_to_ms_required(entry.times.last_modification_time),
             accessed_at: dt_to_ms_required(entry.times.last_access_time),
             expires_at: expiry_ms(&entry.times),
             custom_fields,
-        }
+        })
     }
+}
+
+/// Standard base64 with padding — matches what `reveal` and `projection`
+/// pass to the decoder. No URL-safe variant; the bytes live inside a JSON
+/// string, never in a URL.
+fn b64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 #[cfg(test)]

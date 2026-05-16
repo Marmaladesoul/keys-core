@@ -317,8 +317,10 @@ fn reveal_history_field_returns_not_found_for_missing_field_name() {
 #[test]
 fn reveal_uses_freshly_acquired_session_key() {
     // Live-reveal paths must hit `acquire_session_key` exactly once per
-    // call — no caching, no double-fetch. History reveal must NOT call
-    // it at all (it reads plaintext JSON).
+    // call — no caching, no double-fetch. History reveal of a protected
+    // field (password / protected custom field) hits it exactly once
+    // too, now that history JSON wraps protected fields symmetrically
+    // with live entries.
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.db");
     let mut kdbx = fresh_kdbx();
@@ -369,14 +371,15 @@ fn reveal_uses_freshly_acquired_session_key() {
             "reveal_custom_field must acquire exactly one fresh session key"
         );
 
-        // History reveal is plaintext-JSON-backed — no key fetch.
+        // History reveal of the password slot now unwraps under the
+        // session key — exactly one fetch, matching the live path.
         let _ = engine
             .reveal_history_field(id.0, 0, "Password")
             .expect("reveal history");
         assert_eq!(
             counting.calls(),
-            baseline + 2,
-            "reveal_history_field must NOT acquire a session key"
+            baseline + 3,
+            "reveal_history_field (protected) must acquire exactly one fresh session key"
         );
     }
 }

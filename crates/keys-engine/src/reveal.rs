@@ -2,13 +2,14 @@
 //!
 //! Three entry points — `reveal_password`, `reveal_custom_field`,
 //! `reveal_history_field` — each delegated to from the matching
-//! method on [`crate::Engine`]. The first two fetch the wrapped blob
-//! from `entry_protected`, ask the field-protector callback for a
-//! fresh session key, and AES-GCM-open in process. The third — by
-//! design — does **not** unwrap anything: history snapshots are stored
-//! as plaintext JSON inside `entry_history.snapshot_json`, so the
-//! reveal is just a JSON lookup. See the rustdoc on
-//! [`crate::Engine::reveal_history_field`] for the rationale.
+//! method on [`crate::Engine`]. All three fetch wrapped bytes, ask the
+//! field-protector callback for a fresh session key, and AES-GCM-open
+//! in process: `reveal_password` and `reveal_custom_field` read from
+//! `entry_protected.wrapped_blob` directly; `reveal_history_field`
+//! deserialises `entry_history.snapshot_json` and base64-decodes the
+//! wrapped bytes that live inside it. Non-protected history fields
+//! (custom fields with `protected: false`) skip the unwrap and return
+//! the plaintext from the JSON directly.
 //!
 //! ## Session-key discipline
 //!
@@ -70,16 +71,18 @@ pub(crate) fn reveal_custom_field(
 
 /// Reveal a field from a historic snapshot of an entry.
 ///
-/// **Asymmetric with the live-reveal paths** — history snapshots are
-/// stored as plaintext JSON inside `entry_history.snapshot_json`, not
-/// as AES-GCM-wrapped blobs in `entry_protected`. This is by design:
-/// per the ingest module's history-snapshot rationale, the surrounding
-/// `SQLite` file is itself `SQLCipher`-encrypted at rest, which gives
-/// us the same trust posture as the live `entry_protected` blobs —
-/// plus we avoid serialising one wrapped blob per protected field per
-/// historic snapshot. So this method does **not** call
-/// [`FieldProtector::acquire_session_key`]; it deserialises the
-/// snapshot JSON and reads the requested field directly.
+/// **Symmetric with the live-reveal paths**: protected fields inside a
+/// history snapshot (the canonical `password` slot and any custom field
+/// marked `protected: true`) are AES-GCM-sealed under the same session
+/// key used for live `entry_protected.wrapped_blob` rows, then
+/// base64-encoded into the snapshot JSON. This method deserialises the
+/// JSON, base64-decodes the wrapped bytes for the requested field,
+/// acquires a fresh session key via the [`FieldProtector`], and
+/// AES-GCM-opens — exactly the same shape as [`reveal_password`].
+///
+/// Non-protected custom fields (`protected: false`) carry plaintext in
+/// the JSON and are returned without an unwrap; no session key is
+/// acquired in that case.
 ///
 /// `field_name == "Password"` reads `HistorySnapshot.password`; any
 /// other name reads the value out of the `custom_fields` map. Returns
@@ -87,6 +90,7 @@ pub(crate) fn reveal_custom_field(
 /// named field isn't present in it.
 pub(crate) fn reveal_history_field(
     conn: &Connection,
+    protector: &dyn FieldProtector,
     uuid: Uuid,
     history_index: u32,
     field_name: &str,
@@ -109,17 +113,60 @@ pub(crate) fn reveal_history_field(
     let snap: HistorySnapshot =
         serde_json::from_str(&json).map_err(|e| EngineError::Reveal(RevealError::Json(e)))?;
 
-    let value: String = if field_name == PASSWORD_FIELD {
-        snap.password
+    // Decide what to do with the named field before touching the
+    // session-key callback — non-protected fields skip the unwrap.
+    let payload: FieldPayload = if field_name == PASSWORD_FIELD {
+        FieldPayload::Wrapped(snap.password)
     } else if let Some(cf) = snap.custom_fields.get(field_name) {
-        cf.value.clone()
+        if cf.protected {
+            FieldPayload::Wrapped(cf.value.clone())
+        } else {
+            FieldPayload::Plain(cf.value.clone())
+        }
     } else {
         return Err(EngineError::NotFound {
             entity: "history_field",
         });
     };
 
-    Ok(SecretString::from(value))
+    match payload {
+        FieldPayload::Plain(s) => Ok(SecretString::from(s)),
+        FieldPayload::Wrapped(b64) => {
+            let wrapped =
+                b64_decode(&b64).map_err(|e| EngineError::Reveal(RevealError::Unwrap(e)))?;
+            let session_key = protector
+                .acquire_session_key()
+                .map_err(|e| EngineError::Reveal(RevealError::SessionKey(e.to_string())))?;
+            let plaintext = open_with_key(&session_key, &wrapped)
+                .map(Zeroizing::new)
+                .map_err(|e| EngineError::Reveal(RevealError::Unwrap(e.to_string())))?;
+            drop(session_key);
+            let plaintext_str = std::str::from_utf8(&plaintext)
+                .map_err(|e| {
+                    EngineError::Reveal(RevealError::Unwrap(format!("non-utf8 plaintext: {e}")))
+                })?
+                .to_owned();
+            Ok(SecretString::from(plaintext_str))
+        }
+    }
+}
+
+/// Decide tree for what to do with a named field inside a history
+/// snapshot — keeps the session-key acquisition out of the `Plain`
+/// branch and avoids the `items_after_statements` clippy lint.
+enum FieldPayload {
+    Wrapped(String),
+    Plain(String),
+}
+
+/// Decode a standard-base64 string from the snapshot JSON. Wraps
+/// `base64::DecodeError` into a string so the caller can funnel it
+/// through [`RevealError::Unwrap`].
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| format!("base64 decode: {e}"))
 }
 
 fn reveal_protected_field(
@@ -181,4 +228,6 @@ struct HistorySnapshot {
 #[derive(Deserialize)]
 struct HistoryCustomField {
     value: String,
+    #[serde(default)]
+    protected: bool,
 }

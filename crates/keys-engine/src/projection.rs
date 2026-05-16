@@ -18,8 +18,11 @@
 //! * Other `entry_protected` rows become protected
 //!   [`keepass_core::model::CustomField`]s with `protected = true`.
 //! * `entry_history.snapshot_json` is the
-//!   `crate::ingest::HistorySnapshot` shape; we deserialise back into a
-//!   plaintext [`Entry`] used as a history record.
+//!   `crate::ingest::HistorySnapshot` shape; protected fields inside the
+//!   JSON are base64-encoded AES-GCM-sealed bytes (same wire format as
+//!   `entry_protected.wrapped_blob`) and get unwrapped under the session
+//!   key on the way out, producing a plaintext [`Entry`] used as the
+//!   history record.
 //! * Attachments materialise as fresh [`Vault::binaries`] entries — one
 //!   per unique SHA-256, with `Attachment::ref_id` pointing into the
 //!   new pool. The original `Binary::protected` flag is **not**
@@ -43,7 +46,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use keepass_core::model::{
     Attachment, Binary, CustomField, Entry, EntryId, Group, GroupId, Timestamps, Vault,
 };
-use keepass_core::protector::{FieldProtector, open_with_key};
+use keepass_core::protector::{FieldProtector, SessionKey, open_with_key};
 use rusqlite::Connection;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -160,11 +163,17 @@ pub(crate) fn project(
             entry.tags.clone_from(rows);
         }
 
-        // History.
+        // History. Protected snapshot fields (password + protected
+        // custom fields) carry base64-encoded AES-GCM-sealed bytes —
+        // unwrap them under the session key on the way out so the
+        // projected `Entry::history` carries plaintext, the same shape
+        // a fresh-from-KDBX `Vault` would carry.
         if let Some(rows) = history.get(&entry_uuid) {
             // rows is sorted oldest-first by history_index.
             for snap in rows {
-                entry.history.push(snapshot_to_entry(entry_uuid, snap));
+                entry
+                    .history
+                    .push(snapshot_to_entry(entry_uuid, snap, &session_key)?);
             }
         }
 
@@ -564,7 +573,11 @@ struct HistoryCustomField {
     protected: bool,
 }
 
-fn snapshot_to_entry(entry_uuid: Uuid, snap: &HistorySnapshot) -> Entry {
+fn snapshot_to_entry(
+    entry_uuid: Uuid,
+    snap: &HistorySnapshot,
+    session_key: &SessionKey,
+) -> Result<Entry, EngineError> {
     // History snapshots reuse the live entry's uuid in KeePass — they
     // are *prior versions of the same record*, not new records — so
     // we propagate the same UUID into the snapshot Entry.
@@ -573,7 +586,7 @@ fn snapshot_to_entry(entry_uuid: Uuid, snap: &HistorySnapshot) -> Entry {
     e.username.clone_from(&snap.username);
     e.url.clone_from(&snap.url);
     e.notes.clone_from(&snap.notes);
-    e.password.clone_from(&snap.password);
+    e.password = unwrap_b64_field(entry_uuid, "Password", &snap.password, session_key)?;
     e.tags.clone_from(&snap.tags);
     e.times = build_times(
         snap.created_at,
@@ -582,12 +595,46 @@ fn snapshot_to_entry(entry_uuid: Uuid, snap: &HistorySnapshot) -> Entry {
         snap.expires_at,
     );
     for (k, v) in &snap.custom_fields {
+        let plaintext = if v.protected {
+            unwrap_b64_field(entry_uuid, k, &v.value, session_key)?
+        } else {
+            v.value.clone()
+        };
         e.custom_fields
-            .push(CustomField::new(k.clone(), v.value.clone(), v.protected));
+            .push(CustomField::new(k.clone(), plaintext, v.protected));
     }
     // History entries themselves carry no nested history, no
     // attachments — those aren't part of the snapshot JSON.
-    e
+    Ok(e)
+}
+
+/// Base64-decode + AES-GCM-open a wrapped history field. Errors bubble
+/// up as [`ProjectionError::Unwrap`] with enough context to identify the
+/// failing entry + field name.
+fn unwrap_b64_field(
+    entry_uuid: Uuid,
+    field_name: &str,
+    b64: &str,
+    session_key: &SessionKey,
+) -> Result<String, EngineError> {
+    use base64::Engine as _;
+    let wrapped = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| {
+            EngineError::Projection(ProjectionError::Unwrap(format!(
+                "entry {entry_uuid} history field {field_name}: base64 decode: {e}",
+            )))
+        })?;
+    let plaintext = open_with_key(session_key, &wrapped).map_err(|e| {
+        EngineError::Projection(ProjectionError::Unwrap(format!(
+            "entry {entry_uuid} history field {field_name}: {e}",
+        )))
+    })?;
+    String::from_utf8(plaintext).map_err(|e| {
+        EngineError::Projection(ProjectionError::Unwrap(format!(
+            "entry {entry_uuid} history field {field_name}: non-utf8 plaintext: {e}",
+        )))
+    })
 }
 
 // ───────────────────────── helpers ─────────────────────────

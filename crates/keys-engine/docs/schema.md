@@ -151,6 +151,14 @@ Primary key `(entry_uuid, history_index)`. History is rarely read
 (detail-pane "Show history" only) and never queried into; JSON keeps
 schema migrations cheap.
 
+Protected fields inside the JSON — the canonical `password` slot and any
+`custom_fields` entry with `protected: true` — carry base64-encoded
+AES-GCM-sealed bytes (`nonce(12) || ciphertext || tag(16)`), sealed
+under the same session key as `entry_protected.wrapped_blob`. The JSON
+never contains protected plaintext at rest. Non-protected custom fields
+keep their plaintext in `value`; the `protected` boolean disambiguates.
+`reveal_history_field` and projection unwrap on read.
+
 ### `attachment_blob`
 
 | column | type    | notes                                   |

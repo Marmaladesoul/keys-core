@@ -16,7 +16,7 @@ Source of truth for the assertion is the `vault_round_trip_eq` helper in `tests/
 | Protected `CustomField::value` | Same wrap path as `password`, keyed on `field_name`. |
 | `Entry::tags` (as a **set**) | Dedup-and-sort happens on ingest. Order is not preserved; the set is. |
 | Attachment `(name, SHA-256 of bytes)` | Bytes are content-addressed in `attachment_blob`; `ref_id` is **not** stable across a round-trip (the projection assigns fresh ref-ids walking the entry list). |
-| `Entry::history` length + per-snapshot plaintext shape | Snapshots are serialised to JSON in `entry_history.snapshot_json` and deserialised back. The JSON columns reproduce title/username/url/notes/password/tags/custom_fields/timestamps. |
+| `Entry::history` length + per-snapshot revealed shape | Snapshots are serialised to JSON in `entry_history.snapshot_json` and deserialised back. Protected fields (the canonical `password` slot and any `custom_field` with `protected: true`) are AES-GCM-sealed under the session key and base64-encoded *inside* the JSON — same wire format as `entry_protected.wrapped_blob`. Projection unwraps them on the way out, so the reloaded `Entry::history` carries plaintext that matches the source vault. Comparisons run against the revealed plaintext, never the JSON bytes. |
 | `Meta::recycle_bin_uuid` | Persisted via the `is_recycle_bin` column on `group`. |
 | `Meta::recycle_bin_enabled` | Persisted explicitly in the `setting` table under key `meta.recycle_bin_enabled` (1-byte BLOB). Round-trips cleanly even when `recycle_bin_uuid IS NULL`. Legacy DBs without the row fall back to `recycle_bin_uuid.is_some()`. |
 

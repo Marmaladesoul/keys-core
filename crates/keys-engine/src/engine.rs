@@ -736,14 +736,17 @@ impl Engine {
     /// Reveal the cleartext value of a field in a historic snapshot of
     /// an entry.
     ///
-    /// **Asymmetric with the live-reveal paths.** History snapshots
-    /// are stored as plaintext JSON inside `entry_history.snapshot_json`
-    /// (the surrounding `SQLite` file is `SQLCipher`-encrypted at rest,
-    /// which gives the same trust posture as a per-row AES-GCM wrap
-    /// would). This method therefore does **not** call into the
-    /// [`keepass_core::protector::FieldProtector`];
-    /// it deserialises the snapshot JSON and reads the named field
-    /// directly.
+    /// **Symmetric with the live-reveal paths.** Protected fields
+    /// inside a history snapshot (the canonical `password` slot and any
+    /// custom field with `protected: true`) are AES-GCM-sealed under
+    /// the same session key as the live `entry_protected.wrapped_blob`
+    /// rows, then base64-encoded into the snapshot JSON. This method
+    /// deserialises the JSON, base64-decodes the wrapped bytes for the
+    /// requested field, acquires a fresh session key via the
+    /// [`keepass_core::protector::FieldProtector`], and AES-GCM-opens.
+    /// Non-protected custom fields (`protected: false`) skip the unwrap
+    /// and return the plaintext from the JSON directly — no session-key
+    /// fetch in that case.
     ///
     /// `field_name = "Password"` reads the historic password;
     /// any other name reads from the snapshot's `custom_fields` map.
@@ -752,7 +755,8 @@ impl Engine {
     ///
     /// - [`EngineError::NotFound`] (`entity = "history_snapshot"` or
     ///   `"history_field"`) if the snapshot or named field is missing.
-    /// - [`EngineError::Reveal`] wrapping
+    /// - [`EngineError::Reveal`] for session-key acquisition failure,
+    ///   base64-decode failure, or AES-GCM unwrap failure; or wrapping
     ///   [`RevealError::Json`](crate::RevealError::Json) if the
     ///   `snapshot_json` is malformed.
     /// - [`EngineError::Sqlite`] for query failure.
@@ -762,7 +766,13 @@ impl Engine {
         history_index: u32,
         field_name: &str,
     ) -> Result<SecretString, EngineError> {
-        crate::reveal::reveal_history_field(&self.conn, uuid, history_index, field_name)
+        crate::reveal::reveal_history_field(
+            &self.conn,
+            &*self.field_protector,
+            uuid,
+            history_index,
+            field_name,
+        )
     }
 
     /// Fetch the bytes of an entry attachment by attachment name.

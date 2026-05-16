@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 getrandom = { version = "0.2", features = ["std"] }
 hmac = "0.12"
