@@ -22,11 +22,13 @@
 
 use std::time::SystemTime;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::error::EngineError;
-use crate::model::SmartFolder;
+use crate::model::{EntrySummary, Pagination, SmartFolder};
 use crate::predicate::Predicate;
+use crate::predicate_sql::{self, CompileError};
+use crate::reads;
 
 /// SQL fragment naming the columns [`row_to_smart_folder`] expects.
 /// Kept in a constant so `list_all` and `get_one` stay in lock-step.
@@ -145,4 +147,90 @@ fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Convert a [`CompileError`] into the engine-level error type.
+///
+/// [`CompileError::NotEvaluable`] maps to
+/// [`EngineError::NotEvaluable`]. The empty-junction case
+/// ([`CompileError::EmptyAndOr`]) is a producer bug — the predicate
+/// went through `is_evaluable` checks but had an empty `And` / `Or` /
+/// tag list — and we surface it as `NotEvaluable` too rather than
+/// inventing a third variant for an authoring-time mistake the UI
+/// should have caught.
+fn compile_err_to_engine(_err: CompileError) -> EngineError {
+    EngineError::NotEvaluable
+}
+
+/// Evaluate `predicate` against the entry table and return matching
+/// [`EntrySummary`] rows. Ordering and pagination match
+/// [`crate::reads::list_entries`].
+pub(crate) fn entries_matching(
+    conn: &Connection,
+    predicate: &Predicate,
+    page: Pagination,
+) -> Result<Vec<EntrySummary>, EngineError> {
+    let compiled =
+        predicate_sql::compile(predicate, now_millis()).map_err(compile_err_to_engine)?;
+    let (limit, offset) = reads::clamp_page(page);
+
+    let summary_columns = reads::SUMMARY_COLUMNS;
+    let sql = format!(
+        "SELECT {summary_columns} FROM entry WHERE {where_sql} \
+         ORDER BY modified_at DESC, uuid ASC \
+         LIMIT ? OFFSET ?",
+        where_sql = compiled.where_sql,
+    );
+
+    let mut params: Vec<rusqlite::types::Value> = compiled.params;
+    params.push(rusqlite::types::Value::Integer(limit));
+    params.push(rusqlite::types::Value::Integer(offset));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_from_iter(params), reads::row_to_summary)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Evaluate `predicate` and return the count of matching entries.
+pub(crate) fn count_matching(conn: &Connection, predicate: &Predicate) -> Result<u64, EngineError> {
+    let compiled =
+        predicate_sql::compile(predicate, now_millis()).map_err(compile_err_to_engine)?;
+    let sql = format!(
+        "SELECT COUNT(*) FROM entry WHERE {where_sql}",
+        where_sql = compiled.where_sql,
+    );
+    let count: i64 = conn.query_row(&sql, params_from_iter(compiled.params), |r| r.get(0))?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+/// Resolve a smart folder by id and evaluate its predicate.
+///
+/// `NotFound` if the id does not exist; `NotEvaluable` if the folder's
+/// `evaluable` column is `false` (i.e. the persisted predicate
+/// contains a [`Predicate::Unknown`] node).
+pub(crate) fn smart_folder_entries(
+    conn: &Connection,
+    folder_id: i64,
+    page: Pagination,
+) -> Result<Vec<EntrySummary>, EngineError> {
+    let folder = get_one(conn, folder_id)?.ok_or(EngineError::NotFound {
+        entity: "smart_folder",
+    })?;
+    if !folder.evaluable {
+        return Err(EngineError::NotEvaluable);
+    }
+    entries_matching(conn, &folder.predicate, page)
+}
+
+/// Count variant of [`smart_folder_entries`].
+pub(crate) fn smart_folder_count(conn: &Connection, folder_id: i64) -> Result<u64, EngineError> {
+    let folder = get_one(conn, folder_id)?.ok_or(EngineError::NotFound {
+        entity: "smart_folder",
+    })?;
+    if !folder.evaluable {
+        return Err(EngineError::NotEvaluable);
+    }
+    count_matching(conn, &folder.predicate)
 }

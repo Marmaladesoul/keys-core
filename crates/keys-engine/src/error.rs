@@ -116,6 +116,15 @@ pub enum EngineError {
     /// re-exported in a `From`-friendly shape.
     #[error("kdbx serialise failed: {0}")]
     Serialise(String),
+
+    /// The supplied predicate (or the predicate persisted in a smart
+    /// folder) cannot be compiled to SQL — typically because it
+    /// contains a [`Predicate::Unknown`](crate::Predicate::Unknown)
+    /// node written by a newer client this binary doesn't know how
+    /// to evaluate. Smart-folder read paths refuse to run rather than
+    /// silently returning an empty or partial result.
+    #[error("predicate is not evaluable by this binary")]
+    NotEvaluable,
 }
 
 /// Errors surfaced specifically by [`crate::Engine::project_to_vault`].

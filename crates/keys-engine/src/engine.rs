@@ -445,37 +445,77 @@ impl Engine {
 
     /// Evaluate a smart folder and return its matching entries.
     ///
-    /// Compiles the folder's [`crate::predicate::Predicate`] to SQL
-    /// (Phase 3.6) and runs it. Non-evaluable folders (those that
-    /// contain an unknown predicate variant) return
-    /// [`EngineError::Sqlite`]-wrapped failure today; a dedicated
-    /// `NotEvaluable` error variant lands with task 3.9.
+    /// Looks the folder up by id, compiles its
+    /// [`crate::predicate::Predicate`] to SQL via
+    /// [`crate::predicate_sql::compile`], and runs the result against
+    /// the entry table. Ordering and pagination semantics match
+    /// [`Engine::list_entries`] (most-recently-modified first, `uuid`
+    /// as a deterministic tie breaker).
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::Sqlite`] on query failure or non-evaluable
-    /// folder.
+    /// - [`EngineError::NotFound`] (`entity = "smart_folder"`) if no
+    ///   row with the given id exists.
+    /// - [`EngineError::NotEvaluable`] if the persisted predicate
+    ///   contains a [`Predicate::Unknown`] node (i.e. the row's
+    ///   `evaluable` column is `false`).
+    /// - [`EngineError::Sqlite`] on any other query failure.
     pub fn smart_folder_entries(
         &self,
         folder_id: i64,
         page: Pagination,
     ) -> Result<Vec<EntrySummary>, EngineError> {
-        let _ = (folder_id, page, &self.conn);
-        unimplemented!("task 3.8")
+        crate::smart_folder::smart_folder_entries(&self.conn, folder_id, page)
     }
 
     /// Count entries matching a smart folder.
     ///
-    /// Same evaluation rules as [`Engine::smart_folder_entries`]; cheaper
-    /// than fetching rows when the caller only needs the badge count.
+    /// Same evaluation rules as [`Engine::smart_folder_entries`];
+    /// cheaper than fetching rows when the caller only needs the badge
+    /// count.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::Sqlite`] on query failure or non-evaluable
-    /// folder.
+    /// - [`EngineError::NotFound`] (`entity = "smart_folder"`) if no
+    ///   row with the given id exists.
+    /// - [`EngineError::NotEvaluable`] if the folder is not evaluable.
+    /// - [`EngineError::Sqlite`] on query failure.
     pub fn smart_folder_count(&self, folder_id: i64) -> Result<u64, EngineError> {
-        let _ = (folder_id, &self.conn);
-        unimplemented!("task 3.8")
+        crate::smart_folder::smart_folder_count(&self.conn, folder_id)
+    }
+
+    /// Evaluate an arbitrary [`Predicate`] and return matching entries.
+    ///
+    /// Direct-predicate variant of [`Engine::smart_folder_entries`].
+    /// Intended for built-in smart folders (see
+    /// [`crate::predicate_builtin`]) and any other call site that
+    /// holds a predicate but no persisted `smart_folder` row.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotEvaluable`] if the predicate contains a
+    ///   [`Predicate::Unknown`] node or an empty `And` / `Or` /
+    ///   tag-set.
+    /// - [`EngineError::Sqlite`] on query failure.
+    pub fn entries_matching(
+        &self,
+        predicate: &Predicate,
+        page: Pagination,
+    ) -> Result<Vec<EntrySummary>, EngineError> {
+        crate::smart_folder::entries_matching(&self.conn, predicate, page)
+    }
+
+    /// Count entries matching an arbitrary [`Predicate`].
+    ///
+    /// Direct-predicate variant of [`Engine::smart_folder_count`].
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotEvaluable`] if the predicate is not
+    ///   evaluable.
+    /// - [`EngineError::Sqlite`] on query failure.
+    pub fn count_matching(&self, predicate: &Predicate) -> Result<u64, EngineError> {
+        crate::smart_folder::count_matching(&self.conn, predicate)
     }
 
     /// List every smart folder, ordered by row id ascending (i.e.

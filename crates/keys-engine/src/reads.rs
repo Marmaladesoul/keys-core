@@ -44,7 +44,7 @@ use crate::model::{
 /// SQL fragment listing the columns `EntrySummary` needs, plus the
 /// correlated attachment-count subquery. Kept as a constant so the
 /// `group = None` and `group = Some(_)` variants stay in lock-step.
-const SUMMARY_COLUMNS: &str = "\
+pub(crate) const SUMMARY_COLUMNS: &str = "\
     uuid, group_uuid, title, username, url, url_host, \
     modified_at, last_used_at, \
     password_strength_bucket, password_entropy, \
@@ -346,7 +346,7 @@ struct EntryFullRow {
     icon_custom_uuid: Option<Uuid>,
 }
 
-fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySummary> {
+pub(crate) fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySummary> {
     let attachment_count_i64: i64 = r.get(12)?;
     Ok(EntrySummary {
         uuid: parse_uuid_col(r, 0)?,
@@ -488,7 +488,7 @@ fn icon_ref_from(icon_index: Option<i64>, icon_custom_uuid: Option<Uuid>) -> Ico
 /// zero rows naturally.
 ///
 /// [`Pagination::all`]: crate::Pagination::all
-fn clamp_page(page: Pagination) -> (i64, i64) {
+pub(crate) fn clamp_page(page: Pagination) -> (i64, i64) {
     let limit = if page.limit == u64::MAX {
         -1
     } else {
