@@ -181,7 +181,12 @@ pub(crate) fn project(
     vault.root = root;
     vault.binaries = binary_pool;
     vault.meta.recycle_bin_uuid = recycle_bin_uuid;
-    vault.meta.recycle_bin_enabled = recycle_bin_uuid.is_some();
+    // Prefer the explicit `meta.recycle_bin_enabled` setting row written
+    // by ingest. Legacy DBs predating that row fall back to the derived
+    // "does a bin group exist?" behaviour. The setting captures the
+    // "enabled=true, no bin yet" intermediate state KeePassXC emits.
+    vault.meta.recycle_bin_enabled =
+        load_recycle_bin_enabled(conn)?.unwrap_or_else(|| recycle_bin_uuid.is_some());
 
     Ok(vault)
 }
@@ -199,6 +204,24 @@ struct GroupRow {
     modified_at: i64,
     expires_at: Option<i64>,
     is_recycle_bin: bool,
+}
+
+/// Read the explicit `meta.recycle_bin_enabled` setting row written by
+/// ingest. Returns `Ok(None)` when no row exists — callers fall back to
+/// the derived "does a bin group exist?" behaviour for legacy DBs. The
+/// value is stored as a 1-byte BLOB (`[0]` / `[1]`); any other shape is
+/// treated as `None` so a corrupt row doesn't poison the projection.
+fn load_recycle_bin_enabled(conn: &Connection) -> Result<Option<bool>, EngineError> {
+    let result: Result<Vec<u8>, rusqlite::Error> = conn.query_row(
+        "SELECT value FROM setting WHERE key = 'meta.recycle_bin_enabled'",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    );
+    match result {
+        Ok(bytes) if bytes.len() == 1 => Ok(Some(bytes[0] != 0)),
+        Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(err) => Err(EngineError::Sqlite(err)),
+    }
 }
 
 fn load_group_rows(conn: &Connection) -> Result<Vec<GroupRow>, EngineError> {

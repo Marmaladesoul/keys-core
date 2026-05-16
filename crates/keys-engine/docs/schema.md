@@ -214,6 +214,13 @@ Generic KV. Reserved keys:
   HMAC password plaintexts for `entry.password_fingerprint`.
 - `last_saved_kdbx_bytes` — gzipped serialised KDBX, the common
   ancestor for external-change 3-way merge.
+- `meta.recycle_bin_enabled` — 1-byte BLOB (`[0]` / `[1]`) carrying
+  `Meta::recycle_bin_enabled` verbatim. Written by ingest, read by
+  projection. Lets the schema represent the "enabled=true, no bin
+  group yet" intermediate state KeePassXC emits — the `is_recycle_bin`
+  column on `group` alone can only express `enabled` when a bin group
+  already exists. Legacy DBs without this row fall back to the
+  derived "does a bin group exist?" behaviour.
 
 ## FTS5 virtual table
 

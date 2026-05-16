@@ -18,6 +18,7 @@ Source of truth for the assertion is the `vault_round_trip_eq` helper in `tests/
 | Attachment `(name, SHA-256 of bytes)` | Bytes are content-addressed in `attachment_blob`; `ref_id` is **not** stable across a round-trip (the projection assigns fresh ref-ids walking the entry list). |
 | `Entry::history` length + per-snapshot plaintext shape | Snapshots are serialised to JSON in `entry_history.snapshot_json` and deserialised back. The JSON columns reproduce title/username/url/notes/password/tags/custom_fields/timestamps. |
 | `Meta::recycle_bin_uuid` | Persisted via the `is_recycle_bin` column on `group`. |
+| `Meta::recycle_bin_enabled` | Persisted explicitly in the `setting` table under key `meta.recycle_bin_enabled` (1-byte BLOB). Round-trips cleanly even when `recycle_bin_uuid IS NULL`. Legacy DBs without the row fall back to `recycle_bin_uuid.is_some()`. |
 
 ## Tolerant — compared after normalisation
 
@@ -47,7 +48,6 @@ The round-trip test helper doesn't re-check these, because a strict comparison w
 
 | Surface | Loss | Path to fix |
 |---|---|---|
-| `Meta::recycle_bin_enabled` when `recycle_bin_uuid IS NULL` | Lost — the schema derives `enabled` from "does a bin group exist?". A KDBX file that says "enabled=true, no bin yet" round-trips as "enabled=false". | Persist the flag explicitly in the `setting` table. Cheap, can land alongside the other phase-2 hygiene work. |
 | `Binary::protected` flag | Lost — every attachment projects as `protected = false`. KeePassXC's default for attachments is unprotected, so this matters only for hand-rolled / legacy vaults. | Add a `protected INTEGER NOT NULL DEFAULT 0` column to `attachment_blob` or `entry_attachment`. |
 | Attachment `ref_id` stability | Not preserved across round-trips. Compared by `(name, sha256)` instead. | Not a defect — `ref_id` is an internal index into `Vault::binaries`, not a content identifier. |
 

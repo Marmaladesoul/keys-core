@@ -57,9 +57,25 @@ pub(crate) fn ingest(
         .map_err(|e| EngineError::Ingest(IngestError::SessionKey(e.to_string())))?;
 
     let recycle_bin_uuid = vault.meta.recycle_bin_uuid;
+    let recycle_bin_enabled = vault.meta.recycle_bin_enabled;
 
     let tx = conn.transaction()?;
     clear_vault_tables(&tx)?;
+
+    // Persist `Meta::recycle_bin_enabled` explicitly. The `is_recycle_bin`
+    // column on `group` can only tell us "enabled" when a bin group
+    // already exists; KeePassXC happily ships vaults with
+    // `enabled=true, recycle_bin_uuid=None` (the bin group is lazily
+    // created on first soft-delete), and without this row that state
+    // would round-trip as `enabled=false`. Projection consults this row
+    // first and falls back to the derived behaviour for legacy DBs
+    // without it. Encoded as a 1-byte BLOB (`[0]` / `[1]`) to match the
+    // `setting.value BLOB` convention already used by `fingerprint_key`.
+    let enabled_blob: [u8; 1] = [u8::from(recycle_bin_enabled)];
+    tx.execute(
+        "INSERT OR REPLACE INTO setting(key, value) VALUES ('meta.recycle_bin_enabled', ?1)",
+        params![&enabled_blob[..]],
+    )?;
 
     // Walk groups first so entries' FK references resolve.
     walk_groups(&tx, &vault.root, None, recycle_bin_uuid)?;

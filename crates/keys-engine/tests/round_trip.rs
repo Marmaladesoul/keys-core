@@ -332,16 +332,11 @@ fn vault_round_trip_eq(source: &Vault, reloaded: &Vault) -> Result<(), String> {
             source.meta.recycle_bin_uuid, reloaded.meta.recycle_bin_uuid,
         ));
     }
-    // `recycle_bin_enabled` is **only** comparable when the source had a
-    // bin uuid set. The v1 schema doesn't store the enabled flag
-    // independently: projection derives it as `recycle_bin_uuid.is_some()`,
-    // which loses any "enabled but no bin yet" intermediate state a real
-    // KDBX writer may have emitted (the kdbx3-basic fixture does this:
-    // enabled=true, uuid=None). Tolerate that here; future schema
-    // changes that persist the flag can tighten this back to strict.
-    if source.meta.recycle_bin_uuid.is_some()
-        && source.meta.recycle_bin_enabled != reloaded.meta.recycle_bin_enabled
-    {
+    // `recycle_bin_enabled` is now strict — ingest persists it
+    // explicitly in `setting` under key `meta.recycle_bin_enabled`,
+    // and projection reads it back. This covers the "enabled=true,
+    // uuid=None" intermediate state KeePassXC emits.
+    if source.meta.recycle_bin_enabled != reloaded.meta.recycle_bin_enabled {
         return Err(format!(
             "meta.recycle_bin_enabled: {} vs {}",
             source.meta.recycle_bin_enabled, reloaded.meta.recycle_bin_enabled,
