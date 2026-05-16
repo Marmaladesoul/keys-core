@@ -14,12 +14,13 @@ pub mod predicate_builtin;
 pub mod predicate_sql;
 pub mod projection;
 pub mod reads;
+pub mod reconcile;
 pub mod reveal;
 pub mod save;
 pub mod smart_folder;
 pub mod strength;
 
-pub use engine::{DisconnectReason, Engine, VaultState};
+pub use engine::{DisconnectReason, Engine, ReconcileTrigger, VaultState};
 pub use error::{EngineError, IngestError, ProjectionError, RevealError};
 pub use events::{
     ChangeEvent, ConflictPayload, DataChangeObserver, EntryDeletionInfo, EntryMove,
@@ -43,5 +44,6 @@ pub use predicate_builtin::{
     recycle_bin_contents, weak_password,
 };
 pub use predicate_sql::{CompileError, CompiledPredicate, compile as compile_predicate};
+pub use reconcile::{MergeResult, MergeStats};
 pub use save::SelfWriteSignature;
 pub use strength::{Strength, strength};

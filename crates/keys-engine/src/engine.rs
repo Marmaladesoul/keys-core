@@ -7,10 +7,12 @@
 //! form (`PRAGMA key = "x'<hex>'"`) is used, bypassing `SQLCipher`'s
 //! built-in PBKDF2 key derivation.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::protector::FieldProtector;
 use rusqlite::{Connection, OpenFlags};
@@ -20,7 +22,8 @@ use zeroize::Zeroizing;
 
 use crate::error::EngineError;
 use crate::events::{
-    ChangeEvent, DataChangeObserver, EntryDeletionInfo, EntryMove, GroupDeletionInfo, GroupMove,
+    ChangeEvent, ConflictPayload, DataChangeObserver, EntryDeletionInfo, EntryMove,
+    GroupDeletionInfo, GroupMove,
 };
 use crate::file_watcher::{FileWatcher, FileWatcherEvent, FileWatcherObserver};
 use crate::fingerprint;
@@ -34,6 +37,7 @@ use crate::model::{
 use crate::mutations;
 use crate::predicate::Predicate;
 use crate::projection;
+use crate::reconcile::{self, MergeResult};
 use crate::save::{self, SelfWriteSignature};
 use crate::strength::{self, Strength};
 
@@ -138,10 +142,41 @@ pub struct Engine {
     /// Optional file watcher. When `Some`, the engine registers an
     /// internal [`FileWatcherObserver`] on it during
     /// [`Engine::open`] that translates [`FileWatcherEvent`]s into
-    /// state transitions (and, from task 4.6 onwards, calls to
-    /// `reconcile_with_disk`). Kept on the struct so its lifetime is
-    /// tied to the engine's — dropping the engine drops the watcher.
+    /// state transitions and (from task 4.6 onwards) into a trigger
+    /// to call `reconcile_with_disk`. Kept on the struct so its
+    /// lifetime is tied to the engine's — dropping the engine drops
+    /// the watcher.
     file_watcher: Option<Arc<dyn FileWatcher>>,
+    /// Active conflict payloads, keyed by [`ConflictPayload::id`].
+    /// Stashed by [`Engine::reconcile_with_disk`] when the merge
+    /// surfaces conflicts and consumed by `apply_conflict_resolution`
+    /// (task 4.7). Held behind an [`Arc<Mutex<_>>`] so the trigger
+    /// path (and future async resolution flows) can mutate it
+    /// without taking the whole engine lock.
+    pending_conflicts: Arc<Mutex<HashMap<i64, ConflictPayload>>>,
+}
+
+/// Optional callback the frontend installs so the engine's
+/// file-watcher observer can drive a `reconcile_with_disk` call
+/// without holding the composite key or vault path itself.
+///
+/// The watcher calls [`ReconcileTrigger::trigger`] on every
+/// post-self-write-filter `ContentChanged` event. The implementation
+/// dispatches to whatever long-running flow the frontend uses to
+/// supply the composite key (typically a queued task on the UI
+/// thread that hits the session store). Implementations must be
+/// cheap — they're called from the watcher's internal thread.
+///
+/// Per the 2026-05-16 standing orders, the file-watcher path is
+/// **silent on failure**: if the frontend's trigger returns an
+/// error it should transition the engine state to
+/// [`VaultState::Disconnected`] with
+/// [`DisconnectReason::Other`] carrying the diagnostic, rather than
+/// emitting a dedicated change event.
+pub trait ReconcileTrigger: Send + Sync + std::fmt::Debug {
+    /// Fire whatever flow the frontend uses to call
+    /// [`Engine::reconcile_with_disk`].
+    fn trigger(&self);
 }
 
 /// Shared engine state that's also written from a non-engine thread
@@ -160,11 +195,17 @@ struct EngineShared {
     /// and by the internal file-watcher observer to distinguish our own
     /// writes from foreign edits.
     last_self_write: Option<SelfWriteSignature>,
-    /// Whether the next observed `ContentChanged` event has fired a
-    /// `reconcile_with_disk` call yet. Reserved — task 4.6 will read
-    /// this from the watcher observer. For now we use a debug counter
-    /// only for testing the suppression logic.
+    /// Number of `ContentChanged` events that survived the self-
+    /// write filter. Bumped on every external change the watcher
+    /// reports, regardless of whether a [`ReconcileTrigger`] is
+    /// registered. Test-visible via
+    /// [`Engine::pending_reconcile_calls_for_test`].
     pending_reconcile_calls: u64,
+    /// Optional reconcile trigger installed via
+    /// [`Engine::set_reconcile_trigger`]. The internal file-watcher
+    /// observer fires it on every post-self-write-filter
+    /// `ContentChanged` event.
+    reconcile_trigger: Option<Arc<dyn ReconcileTrigger>>,
 }
 
 /// Internal [`FileWatcherObserver`] installed by [`Engine::open`] when a
@@ -200,8 +241,18 @@ impl FileWatcherObserver for EngineFileWatcherObserver {
                         return;
                     }
                 }
-                // TODO 4.6: call reconcile_with_disk()
                 guard.pending_reconcile_calls += 1;
+                // Task 4.6: fire the frontend-registered reconcile
+                // trigger, if any. The trigger is responsible for
+                // gathering the composite key + vault path and
+                // calling `Engine::reconcile_with_disk`. We clone the
+                // Arc and drop the guard before invocation so the
+                // trigger can re-enter the engine without deadlocking.
+                let trigger = guard.reconcile_trigger.clone();
+                drop(guard);
+                if let Some(t) = trigger {
+                    t.trigger();
+                }
             }
             FileWatcherEvent::Unavailable { reason } => {
                 let mut guard = self.shared.lock().unwrap();
@@ -283,6 +334,7 @@ impl Engine {
             state: VaultState::Active,
             last_self_write: None,
             pending_reconcile_calls: 0,
+            reconcile_trigger: None,
         }));
 
         // If a file watcher was supplied, register the engine's internal
@@ -303,6 +355,7 @@ impl Engine {
             shared,
             observer: None,
             file_watcher,
+            pending_conflicts: Arc::new(Mutex::new(HashMap::new())),
         };
         // Note: `VaultUnlocked` is *not* emitted here — no observer is
         // wired yet. Callers that want the event should set an observer
@@ -539,6 +592,129 @@ impl Engine {
         self.conn.execute(
             "INSERT OR REPLACE INTO setting(key, value) VALUES ('last_saved_kdbx_bytes', ?1)",
             rusqlite::params![bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Reconcile the engine's `SQLite` state against the current
+    /// on-disk KDBX file at `kdbx_path`.
+    ///
+    /// Reads and parses the disk bytes via
+    /// [`keepass_core::kdbx::Kdbx::open_from_bytes`] under
+    /// `composite_key` and this engine's field protector. Projects
+    /// the engine's current state to a [`Vault`](keepass_core::model::Vault),
+    /// runs a two-way merge via
+    /// [`keepass_merge::merge`] (each entry's `<History>` list acts
+    /// as the per-entry common ancestor; the engine's
+    /// `last_saved_kdbx_bytes` is the vault-level baseline), and:
+    ///
+    /// - If the two states are already equivalent, returns
+    ///   [`MergeResult::NoChange`] and refreshes
+    ///   `last_saved_kdbx_bytes` to the disk bytes.
+    /// - If the merge produced conflicts, stashes the
+    ///   [`ConflictPayload`] for later resolution and returns
+    ///   [`MergeResult::Conflict`]. `SQLite` is **not** mutated.
+    ///   The engine also emits a
+    ///   [`ChangeEvent::ConflictDetected`] for any installed
+    ///   observer.
+    /// - Otherwise applies the merge in a single transaction (via
+    ///   the existing ingest path) and returns
+    ///   [`MergeResult::Merged`]. The engine emits a
+    ///   [`ChangeEvent::ExternalChangeMerged`].
+    ///
+    /// Atomicity: the `SQLite` write path holds a single transaction.
+    /// A failure mid-write rolls back; the engine state is
+    /// unchanged. The merge step itself runs against an immutable
+    /// projection — failure there returns an error without touching
+    /// `SQLite`.
+    ///
+    /// Composite-key handling: the engine doesn't store the
+    /// composite key. Callers pass it on each reconcile so frontends
+    /// can keep it in their own session store.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Io`] if the disk file can't be read.
+    /// - [`EngineError::Serialise`] wrapping any
+    ///   [`keepass_core::Error`] / merge-pass failure.
+    /// - [`EngineError::Sqlite`] / [`EngineError::Ingest`] for
+    ///   apply-step failures.
+    pub fn reconcile_with_disk(
+        &mut self,
+        kdbx_path: &Path,
+        composite_key: &CompositeKey,
+    ) -> Result<MergeResult, EngineError> {
+        reconcile::reconcile_with_disk(self, kdbx_path, composite_key)
+    }
+
+    /// Install a [`ReconcileTrigger`] so the file-watcher path can
+    /// drive [`Engine::reconcile_with_disk`] indirectly when an
+    /// external KDBX change is detected. Replaces any previously
+    /// installed trigger; pass `None` (via [`Engine::clear_reconcile_trigger`])
+    /// to disable the auto-trigger path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine's internal shared-state `Mutex` is
+    /// poisoned — see [`Engine::last_self_write`] for the same caveat.
+    pub fn set_reconcile_trigger(&mut self, trigger: Arc<dyn ReconcileTrigger>) {
+        self.shared.lock().unwrap().reconcile_trigger = Some(trigger);
+    }
+
+    /// Remove any installed [`ReconcileTrigger`]. Subsequent file-
+    /// watcher events still bump the internal counter but do not fan
+    /// out to a frontend callback.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine's internal shared-state `Mutex` is
+    /// poisoned — see [`Engine::last_self_write`] for the same caveat.
+    pub fn clear_reconcile_trigger(&mut self) {
+        self.shared.lock().unwrap().reconcile_trigger = None;
+    }
+
+    /// Fetch (and remove) a stashed conflict payload by id. Called
+    /// by task 4.7's `apply_conflict_resolution` once the frontend
+    /// has resolved the conflicts.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn take_pending_conflict(&self, id: i64) -> Option<ConflictPayload> {
+        self.pending_conflicts.lock().unwrap().remove(&id)
+    }
+
+    /// Test-only: count of currently stashed conflict payloads.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_conflict_count_for_test(&self) -> usize {
+        self.pending_conflicts.lock().unwrap().len()
+    }
+
+    /// Crate-internal: return the engine's [`FieldProtector`] as an
+    /// [`Arc`]. Used by [`crate::reconcile`] to feed the protector
+    /// into a fresh [`Kdbx::unlock_with_protector`] call.
+    pub(crate) fn field_protector_arc(&self) -> Arc<dyn FieldProtector> {
+        Arc::clone(&self.field_protector)
+    }
+
+    /// Crate-internal: stash a [`ConflictPayload`] so the eventual
+    /// `apply_conflict_resolution` (task 4.7) can find it.
+    pub(crate) fn stash_conflict_payload(&self, payload: ConflictPayload) {
+        self.pending_conflicts
+            .lock()
+            .unwrap()
+            .insert(payload.id, payload);
+    }
+
+    /// Crate-internal: re-ingest a merged [`Kdbx`] into `SQLite`.
+    /// The single-transaction discipline lives in
+    /// [`crate::ingest::ingest`]; the reconcile path uses this so
+    /// failure rolls back cleanly without firing events.
+    pub(crate) fn ingest_merged(&mut self, kdbx: &Kdbx<Unlocked>) -> Result<(), EngineError> {
+        let _outcome = crate::ingest::ingest(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            kdbx,
         )?;
         Ok(())
     }

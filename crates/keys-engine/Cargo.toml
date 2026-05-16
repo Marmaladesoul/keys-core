@@ -17,6 +17,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 getrandom = { version = "0.2", features = ["std"] }
 hmac = "0.12"
 keepass-core = { path = "../../../KeepassCore/crates/keepass-core" }
+keepass-merge = { path = "../../../KeepassCore/crates/keepass-merge" }
 notify = "6"
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 secrecy = "0.10"

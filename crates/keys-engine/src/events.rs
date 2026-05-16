@@ -71,15 +71,17 @@ pub enum ChangeEvent {
     SmartFolderDeleted(i64),
     /// A successful [`crate::Engine::save_to_kdbx`] write completed.
     SaveCompleted,
-    /// External KDBX changes were merged in. Reserved for Phase 4.6/4.7;
-    /// the exact shape of [`ConflictPayload`] will firm up there.
+    /// External KDBX changes were merged into `SQLite`. Carries the
+    /// aggregate counts of what was applied; the engine's `SQLite`
+    /// mirror has already been updated when this fires.
     ExternalChangeMerged {
-        /// Uuids of entries / groups successfully merged.
-        applied: Vec<Uuid>,
-        /// Conflicts that required surfacing.
-        conflicts: Vec<ConflictPayload>,
+        /// Counts of merge mutations applied to `SQLite`.
+        applied: crate::reconcile::MergeStats,
     },
-    /// A merge conflict was detected. Reserved for Phase 4.6/4.7.
+    /// A merge conflict was detected and requires user resolution.
+    /// `SQLite` state was **not** mutated; the engine has stashed the
+    /// payload (keyed by [`ConflictPayload::id`]) for a later
+    /// `apply_conflict_resolution` call (task 4.7).
     ConflictDetected(ConflictPayload),
     /// The vault was locked. Not wired yet — reserved for a future
     /// explicit lock path.
@@ -131,18 +133,36 @@ pub struct GroupMove {
     pub to_parent: Uuid,
 }
 
-/// Opaque placeholder for merge-conflict payloads. The full shape will
-/// land alongside Phase 4.6/4.7 (external-change merge); for 4.2 / 4.3
-/// the type exists so the variants that reference it compile, but no
-/// emission path currently constructs one.
+/// Conflict surface for an external-change merge that requires user
+/// resolution before any state lands in `SQLite`.
+///
+/// Produced by [`crate::Engine::reconcile_with_disk`] when the
+/// underlying `keepass-merge` run reports per-entry conflicts (both
+/// sides edited the same field differently against the per-entry
+/// history ancestor) or `delete vs edit` conflicts. The shape mirrors
+/// `keepass-merge`'s own conflict types so the frontend resolver UI
+/// can render and round-trip them verbatim.
+///
+/// The engine stashes one payload per outstanding conflict run under
+/// [`Self::id`]; the frontend later echoes the id back to
+/// `apply_conflict_resolution` (task 4.7) to identify which run is
+/// being resolved.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ConflictPayload {
-    /// Synthetic id assigned by the engine for a given merge outcome.
-    /// The eventual shape may replace this with a richer key.
-    pub merge_outcome_id: i64,
-    /// Human-readable summary of the conflict. Replaced by a structured
-    /// representation when the merge path lands.
-    pub description: String,
+    /// Synthetic id assigned by the engine for this conflict run.
+    /// The frontend echoes this back to `apply_conflict_resolution`
+    /// (task 4.7).
+    pub id: i64,
+    /// Per-entry field / attachment / icon conflicts surfaced by the
+    /// merge. Mirrors `keepass_merge::EntryConflict` verbatim — each
+    /// entry carries the local + remote `Entry` snapshots plus a
+    /// pre-computed list of field / attachment / icon deltas.
+    pub entry_conflicts: Vec<keepass_merge::EntryConflict>,
+    /// Per-entry `delete-vs-edit` conflicts. Each id corresponds to
+    /// an entry one side tombstoned and the other side edited; the
+    /// frontend picks `KeepLocal` or `AcceptRemoteDelete`.
+    pub delete_edit_conflicts: Vec<keepass_core::model::EntryId>,
 }
 
 /// Receives [`ChangeEvent`]s from an [`crate::Engine`].
