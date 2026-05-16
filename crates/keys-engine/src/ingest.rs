@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::error::{EngineError, IngestError};
 use crate::fingerprint;
+use crate::meta;
 use crate::strength;
 
 /// Canonical KDBX field name for an entry's password slot.
@@ -59,6 +60,13 @@ pub(crate) fn ingest(
 
     let tx = conn.transaction()?;
     clear_vault_tables(&tx)?;
+    meta::clear_meta_tables(&tx)?;
+
+    // Persist the full `Meta` block and `Vault::deleted_objects`. After
+    // this, SQLite is a complete representation of the vault — the save
+    // path no longer has to splice anything from a live `Kdbx` handle.
+    meta::write_meta(&tx, &vault.meta)?;
+    meta::write_deleted_objects(&tx, &vault.deleted_objects)?;
 
     // Persist `Meta::recycle_bin_enabled` explicitly. The `is_recycle_bin`
     // column on `group` can only tell us "enabled" when a bin group

@@ -320,28 +320,12 @@ fn reopen_kdbx(path: &Path) -> Kdbx<Unlocked> {
 /// KDBX. Returns `Err(reason)` on divergence with a message that
 /// points at the divergent field.
 fn vault_round_trip_eq(source: &Vault, reloaded: &Vault) -> Result<(), String> {
-    // Meta — only the recycle-bin pair is projected. Everything else
-    // round-trips through `splice_preserving_meta` from the live kdbx
-    // handle, so a cross-check here would essentially compare
-    // `source.meta` to `reloaded.meta` for fields that are carried
-    // verbatim. That'd add no real coverage; we restrict to the two
-    // fields the projection actually owns.
-    if source.meta.recycle_bin_uuid != reloaded.meta.recycle_bin_uuid {
-        return Err(format!(
-            "meta.recycle_bin_uuid: {:?} vs {:?}",
-            source.meta.recycle_bin_uuid, reloaded.meta.recycle_bin_uuid,
-        ));
-    }
-    // `recycle_bin_enabled` is now strict — ingest persists it
-    // explicitly in `setting` under key `meta.recycle_bin_enabled`,
-    // and projection reads it back. This covers the "enabled=true,
-    // uuid=None" intermediate state KeePassXC emits.
-    if source.meta.recycle_bin_enabled != reloaded.meta.recycle_bin_enabled {
-        return Err(format!(
-            "meta.recycle_bin_enabled: {} vs {}",
-            source.meta.recycle_bin_enabled, reloaded.meta.recycle_bin_enabled,
-        ));
-    }
+    // Meta — every field round-trips through SQLite since
+    // migration 0003. Compare strictly; timestamps use the second-
+    // precision tolerance the rest of the helper uses (KDBX
+    // serialisation drops sub-second precision).
+    compare_meta_strict(&source.meta, &reloaded.meta)?;
+    compare_deleted_objects(&source.deleted_objects, &reloaded.deleted_objects)?;
 
     // Build attachment SHA lookups against each side's binary pool so
     // attachment comparison can be "name + sha256" without depending on
@@ -351,6 +335,234 @@ fn vault_round_trip_eq(source: &Vault, reloaded: &Vault) -> Result<(), String> {
 
     compare_groups(&source.root, &reloaded.root, &src_sha, &dst_sha, "root")?;
 
+    Ok(())
+}
+
+/// Strict Meta comparison. Timestamps use second-precision tolerance
+/// (KDBX strips sub-second components); everything else is exact.
+#[allow(clippy::too_many_lines)]
+fn compare_meta_strict(
+    a: &keepass_core::model::Meta,
+    b: &keepass_core::model::Meta,
+) -> Result<(), String> {
+    if a.generator != b.generator {
+        return Err(format!(
+            "meta.generator: {:?} vs {:?}",
+            a.generator, b.generator
+        ));
+    }
+    if a.database_name != b.database_name {
+        return Err(format!(
+            "meta.database_name: {:?} vs {:?}",
+            a.database_name, b.database_name
+        ));
+    }
+    if a.database_description != b.database_description {
+        return Err(format!(
+            "meta.database_description: {:?} vs {:?}",
+            a.database_description, b.database_description
+        ));
+    }
+    if a.default_username != b.default_username {
+        return Err(format!(
+            "meta.default_username: {:?} vs {:?}",
+            a.default_username, b.default_username
+        ));
+    }
+    if a.recycle_bin_enabled != b.recycle_bin_enabled {
+        return Err(format!(
+            "meta.recycle_bin_enabled: {} vs {}",
+            a.recycle_bin_enabled, b.recycle_bin_enabled
+        ));
+    }
+    if a.recycle_bin_uuid != b.recycle_bin_uuid {
+        return Err(format!(
+            "meta.recycle_bin_uuid: {:?} vs {:?}",
+            a.recycle_bin_uuid, b.recycle_bin_uuid
+        ));
+    }
+    if a.memory_protection != b.memory_protection {
+        return Err(format!(
+            "meta.memory_protection: {:?} vs {:?}",
+            a.memory_protection, b.memory_protection
+        ));
+    }
+    if a.master_key_change_rec != b.master_key_change_rec {
+        return Err(format!(
+            "meta.master_key_change_rec: {} vs {}",
+            a.master_key_change_rec, b.master_key_change_rec
+        ));
+    }
+    if a.master_key_change_force != b.master_key_change_force {
+        return Err(format!(
+            "meta.master_key_change_force: {} vs {}",
+            a.master_key_change_force, b.master_key_change_force
+        ));
+    }
+    if a.history_max_items != b.history_max_items {
+        return Err(format!(
+            "meta.history_max_items: {} vs {}",
+            a.history_max_items, b.history_max_items
+        ));
+    }
+    if a.history_max_size != b.history_max_size {
+        return Err(format!(
+            "meta.history_max_size: {} vs {}",
+            a.history_max_size, b.history_max_size
+        ));
+    }
+    if a.maintenance_history_days != b.maintenance_history_days {
+        return Err(format!(
+            "meta.maintenance_history_days: {} vs {}",
+            a.maintenance_history_days, b.maintenance_history_days
+        ));
+    }
+    if a.color != b.color {
+        return Err(format!("meta.color: {:?} vs {:?}", a.color, b.color));
+    }
+    // KDBX3 omits header_hash on save and re-derives on load; KDBX4
+    // moves it to the binary header. The string field on `Meta` round-
+    // trips through SQLite cleanly, but a kdbx → save → reopen cycle
+    // legitimately mutates it. Skip the strict check; the dedicated
+    // meta_persistence test covers the SQLite-only round-trip.
+
+    compare_meta_timestamp(
+        "meta.database_name_changed",
+        a.database_name_changed,
+        b.database_name_changed,
+    )?;
+    compare_meta_timestamp(
+        "meta.database_description_changed",
+        a.database_description_changed,
+        b.database_description_changed,
+    )?;
+    compare_meta_timestamp(
+        "meta.default_username_changed",
+        a.default_username_changed,
+        b.default_username_changed,
+    )?;
+    compare_meta_timestamp(
+        "meta.recycle_bin_changed",
+        a.recycle_bin_changed,
+        b.recycle_bin_changed,
+    )?;
+    compare_meta_timestamp(
+        "meta.settings_changed",
+        a.settings_changed,
+        b.settings_changed,
+    )?;
+    compare_meta_timestamp(
+        "meta.master_key_changed",
+        a.master_key_changed,
+        b.master_key_changed,
+    )?;
+
+    // Custom icons — compare as a set keyed by uuid (order is not
+    // guaranteed to match across a round-trip).
+    if a.custom_icons.len() != b.custom_icons.len() {
+        return Err(format!(
+            "meta.custom_icons count: {} vs {}",
+            a.custom_icons.len(),
+            b.custom_icons.len()
+        ));
+    }
+    for icon_a in &a.custom_icons {
+        let icon_b = b
+            .custom_icons
+            .iter()
+            .find(|i| i.uuid == icon_a.uuid)
+            .ok_or_else(|| format!("meta.custom_icons[{}] missing in reloaded", icon_a.uuid))?;
+        if icon_a.data != icon_b.data {
+            return Err(format!("meta.custom_icons[{}] bytes differ", icon_a.uuid));
+        }
+        if icon_a.name != icon_b.name {
+            return Err(format!(
+                "meta.custom_icons[{}] name: {:?} vs {:?}",
+                icon_a.uuid, icon_a.name, icon_b.name
+            ));
+        }
+        compare_meta_timestamp(
+            &format!("meta.custom_icons[{}].last_modified", icon_a.uuid),
+            icon_a.last_modified,
+            icon_b.last_modified,
+        )?;
+    }
+
+    // Custom data — compare as a set keyed by key.
+    if a.custom_data.len() != b.custom_data.len() {
+        return Err(format!(
+            "meta.custom_data count: {} vs {}",
+            a.custom_data.len(),
+            b.custom_data.len()
+        ));
+    }
+    for item_a in &a.custom_data {
+        let item_b = b
+            .custom_data
+            .iter()
+            .find(|i| i.key == item_a.key)
+            .ok_or_else(|| format!("meta.custom_data[{:?}] missing in reloaded", item_a.key))?;
+        if item_a.value != item_b.value {
+            return Err(format!(
+                "meta.custom_data[{:?}] value: {:?} vs {:?}",
+                item_a.key, item_a.value, item_b.value
+            ));
+        }
+        compare_meta_timestamp(
+            &format!("meta.custom_data[{:?}].last_modified", item_a.key),
+            item_a.last_modified,
+            item_b.last_modified,
+        )?;
+    }
+
+    // Unknown XML — compare counts only; tag and raw_xml may be
+    // re-emitted with different formatting by quick-xml so byte-exact
+    // is too strict. (The meta_persistence test compares byte-exact
+    // through SQLite alone, where the encoder isn't involved.)
+    if a.unknown_xml.len() != b.unknown_xml.len() {
+        return Err(format!(
+            "meta.unknown_xml count: {} vs {}",
+            a.unknown_xml.len(),
+            b.unknown_xml.len()
+        ));
+    }
+
+    Ok(())
+}
+
+fn compare_meta_timestamp(
+    field: &str,
+    a: Option<chrono::DateTime<chrono::Utc>>,
+    b: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), String> {
+    let to_secs = |dt: Option<chrono::DateTime<chrono::Utc>>| dt.map(|d| d.timestamp());
+    if to_secs(a) == to_secs(b) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{field}: {a:?} vs {b:?} (second-precision mismatch)"
+        ))
+    }
+}
+
+fn compare_deleted_objects(
+    a: &[keepass_core::model::DeletedObject],
+    b: &[keepass_core::model::DeletedObject],
+) -> Result<(), String> {
+    if a.len() != b.len() {
+        return Err(format!("deleted_objects count: {} vs {}", a.len(), b.len()));
+    }
+    for obj_a in a {
+        let obj_b = b
+            .iter()
+            .find(|o| o.uuid == obj_a.uuid)
+            .ok_or_else(|| format!("deleted_object {} missing in reloaded", obj_a.uuid))?;
+        compare_meta_timestamp(
+            &format!("deleted_object[{}].deleted_at", obj_a.uuid),
+            obj_a.deleted_at,
+            obj_b.deleted_at,
+        )?;
+    }
     Ok(())
 }
 

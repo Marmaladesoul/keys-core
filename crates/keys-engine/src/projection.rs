@@ -52,6 +52,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::{EngineError, ProjectionError};
+use crate::meta;
 
 /// Canonical KDBX field name for an entry's password slot — must match
 /// [`crate::ingest`]'s constant of the same name.
@@ -188,6 +189,12 @@ pub(crate) fn project(
     let mut vault = Vault::empty(root.id);
     vault.root = root;
     vault.binaries = binary_pool;
+
+    // Reconstitute the full `Meta` block from the persisted
+    // setting rows + `meta_*` companion tables (migration 0003). The
+    // engine no longer needs a live `Kdbx<Unlocked>` handle to round-trip
+    // `Meta` faithfully; SQLite is the source of truth.
+    meta::read_meta_into(conn, &mut vault.meta)?;
     vault.meta.recycle_bin_uuid = recycle_bin_uuid;
     // Prefer the explicit `meta.recycle_bin_enabled` setting row written
     // by ingest. Legacy DBs predating that row fall back to the derived
@@ -195,6 +202,8 @@ pub(crate) fn project(
     // "enabled=true, no bin yet" intermediate state KeePassXC emits.
     vault.meta.recycle_bin_enabled =
         load_recycle_bin_enabled(conn)?.unwrap_or_else(|| recycle_bin_uuid.is_some());
+
+    vault.deleted_objects = meta::read_deleted_objects(conn)?;
 
     Ok(vault)
 }

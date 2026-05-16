@@ -29,6 +29,63 @@ use crate::projection;
 use crate::save::{self, SelfWriteSignature};
 use crate::strength::{self, Strength};
 
+/// Lifecycle / health classification for an [`Engine`].
+///
+/// Surfaced via [`Engine::state`]. The variants form a small state
+/// machine intended to cover both the local-file world (Phase 4
+/// file-watcher integration) and the future cloud-storage world
+/// (vaults backed by a remote provider that can be offline).
+///
+/// Variants are deliberately `#[non_exhaustive]` because the set
+/// will grow — e.g. a future `Syncing` state for in-flight cloud
+/// replication. Callers should treat unknown variants as
+/// "non-Active": writes are not safe, reads are best-effort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VaultState {
+    /// Engine fully operational. `SQLite` is open, and the underlying
+    /// KDBX file (or remote backing store) is reachable. Writes are
+    /// allowed.
+    Active,
+    /// `SQLite` is readable but the underlying KDBX file is missing or
+    /// unreachable. Reads work; writes are gated. The exact reason
+    /// is carried so UI can surface a useful message.
+    Disconnected {
+        /// Why the engine is disconnected — file missing, IO error,
+        /// network unavailable for a cloud-backed vault, etc.
+        reason: DisconnectReason,
+    },
+    /// Engine has been deliberately demoted to read-only — e.g. the
+    /// user locked the vault but kept `SQLite` open for inspection.
+    /// Reserved for a future explicit lock path; transitions don't
+    /// wire in this PR.
+    ReadOnly,
+    /// Engine encountered an unrecoverable error. Caller must close
+    /// and reopen.
+    Error,
+}
+
+/// Why an [`Engine`] is in the [`VaultState::Disconnected`] state.
+///
+/// Variants are deliberately `#[non_exhaustive]` so cloud-storage
+/// providers can add more without breaking matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DisconnectReason {
+    /// The KDBX file is missing from its expected on-disk path.
+    FileMissing,
+    /// The KDBX file is present but the engine couldn't read it
+    /// (permissions, IO error, etc.). The payload is the diagnostic
+    /// message.
+    FileUnreadable(String),
+    /// A cloud / remote backing store is currently unreachable.
+    /// Reserved for the future cloud-storage work; not used by the
+    /// local-file path.
+    NetworkUnavailable,
+    /// Anything else, with a diagnostic.
+    Other(String),
+}
+
 /// `SQLCipher`-backed `SQLite` engine handle.
 ///
 /// Construct via [`Engine::open`]. Drop via [`Engine::close`] (or just
@@ -60,6 +117,15 @@ pub struct Engine {
     /// written one. Consumed in task 2.6 by the watcher integration to
     /// distinguish our own writes from foreign edits.
     last_self_write: Option<SelfWriteSignature>,
+    /// Current lifecycle / health state. See [`VaultState`].
+    ///
+    /// In this PR the state machine has a single live transition —
+    /// "opened cleanly → `Active`". The `Disconnected` / `ReadOnly` /
+    /// `Error` variants are part of the forward-design surface so
+    /// downstream code (Phase 4 file watcher, future cloud-storage
+    /// providers) can demote the engine without us having to expand
+    /// the public API later.
+    state: VaultState,
 }
 
 impl Engine {
@@ -123,6 +189,7 @@ impl Engine {
             fingerprint_key,
             field_protector,
             last_self_write: None,
+            state: VaultState::Active,
         })
     }
 
@@ -180,12 +247,12 @@ impl Engine {
     /// consumes, and the shape round-trip property tests (task 2.7)
     /// compare against.
     ///
-    /// The projected vault carries no per-vault metadata beyond
-    /// `recycle_bin_uuid` / `recycle_bin_enabled` — `Meta` fields like
-    /// `database_name`, `generator`, `custom_icons`, etc. are not
-    /// persisted in the v1 schema. The serialise path is responsible
-    /// for re-applying them from a separate source (the live `Kdbx`
-    /// handle's meta block).
+    /// The projected vault carries the full `Meta` block (every
+    /// scalar, `custom_icons`, `custom_data`, `memory_protection`,
+    /// `unknown_xml`) and `deleted_objects` — all reconstituted from
+    /// the migration-0003 persistence layer. The save path can install
+    /// the projection on a fresh `Kdbx<Unlocked>` handle without losing
+    /// any metadata.
     ///
     /// # Errors
     ///
@@ -217,12 +284,11 @@ impl Engine {
     ///
     /// ## Meta preservation
     ///
-    /// The v1 schema persists only two fields of
-    /// [`keepass_core::model::Meta`] (the recycle-bin pair); every
-    /// other field — `database_name`, `custom_icons`, `custom_data`,
-    /// `unknown_xml`, etc. — is taken from the live `kdbx` handle and
-    /// carried forward verbatim onto the projected vault before the
-    /// splice. Tombstones (`deleted_objects`) get the same treatment.
+    /// Since migration 0003, every
+    /// [`keepass_core::model::Meta`] field is persisted in `SQLite`, so
+    /// the projection reconstitutes the meta block in full. The live
+    /// `kdbx` handle's vault contents (entries, groups, meta) are
+    /// replaced wholesale by the projection — no splice required.
     ///
     /// ## Atomic write
     ///
@@ -251,6 +317,19 @@ impl Engine {
     #[must_use]
     pub fn last_self_write(&self) -> Option<SelfWriteSignature> {
         self.last_self_write
+    }
+
+    /// Current lifecycle / health state of this engine.
+    ///
+    /// In this PR the only transition wired in is
+    /// "`Engine::open` succeeded → [`VaultState::Active`]". The other
+    /// variants (`Disconnected`, `ReadOnly`, `Error`) are part of the
+    /// forward-design surface and start being driven from Phase 4
+    /// onwards (file-watcher events, explicit lock, unrecoverable
+    /// errors).
+    #[must_use]
+    pub fn state(&self) -> VaultState {
+        self.state.clone()
     }
 
     /// Crate-internal setter used by [`crate::save::save`] to record

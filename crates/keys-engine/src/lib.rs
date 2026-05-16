@@ -3,6 +3,7 @@ pub mod error;
 pub mod fingerprint;
 pub mod ingest;
 pub mod key_provider;
+pub mod meta;
 pub mod migrations;
 pub mod model;
 pub mod predicate;
@@ -15,7 +16,7 @@ pub mod save;
 pub mod smart_folder;
 pub mod strength;
 
-pub use engine::Engine;
+pub use engine::{DisconnectReason, Engine, VaultState};
 pub use error::{EngineError, IngestError, ProjectionError, RevealError};
 pub use fingerprint::fingerprint;
 pub use key_provider::{DbKey, KeyProvider, KeyProviderError};

@@ -235,6 +235,59 @@ Generic KV. Reserved keys:
   column on `group` alone can only express `enabled` when a bin group
   already exists. Legacy DBs without this row fall back to the
   derived "does a bin group exist?" behaviour.
+- **`meta.*` family** (migration 0003) — every scalar field of
+  `keepass_core::model::Meta`. The list:
+  - `meta.generator`, `meta.database_name`, `meta.database_description`,
+    `meta.default_username`, `meta.color`, `meta.header_hash`
+    — utf-8 string bytes.
+  - `meta.database_name_changed`, `meta.database_description_changed`,
+    `meta.default_username_changed`, `meta.recycle_bin_changed`,
+    `meta.settings_changed`, `meta.master_key_changed` — little-endian
+    `i64` milliseconds since the Unix epoch. Absent row ≡ `None`.
+  - `meta.master_key_change_rec`, `meta.master_key_change_force`,
+    `meta.history_max_size` — little-endian `i64`.
+  - `meta.history_max_items` — little-endian `i32`.
+  - `meta.maintenance_history_days` — little-endian `u32`.
+  - `meta.memory_protection` — single byte; bits 0..=4 encode
+    `protect_title`, `protect_username`, `protect_password`,
+    `protect_url`, `protect_notes` respectively.
+  - `meta.unknown_xml` — JSON array of
+    `{ "tag": "...", "raw_xml": "<base64>" }` records. Captures the
+    `<UnknownElement>` round-trip pool verbatim.
+
+## Meta-owned tables (migration 0003)
+
+### `meta_custom_icon`
+
+| column           | type    | notes               |
+|------------------|---------|---------------------|
+| uuid             | TEXT    | PRIMARY KEY         |
+| name             | TEXT    | NOT NULL DEFAULT '' |
+| bytes            | BLOB    | NOT NULL            |
+| last_modified_at | INTEGER | nullable; ms epoch  |
+
+Pool of custom entry / group icons. Indexed by uuid (the primary key).
+
+### `meta_custom_data`
+
+| column           | type    | notes               |
+|------------------|---------|---------------------|
+| key              | TEXT    | PRIMARY KEY         |
+| value            | TEXT    | NOT NULL            |
+| last_modified_at | INTEGER | nullable; ms epoch  |
+
+Free-form key/value strings preserved verbatim for round-trip.
+
+### `meta_deleted_object`
+
+| column     | type    | notes              |
+|------------|---------|--------------------|
+| uuid       | TEXT    | PRIMARY KEY        |
+| deleted_at | INTEGER | nullable; ms epoch |
+
+Tombstones for deleted entries / groups, recorded for future
+sync/merge work. Indexed on `deleted_at` for
+"what got deleted recently?" queries.
 
 ## FTS5 virtual table
 

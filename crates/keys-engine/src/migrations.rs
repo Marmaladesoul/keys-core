@@ -42,6 +42,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "entry_custom_field",
         sql: include_str!("migrations/0002_entry_custom_field.sql"),
     },
+    Migration {
+        version: 3,
+        name: "meta",
+        sql: include_str!("migrations/0003_meta.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.

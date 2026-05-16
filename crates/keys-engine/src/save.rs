@@ -1,6 +1,7 @@
 //! `SQLite` → KDBX serialise — task 2.5.
 //!
-//! Splices the engine's projected [`Vault`] into an existing
+//! Projects the engine's `SQLite` mirror back into a fresh
+//! [`Vault`](keepass_core::model::Vault), installs it on the supplied
 //! [`Kdbx<Unlocked>`] handle, calls
 //! [`Kdbx::save_to_bytes`](keepass_core::kdbx::Kdbx::save_to_bytes) to
 //! re-encrypt under the existing crypto envelope, and atomically writes
@@ -8,14 +9,13 @@
 //!
 //! ## Meta preservation
 //!
-//! Projection only round-trips `recycle_bin_enabled` and
-//! `recycle_bin_uuid` on [`Meta`](keepass_core::model::Meta); the v1
-//! schema doesn't persist any other `Meta` field. To avoid clobbering
-//! `database_name`, `custom_icons`, `custom_data`, `unknown_xml`, etc.,
-//! this path **takes the existing `kdbx` handle's `meta` as the base**
-//! and overlays only the two recycle-bin fields from projection. Same
-//! treatment for `deleted_objects` — projection doesn't track
-//! tombstones in v1, so we carry the existing handle's list forward.
+//! Since migration 0003 the projection reconstitutes the full
+//! [`Meta`](keepass_core::model::Meta) block (every scalar field, the
+//! custom-icons pool, custom-data items, memory-protection flags,
+//! unknown-xml fragments) *and* `Vault::deleted_objects` from `SQLite`.
+//! The save path no longer needs the live `Kdbx` handle to carry any
+//! of these forward — `replace_vault(projected)` overwrites the
+//! handle's vault wholesale and is sufficient.
 //!
 //! ## Atomic write
 //!
@@ -34,7 +34,6 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use keepass_core::kdbx::{Kdbx, Unlocked};
-use keepass_core::model::Vault;
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -60,12 +59,13 @@ pub(crate) fn save(
     path: &Path,
     kdbx: &mut Kdbx<Unlocked>,
 ) -> Result<(), EngineError> {
-    // 1. Project the SQLite mirror back to a Vault.
-    let mut projected = engine.project_to_vault()?;
+    // 1. Project the SQLite mirror back to a Vault. After migration
+    //    0003, the projection reconstitutes the full `Meta` and
+    //    `deleted_objects` — no live-handle splice required.
+    let projected = engine.project_to_vault()?;
 
-    // 2. Splice into kdbx, preserving Meta / DeletedObjects that the
-    //    v1 schema doesn't track.
-    splice_preserving_meta(kdbx, &mut projected);
+    // 2. Install the projected vault on `kdbx`. The handle's previous
+    //    vault contents (entries, groups, meta) are replaced wholesale.
     kdbx.replace_vault(projected);
 
     // 3. Serialise.
@@ -87,31 +87,6 @@ pub(crate) fn save(
     engine.set_last_saved_kdbx_bytes(&bytes)?;
 
     Ok(())
-}
-
-/// Carry forward `Meta` and `DeletedObjects` from `kdbx` onto
-/// `projected`, overwriting only the two recycle-bin fields the
-/// projection actually owns.
-///
-/// Why not just merge field-by-field? `Meta` is `#[non_exhaustive]`,
-/// and the projection only ever sets `recycle_bin_enabled` /
-/// `recycle_bin_uuid`. The simplest way to keep "carry everything else
-/// forward" future-proof against new `Meta` fields is to take the
-/// existing meta as the base and overlay the two we own.
-fn splice_preserving_meta(kdbx: &Kdbx<Unlocked>, projected: &mut Vault) {
-    let projected_recycle_uuid = projected.meta.recycle_bin_uuid;
-    let projected_recycle_enabled = projected.meta.recycle_bin_enabled;
-
-    projected.meta = kdbx.vault().meta.clone();
-    projected.meta.recycle_bin_uuid = projected_recycle_uuid;
-    projected.meta.recycle_bin_enabled = projected_recycle_enabled;
-
-    // Projection has no tombstone column in the v1 schema. Carry the
-    // existing handle's list forward verbatim so a save doesn't strip
-    // them.
-    projected
-        .deleted_objects
-        .clone_from(&kdbx.vault().deleted_objects);
 }
 
 /// Write `bytes` to `path` atomically.

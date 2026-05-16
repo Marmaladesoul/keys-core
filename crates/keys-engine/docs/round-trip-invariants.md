@@ -19,6 +19,13 @@ Source of truth for the assertion is the `vault_round_trip_eq` helper in `tests/
 | `Entry::history` length + per-snapshot revealed shape | Snapshots are serialised to JSON in `entry_history.snapshot_json` and deserialised back. Protected fields (the canonical `password` slot and any `custom_field` with `protected: true`) are AES-GCM-sealed under the session key and base64-encoded *inside* the JSON — same wire format as `entry_protected.wrapped_blob`. Projection unwraps them on the way out, so the reloaded `Entry::history` carries plaintext that matches the source vault. Comparisons run against the revealed plaintext, never the JSON bytes. |
 | `Meta::recycle_bin_uuid` | Persisted via the `is_recycle_bin` column on `group`. |
 | `Meta::recycle_bin_enabled` | Persisted explicitly in the `setting` table under key `meta.recycle_bin_enabled` (1-byte BLOB). Round-trips cleanly even when `recycle_bin_uuid IS NULL`. Legacy DBs without the row fall back to `recycle_bin_uuid.is_some()`. |
+| `Meta::generator`, `database_name`, `database_description`, `default_username`, `color`, `header_hash` | Persisted as utf-8 bytes in `setting` rows keyed `meta.*` (migration 0003). |
+| `Meta::history_max_items`, `history_max_size`, `maintenance_history_days`, `master_key_change_rec`, `master_key_change_force` | Persisted as little-endian fixed-width ints in `setting` rows keyed `meta.*` (migration 0003). |
+| `Meta::memory_protection` | Five booleans packed into a single byte in the `meta.memory_protection` setting row (migration 0003). |
+| `Meta::custom_icons` | One row per icon in the `meta_custom_icon` table — `(uuid, name, bytes, last_modified_at)`. Compared as a set keyed by uuid in the round-trip harness because save-time order is not guaranteed (migration 0003). |
+| `Meta::custom_data` | One row per item in `meta_custom_data` — `(key, value, last_modified_at)` (migration 0003). |
+| `Meta::*_changed` timestamps (`database_name_changed`, `database_description_changed`, `default_username_changed`, `recycle_bin_changed`, `settings_changed`, `master_key_changed`) | Persisted as little-endian `i64` ms-since-epoch in `setting` rows (migration 0003). Compared at second precision per the timestamp rules below. |
+| `Vault::deleted_objects` | Tombstone rows in `meta_deleted_object` — `(uuid, deleted_at)` (migration 0003). Compared as a set keyed by uuid. |
 
 ## Tolerant — compared after normalisation
 
@@ -28,21 +35,11 @@ Source of truth for the assertion is the `vault_round_trip_eq` helper in `tests/
 | `None` vs `Some(epoch)` timestamps | Treated equivalent. The v1 schema declares `created_at` / `modified_at` / `accessed_at` `NOT NULL`, so a source-side `None` becomes `Some(0)` after ingest+projection. Both forms compare equal to each other and to a "no information" baseline. |
 | `Entry::tags` order | Compared as `HashSet`, not `Vec`. Projection sorts tags alphabetically; the source vault may carry any order. |
 
-## Lost-but-preserved-from-source — not in the v1 schema, but preserved on save
+## Lost-but-preserved-from-source — historical
 
-These `Meta` fields aren't persisted in the SQLite mirror. The save path (`save.rs::splice_preserving_meta`) carries them across by copying `kdbx.vault().meta` onto the projected vault before serialising, so they **do** survive a single round-trip — but only because the live kdbx handle still has them. After a `close → reopen` of the engine without the original kdbx handle (which doesn't happen in this test), they'd be regenerated as default by the next save.
+This section listed `Meta` fields that the v1 schema didn't persist; `save.rs::splice_preserving_meta` used to carry them forward by copying from the live `Kdbx<Unlocked>` handle. Migration 0003 (the meta-into-sqlite work) graduated every one of those fields to **strict**, and `splice_preserving_meta` has been retired. SQLite is now a complete representation of the vault — the engine can reconstitute a KDBX file without any input from a live `Kdbx` handle.
 
-- `Meta::database_name`
-- `Meta::generator`
-- `Meta::history_max_items`, `history_max_size`
-- `Meta::custom_icons`
-- `Meta::custom_data`
-- `Meta::memory_protection`
-- `Meta::unknown_xml`
-- `Vault::deleted_objects`
-- All other non-recycle-bin `Meta` fields
-
-The round-trip test helper doesn't re-check these, because a strict comparison would only verify that `kdbx.vault().meta` equals `kdbx.vault().meta` — the splice carries them verbatim. A future schema migration that persists `Meta` would let these graduate to **strict**.
+`Meta::unknown_xml` is persisted (as a JSON list of `(tag, base64(raw_xml))` records in the `meta.unknown_xml` setting row) but compared by **count only** in the round-trip harness because `quick-xml` is free to re-emit attribute ordering / whitespace / empty-element shorthand differently on each pass. The SQLite-only round-trip is byte-exact; only the kdbx → save → reopen path is tolerant on this field.
 
 ## Known-defect — recognised data loss in v1 schema
 

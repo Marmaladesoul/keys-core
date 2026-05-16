@@ -106,7 +106,7 @@ fn migration_creates_entry_custom_field_table() {
 }
 
 #[test]
-fn apply_pending_idempotent_at_v2() {
+fn apply_pending_idempotent_at_latest() {
     let mut conn = Connection::open_in_memory().expect("open in-memory");
     migrations::apply_pending(&mut conn).expect("first apply");
     migrations::apply_pending(&mut conn).expect("second apply no-op");
@@ -114,7 +114,8 @@ fn apply_pending_idempotent_at_v2() {
     let max: i64 = conn
         .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
         .expect("query schema_version");
-    assert_eq!(max, 2, "schema is at v2");
+    let expected = i64::from(MIGRATIONS.last().expect("at least one migration").version);
+    assert_eq!(max, expected, "schema is at latest migration");
 
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
