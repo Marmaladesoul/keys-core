@@ -259,6 +259,51 @@ impl Engine {
         self.last_self_write = Some(signature);
     }
 
+    /// The raw KDBX bytes of the most recent
+    /// [`Engine::save_to_kdbx`] write — the *common ancestor* for a
+    /// future external-change 3-way merge (task 4.4).
+    ///
+    /// Returns `Ok(None)` if this engine has never successfully saved
+    /// a KDBX (fresh database, or a freshly reopened database whose
+    /// previous handle never made it to the save path). Otherwise the
+    /// bytes are byte-identical to what the last `save_to_kdbx` wrote
+    /// to disk and can be fed straight into
+    /// [`keepass_core::kdbx::Kdbx::open`] for re-parsing.
+    ///
+    /// Persisted in the `setting` table under key
+    /// `last_saved_kdbx_bytes`, so the value survives engine
+    /// close + reopen. `SQLCipher` provides encryption-at-rest; the
+    /// bytes themselves are the raw post-KDBX-encryption ciphertext
+    /// (which is already internally compressed by KDBX), no extra
+    /// wrapping applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn last_saved_kdbx_bytes(&self) -> Result<Option<Vec<u8>>, EngineError> {
+        match self.conn.query_row(
+            "SELECT value FROM setting WHERE key = 'last_saved_kdbx_bytes'",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        ) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(EngineError::Sqlite(err)),
+        }
+    }
+
+    /// Crate-internal setter used by [`crate::save::save`] to persist
+    /// the just-written KDBX bytes as the common ancestor for the
+    /// next 3-way merge (task 4.4). INSERT OR REPLACE so subsequent
+    /// saves overwrite the row in place.
+    pub(crate) fn set_last_saved_kdbx_bytes(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO setting(key, value) VALUES ('last_saved_kdbx_bytes', ?1)",
+            rusqlite::params![bytes],
+        )?;
+        Ok(())
+    }
+
     /// One-shot: did `(observed_mtime, observed_size)` come from our own
     /// most recent [`Engine::save_to_kdbx`]?
     ///

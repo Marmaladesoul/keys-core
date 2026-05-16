@@ -212,8 +212,14 @@ Generic KV. Reserved keys:
 - `fingerprint_key` — 32 random bytes, encrypted under SQLCipher (same
   key as the rest of the file; the protection is at rest). Used to
   HMAC password plaintexts for `entry.password_fingerprint`.
-- `last_saved_kdbx_bytes` — gzipped serialised KDBX, the common
-  ancestor for external-change 3-way merge.
+- `last_saved_kdbx_bytes` — raw KDBX bytes of the most recent
+  [`Engine::save_to_kdbx`] write, the common ancestor for an
+  external-change 3-way merge. Stored uncompressed: SQLCipher already
+  encrypts the row at rest, and KDBX is already internally compressed,
+  so an extra gzip layer would save <5% at the cost of an extra moving
+  part. Written atomically with the on-disk save in task 2.5; read
+  back by task 4.6 and fed into [`keepass_core::kdbx::Kdbx::open`] for
+  3-way merge.
 - `meta.recycle_bin_enabled` — 1-byte BLOB (`[0]` / `[1]`) carrying
   `Meta::recycle_bin_enabled` verbatim. Written by ingest, read by
   projection. Lets the schema represent the "enabled=true, no bin

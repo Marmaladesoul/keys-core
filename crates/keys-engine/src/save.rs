@@ -79,6 +79,13 @@ pub(crate) fn save(
     // 5. Record signature.
     engine.set_last_self_write(signature);
 
+    // 6. Persist the just-written bytes as the common ancestor for the
+    //    next external-change 3-way merge (task 4.4). Raw bytes — per
+    //    the 2026-05-16 decision, SQLCipher already encrypts at rest and
+    //    KDBX is already internally compressed, so gzip would buy <5%
+    //    at the cost of an extra moving part.
+    engine.set_last_saved_kdbx_bytes(&bytes)?;
+
     Ok(())
 }
 

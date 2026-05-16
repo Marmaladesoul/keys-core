@@ -138,8 +138,11 @@ CREATE TABLE smart_folder (
 --   * fingerprint_key       — 32 random bytes (encrypted under SQLCipher)
 --                             used to HMAC password plaintexts for the
 --                             duplicate-detection column on `entry`.
---   * last_saved_kdbx_bytes — gzipped serialised KDBX, the common
---                             ancestor for 3-way external-change merge.
+--   * last_saved_kdbx_bytes — raw KDBX bytes of the most recent
+--                             save_to_kdbx write; common ancestor for
+--                             3-way external-change merge (task 4.4).
+--                             Uncompressed: SQLCipher already encrypts
+--                             at rest and KDBX is internally compressed.
 CREATE TABLE setting (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
