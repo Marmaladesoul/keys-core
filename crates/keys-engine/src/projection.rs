@@ -43,12 +43,11 @@ use chrono::{DateTime, TimeZone, Utc};
 use keepass_core::model::{
     Attachment, Binary, CustomField, Entry, EntryId, Group, GroupId, Timestamps, Vault,
 };
-use keepass_core::protector::FieldProtector;
+use keepass_core::protector::{FieldProtector, open_with_key};
 use rusqlite::Connection;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::crypto::unwrap_with_session_key;
 use crate::error::{EngineError, ProjectionError};
 
 /// Canonical KDBX field name for an entry's password slot — must match
@@ -102,7 +101,7 @@ pub(crate) fn project(
         // Protected fields.
         if let Some(rows) = protected.get(&entry_uuid) {
             for (field_name, wrapped) in rows {
-                let plaintext = unwrap_with_session_key(&session_key, wrapped).map_err(|e| {
+                let plaintext = open_with_key(&session_key, wrapped).map_err(|e| {
                     EngineError::Projection(ProjectionError::Unwrap(format!(
                         "entry {entry_uuid} field {field_name}: {e}",
                     )))

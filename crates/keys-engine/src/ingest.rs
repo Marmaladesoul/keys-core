@@ -12,12 +12,10 @@
 
 use std::collections::HashMap;
 
-use aes_gcm::Aes256Gcm;
-use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chrono::{DateTime, Utc};
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{Entry, Group, GroupId, Vault};
-use keepass_core::protector::{FieldProtector, SessionKey};
+use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -276,8 +274,8 @@ fn insert_entry(
 
     // Canonical Password slot. Always written (even empty) so the
     // reveal path has a deterministic row to look up.
-    let wrapped_password = wrap_with_session_key(session_key, password_plain)
-        .map_err(|e| EngineError::Ingest(IngestError::Wrap(e)))?;
+    let wrapped_password = seal_with_key(session_key, password_plain)
+        .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
     conn.execute(
         "INSERT INTO entry_protected (entry_uuid, field_name, wrapped_blob) \
          VALUES (?1, ?2, ?3)",
@@ -296,8 +294,8 @@ fn insert_entry(
             if cf.key == PASSWORD_FIELD {
                 continue;
             }
-            let wrapped = wrap_with_session_key(session_key, cf.value.as_bytes())
-                .map_err(|e| EngineError::Ingest(IngestError::Wrap(e)))?;
+            let wrapped = seal_with_key(session_key, cf.value.as_bytes())
+                .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
             conn.execute(
                 "INSERT INTO entry_protected (entry_uuid, field_name, wrapped_blob) \
                  VALUES (?1, ?2, ?3)",
@@ -408,46 +406,6 @@ fn insert_non_protected_custom_field(
         params![entry_uuid, field_name, value],
     )?;
     Ok(())
-}
-
-/// AES-256-GCM seal `plaintext` under the supplied session key.
-///
-/// Wire format: `nonce(12) || ciphertext || tag(16)`. Matches the
-/// shape produced by `keepass_core::protector::seal_with_key` (which
-/// is `pub(crate)` so we don't reuse it directly), and matches the
-/// expectation documented on `entry_protected.wrapped_blob` in
-/// `schema.md`. The aes-gcm crate's `encrypt` returns
-/// `ciphertext || tag` already concatenated, so we just prepend the
-/// 12-byte random nonce.
-fn wrap_with_session_key(session_key: &SessionKey, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    let cipher = Aes256Gcm::new_from_slice(session_key.as_bytes()).map_err(|e| e.to_string())?;
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext)
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::with_capacity(nonce.len() + ciphertext.len());
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
-}
-
-/// Inverse of [`wrap_with_session_key`] — used by tests to assert the
-/// stored blob is recoverable under the same session key.
-#[cfg(test)]
-pub(crate) fn unwrap_with_session_key(
-    session_key: &SessionKey,
-    wrapped: &[u8],
-) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
-    if wrapped.len() < 12 + 16 {
-        return Err("wrapped blob too short".into());
-    }
-    let (nonce_bytes, ciphertext) = wrapped.split_at(12);
-    let cipher = Aes256Gcm::new_from_slice(session_key.as_bytes()).map_err(|e| e.to_string())?;
-    let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-    cipher
-        .decrypt(nonce, ciphertext)
-        .map(zeroize::Zeroizing::new)
-        .map_err(|e| e.to_string())
 }
 
 /// Parse the host out of a URL. Lowercased for the indexed
@@ -563,33 +521,5 @@ mod tests {
         assert_eq!(parse_host("not a url"), "");
         // Schemeless input is not a URL per RFC 3986; url crate refuses.
         assert_eq!(parse_host("example.com"), "");
-    }
-
-    #[derive(Debug)]
-    struct FixedSession([u8; 32]);
-    impl FieldProtector for FixedSession {
-        fn acquire_session_key(
-            &self,
-        ) -> Result<SessionKey, keepass_core::protector::ProtectorError> {
-            Ok(SessionKey::from_bytes(self.0))
-        }
-    }
-
-    #[test]
-    fn wrap_unwrap_round_trips() {
-        let p = FixedSession([7u8; 32]);
-        let k = p.acquire_session_key().unwrap();
-        let sealed = wrap_with_session_key(&k, b"hunter2").unwrap();
-        let opened = unwrap_with_session_key(&k, &sealed).unwrap();
-        assert_eq!(opened.as_slice(), b"hunter2");
-    }
-
-    #[test]
-    fn wrap_uses_distinct_nonces() {
-        let p = FixedSession([3u8; 32]);
-        let k = p.acquire_session_key().unwrap();
-        let a = wrap_with_session_key(&k, b"same").unwrap();
-        let b = wrap_with_session_key(&k, b"same").unwrap();
-        assert_ne!(a, b, "AES-GCM nonce must be random per seal");
     }
 }

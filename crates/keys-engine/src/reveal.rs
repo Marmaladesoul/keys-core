@@ -22,14 +22,13 @@
 
 use std::collections::HashMap;
 
-use keepass_core::protector::FieldProtector;
+use keepass_core::protector::{FieldProtector, open_with_key};
 use rusqlite::{Connection, OptionalExtension, params};
 use secrecy::SecretString;
 use serde::Deserialize;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::crypto::unwrap_with_session_key;
 use crate::error::{EngineError, RevealError};
 
 /// Canonical KDBX field name for an entry's password slot — kept in
@@ -154,9 +153,9 @@ fn reveal_protected_field(
 
     // Plaintext into a Zeroizing buffer first so the intermediate
     // `Vec<u8>` doesn't linger past the conversion into `SecretString`.
-    let plaintext = unwrap_with_session_key(&session_key, &wrapped)
+    let plaintext = open_with_key(&session_key, &wrapped)
         .map(Zeroizing::new)
-        .map_err(|e| EngineError::Reveal(RevealError::Unwrap(e)))?;
+        .map_err(|e| EngineError::Reveal(RevealError::Unwrap(e.to_string())))?;
     drop(session_key);
 
     let plaintext_str = std::str::from_utf8(&plaintext)
