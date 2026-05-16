@@ -568,6 +568,44 @@ impl Engine {
         crate::smart_folder::delete(&mut self.conn, id)
     }
 
+    /// Test-only helper: compile `predicate` against `now_ms` and
+    /// return the UUIDs of matching entries.
+    ///
+    /// Exists so the predicate-SQL compiler's integration test can
+    /// run a compiled fragment against the real schema without 3.8's
+    /// `Engine::smart_folder_entries` being in place yet. Hidden from
+    /// the public docs to keep the surface clean; not intended for
+    /// production callers — 3.8's `smart_folder_entries` is the
+    /// real surface.
+    #[doc(hidden)]
+    pub fn compiled_predicate_uuids_for_test(
+        &self,
+        predicate: &Predicate,
+        now_ms: i64,
+    ) -> Result<Vec<Uuid>, EngineError> {
+        let compiled = crate::predicate_sql::compile(predicate, now_ms).map_err(|e| {
+            EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
+        let sql = format!(
+            "SELECT uuid FROM entry WHERE {} ORDER BY uuid ASC",
+            compiled.where_sql
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(compiled.params), |r| {
+                let s: String = r.get(0)?;
+                Uuid::parse_str(&s).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Reveal the cleartext password for an entry.
     ///
     /// Fetches the wrapped blob from `entry_protected`, asks the

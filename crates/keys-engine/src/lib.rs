@@ -7,6 +7,7 @@ pub mod key_provider;
 pub mod migrations;
 pub mod model;
 pub mod predicate;
+pub mod predicate_sql;
 pub mod projection;
 pub mod reads;
 pub mod reveal;
@@ -24,5 +25,6 @@ pub use model::{
     Pagination, SmartFolder, StrengthBucket,
 };
 pub use predicate::Predicate;
+pub use predicate_sql::{CompileError, CompiledPredicate, compile as compile_predicate};
 pub use save::SelfWriteSignature;
 pub use strength::{Strength, strength};
