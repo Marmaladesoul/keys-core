@@ -19,6 +19,9 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::EngineError;
+use crate::events::{
+    ChangeEvent, DataChangeObserver, EntryDeletionInfo, EntryMove, GroupDeletionInfo, GroupMove,
+};
 use crate::fingerprint;
 use crate::ingest;
 use crate::key_provider::{DbKey, KeyProvider};
@@ -130,6 +133,14 @@ pub struct Engine {
     /// providers) can demote the engine without us having to expand
     /// the public API later.
     state: VaultState,
+    /// Optional change observer. Phase 4.2/4.3 — set via
+    /// [`Engine::set_observer`], cleared via [`Engine::clear_observer`].
+    /// When `Some`, mutation methods invoke
+    /// [`DataChangeObserver::on_event`] **synchronously on the mutation
+    /// thread** after the transaction commits. Observers must be cheap
+    /// (e.g. push to a channel) — a frontend that wants async dispatch
+    /// adapts inside its impl.
+    observer: Option<Arc<dyn DataChangeObserver>>,
 }
 
 impl Engine {
@@ -188,13 +199,20 @@ impl Engine {
 
         let fingerprint_key = ensure_fingerprint_key(&mut conn)?;
 
-        Ok(Self {
+        let engine = Self {
             conn,
             fingerprint_key,
             field_protector,
             last_self_write: None,
             state: VaultState::Active,
-        })
+            observer: None,
+        };
+        // Note: `VaultUnlocked` is *not* emitted here — no observer is
+        // wired yet. Callers that want the event should set an observer
+        // first and then emit it themselves, or we could fire after a
+        // subsequent `set_observer`. The trait predates the open call,
+        // so this is by design.
+        Ok(engine)
     }
 
     /// Replace this engine's vault tables with the contents of `kdbx`.
@@ -227,12 +245,21 @@ impl Engine {
     ///   [`crate::IngestError::SessionKey`] if the wrap pass fails.
     /// - [`EngineError::Sqlite`] for transaction / INSERT failures.
     pub fn ingest_from_kdbx(&mut self, kdbx: &Kdbx<Unlocked>) -> Result<(), EngineError> {
-        ingest::ingest(
+        let outcome = ingest::ingest(
             &mut self.conn,
             &self.fingerprint_key,
             &*self.field_protector,
             kdbx,
-        )
+        )?;
+        // Bulk events — one per kind. Frontends rebuilding from scratch
+        // react once per kind rather than per row.
+        if !outcome.group_uuids.is_empty() {
+            self.emit(ChangeEvent::GroupsAdded(outcome.group_uuids));
+        }
+        if !outcome.entry_uuids.is_empty() {
+            self.emit(ChangeEvent::EntriesAdded(outcome.entry_uuids));
+        }
+        Ok(())
     }
 
     /// Project this engine's `SQLite` mirror back into a
@@ -313,7 +340,9 @@ impl Engine {
         path: &Path,
         kdbx: &mut Kdbx<Unlocked>,
     ) -> Result<(), EngineError> {
-        save::save(self, path, kdbx)
+        save::save(self, path, kdbx)?;
+        self.emit(ChangeEvent::SaveCompleted);
+        Ok(())
     }
 
     /// The `(mtime, size)` of the most recent KDBX file this engine
@@ -473,6 +502,29 @@ impl Engine {
         self.conn
             .close()
             .map_err(|(_, err)| EngineError::Sqlite(err))
+    }
+
+    /// Install a [`DataChangeObserver`]. Replaces any previously
+    /// installed observer. Subsequent successful mutations will invoke
+    /// [`DataChangeObserver::on_event`] synchronously on the mutation
+    /// thread.
+    pub fn set_observer(&mut self, observer: Arc<dyn DataChangeObserver>) {
+        self.observer = Some(observer);
+    }
+
+    /// Remove any installed observer. Subsequent mutations will not
+    /// fire events until another observer is installed.
+    pub fn clear_observer(&mut self) {
+        self.observer = None;
+    }
+
+    /// Fire a [`ChangeEvent`] if an observer is installed; no-op
+    /// otherwise. Always called after a successful commit by the
+    /// mutation methods — never inside a transaction.
+    pub(crate) fn emit(&self, event: ChangeEvent) {
+        if let Some(observer) = &self.observer {
+            observer.on_event(event);
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -701,7 +753,9 @@ impl Engine {
         name: &str,
         predicate: &Predicate,
     ) -> Result<i64, EngineError> {
-        crate::smart_folder::create(&mut self.conn, name, predicate)
+        let id = crate::smart_folder::create(&mut self.conn, name, predicate)?;
+        self.emit(ChangeEvent::SmartFolderCreated(id));
+        Ok(id)
     }
 
     /// Update an existing smart folder's name and predicate.
@@ -722,7 +776,9 @@ impl Engine {
         name: &str,
         predicate: &Predicate,
     ) -> Result<(), EngineError> {
-        crate::smart_folder::update(&mut self.conn, id, name, predicate)
+        crate::smart_folder::update(&mut self.conn, id, name, predicate)?;
+        self.emit(ChangeEvent::SmartFolderUpdated(id));
+        Ok(())
     }
 
     /// Delete a smart folder by id.
@@ -733,7 +789,9 @@ impl Engine {
     ///   row with the given id exists.
     /// - [`EngineError::Sqlite`] on `DELETE` failure.
     pub fn delete_smart_folder(&mut self, id: i64) -> Result<(), EngineError> {
-        crate::smart_folder::delete(&mut self.conn, id)
+        crate::smart_folder::delete(&mut self.conn, id)?;
+        self.emit(ChangeEvent::SmartFolderDeleted(id));
+        Ok(())
     }
 
     /// Test-only helper: compile `predicate` against `now_ms` and
@@ -877,12 +935,13 @@ impl Engine {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Mutation API — Phase 4 task 4.1.
+    // Mutation API — Phase 4 tasks 4.1 / 4.3.
     //
     // Every mutation runs inside a single transaction, refreshes the
-    // relevant `modified_at`, and maintains derived columns. Event
-    // emission lands in task 4.3; for now each method leaves a
-    // `// TODO 4.3:` comment at the post-commit emission point.
+    // relevant `modified_at`, and maintains derived columns. After the
+    // commit returns, each method invokes [`Engine::emit`] with the
+    // appropriate [`ChangeEvent`]; observers see events only for
+    // successful mutations (failed mutations roll back and never emit).
     // ────────────────────────────────────────────────────────────────────
 
     /// Create a new entry in `group_uuid`. Returns the new entry's
@@ -915,7 +974,7 @@ impl Engine {
             group_uuid,
             fields,
         )?;
-        // TODO 4.3: emit ChangeEvent::EntriesAdded(vec![result]).
+        self.emit(ChangeEvent::EntriesAdded(vec![result]));
         Ok(result)
     }
 
@@ -941,7 +1000,7 @@ impl Engine {
             uuid,
             update,
         )?;
-        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
     }
 
@@ -954,7 +1013,7 @@ impl Engine {
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn recycle_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
         mutations::recycle_entry(&mut self.conn, uuid)?;
-        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        self.emit(ChangeEvent::EntriesRecycled(vec![uuid]));
         Ok(())
     }
 
@@ -967,7 +1026,7 @@ impl Engine {
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn restore_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
         mutations::restore_entry(&mut self.conn, uuid)?;
-        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        self.emit(ChangeEvent::EntriesRestored(vec![uuid]));
         Ok(())
     }
 
@@ -982,8 +1041,11 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
     /// - [`EngineError::Sqlite`] on delete failure.
     pub fn delete_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
-        mutations::delete_entry(&mut self.conn, uuid)?;
-        // TODO 4.3: emit ChangeEvent::EntriesRemoved(vec![uuid]).
+        let outcome = mutations::delete_entry(&mut self.conn, uuid)?;
+        self.emit(ChangeEvent::EntriesDeleted(vec![EntryDeletionInfo {
+            uuid,
+            previous_group: outcome.previous_group,
+        }]));
         Ok(())
     }
 
@@ -994,8 +1056,12 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "entry"` or `"group"`).
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn move_entry(&mut self, uuid: Uuid, new_group_uuid: Uuid) -> Result<(), EngineError> {
-        mutations::move_entry(&mut self.conn, uuid, new_group_uuid)?;
-        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        let outcome = mutations::move_entry(&mut self.conn, uuid, new_group_uuid)?;
+        self.emit(ChangeEvent::EntriesMoved(vec![EntryMove {
+            uuid,
+            from_group: outcome.from_group,
+            to_group: outcome.to_group,
+        }]));
         Ok(())
     }
 
@@ -1022,7 +1088,10 @@ impl Engine {
             field_name,
             plaintext,
         )?;
-        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        self.emit(ChangeEvent::ProtectedFieldChanged {
+            entry_uuid: uuid,
+            field_name: field_name.to_owned(),
+        });
         Ok(())
     }
 
@@ -1040,7 +1109,7 @@ impl Engine {
         value: &str,
     ) -> Result<(), EngineError> {
         mutations::set_non_protected_custom_field(&mut self.conn, uuid, field_name, value)?;
-        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
     }
 
@@ -1058,7 +1127,7 @@ impl Engine {
     /// - [`EngineError::Sqlite`].
     pub fn remove_custom_field(&mut self, uuid: Uuid, field_name: &str) -> Result<(), EngineError> {
         mutations::remove_custom_field(&mut self.conn, uuid, field_name)?;
-        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
     }
 
@@ -1071,7 +1140,13 @@ impl Engine {
     /// - [`EngineError::Sqlite`].
     pub fn set_tags(&mut self, uuid: Uuid, tags: Vec<String>) -> Result<(), EngineError> {
         mutations::set_tags(&mut self.conn, uuid, tags)?;
-        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        // Two events: the tag set changed (`TagsChanged`), and the
+        // entry's `modified_at` was bumped (`EntriesUpdated`). Frontends
+        // that only care about tag indices subscribe to the first;
+        // entry-row observers subscribe to the second. Cheap to fire
+        // both, no need to make the observer reason about overlap.
+        self.emit(ChangeEvent::TagsChanged(vec![uuid]));
+        self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
     }
 
@@ -1090,7 +1165,7 @@ impl Engine {
         bytes: Vec<u8>,
     ) -> Result<(), EngineError> {
         mutations::attach_file(&mut self.conn, uuid, name, bytes)?;
-        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())
     }
 
@@ -1103,7 +1178,7 @@ impl Engine {
     /// - [`EngineError::Sqlite`].
     pub fn remove_attachment(&mut self, uuid: Uuid, name: &str) -> Result<(), EngineError> {
         mutations::remove_attachment(&mut self.conn, uuid, name)?;
-        // TODO 4.3: emit ChangeEvent::EntriesUpdated(vec![uuid]).
+        self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())
     }
 
@@ -1120,7 +1195,7 @@ impl Engine {
         fields: NewGroupFields,
     ) -> Result<Uuid, EngineError> {
         let uuid = mutations::create_group(&mut self.conn, parent_uuid, fields)?;
-        // TODO 4.3: emit ChangeEvent::GroupsAdded(vec![uuid]).
+        self.emit(ChangeEvent::GroupsAdded(vec![uuid]));
         Ok(uuid)
     }
 
@@ -1133,7 +1208,7 @@ impl Engine {
     /// - [`EngineError::Sqlite`].
     pub fn update_group(&mut self, uuid: Uuid, update: GroupUpdate) -> Result<(), EngineError> {
         mutations::update_group(&mut self.conn, uuid, update)?;
-        // TODO 4.3: emit ChangeEvent::GroupsUpdated(vec![uuid]).
+        self.emit(ChangeEvent::GroupsUpdated(vec![uuid]));
         Ok(())
     }
 
@@ -1157,7 +1232,12 @@ impl Engine {
     /// - [`EngineError::Sqlite`].
     pub fn recycle_group(&mut self, uuid: Uuid) -> Result<(), EngineError> {
         mutations::recycle_group(&mut self.conn, uuid)?;
-        // TODO 4.3: emit ChangeEvent::GroupsUpdated(vec![uuid]).
+        // Only the group event fires — descendant entries and groups
+        // are implicitly recycled by sitting under a recycled ancestor.
+        // Frontends listening on group events know to re-query their
+        // subtree views; emitting per-descendant events would force
+        // every observer to consume them even when they don't care.
+        self.emit(ChangeEvent::GroupsRecycled(vec![uuid]));
         Ok(())
     }
 
@@ -1173,7 +1253,10 @@ impl Engine {
     /// - [`EngineError::Sqlite`].
     pub fn restore_group(&mut self, uuid: Uuid, new_parent_uuid: Uuid) -> Result<(), EngineError> {
         mutations::restore_group(&mut self.conn, uuid, new_parent_uuid)?;
-        // TODO 4.3: emit ChangeEvent::GroupsUpdated(vec![uuid]).
+        // Same shape as recycle — emit only the group event. Descendant
+        // recycle status is determined by ancestor walk, not a column,
+        // so there's nothing to fan out per row.
+        self.emit(ChangeEvent::GroupsRestored(vec![uuid]));
         Ok(())
     }
 
@@ -1188,8 +1271,31 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "group"`).
     /// - [`EngineError::Sqlite`].
     pub fn delete_group(&mut self, uuid: Uuid) -> Result<(), EngineError> {
-        mutations::delete_group(&mut self.conn, uuid)?;
-        // TODO 4.3: emit ChangeEvent::GroupsRemoved(vec![uuid]).
+        let outcome = mutations::delete_group(&mut self.conn, uuid)?;
+        // One combined `EntriesDeleted` and one combined `GroupsDeleted`
+        // covering the entire cascade. Order: entries first, then
+        // groups — leaves-up, mirroring the delete order inside the
+        // transaction. Frontends get all the info in two events.
+        if !outcome.deleted_entries.is_empty() {
+            let entries = outcome
+                .deleted_entries
+                .into_iter()
+                .map(|(uuid, previous_group)| EntryDeletionInfo {
+                    uuid,
+                    previous_group,
+                })
+                .collect();
+            self.emit(ChangeEvent::EntriesDeleted(entries));
+        }
+        let groups = outcome
+            .deleted_groups
+            .into_iter()
+            .map(|(uuid, previous_parent)| GroupDeletionInfo {
+                uuid,
+                previous_parent,
+            })
+            .collect();
+        self.emit(ChangeEvent::GroupsDeleted(groups));
         Ok(())
     }
 
@@ -1202,8 +1308,12 @@ impl Engine {
     /// - [`EngineError::CycleDetected`].
     /// - [`EngineError::Sqlite`].
     pub fn move_group(&mut self, uuid: Uuid, new_parent_uuid: Uuid) -> Result<(), EngineError> {
-        mutations::move_group(&mut self.conn, uuid, new_parent_uuid)?;
-        // TODO 4.3: emit ChangeEvent::GroupsUpdated(vec![uuid]).
+        let outcome = mutations::move_group(&mut self.conn, uuid, new_parent_uuid)?;
+        self.emit(ChangeEvent::GroupsMoved(vec![GroupMove {
+            uuid,
+            from_parent: outcome.from_parent,
+            to_parent: outcome.to_parent,
+        }]));
         Ok(())
     }
 

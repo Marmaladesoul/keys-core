@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod error;
+pub mod events;
 pub mod fingerprint;
 pub mod ingest;
 pub mod key_provider;
@@ -19,6 +20,10 @@ pub mod strength;
 
 pub use engine::{DisconnectReason, Engine, VaultState};
 pub use error::{EngineError, IngestError, ProjectionError, RevealError};
+pub use events::{
+    ChangeEvent, ConflictPayload, DataChangeObserver, EntryDeletionInfo, EntryMove,
+    GroupDeletionInfo, GroupMove,
+};
 pub use fingerprint::fingerprint;
 pub use key_provider::{DbKey, KeyProvider, KeyProviderError};
 pub use migrations::MigrationError;

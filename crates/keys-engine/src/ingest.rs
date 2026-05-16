@@ -33,6 +33,15 @@ use crate::strength;
 /// key.
 const PASSWORD_FIELD: &str = "Password";
 
+/// Outcome of an ingest pass. Captured uuids let the engine fire a
+/// single combined `GroupsAdded` + `EntriesAdded` pair of events after
+/// the transaction commits.
+#[derive(Debug, Default)]
+pub(crate) struct IngestOutcome {
+    pub group_uuids: Vec<Uuid>,
+    pub entry_uuids: Vec<Uuid>,
+}
+
 /// Top-level ingest entry point. Holds a single transaction across the
 /// entire walk so a failure rolls back cleanly.
 pub(crate) fn ingest(
@@ -40,7 +49,7 @@ pub(crate) fn ingest(
     fingerprint_key: &[u8; 32],
     protector: &dyn FieldProtector,
     kdbx: &Kdbx<Unlocked>,
-) -> Result<(), EngineError> {
+) -> Result<IngestOutcome, EngineError> {
     // Unwrap the in-memory wrap layer once: every Entry from this
     // Vault carries plaintext in `password` and `custom_fields[i].value`
     // for the duration of the call. Drop it as soon as the walk is
@@ -83,8 +92,10 @@ pub(crate) fn ingest(
         params![&enabled_blob[..]],
     )?;
 
+    let mut outcome = IngestOutcome::default();
+
     // Walk groups first so entries' FK references resolve.
-    walk_groups(&tx, &vault.root, None, recycle_bin_uuid)?;
+    walk_groups(&tx, &vault.root, None, recycle_bin_uuid, &mut outcome)?;
 
     // Index the binary pool by ref_id so attachment lookups are O(1).
     // KDBX `ref_id` is the index into `Vault::binaries`.
@@ -99,11 +110,12 @@ pub(crate) fn ingest(
         fingerprint_key,
         &session_key,
         &binaries,
+        &mut outcome,
     )?;
 
     tx.commit()?;
     drop(vault);
-    Ok(())
+    Ok(outcome)
 }
 
 /// `DELETE FROM` every vault-content table. Schema and migration rows
@@ -130,6 +142,7 @@ fn walk_groups(
     group: &Group,
     parent_uuid: Option<Uuid>,
     recycle_bin_uuid: Option<GroupId>,
+    outcome: &mut IngestOutcome,
 ) -> Result<(), rusqlite::Error> {
     let uuid_str = group.id.0.to_string();
     let parent_str = parent_uuid.as_ref().map(Uuid::to_string);
@@ -154,8 +167,9 @@ fn walk_groups(
         ],
     )?;
 
+    outcome.group_uuids.push(group.id.0);
     for child in &group.groups {
-        walk_groups(conn, child, Some(group.id.0), recycle_bin_uuid)?;
+        walk_groups(conn, child, Some(group.id.0), recycle_bin_uuid, outcome)?;
     }
     Ok(())
 }
@@ -170,6 +184,7 @@ fn walk_entries(
     fingerprint_key: &[u8; 32],
     session_key: &SessionKey,
     binaries: &[&[u8]],
+    outcome: &mut IngestOutcome,
 ) -> Result<(), EngineError> {
     let group_is_recycle_bin = recycle_bin_uuid.is_some_and(|rb| rb == group.id);
     let in_recycle_bin = is_under_recycle_bin || group_is_recycle_bin;
@@ -185,6 +200,7 @@ fn walk_entries(
             session_key,
             binaries,
         )?;
+        outcome.entry_uuids.push(entry.id.0);
     }
 
     for child in &group.groups {
@@ -197,6 +213,7 @@ fn walk_entries(
             fingerprint_key,
             session_key,
             binaries,
+            outcome,
         )?;
     }
 

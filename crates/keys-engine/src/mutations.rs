@@ -6,9 +6,11 @@
 //! `password_strength_bucket`, `password_entropy`,
 //! `password_fingerprint`) when protected fields change.
 //!
-//! Event emission for the upcoming change-bus (Phase 4.3) is not in
-//! this module — each public mutation method on [`crate::Engine`]
-//! leaves a `// TODO 4.3:` comment at the post-commit emission point.
+//! Event emission for the Phase 4.3 change-bus lives on
+//! [`crate::Engine`] — the mutation functions here return the small
+//! outcome structs the engine needs to construct events (previous group
+//! for a deleted entry, the cascade list for a recursive group delete,
+//! etc.), and the engine fires events after the commit returns.
 
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +29,41 @@ use crate::strength;
 /// Canonical KDBX field name for the password slot. Must match
 /// [`crate::ingest`]'s `PASSWORD_FIELD`.
 const PASSWORD_FIELD: &str = "Password";
+
+/// Outcome of [`delete_entry`] — carries the pre-delete group so the
+/// engine can populate an [`crate::events::EntryDeletionInfo`].
+#[derive(Debug)]
+pub(crate) struct DeleteEntryOutcome {
+    pub previous_group: Uuid,
+}
+
+/// Outcome of [`move_entry`] — carries both endpoints so the engine can
+/// populate an [`crate::events::EntryMove`].
+#[derive(Debug)]
+pub(crate) struct MoveEntryOutcome {
+    pub from_group: Uuid,
+    pub to_group: Uuid,
+}
+
+/// Outcome of [`move_group`] — carries both endpoints.
+#[derive(Debug)]
+pub(crate) struct MoveGroupOutcome {
+    pub from_parent: Uuid,
+    pub to_parent: Uuid,
+}
+
+/// Outcome of [`delete_group`] — carries the full cascade so the engine
+/// can fold a single combined `GroupsDeleted` + `EntriesDeleted` pair
+/// of events.
+#[derive(Debug, Default)]
+pub(crate) struct DeleteGroupOutcome {
+    /// Every group removed by the cascade, paired with the parent it
+    /// had immediately before deletion.
+    pub deleted_groups: Vec<(Uuid, Option<Uuid>)>,
+    /// Every entry removed by the cascade, paired with the group it
+    /// was in immediately before deletion.
+    pub deleted_entries: Vec<(Uuid, Uuid)>,
+}
 
 /// Wall-clock `now` in ms since the Unix epoch. Saturates on platform
 /// edge cases rather than panicking — a mutation should never abort
@@ -365,37 +402,63 @@ pub(crate) fn restore_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
     Ok(())
 }
 
-pub(crate) fn delete_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
+pub(crate) fn delete_entry(
+    conn: &mut Connection,
+    uuid: Uuid,
+) -> Result<DeleteEntryOutcome, EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
-    if !entry_exists(&tx, &uuid_str)? {
-        return Err(EngineError::NotFound { entity: "entry" });
-    }
+    let previous_group_str: String = match tx
+        .query_row(
+            "SELECT group_uuid FROM entry WHERE uuid = ?1",
+            params![uuid_str],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        Some(g) => g,
+        None => return Err(EngineError::NotFound { entity: "entry" }),
+    };
+    let previous_group = Uuid::parse_str(&previous_group_str)
+        .map_err(|e| EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
     tx.execute("DELETE FROM entry WHERE uuid = ?1", params![uuid_str])?;
     tx.commit()?;
-    Ok(())
+    Ok(DeleteEntryOutcome { previous_group })
 }
 
 pub(crate) fn move_entry(
     conn: &mut Connection,
     uuid: Uuid,
     new_group_uuid: Uuid,
-) -> Result<(), EngineError> {
+) -> Result<MoveEntryOutcome, EngineError> {
     let uuid_str = uuid.to_string();
     let group_str = new_group_uuid.to_string();
     let tx = conn.transaction()?;
-    if !entry_exists(&tx, &uuid_str)? {
-        return Err(EngineError::NotFound { entity: "entry" });
-    }
+    let previous_group_str: String = match tx
+        .query_row(
+            "SELECT group_uuid FROM entry WHERE uuid = ?1",
+            params![uuid_str],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        Some(g) => g,
+        None => return Err(EngineError::NotFound { entity: "entry" }),
+    };
     if !group_exists(&tx, &group_str)? {
         return Err(EngineError::NotFound { entity: "group" });
     }
+    let from_group = Uuid::parse_str(&previous_group_str)
+        .map_err(|e| EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
     tx.execute(
         "UPDATE entry SET group_uuid = ?1, modified_at = ?2 WHERE uuid = ?3",
         params![group_str, now_ms(), uuid_str],
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(MoveEntryOutcome {
+        from_group,
+        to_group: new_group_uuid,
+    })
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -693,7 +756,7 @@ pub(crate) fn restore_group(
     conn: &mut Connection,
     uuid: Uuid,
     new_parent_uuid: Uuid,
-) -> Result<(), EngineError> {
+) -> Result<MoveGroupOutcome, EngineError> {
     move_group(conn, uuid, new_parent_uuid)
 }
 
@@ -704,30 +767,74 @@ pub(crate) fn restore_group(
 /// so we recursively delete children manually. Entry child tables
 /// (`entry_protected`, `entry_attachment`, `entry_custom_field`,
 /// `entry_history`, `entry_tag`) cascade off `entry`.
-pub(crate) fn delete_group(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
+pub(crate) fn delete_group(
+    conn: &mut Connection,
+    uuid: Uuid,
+) -> Result<DeleteGroupOutcome, EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
-    if !group_exists(&tx, &uuid_str)? {
-        return Err(EngineError::NotFound { entity: "group" });
-    }
-    delete_group_recursive(&tx, &uuid_str)?;
+    // Pull the target group's parent up front so the outcome carries the
+    // pre-delete attachment point. `parent_uuid` is NULL only for the
+    // root group.
+    let previous_parent_str: Option<String> = match tx
+        .query_row(
+            "SELECT parent_uuid FROM \"group\" WHERE uuid = ?1",
+            params![uuid_str],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+    {
+        Some(p) => p,
+        None => return Err(EngineError::NotFound { entity: "group" }),
+    };
+    let previous_parent = match previous_parent_str {
+        Some(s) => Some(Uuid::parse_str(&s).map_err(|e| {
+            EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?),
+        None => None,
+    };
+
+    let mut outcome = DeleteGroupOutcome::default();
+    delete_group_recursive(&tx, &uuid_str, previous_parent, &mut outcome)?;
     tx.commit()?;
-    Ok(())
+    Ok(outcome)
 }
 
-fn delete_group_recursive(tx: &Transaction<'_>, uuid: &str) -> Result<(), EngineError> {
-    // Children first.
+fn delete_group_recursive(
+    tx: &Transaction<'_>,
+    uuid: &str,
+    parent_uuid: Option<Uuid>,
+    outcome: &mut DeleteGroupOutcome,
+) -> Result<(), EngineError> {
+    let self_uuid = Uuid::parse_str(uuid)
+        .map_err(|e| EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+
+    // Children first so the cascade order is leaves-up.
     let children: Vec<String> = {
         let mut stmt = tx.prepare("SELECT uuid FROM \"group\" WHERE parent_uuid = ?1")?;
         stmt.query_map(params![uuid], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?
     };
     for child in children {
-        delete_group_recursive(tx, &child)?;
+        delete_group_recursive(tx, &child, Some(self_uuid), outcome)?;
     }
-    // Direct child entries.
+
+    // Direct child entries — collect uuids first for the event.
+    let child_entries: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT uuid FROM entry WHERE group_uuid = ?1")?;
+        stmt.query_map(params![uuid], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for entry_uuid_str in child_entries {
+        let entry_uuid = Uuid::parse_str(&entry_uuid_str).map_err(|e| {
+            EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
+        outcome.deleted_entries.push((entry_uuid, self_uuid));
+    }
+
     tx.execute("DELETE FROM entry WHERE group_uuid = ?1", params![uuid])?;
     tx.execute("DELETE FROM \"group\" WHERE uuid = ?1", params![uuid])?;
+    outcome.deleted_groups.push((self_uuid, parent_uuid));
     Ok(())
 }
 
@@ -735,7 +842,7 @@ pub(crate) fn move_group(
     conn: &mut Connection,
     uuid: Uuid,
     new_parent_uuid: Uuid,
-) -> Result<(), EngineError> {
+) -> Result<MoveGroupOutcome, EngineError> {
     let uuid_str = uuid.to_string();
     let new_parent_str = new_parent_uuid.to_string();
 
@@ -743,12 +850,30 @@ pub(crate) fn move_group(
         return Err(EngineError::CycleDetected);
     }
     let tx = conn.transaction()?;
-    if !group_exists(&tx, &uuid_str)? {
-        return Err(EngineError::NotFound { entity: "group" });
-    }
+    let previous_parent_str: Option<String> = match tx
+        .query_row(
+            "SELECT parent_uuid FROM \"group\" WHERE uuid = ?1",
+            params![uuid_str],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+    {
+        Some(p) => p,
+        None => return Err(EngineError::NotFound { entity: "group" }),
+    };
     if !group_exists(&tx, &new_parent_str)? {
         return Err(EngineError::NotFound { entity: "group" });
     }
+    let from_parent = match previous_parent_str {
+        Some(s) => Uuid::parse_str(&s).map_err(|e| {
+            EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?,
+        // Root has no parent — we still need a sentinel. Use the
+        // moved group's own uuid; callers shouldn't be moving the root
+        // anyway, so this branch is degenerate. The cycle check below
+        // will also catch the self-move.
+        None => uuid,
+    };
 
     // Walk up from new_parent; if we hit `uuid`, it's a cycle.
     let mut cursor: Option<String> = Some(new_parent_str.clone());
@@ -771,5 +896,8 @@ pub(crate) fn move_group(
         params![new_parent_str, now_ms(), uuid_str],
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(MoveGroupOutcome {
+        from_parent,
+        to_parent: new_parent_uuid,
+    })
 }
