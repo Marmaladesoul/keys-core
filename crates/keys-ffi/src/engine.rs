@@ -251,6 +251,24 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.clear_entry_custom_icon(u)?))
     }
 
+    /// See [`keys_engine::Engine::touch_entry`]. Bumps the entry's
+    /// `last_used_at` to now without touching `modified_at`; emits the
+    /// quiet `ChangeEvent::EntryTouched` event so listeners can avoid
+    /// re-rendering full entry detail.
+    pub fn touch_entry(&self, entry_uuid: String) -> Result<(), EngineError> {
+        let u = parse_uuid(&entry_uuid, "entry")?;
+        self.with_engine_mut(|e| Ok(e.touch_entry(u)?))
+    }
+
+    /// See [`keys_engine::Engine::clear_entry_last_access`]. Sets the
+    /// entry's `last_used_at` back to NULL; emits
+    /// `ChangeEvent::EntriesUpdated` (this is a user-driven explicit
+    /// clear from the entry detail editor).
+    pub fn clear_entry_last_access(&self, entry_uuid: String) -> Result<(), EngineError> {
+        let u = parse_uuid(&entry_uuid, "entry")?;
+        self.with_engine_mut(|e| Ok(e.clear_entry_last_access(u)?))
+    }
+
     /// See [`keys_engine::Engine::custom_icon_bytes`]. Returns `None`
     /// if no icon with that UUID is in the pool.
     pub fn custom_icon_bytes(&self, uuid: String) -> Result<Option<Vec<u8>>, EngineError> {

@@ -26,6 +26,17 @@ pub enum ChangeEvent {
     /// One or more entries were updated in-place (title, url, password,
     /// custom fields, attachments — anything that bumps `modified_at`).
     EntriesUpdated(Vec<Uuid>),
+    /// An entry's `last_used_at` was bumped via a read-touch flow
+    /// (`AutoFill` fulfilment, in-app password reveal). Distinct from
+    /// [`Self::EntriesUpdated`] because nothing else on the entry
+    /// changed — in particular `modified_at` is NOT bumped, so listeners
+    /// should treat this as a benign last-access notification and avoid
+    /// re-rendering full entry detail. Fired by
+    /// [`crate::Engine::touch_entry`].
+    EntryTouched {
+        /// The entry whose `last_used_at` was bumped.
+        uuid: Uuid,
+    },
     /// One or more entries were hard-deleted. Carries the pre-delete
     /// group uuid for each so observers can invalidate group-scoped
     /// caches.

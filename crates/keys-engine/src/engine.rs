@@ -1322,6 +1322,54 @@ impl Engine {
         Ok(())
     }
 
+    /// Bump an entry's `last_used_at` to now. Read-touch flow: nothing
+    /// else on the entry changes (no `modified_at` bump, no history
+    /// snapshot, no protected-field reseal). Intended for `AutoFill`
+    /// fulfilment and in-app password reveal, both of which fire many
+    /// times per session.
+    ///
+    /// Emits [`ChangeEvent::EntryTouched`] rather than
+    /// [`ChangeEvent::EntriesUpdated`] — the latter is a heavy refresh
+    /// signal that would force listeners (e.g. an open entry detail
+    /// pane) to re-pull on every touch. `EntryTouched` is the quiet
+    /// last-access channel; listeners that care about Recently-Used
+    /// ordering subscribe to it explicitly.
+    ///
+    /// Mirrors the legacy `Vault::touch_entry` semantics so the Phase
+    /// 6.17 Keys-Mac migration is a like-for-like swap.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry
+    ///   row matches the uuid.
+    /// - [`EngineError::Sqlite`] on update failure.
+    pub fn touch_entry(&mut self, entry_uuid: Uuid) -> Result<(), EngineError> {
+        mutations::touch_entry(&mut self.conn, entry_uuid)?;
+        self.emit(ChangeEvent::EntryTouched { uuid: entry_uuid });
+        Ok(())
+    }
+
+    /// Clear an entry's `last_used_at`, returning the column to NULL.
+    /// User-driven explicit reset from the entry detail editor (e.g.
+    /// after `AutoFill` stamped an entry that shouldn't have shown up
+    /// in Recently-Used).
+    ///
+    /// Like [`Engine::touch_entry`], does NOT bump `modified_at` and
+    /// takes no history snapshot. Unlike `touch_entry`, this is a
+    /// view-affecting user gesture, so it emits
+    /// [`ChangeEvent::EntriesUpdated`] (entry detail panes refresh).
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry
+    ///   row matches the uuid.
+    /// - [`EngineError::Sqlite`] on update failure.
+    pub fn clear_entry_last_access(&mut self, entry_uuid: Uuid) -> Result<(), EngineError> {
+        mutations::clear_entry_last_access(&mut self.conn, entry_uuid)?;
+        self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
+        Ok(())
+    }
+
     /// Fetch the raw bytes for a custom icon by UUID.
     ///
     /// Returns `Ok(None)` if no icon with that UUID is in the pool —

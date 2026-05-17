@@ -40,6 +40,13 @@ pub enum ChangeEvent {
     EntriesUpdated {
         uuids: Vec<String>,
     },
+    /// An entry's `last_used_at` was bumped via a read-touch flow
+    /// (e.g. `AutoFill` fulfilment). Distinct from `EntriesUpdated`
+    /// because `modified_at` is NOT bumped — listeners should treat
+    /// this as a quiet last-access notification.
+    EntryTouched {
+        uuid: String,
+    },
     EntriesDeleted {
         entries: Vec<EntryDeletion>,
     },
@@ -178,6 +185,9 @@ impl From<EngChangeEvent> for ChangeEvent {
         match e {
             EngChangeEvent::EntriesAdded(u) => Self::EntriesAdded { uuids: uuid_vec(u) },
             EngChangeEvent::EntriesUpdated(u) => Self::EntriesUpdated { uuids: uuid_vec(u) },
+            EngChangeEvent::EntryTouched { uuid } => Self::EntryTouched {
+                uuid: uuid.to_string(),
+            },
             EngChangeEvent::EntriesDeleted(d) => Self::EntriesDeleted {
                 entries: d.into_iter().map(Into::into).collect(),
             },

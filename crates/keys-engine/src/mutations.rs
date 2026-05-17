@@ -420,6 +420,47 @@ pub(crate) fn clear_entry_custom_icon(
     Ok(())
 }
 
+/// Bump `entry.last_used_at` to now. Mirrors the legacy
+/// `Vault::touch_entry` contract: nothing else on the entry changes
+/// (no `modified_at` bump, no history snapshot), so the touch reads
+/// as a benign last-access stamp rather than a real edit. The engine
+/// emits [`crate::ChangeEvent::EntryTouched`] for this rather than
+/// [`crate::ChangeEvent::EntriesUpdated`].
+pub(crate) fn touch_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
+    let uuid_str = uuid.to_string();
+    let tx = conn.transaction()?;
+    if !entry_exists(&tx, &uuid_str)? {
+        return Err(EngineError::NotFound { entity: "entry" });
+    }
+    tx.execute(
+        "UPDATE entry SET last_used_at = ?1 WHERE uuid = ?2",
+        params![now_ms(), uuid_str],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Set `entry.last_used_at` back to NULL. User-driven explicit clear
+/// from the entry-detail editor (e.g. "this `AutoFill` match shouldn't
+/// have shown up in recents"). Like [`touch_entry`], does NOT bump
+/// `modified_at`.
+pub(crate) fn clear_entry_last_access(
+    conn: &mut Connection,
+    uuid: Uuid,
+) -> Result<(), EngineError> {
+    let uuid_str = uuid.to_string();
+    let tx = conn.transaction()?;
+    if !entry_exists(&tx, &uuid_str)? {
+        return Err(EngineError::NotFound { entity: "entry" });
+    }
+    tx.execute(
+        "UPDATE entry SET last_used_at = NULL WHERE uuid = ?1",
+        params![uuid_str],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;

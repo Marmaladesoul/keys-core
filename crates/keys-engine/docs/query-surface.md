@@ -156,6 +156,25 @@ content-hash dedup, returns the icon's UUID) and
 leaves the pool blob in place — orphan icons are reaped by save-path
 GC, matching legacy `Vault` semantics).
 
+### Last-access stamps
+
+Two engine methods write the `last_used_at` column without bumping
+`modified_at` (mirroring legacy `Vault` semantics):
+
+- `Engine::touch_entry(uuid)` — read-touch flow (AutoFill fulfilment,
+  in-app reveal). Bumps `last_used_at` to now. Emits the dedicated
+  `ChangeEvent::EntryTouched { uuid }` event rather than the heavier
+  `EntriesUpdated`, so listeners that don't care about Recently-Used
+  ordering can ignore the high-volume AutoFill traffic without
+  re-rendering full entry detail.
+- `Engine::clear_entry_last_access(uuid)` — user-driven explicit
+  reset from the entry detail editor. Sets `last_used_at` back to
+  NULL. Emits `ChangeEvent::EntriesUpdated(vec![uuid])` because this
+  is a view-affecting user gesture.
+
+Both return `EngineError::NotFound { entity: "entry" }` for an
+unknown uuid.
+
 ### `CustomFieldRef` / `AttachmentRef`
 
 ```rust
@@ -249,6 +268,7 @@ rather than "nothing matches".
 
 ## Decisions deferred to later tasks
 
-- `last_used_at` write path from AutoFill (Phase 7.7).
+- AutoFill consumer of `Engine::touch_entry` (Phase 7.7) — the
+  write path itself landed in Phase 6.17-E.
 - `NotEvaluable` error variant for unknown-predicate folders (Phase 3.9).
 - Tolerant decoder that preserves unknown-predicate raw JSON (Phase 3.9).
