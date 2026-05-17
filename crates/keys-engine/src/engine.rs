@@ -1268,6 +1268,75 @@ impl Engine {
         Ok(())
     }
 
+    /// Register a PNG (or any image-format-of-the-frontend's-choosing)
+    /// blob in the vault's custom-icon pool and return its UUID.
+    ///
+    /// Dedup-by-content-hash: if an existing icon already has the same
+    /// SHA-256 as `png_bytes`, its UUID is returned and the pool is
+    /// left unchanged. Matches `keepass-core`'s
+    /// `Kdbx::add_custom_icon` semantics so the SQLite-backed engine
+    /// and the in-memory `Vault` shim agree on UUIDs for the same
+    /// bytes (load-bearing during the Phase 6.17 migration window).
+    ///
+    /// Emits [`ChangeEvent::MetaUpdated`] with key
+    /// `"meta.custom_icons"` on a fresh insert. A dedup hit does NOT
+    /// emit (nothing changed).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on write failure, or
+    /// [`EngineError::Projection`] if a persisted UUID row fails to
+    /// parse (corrupt DB).
+    pub fn add_custom_icon(&mut self, png_bytes: &[u8]) -> Result<String, EngineError> {
+        let (uuid, inserted) = crate::meta::add_custom_icon_dedup(&self.conn, png_bytes)?;
+        if inserted {
+            self.emit(ChangeEvent::MetaUpdated {
+                keys: vec![crate::meta::KEY_CUSTOM_ICONS.to_string()],
+            });
+        }
+        Ok(uuid.to_string())
+    }
+
+    /// Clear an entry's reference to a custom icon, restoring it to
+    /// the built-in icon at `icon_index` (which is left unchanged).
+    ///
+    /// Does **not** delete the underlying icon blob from
+    /// `meta_custom_icon` — other entries or groups may still
+    /// reference it. Use [`Engine::add_custom_icon`] +
+    /// `update_entry` if you want to swap icons; this method is for
+    /// the "go back to default" UX.
+    ///
+    /// Emits [`ChangeEvent::EntriesUpdated`] with the supplied uuid
+    /// (the same event the generic `update_entry` path fires) so
+    /// observers don't need to learn a new variant for this one
+    /// column.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry
+    ///   row matches the uuid.
+    /// - [`EngineError::Sqlite`] on update failure.
+    pub fn clear_entry_custom_icon(&mut self, entry_uuid: Uuid) -> Result<(), EngineError> {
+        mutations::clear_entry_custom_icon(&mut self.conn, entry_uuid)?;
+        self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
+        Ok(())
+    }
+
+    /// Fetch the raw bytes for a custom icon by UUID.
+    ///
+    /// Returns `Ok(None)` if no icon with that UUID is in the pool —
+    /// callers should treat that as "icon no longer registered", not
+    /// an error. Stale references can survive in caches /
+    /// snapshots, and propagating a `NotFound` here would force
+    /// every renderer to handle that case as an exception path.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Sqlite`] on query failure.
+    pub fn custom_icon_bytes(&self, uuid: Uuid) -> Result<Option<Vec<u8>>, EngineError> {
+        crate::meta::read_custom_icon_bytes(&self.conn, uuid)
+    }
+
     /// Return the full group tree as a flat list.
     ///
     /// Tree shape is reconstructed by the caller from each

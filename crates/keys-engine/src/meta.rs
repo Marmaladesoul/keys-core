@@ -256,6 +256,88 @@ pub(crate) fn write_history_max_size(conn: &Connection, value: i64) -> Result<()
     set_i64(conn, KEY_HISTORY_MAX_SIZE, value)
 }
 
+// ─────────────────────── custom-icon accessors ───────────────────────
+//
+// Pool-level reads/writes that bypass the full `Meta` round-trip so the
+// frontend can add / fetch icon blobs without re-projecting every meta
+// field. Dedup-by-content-hash mirrors `keepass-core::Kdbx::add_custom_icon`
+// so the in-memory and SQLite paths produce the same UUIDs for the same
+// bytes (load-bearing for the Keys-Mac shim during the migration window).
+
+/// Setting key used in [`crate::events::ChangeEvent::MetaUpdated`] when
+/// the custom-icon pool changes. Not a real `setting` row — the pool
+/// lives in `meta_custom_icon`, this string is just the namespaced
+/// identifier observers subscribe to.
+pub(crate) const KEY_CUSTOM_ICONS: &str = "meta.custom_icons";
+
+/// Insert a custom-icon blob into `meta_custom_icon`, deduplicating by
+/// SHA-256 of the bytes. Returns the existing icon's UUID on a dedup
+/// hit (and `inserted = false`), or a freshly generated v4 UUID on a
+/// new insert (and `inserted = true`).
+///
+/// Mirrors `keepass-core::kdbx::add_or_dedup_icon`: same hash, same
+/// preserve-existing-metadata semantics (`name` / `last_modified_at`
+/// on a dedup hit are NOT overwritten). Callers that want event
+/// emission should fire it themselves after the surrounding
+/// transaction commits, conditional on `inserted` if desired.
+pub(crate) fn add_custom_icon_dedup(
+    conn: &Connection,
+    bytes: &[u8],
+) -> Result<(Uuid, bool), EngineError> {
+    use sha2::{Digest, Sha256};
+    let incoming: [u8; 32] = Sha256::digest(bytes).into();
+
+    // Hash every existing icon and check for a match. Pool sizes are
+    // small (typically <50 icons in the wild) so an in-Rust scan beats
+    // adding a hash column and an index.
+    let mut stmt = conn.prepare("SELECT uuid, bytes FROM meta_custom_icon")?;
+    let rows = stmt
+        .query_map([], |row| {
+            let uuid_str: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((uuid_str, blob))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (uuid_str, blob) in rows {
+        let hash: [u8; 32] = Sha256::digest(&blob).into();
+        if hash == incoming {
+            let existing = Uuid::parse_str(&uuid_str).map_err(|e| {
+                EngineError::Projection(ProjectionError::SchemaInvariant(format!(
+                    "meta_custom_icon.uuid not a UUID: {e}"
+                )))
+            })?;
+            return Ok((existing, false));
+        }
+    }
+
+    let uuid = Uuid::new_v4();
+    let now_ms = Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT INTO meta_custom_icon (uuid, name, bytes, last_modified_at) \
+         VALUES (?1, '', ?2, ?3)",
+        params![uuid.to_string(), bytes, now_ms],
+    )?;
+    Ok((uuid, true))
+}
+
+/// Look up the raw bytes for a custom icon by UUID. Returns `Ok(None)`
+/// when no row matches — callers should treat that as "icon no longer
+/// in pool", not an error (icons can be referenced after deletion in
+/// stale snapshots).
+pub(crate) fn read_custom_icon_bytes(
+    conn: &Connection,
+    uuid: Uuid,
+) -> Result<Option<Vec<u8>>, EngineError> {
+    conn.query_row(
+        "SELECT bytes FROM meta_custom_icon WHERE uuid = ?1",
+        params![uuid.to_string()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+    .map_err(EngineError::Sqlite)
+}
+
 // ─────────────────────── read path ───────────────────────
 
 /// Read every persisted Meta field and merge onto `meta`. Fields that

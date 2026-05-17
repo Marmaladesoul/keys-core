@@ -827,3 +827,97 @@ async fn engine_history_widening_round_trip_via_ffi() {
     assert!(snap.created_at > 0);
     assert!(snap.modified_at > 0);
 }
+
+// ─────────────────────── custom-icon FFI surface ───────────────────────
+
+#[test]
+fn engine_custom_icon_surface_round_trips_via_ffi() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    seed_kdbx(&kdbx_path);
+    let engine = open_fresh_engine(&db_path);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        engine
+            .ingest_from_kdbx(
+                kdbx_path.to_string_lossy().into_owned(),
+                KDBX_PASSWORD.to_owned(),
+            )
+            .await
+            .expect("ingest");
+    });
+
+    let icon_bytes = b"\x89PNG\r\n\x1a\nffi-custom-icon-payload".to_vec();
+
+    // add_custom_icon returns a UUID string; dedup returns the same.
+    let uuid_a = engine
+        .add_custom_icon(icon_bytes.clone())
+        .expect("add icon");
+    let uuid_dup = engine
+        .add_custom_icon(icon_bytes.clone())
+        .expect("dedup add");
+    assert_eq!(uuid_a, uuid_dup, "dedup-by-hash must return same UUID");
+
+    // custom_icon_bytes round-trips the blob.
+    let fetched = engine
+        .custom_icon_bytes(uuid_a.clone())
+        .expect("fetch bytes")
+        .expect("some");
+    assert_eq!(fetched, icon_bytes);
+
+    // custom_icon_bytes returns None for an unknown UUID.
+    let unknown = uuid::Uuid::new_v4().to_string();
+    assert!(
+        engine
+            .custom_icon_bytes(unknown)
+            .expect("fetch unknown")
+            .is_none()
+    );
+
+    // clear_entry_custom_icon: create an entry pointing at the icon,
+    // clear, confirm the row's `icon` reverts to a built-in ref while
+    // the pool blob survives.
+    let (_g, entry_uuid) = make_group_and_entry(&engine);
+    // Wire the icon onto the entry via update_entry's icon patch.
+    engine
+        .update_entry(
+            entry_uuid.clone(),
+            keys_ffi::EngineEntryUpdate {
+                title: None,
+                username: None,
+                url: None,
+                notes: None,
+                password: None,
+                icon: Some(IconRef::Custom {
+                    uuid: uuid_a.clone(),
+                }),
+                expires_at: None,
+            },
+        )
+        .expect("attach icon");
+
+    engine
+        .clear_entry_custom_icon(entry_uuid.clone())
+        .expect("clear");
+
+    let entry = engine
+        .entry(entry_uuid.clone())
+        .expect("entry")
+        .expect("some");
+    assert!(
+        matches!(entry.icon, IconRef::Builtin { .. }),
+        "entry icon should revert to Builtin after clear, got {:?}",
+        entry.icon
+    );
+
+    // Blob still in the pool — no GC on clear.
+    let still_there = engine
+        .custom_icon_bytes(uuid_a)
+        .expect("refetch")
+        .expect("blob retained");
+    assert_eq!(still_there, icon_bytes);
+}

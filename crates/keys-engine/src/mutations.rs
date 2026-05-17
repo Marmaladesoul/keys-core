@@ -391,6 +391,35 @@ fn bump_modified(tx: &Transaction<'_>, uuid: &str) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Clear `entry.icon_custom_uuid` for a single entry, returning the
+/// entry to its built-in icon (`icon_index`, which is left unchanged —
+/// it's the orthogonal fallback slot per KDBX semantics, see
+/// `keepass_core::model::entry_editor::EntryEditor::set_custom_icon`).
+///
+/// Does **not** touch `meta_custom_icon`: the blob may still be
+/// referenced by other entries or groups. The Phase 5 "save-path GC
+/// silently resets dangling refs" invariant means a stale ref would
+/// be a no-op at save time anyway, but the engine's stricter model
+/// prefers to clear the column explicitly so projection round-trips
+/// match.
+pub(crate) fn clear_entry_custom_icon(
+    conn: &mut Connection,
+    uuid: Uuid,
+) -> Result<(), EngineError> {
+    let uuid_str = uuid.to_string();
+    let tx = conn.transaction()?;
+    if !entry_exists(&tx, &uuid_str)? {
+        return Err(EngineError::NotFound { entity: "entry" });
+    }
+    tx.execute(
+        "UPDATE entry SET icon_custom_uuid = NULL WHERE uuid = ?1",
+        params![uuid_str],
+    )?;
+    bump_modified(&tx, &uuid_str)?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;

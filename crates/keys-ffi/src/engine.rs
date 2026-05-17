@@ -236,6 +236,28 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.set_history_max_size(max)?))
     }
 
+    /// See [`keys_engine::Engine::add_custom_icon`]. Returns the icon's
+    /// UUID as a string (fresh on insert, the existing one on a
+    /// SHA-256 dedup hit).
+    pub fn add_custom_icon(&self, png_bytes: Vec<u8>) -> Result<String, EngineError> {
+        self.with_engine_mut(|e| Ok(e.add_custom_icon(&png_bytes)?))
+    }
+
+    /// See [`keys_engine::Engine::clear_entry_custom_icon`]. Nulls the
+    /// entry's `icon_custom_uuid` column; the blob in `meta_custom_icon`
+    /// is left in place.
+    pub fn clear_entry_custom_icon(&self, entry_uuid: String) -> Result<(), EngineError> {
+        let u = parse_uuid(&entry_uuid, "entry")?;
+        self.with_engine_mut(|e| Ok(e.clear_entry_custom_icon(u)?))
+    }
+
+    /// See [`keys_engine::Engine::custom_icon_bytes`]. Returns `None`
+    /// if no icon with that UUID is in the pool.
+    pub fn custom_icon_bytes(&self, uuid: String) -> Result<Option<Vec<u8>>, EngineError> {
+        let u = parse_uuid(&uuid, "custom_icon")?;
+        self.with_engine(|e| Ok(e.custom_icon_bytes(u)?))
+    }
+
     pub fn search(
         &self,
         query: String,

@@ -149,9 +149,12 @@ enum IconRef {
 }
 ```
 
-Custom-icon blob retrieval (`Engine::custom_icon_bytes`) is intentionally
-**not** part of this Phase 1 surface — frontends rendering custom icons
-will get a dedicated query method in Phase 3+.
+Custom-icon blob retrieval is exposed via `Engine::custom_icon_bytes`
+(Phase 6.17-D). Pair it with `Engine::add_custom_icon` (SHA-256
+content-hash dedup, returns the icon's UUID) and
+`Engine::clear_entry_custom_icon` (nulls an entry's `icon_custom_uuid`,
+leaves the pool blob in place — orphan icons are reaped by save-path
+GC, matching legacy `Vault` semantics).
 
 ### `CustomFieldRef` / `AttachmentRef`
 
@@ -246,7 +249,6 @@ rather than "nothing matches".
 
 ## Decisions deferred to later tasks
 
-- Custom-icon blob retrieval (no method yet).
 - `last_used_at` write path from AutoFill (Phase 7.7).
 - `NotEvaluable` error variant for unknown-predicate folders (Phase 3.9).
 - Tolerant decoder that preserves unknown-predicate raw JSON (Phase 3.9).
