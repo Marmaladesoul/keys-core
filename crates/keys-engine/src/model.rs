@@ -134,8 +134,23 @@ pub struct EntrySummary {
     pub url: String,
     /// Parsed host of `url` — populated by ingest for `AutoFill` lookup.
     pub url_host: String,
+    /// Notes field (plain text).
+    ///
+    /// Carried on the summary so the entry-list UI can run client-side
+    /// "notes-only" search-scope narrowing without re-fetching each row
+    /// via [`crate::Engine::entry`]. Full entry detail still goes
+    /// through `Engine::entry`.
+    pub notes: String,
+    /// Created-at timestamp, ms since Unix epoch (UTC). On the summary
+    /// to power "sort by creation date" + date-section headers in the
+    /// entry list.
+    pub created_at: i64,
     /// Last-modified time, ms since Unix epoch (UTC).
     pub modified_at: i64,
+    /// Last-accessed timestamp, ms since Unix epoch (UTC). On the
+    /// summary to power "sort by last access" + Recently-Used sections
+    /// in the entry list.
+    pub accessed_at: i64,
     /// Last-used time, ms since Unix epoch (UTC); `None` until first use.
     pub last_used_at: Option<i64>,
     /// Password strength bucket; `None` if not yet computed.

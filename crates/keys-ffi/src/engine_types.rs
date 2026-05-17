@@ -216,7 +216,17 @@ pub struct EngineEntrySummary {
     pub username: String,
     pub url: String,
     pub url_host: String,
+    /// Notes field (plain text). Surfaced on the summary so the entry
+    /// list can drive client-side "notes-only" search-scope narrowing
+    /// without a per-row reveal round-trip.
+    pub notes: String,
+    /// Created-at timestamp, ms since Unix epoch. Powers
+    /// "sort by creation date" + date-section headers in the list.
+    pub created_at: i64,
     pub modified_at: i64,
+    /// Last-accessed timestamp, ms since Unix epoch. Powers
+    /// "sort by last access" + Recently-Used section in the list.
+    pub accessed_at: i64,
     pub last_used_at: Option<i64>,
     pub password_strength_bucket: Option<StrengthBucket>,
     pub password_entropy: Option<f64>,
@@ -233,7 +243,10 @@ impl From<eng::EntrySummary> for EngineEntrySummary {
             username: e.username,
             url: e.url,
             url_host: e.url_host,
+            notes: e.notes,
+            created_at: e.created_at,
             modified_at: e.modified_at,
+            accessed_at: e.accessed_at,
             last_used_at: e.last_used_at,
             password_strength_bucket: e.password_strength_bucket.map(Into::into),
             password_entropy: e.password_entropy,

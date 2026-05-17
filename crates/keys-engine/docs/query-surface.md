@@ -53,7 +53,10 @@ Lightweight row for list / sidebar / AutoFill UIs:
 | `username` | `String` | `entry.username` |
 | `url` | `String` | `entry.url` |
 | `url_host` | `String` | `entry.url_host` |
+| `notes` | `String` | `entry.notes` |
+| `created_at` | `i64` ms | `entry.created_at` |
 | `modified_at` | `i64` ms | `entry.modified_at` |
+| `accessed_at` | `i64` ms | `entry.accessed_at` |
 | `last_used_at` | `Option<i64>` ms | `entry.last_used_at` |
 | `password_strength_bucket` | `Option<StrengthBucket>` | `entry.password_strength_bucket` |
 | `password_entropy` | `Option<f64>` bits | `entry.password_entropy` |
@@ -66,9 +69,6 @@ Superset of `EntrySummary` plus:
 
 | field | type | notes |
 |---|---|---|
-| `notes` | `String` | |
-| `created_at` | `i64` ms | |
-| `accessed_at` | `i64` ms | |
 | `expires_at` | `Option<i64>` ms | `None` = no expiry |
 | `is_recycled` | `bool` | |
 | `custom_fields` | `Vec<CustomFieldRef>` | name + `is_protected` only; reveal for values |

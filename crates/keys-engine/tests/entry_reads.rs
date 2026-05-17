@@ -277,6 +277,43 @@ fn list_entries_summary_strength_bucket_round_trips() {
 }
 
 #[test]
+fn list_entries_summary_carries_notes_and_timestamps() {
+    // Summary widening (PR following #75): EntrySummary now carries
+    // `notes`, `created_at`, `accessed_at` so the entry-list UI can
+    // sort + section + run notes-only search-scope narrowing without
+    // a per-row engine.entry() round-trip.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keys.db");
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let id = kdbx
+        .add_entry(
+            root,
+            NewEntry::new("with-notes").notes("the quick brown fox"),
+        )
+        .expect("add");
+
+    // Pin both timestamps so the assertion is deterministic.
+    let mut vault = kdbx.vault().clone();
+    for entry in walk_entries_mut(&mut vault.root) {
+        if entry.id == id {
+            entry.times.creation_time = Utc.timestamp_millis_opt(1_234_000).single();
+            entry.times.last_access_time = Utc.timestamp_millis_opt(5_678_000).single();
+        }
+    }
+    kdbx.replace_vault(vault);
+
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    let rows = engine.list_entries(None, Pagination::all()).expect("list");
+    let row = rows.iter().find(|e| e.uuid == id.0).expect("found");
+    assert_eq!(row.notes, "the quick brown fox");
+    assert_eq!(row.created_at, 1_234_000);
+    assert_eq!(row.accessed_at, 5_678_000);
+}
+
+#[test]
 fn list_entries_summary_url_host_extracted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.db");

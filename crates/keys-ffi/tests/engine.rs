@@ -194,6 +194,21 @@ async fn engine_list_entries_via_ffi() {
     assert_eq!(acme.url, "https://example.com/");
     // UUID round-trips as a canonical string
     let _ = uuid::Uuid::parse_str(&acme.uuid).expect("uuid parses");
+    // Summary widening: notes + created_at + accessed_at cross the FFI
+    // boundary so Keys-Mac's list view can drive sort/section/search
+    // narrowing without a per-row `engine.entry()` round-trip.
+    // `seed_kdbx` doesn't set notes — the field still exists, just empty.
+    assert_eq!(acme.notes, "");
+    assert!(
+        acme.created_at > 0,
+        "created_at populated by ingest (got {})",
+        acme.created_at
+    );
+    assert!(
+        acme.accessed_at > 0,
+        "accessed_at populated by ingest (got {})",
+        acme.accessed_at
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

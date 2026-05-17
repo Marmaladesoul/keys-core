@@ -48,8 +48,8 @@ use crate::model::{
 /// correlated attachment-count subquery. Kept as a constant so the
 /// `group = None` and `group = Some(_)` variants stay in lock-step.
 pub(crate) const SUMMARY_COLUMNS: &str = "\
-    uuid, group_uuid, title, username, url, url_host, \
-    modified_at, last_used_at, \
+    uuid, group_uuid, title, username, url, url_host, notes, \
+    created_at, modified_at, accessed_at, last_used_at, \
     password_strength_bucket, password_entropy, \
     icon_index, icon_custom_uuid, \
     (SELECT COUNT(*) FROM entry_attachment ea WHERE ea.entry_uuid = entry.uuid) \
@@ -523,7 +523,7 @@ struct EntryFullRow {
 }
 
 pub(crate) fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySummary> {
-    let attachment_count_i64: i64 = r.get(12)?;
+    let attachment_count_i64: i64 = r.get(15)?;
     Ok(EntrySummary {
         uuid: parse_uuid_col(r, 0)?,
         group_uuid: parse_uuid_col(r, 1)?,
@@ -531,13 +531,16 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySum
         username: r.get(3)?,
         url: r.get(4)?,
         url_host: r.get(5)?,
-        modified_at: r.get(6)?,
-        last_used_at: r.get(7)?,
+        notes: r.get(6)?,
+        created_at: r.get(7)?,
+        modified_at: r.get(8)?,
+        accessed_at: r.get(9)?,
+        last_used_at: r.get(10)?,
         password_strength_bucket: r
-            .get::<_, Option<i64>>(8)?
+            .get::<_, Option<i64>>(11)?
             .and_then(strength_bucket_from_i64),
-        password_entropy: r.get(9)?,
-        icon: icon_ref_from(r.get(10)?, parse_optional_uuid_col(r, 11)?),
+        password_entropy: r.get(12)?,
+        icon: icon_ref_from(r.get(13)?, parse_optional_uuid_col(r, 14)?),
         attachment_count: u32::try_from(attachment_count_i64).unwrap_or(u32::MAX),
     })
 }
