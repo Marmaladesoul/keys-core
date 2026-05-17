@@ -51,6 +51,13 @@ pub(crate) const KEY_SETTINGS_CHANGED: &str = "meta.settings_changed";
 pub(crate) const KEY_MASTER_KEY_CHANGED: &str = "meta.master_key_changed";
 pub(crate) const KEY_MASTER_KEY_CHANGE_REC: &str = "meta.master_key_change_rec";
 pub(crate) const KEY_MASTER_KEY_CHANGE_FORCE: &str = "meta.master_key_change_force";
+pub(crate) const KEY_RECYCLE_BIN_ENABLED: &str = "meta.recycle_bin_enabled";
+/// Event-only setting key for the recycle-bin uuid. The actual uuid
+/// lives on the `group` table's `is_recycle_bin = 1` row, not in
+/// `setting` — this constant exists so `ChangeEvent::MetaUpdated` can
+/// name the field observers subscribe to without inventing a string at
+/// each callsite.
+pub(crate) const KEY_RECYCLE_BIN_UUID: &str = "meta.recycle_bin_uuid";
 pub(crate) const KEY_HISTORY_MAX_ITEMS: &str = "meta.history_max_items";
 pub(crate) const KEY_HISTORY_MAX_SIZE: &str = "meta.history_max_size";
 pub(crate) const KEY_MAINTENANCE_HISTORY_DAYS: &str = "meta.maintenance_history_days";
@@ -227,6 +234,54 @@ pub(crate) fn read_recycle_bin_enabled(conn: &Connection) -> Result<bool, Engine
         }
         Err(err) => Err(EngineError::Sqlite(err)),
     }
+}
+
+/// Write `meta.recycle_bin_enabled` as a 1-byte blob. Matches the
+/// shape ingest writes (see `ingest.rs`), so the projection / read-back
+/// paths don't need a parallel decode branch. Caller is responsible
+/// for emitting the change event after the surrounding transaction
+/// commits.
+pub(crate) fn write_recycle_bin_enabled(
+    conn: &Connection,
+    enabled: bool,
+) -> Result<(), rusqlite::Error> {
+    let blob: [u8; 1] = [u8::from(enabled)];
+    set_blob(conn, KEY_RECYCLE_BIN_ENABLED, &blob)
+}
+
+/// Designate the group with `uuid` as the vault's recycle bin. Sets
+/// `group.is_recycle_bin = 1` for that row and clears the flag on any
+/// previously-designated bin group — KDBX permits exactly one bin per
+/// vault, and the schema documents that invariant.
+///
+/// Caller must have verified the target group exists before calling.
+pub(crate) fn write_recycle_bin_group(
+    conn: &Connection,
+    uuid: &str,
+) -> Result<(), rusqlite::Error> {
+    // Clear any existing bin flag first — exclusivity invariant.
+    conn.execute(
+        "UPDATE \"group\" SET is_recycle_bin = 0 WHERE is_recycle_bin = 1 AND uuid != ?1",
+        params![uuid],
+    )?;
+    conn.execute(
+        "UPDATE \"group\" SET is_recycle_bin = 1 WHERE uuid = ?1",
+        params![uuid],
+    )?;
+    Ok(())
+}
+
+/// Clear the bin designation from whichever group currently holds it.
+/// No-op if no group is flagged. Used by `Engine::set_recycle_bin` when
+/// the caller passes `group_uuid = None` alongside `enabled = true`
+/// (enabled but no bin chosen yet — `recycle_entry` will lazily create
+/// one).
+pub(crate) fn clear_recycle_bin_group(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE \"group\" SET is_recycle_bin = 0 WHERE is_recycle_bin = 1",
+        [],
+    )?;
+    Ok(())
 }
 
 /// Read `meta.history_max_items`. Returns the keepass-core default

@@ -204,6 +204,163 @@ fn history_max_size_reads_persisted_value() {
 
 // ─────────────────────── setters ───────────────────────
 
+// ─────────────────────── set_recycle_bin ───────────────────────
+
+/// Build a kdbx with a single extra group under root, return the
+/// engine + that group's uuid.
+fn engine_with_extra_group(path: &Path, name: &str) -> (Engine, Uuid) {
+    let mut kdbx = fresh_kdbx(name);
+    let extra = Uuid::new_v4();
+    let mut vault = kdbx.vault().clone();
+    let mut g = Group::empty(GroupId(extra));
+    g.name = "Extra".into();
+    vault.root.groups.push(g);
+    kdbx.replace_vault(vault);
+    let mut engine = open_engine(path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+    (engine, extra)
+}
+
+#[test]
+fn set_recycle_bin_designates_group_and_enables() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let (mut engine, extra) = engine_with_extra_group(&path, "designate");
+
+    engine.set_recycle_bin(true, Some(extra)).expect("set bin");
+    assert_eq!(
+        engine.recycle_bin_uuid().expect("read uuid"),
+        Some(extra.to_string())
+    );
+    assert!(engine.recycle_bin_enabled().expect("read enabled"));
+}
+
+#[test]
+fn set_recycle_bin_enabled_no_group_clears_designation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let (mut engine, extra) = engine_with_extra_group(&path, "enabled-no-group");
+
+    // First designate a bin...
+    engine.set_recycle_bin(true, Some(extra)).expect("set bin");
+    assert_eq!(
+        engine.recycle_bin_uuid().expect("read"),
+        Some(extra.to_string())
+    );
+
+    // ...then pass enabled=true with no group. Mirrors keepass-core:
+    // the designation is cleared, enabled is left true. `recycle_entry`
+    // will lazily create a bin on the next soft-delete.
+    engine.set_recycle_bin(true, None).expect("clear bin");
+    assert_eq!(engine.recycle_bin_uuid().expect("read"), None);
+    assert!(engine.recycle_bin_enabled().expect("read enabled"));
+}
+
+#[test]
+fn set_recycle_bin_disabled_clears_designation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let (mut engine, extra) = engine_with_extra_group(&path, "disable");
+
+    engine.set_recycle_bin(true, Some(extra)).expect("set");
+    engine.set_recycle_bin(false, None).expect("disable");
+
+    assert!(!engine.recycle_bin_enabled().expect("read enabled"));
+    assert_eq!(engine.recycle_bin_uuid().expect("read uuid"), None);
+}
+
+#[test]
+fn set_recycle_bin_unknown_group_returns_not_found() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let kdbx = fresh_kdbx("unknown");
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    let bogus = Uuid::new_v4();
+    let err = engine
+        .set_recycle_bin(true, Some(bogus))
+        .expect_err("should fail");
+    match err {
+        keys_engine::EngineError::NotFound { entity } => assert_eq!(entity, "group"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+
+    // And nothing should have been persisted.
+    assert!(!engine.recycle_bin_enabled().expect("read"));
+    assert_eq!(engine.recycle_bin_uuid().expect("read"), None);
+}
+
+#[test]
+fn set_recycle_bin_round_trips_close_and_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let (mut engine, extra) = engine_with_extra_group(&path, "round-trip");
+
+    engine.set_recycle_bin(true, Some(extra)).expect("set");
+    engine.close().expect("close");
+
+    let engine = open_engine(&path);
+    assert_eq!(
+        engine.recycle_bin_uuid().expect("read"),
+        Some(extra.to_string())
+    );
+    assert!(engine.recycle_bin_enabled().expect("read"));
+}
+
+#[test]
+fn set_recycle_bin_emits_meta_updated_event() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let (mut engine, extra) = engine_with_extra_group(&path, "emit");
+
+    let observer = Arc::new(CaptureObserver::default());
+    engine.set_observer(observer.clone());
+    engine.set_recycle_bin(true, Some(extra)).expect("set");
+
+    let events = observer.snapshot();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ChangeEvent::MetaUpdated { keys } => {
+            assert!(keys.contains(&"meta.recycle_bin_enabled".to_string()));
+            assert!(keys.contains(&"meta.recycle_bin_uuid".to_string()));
+        }
+        other => panic!("expected MetaUpdated, got {other:?}"),
+    }
+}
+
+#[test]
+fn set_recycle_bin_swaps_designation_atomically() {
+    // Exclusivity invariant: at most one group has is_recycle_bin = 1.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let mut kdbx = fresh_kdbx("swap");
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let mut vault = kdbx.vault().clone();
+    let mut g1 = Group::empty(GroupId(first));
+    g1.name = "Bin A".into();
+    let mut g2 = Group::empty(GroupId(second));
+    g2.name = "Bin B".into();
+    vault.root.groups.push(g1);
+    vault.root.groups.push(g2);
+    kdbx.replace_vault(vault);
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    engine.set_recycle_bin(true, Some(first)).expect("first");
+    assert_eq!(
+        engine.recycle_bin_uuid().expect("read"),
+        Some(first.to_string())
+    );
+    engine.set_recycle_bin(true, Some(second)).expect("swap");
+    assert_eq!(
+        engine.recycle_bin_uuid().expect("read"),
+        Some(second.to_string()),
+        "designation should have moved to second"
+    );
+}
+
 #[test]
 fn set_history_max_items_persists_and_round_trips() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -461,6 +461,39 @@ pub(crate) fn clear_entry_last_access(
     Ok(())
 }
 
+/// Configure the recycle-bin policy. Mirrors
+/// `keepass_core::Kdbx::set_recycle_bin`: writes both `enabled` and
+/// the bin-group designation atomically, in a single transaction.
+///
+/// `group_uuid = Some(uuid)` designates that group as the bin (and
+/// clears the flag on any previously-designated bin — the schema
+/// permits only one bin per vault). `group_uuid = None` clears the
+/// bin designation entirely.
+///
+/// Returns [`EngineError::NotFound`] (`entity = "group"`) if
+/// `group_uuid` is Some but no matching group row exists. The check
+/// runs inside the transaction so a concurrent delete can't slip
+/// between validation and the flag write.
+pub(crate) fn set_recycle_bin(
+    conn: &mut Connection,
+    enabled: bool,
+    group_uuid: Option<Uuid>,
+) -> Result<(), EngineError> {
+    let tx = conn.transaction()?;
+    if let Some(uuid) = group_uuid {
+        let uuid_str = uuid.to_string();
+        if !group_exists(&tx, &uuid_str)? {
+            return Err(EngineError::NotFound { entity: "group" });
+        }
+        crate::meta::write_recycle_bin_group(&tx, &uuid_str)?;
+    } else {
+        crate::meta::clear_recycle_bin_group(&tx)?;
+    }
+    crate::meta::write_recycle_bin_enabled(&tx, enabled)?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;

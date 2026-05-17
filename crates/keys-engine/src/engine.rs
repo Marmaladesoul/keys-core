@@ -1236,6 +1236,51 @@ impl Engine {
         crate::meta::read_history_max_size(&self.conn)
     }
 
+    /// Configure the recycle-bin policy. `enabled` toggles soft-delete
+    /// for [`Engine::recycle_entry`] / `recycle_group`; `group_uuid`
+    /// selects which group acts as the bin (or `None` to clear the
+    /// reference — `recycle_entry` will lazily create a bin on first
+    /// soft-delete if `enabled` is true and no bin is set).
+    ///
+    /// Mirrors `keepass_core::Kdbx::set_recycle_bin`: writes both
+    /// fields exactly as supplied, in a single transaction. The schema
+    /// invariant "at most one group has `is_recycle_bin = 1`" is
+    /// upheld — if `group_uuid` is Some and a different group already
+    /// holds the flag, that flag is cleared atomically with the new
+    /// designation.
+    ///
+    /// Emits [`ChangeEvent::MetaUpdated`] carrying the
+    /// `meta.recycle_bin_enabled` and `meta.recycle_bin_uuid` keys
+    /// (the latter even though it isn't a real `setting` row — the
+    /// designation lives on `group.is_recycle_bin`; the key is a bus
+    /// identifier only).
+    ///
+    /// Backs the Keys-Mac fresh-vault creation flow
+    /// (`WelcomeView.createVault`), which designates a brand-new bin
+    /// group on the first save of a freshly minted vault. Phase 6.17-I
+    /// retires the in-memory `Vault::set_recycle_bin` shim in favour
+    /// of this engine method.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`) if `group_uuid`
+    ///   is Some but no matching group row exists.
+    /// - [`EngineError::Sqlite`] on write failure.
+    pub fn set_recycle_bin(
+        &mut self,
+        enabled: bool,
+        group_uuid: Option<Uuid>,
+    ) -> Result<(), EngineError> {
+        mutations::set_recycle_bin(&mut self.conn, enabled, group_uuid)?;
+        self.emit(ChangeEvent::MetaUpdated {
+            keys: vec![
+                crate::meta::KEY_RECYCLE_BIN_ENABLED.to_string(),
+                crate::meta::KEY_RECYCLE_BIN_UUID.to_string(),
+            ],
+        });
+        Ok(())
+    }
+
     /// Set the per-entry history retention count cap.
     ///
     /// Persists `meta.history_max_items` and emits

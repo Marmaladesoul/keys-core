@@ -250,6 +250,23 @@ impl Engine {
         self.with_engine(|e| Ok(e.history_max_size()?))
     }
 
+    /// See [`keys_engine::Engine::set_recycle_bin`]. `group_uuid` is
+    /// the canonical lowercase UUID string of the bin group, or `None`
+    /// to clear the bin designation. A malformed `group_uuid` surfaces
+    /// as [`EngineError::NotFound`] with `entity = "group"`, mirroring
+    /// every other engine-FFI parse path.
+    pub fn set_recycle_bin(
+        &self,
+        enabled: bool,
+        group_uuid: Option<String>,
+    ) -> Result<(), EngineError> {
+        let parsed = match group_uuid {
+            Some(s) => Some(parse_uuid(&s, "group")?),
+            None => None,
+        };
+        self.with_engine_mut(|e| Ok(e.set_recycle_bin(enabled, parsed)?))
+    }
+
     /// See [`keys_engine::Engine::set_history_max_items`].
     pub fn set_history_max_items(&self, max: i32) -> Result<(), EngineError> {
         self.with_engine_mut(|e| Ok(e.set_history_max_items(max)?))
