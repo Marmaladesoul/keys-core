@@ -232,6 +232,12 @@ pub struct EngineEntrySummary {
     pub password_entropy: Option<f64>,
     pub attachment_count: u32,
     pub icon: IconRef,
+    /// `true` when the entry carries a TOTP secret — either via an
+    /// `otpauth://` URL or a custom field named `otp` / `TOTP` /
+    /// `OTPAuth` / `TOTP Seed`. Precomputed on the engine side; the
+    /// AutoFill OTP-picker mode filters on this without per-row
+    /// field-name inspection.
+    pub has_totp: bool,
 }
 
 impl From<eng::EntrySummary> for EngineEntrySummary {
@@ -252,6 +258,7 @@ impl From<eng::EntrySummary> for EngineEntrySummary {
             password_entropy: e.password_entropy,
             attachment_count: e.attachment_count,
             icon: e.icon.into(),
+            has_totp: e.has_totp,
         }
     }
 }

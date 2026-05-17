@@ -25,6 +25,7 @@ use crate::error::EngineError;
 use crate::fingerprint;
 use crate::model::{EntryUpdate, GroupUpdate, IconRef, NewEntryFields, NewGroupFields};
 use crate::strength;
+use crate::totp;
 
 /// Canonical KDBX field name for the password slot. Must match
 /// [`crate::ingest`]'s `PASSWORD_FIELD`.
@@ -218,6 +219,11 @@ pub(crate) fn create_entry(
     let fp_param: Option<&[u8]> = fp.as_ref().map(|b| &b[..]);
     let url_host = parse_host(&fields.url);
     let (icon_index, icon_custom_uuid) = icon_parts(&fields.icon);
+    let has_totp = totp::url_is_otpauth(&fields.url)
+        || fields
+            .custom_fields
+            .iter()
+            .any(|cf| totp::is_totp_field(&cf.name));
 
     tx.execute(
         "INSERT INTO entry (\
@@ -225,8 +231,8 @@ pub(crate) fn create_entry(
             icon_index, icon_custom_uuid, created_at, modified_at, \
             accessed_at, last_used_at, expires_at, \
             password_strength_bucket, password_entropy, password_fingerprint, \
-            is_recycled\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0)",
+            is_recycled, has_totp\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0, ?18)",
         params![
             entry_uuid_str,
             group_uuid_str,
@@ -245,6 +251,7 @@ pub(crate) fn create_entry(
             i64::from(bucket),
             entropy,
             fp_param,
+            i64::from(has_totp),
         ],
     )?;
 
@@ -328,12 +335,14 @@ pub(crate) fn update_entry(
             params![username, uuid_str],
         )?;
     }
+    let mut url_changed = false;
     if let Some(url) = update.url {
         let host = parse_host(&url);
         tx.execute(
             "UPDATE entry SET url = ?1, url_host = ?2 WHERE uuid = ?3",
             params![url, host, uuid_str],
         )?;
+        url_changed = true;
     }
     if let Some(notes) = update.notes {
         tx.execute(
@@ -378,6 +387,9 @@ pub(crate) fn update_entry(
         )?;
     }
 
+    if url_changed {
+        recompute_has_totp(&tx, &uuid_str)?;
+    }
     bump_modified(&tx, &uuid_str)?;
     tx.commit()?;
     Ok(())
@@ -387,6 +399,46 @@ fn bump_modified(tx: &Transaction<'_>, uuid: &str) -> Result<(), EngineError> {
     tx.execute(
         "UPDATE entry SET modified_at = ?1 WHERE uuid = ?2",
         params![now_ms(), uuid],
+    )?;
+    Ok(())
+}
+
+/// Recompute `entry.has_totp` for a single entry from its current
+/// URL and custom-field set. Call after any mutation that can flip
+/// the bit: protected-field add/remove, non-protected-field
+/// add/remove, or URL change. See [`crate::totp`] for the detection
+/// convention.
+fn recompute_has_totp(tx: &Transaction<'_>, uuid: &str) -> Result<(), EngineError> {
+    // Read current URL + field names, then write the recomputed bit
+    // in one UPDATE. Doing it Rust-side (rather than a compound SQL
+    // expression) keeps the detection rule in one place — the
+    // [`crate::totp`] helpers — so the migration backfill, ingest,
+    // and live mutations all derive `has_totp` from the same source
+    // of truth.
+    let url: String = tx.query_row(
+        "SELECT url FROM entry WHERE uuid = ?1",
+        params![uuid],
+        |r| r.get(0),
+    )?;
+    let mut has = totp::url_is_otpauth(&url);
+    if !has {
+        let mut stmt = tx.prepare(
+            "SELECT field_name FROM entry_protected WHERE entry_uuid = ?1 \
+             UNION ALL \
+             SELECT field_name FROM entry_custom_field WHERE entry_uuid = ?1",
+        )?;
+        let mut rows = stmt.query(params![uuid])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            if totp::is_totp_field(&name) {
+                has = true;
+                break;
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE entry SET has_totp = ?1 WHERE uuid = ?2",
+        params![i64::from(has), uuid],
     )?;
     Ok(())
 }
@@ -627,6 +679,11 @@ pub(crate) fn set_protected_field(
              WHERE uuid = ?4",
             params![i64::from(bucket), entropy, fp_param, uuid_str],
         )?;
+    } else if totp::is_totp_field(field_name) {
+        // Adding/replacing a recognised TOTP-bearing protected field
+        // flips `has_totp` on. Recompute rather than blindly setting
+        // to 1 so the helper stays the single source of truth.
+        recompute_has_totp(&tx, &uuid_str)?;
     }
 
     bump_modified(&tx, &uuid_str)?;
@@ -651,6 +708,9 @@ pub(crate) fn set_non_protected_custom_field(
          ON CONFLICT(entry_uuid, field_name) DO UPDATE SET value = excluded.value",
         params![uuid_str, field_name, value],
     )?;
+    if totp::is_totp_field(field_name) {
+        recompute_has_totp(&tx, &uuid_str)?;
+    }
     bump_modified(&tx, &uuid_str)?;
     tx.commit()?;
     Ok(())
@@ -683,6 +743,9 @@ pub(crate) fn remove_custom_field(
         "DELETE FROM entry_custom_field WHERE entry_uuid = ?1 AND field_name = ?2",
         params![uuid_str, field_name],
     )?;
+    if totp::is_totp_field(field_name) {
+        recompute_has_totp(&tx, &uuid_str)?;
+    }
     bump_modified(&tx, &uuid_str)?;
     tx.commit()?;
     Ok(())

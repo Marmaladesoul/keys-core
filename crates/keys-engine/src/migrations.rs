@@ -52,6 +52,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "group_sort_order",
         sql: include_str!("migrations/0004_group_sort_order.sql"),
     },
+    Migration {
+        version: 5,
+        name: "entry_has_totp",
+        sql: include_str!("migrations/0005_entry_has_totp.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.

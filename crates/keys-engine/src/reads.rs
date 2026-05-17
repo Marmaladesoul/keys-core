@@ -53,7 +53,8 @@ pub(crate) const SUMMARY_COLUMNS: &str = "\
     password_strength_bucket, password_entropy, \
     icon_index, icon_custom_uuid, \
     (SELECT COUNT(*) FROM entry_attachment ea WHERE ea.entry_uuid = entry.uuid) \
-        AS attachment_count";
+        AS attachment_count, \
+    has_totp";
 
 pub(crate) fn list_entries(
     conn: &Connection,
@@ -923,6 +924,7 @@ struct EntryFullRow {
 
 pub(crate) fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySummary> {
     let attachment_count_i64: i64 = r.get(15)?;
+    let has_totp_i64: i64 = r.get(16)?;
     Ok(EntrySummary {
         uuid: parse_uuid_col(r, 0)?,
         group_uuid: parse_uuid_col(r, 1)?,
@@ -941,6 +943,7 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySum
         password_entropy: r.get(12)?,
         icon: icon_ref_from(r.get(13)?, parse_optional_uuid_col(r, 14)?),
         attachment_count: u32::try_from(attachment_count_i64).unwrap_or(u32::MAX),
+        has_totp: has_totp_i64 != 0,
     })
 }
 

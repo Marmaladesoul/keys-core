@@ -165,6 +165,13 @@ pub struct EntrySummary {
     pub attachment_count: u32,
     /// Icon reference.
     pub icon: IconRef,
+    /// `true` when the entry carries a TOTP secret — either via an
+    /// `otpauth://` URL or a custom field named `otp` / `TOTP` /
+    /// `OTPAuth` / `TOTP Seed`. Precomputed at mutation time and
+    /// stored in `entry.has_totp` (migration 0005) so the `AutoFill`
+    /// OTP-picker hot path can filter without per-row field-name
+    /// inspection. Engine-internal — does not round-trip to KDBX.
+    pub has_totp: bool,
 }
 
 /// Full entry row for the detail pane.

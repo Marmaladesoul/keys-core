@@ -25,6 +25,7 @@ use crate::error::{EngineError, IngestError};
 use crate::fingerprint;
 use crate::meta;
 use crate::strength;
+use crate::totp;
 
 /// Canonical KDBX field name for an entry's password slot.
 ///
@@ -273,6 +274,11 @@ fn insert_entry(
     };
 
     let url_host = parse_host(&entry.url);
+    let has_totp = totp::url_is_otpauth(&entry.url)
+        || entry
+            .custom_fields
+            .iter()
+            .any(|cf| totp::is_totp_field(&cf.key));
 
     let created_at = dt_to_ms_required(entry.times.creation_time);
     let modified_at = dt_to_ms_required(entry.times.last_modification_time);
@@ -290,8 +296,8 @@ fn insert_entry(
             icon_index, icon_custom_uuid, created_at, modified_at, \
             accessed_at, last_used_at, expires_at, \
             password_strength_bucket, password_entropy, password_fingerprint, \
-            is_recycled\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            is_recycled, has_totp\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             entry_uuid,
             group_uuid,
@@ -311,6 +317,7 @@ fn insert_entry(
             entropy,
             pw_fingerprint_param,
             i64::from(is_recycled),
+            i64::from(has_totp),
         ],
     )?;
 

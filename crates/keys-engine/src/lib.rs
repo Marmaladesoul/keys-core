@@ -20,6 +20,7 @@ pub mod reveal;
 pub mod save;
 pub mod smart_folder;
 pub mod strength;
+pub mod totp;
 
 pub use engine::{DisconnectReason, Engine, ReconcileTrigger, VaultState};
 pub use error::{EngineError, IngestError, ProjectionError, RevealError};
