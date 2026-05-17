@@ -262,6 +262,55 @@ fn engine_open_applies_migrations() {
 }
 
 #[test]
+fn engine_open_enables_wal_journal_mode() {
+    // WAL is materially better for concurrent reader+writer access
+    // (the AutoFill case: extension reads while main app writes).
+    // The engine sets `PRAGMA journal_mode = WAL` on every open;
+    // verify the file ends up in WAL mode and stays there across
+    // re-opens.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keys.db");
+    let key = FixedKey([0xa5; 32]);
+
+    Engine::open(&path, &key, protector(), None)
+        .expect("open fresh")
+        .close()
+        .expect("close");
+
+    let raw = Connection::open(&path).expect("raw open");
+    raw.execute_batch(
+        "PRAGMA key = \"x'a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5'\"",
+    )
+    .expect("apply key");
+
+    let mode: String = raw
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .expect("query journal_mode");
+    assert_eq!(
+        mode.to_ascii_lowercase(),
+        "wal",
+        "engine should leave the database in WAL journal mode",
+    );
+
+    // Reopen via the engine — should remain WAL.
+    drop(raw);
+    Engine::open(&path, &key, protector(), None)
+        .expect("reopen")
+        .close()
+        .expect("close again");
+
+    let raw = Connection::open(&path).expect("raw open");
+    raw.execute_batch(
+        "PRAGMA key = \"x'a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5'\"",
+    )
+    .expect("apply key");
+    let mode: String = raw
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .expect("query journal_mode");
+    assert_eq!(mode.to_ascii_lowercase(), "wal", "still WAL after reopen");
+}
+
+#[test]
 fn engine_open_idempotent_on_existing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.db");

@@ -282,6 +282,169 @@ pub(crate) fn search(
     Ok(rows)
 }
 
+/// Find entries matching an `AutoFill` service identifier.
+///
+/// The identifier can be a bare host (`google.com`), a full URL
+/// (`https://accounts.google.com/signin?...`), or anything in between.
+/// We parse out a host if we can, then match against the indexed
+/// `entry.url_host` column in three tiers (most-specific first):
+///
+/// 1. **Exact host match** — case-insensitive equality with `url_host`.
+/// 2. **eTLD+1 match** — strip a leading `www.` and reduce to the
+///    registrable domain via [`registrable_domain`]; match entries
+///    whose `url_host` either equals that domain or ends in
+///    `.<domain>`. Catches `accounts.google.com` finding entries
+///    saved as `google.com` and vice versa.
+/// 3. **Substring match** — the original identifier appears anywhere
+///    inside `entry.url` (LIKE `%id%`). Last-resort tier for entries
+///    that don't have a parseable URL.
+///
+/// Recycled entries are excluded.
+///
+/// Results are deduplicated by entry uuid (keeping the best tier),
+/// ordered by tier ascending, then `last_used_at DESC NULLS LAST`,
+/// then `modified_at DESC`, then `uuid ASC` for determinism. Capped
+/// at `limit` rows.
+///
+/// # Why no Public Suffix List
+///
+/// For v1 we use a tiny right-to-left algorithm with a hand-rolled
+/// list of two-label public suffixes (`co.uk`, `com.au`, etc.). This
+/// covers the common `AutoFill` cases without pulling in the 200 KB
+/// `publicsuffix` crate. A full PSL can land later if real-world
+/// usage shows gaps.
+pub(crate) fn search_by_service(
+    conn: &Connection,
+    identifier: &str,
+    limit: usize,
+) -> Result<Vec<EntrySummary>, EngineError> {
+    let trimmed = identifier.trim();
+    if trimmed.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Try to pull a host out of the identifier. URL parsing handles
+    // the full-URL case; bare hosts (no scheme) fail to parse, so we
+    // fall back to treating the trimmed input as a host candidate.
+    let raw_host = url::Url::parse(trimmed)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| trimmed.to_ascii_lowercase());
+
+    let exact_host = strip_www(&raw_host).to_owned();
+    let etld1 = registrable_domain(&exact_host);
+
+    // The substring tier matches against the raw `url` column, which
+    // is stored verbatim from ingest (mixed case). Use NOCASE
+    // collation in the LIKE for case-insensitive matching, escape
+    // SQL wildcards in user input.
+    let url_like = format!("%{}%", escape_like(trimmed));
+
+    // `etld_suffix_like` matches any url_host ending in `.<etld1>`
+    // (a subdomain of the registrable domain). Wildcards in the
+    // domain are not possible because etld1 is derived from a parsed
+    // host, but escape anyway as defence in depth.
+    let etld_suffix_like = format!("%.{}", escape_like(&etld1));
+
+    // SQL strategy: pull every candidate row, tag it with the best
+    // tier it satisfies, dedupe by uuid taking MIN(tier), then sort
+    // by tier + recency. The CASE expression encodes tier priority
+    // (1 = exact host, 2 = eTLD+1, 3 = substring).
+    //
+    // `entry.is_recycled = 0` filters out recycle-bin entries up
+    // front. The candidate set is bounded by the WHERE clause: any
+    // row that matches at least one tier.
+    let sql = format!(
+        "WITH ranked AS ( \
+             SELECT entry.uuid AS uuid, \
+                    CASE \
+                        WHEN entry.url_host = ?1 THEN 1 \
+                        WHEN entry.url_host = ?2 OR entry.url_host LIKE ?3 ESCAPE '\\' \
+                            THEN 2 \
+                        WHEN entry.url LIKE ?4 ESCAPE '\\' COLLATE NOCASE THEN 3 \
+                        ELSE 99 \
+                    END AS tier \
+             FROM entry \
+             WHERE entry.is_recycled = 0 \
+               AND ( \
+                   entry.url_host = ?1 \
+                   OR entry.url_host = ?2 \
+                   OR entry.url_host LIKE ?3 ESCAPE '\\' \
+                   OR entry.url LIKE ?4 ESCAPE '\\' COLLATE NOCASE \
+               ) \
+         ), \
+         best AS ( \
+             SELECT uuid AS best_uuid, MIN(tier) AS best_tier \
+             FROM ranked GROUP BY uuid \
+         ) \
+         SELECT {SUMMARY_COLUMNS} \
+         FROM entry \
+         JOIN best ON best.best_uuid = entry.uuid \
+         ORDER BY best.best_tier ASC, \
+                  (entry.last_used_at IS NULL) ASC, \
+                  entry.last_used_at DESC, \
+                  entry.modified_at DESC, \
+                  entry.uuid ASC \
+         LIMIT ?5"
+    );
+
+    // Cap limit at i64::MAX (well above any realistic AutoFill limit).
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(
+            params![exact_host, etld1, etld_suffix_like, url_like, limit_i64],
+            row_to_summary,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Strip a leading `www.` from a host. Only the literal `www.`
+/// prefix — subdomains like `www2.` are left alone. Returns a
+/// borrowed slice when no prefix is present.
+fn strip_www(host: &str) -> &str {
+    host.strip_prefix("www.").unwrap_or(host)
+}
+
+/// Reduce a hostname to its registrable domain (a coarse "eTLD+1").
+///
+/// Algorithm: split on `.`, peel labels from the right. If the last
+/// two labels are a known two-label public suffix (`co.uk`,
+/// `com.au`, …), the registrable domain is the last three labels;
+/// otherwise it's the last two. Inputs with fewer than two labels
+/// (IP addresses, single-label hostnames) are returned unchanged.
+///
+/// This is intentionally not a full Public Suffix List — see the
+/// rationale on [`search_by_service`].
+fn registrable_domain(host: &str) -> String {
+    let host = strip_www(host);
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 {
+        return host.to_owned();
+    }
+    let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
+    if labels.len() >= 3 && TWO_LABEL_PUBLIC_SUFFIXES.contains(&last_two.as_str()) {
+        format!("{}.{}", labels[labels.len() - 3], last_two)
+    } else {
+        last_two
+    }
+}
+
+/// Hand-curated list of common two-label public suffixes. Covers the
+/// usual `AutoFill` country-coded TLDs (`co.uk`, `com.au`, …) without
+/// the bulk of a full PSL. If real-world `AutoFill` hits a suffix not
+/// listed here, the eTLD+1 tier degrades to a too-aggressive match
+/// (e.g. `co.uk` itself), but the exact-host tier still works and
+/// the substring tier picks up the slack.
+const TWO_LABEL_PUBLIC_SUFFIXES: &[&str] = &[
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk", "com.au", "net.au", "org.au",
+    "edu.au", "gov.au", "id.au", "co.nz", "net.nz", "org.nz", "co.jp", "ne.jp", "or.jp", "ac.jp",
+    "go.jp", "co.kr", "or.kr", "co.za", "org.za", "com.br", "net.br", "org.br", "com.mx", "com.ar",
+    "com.sg", "com.hk", "com.tw", "com.tr", "co.in", "co.id", "co.il",
+];
+
 /// Escape user input for use as an FTS5 `MATCH` argument.
 ///
 /// FTS5's query grammar treats a wide range of ASCII punctuation as
@@ -868,6 +1031,49 @@ mod tests {
         assert_eq!(escape_like("50%"), "50\\%");
         assert_eq!(escape_like("a_b"), "a\\_b");
         assert_eq!(escape_like("c\\d"), "c\\\\d");
+    }
+
+    #[test]
+    fn strip_www_only_strips_literal_prefix() {
+        assert_eq!(strip_www("www.example.com"), "example.com");
+        assert_eq!(strip_www("example.com"), "example.com");
+        // Not the literal `www.` prefix — leave alone.
+        assert_eq!(strip_www("www2.example.com"), "www2.example.com");
+        assert_eq!(strip_www("api.www.example.com"), "api.www.example.com");
+    }
+
+    #[test]
+    fn registrable_domain_basic_two_label() {
+        assert_eq!(registrable_domain("example.com"), "example.com");
+        assert_eq!(registrable_domain("accounts.google.com"), "google.com");
+        assert_eq!(
+            registrable_domain("api.v2.accounts.google.com"),
+            "google.com"
+        );
+    }
+
+    #[test]
+    fn registrable_domain_two_label_public_suffix() {
+        assert_eq!(registrable_domain("bbc.co.uk"), "bbc.co.uk");
+        assert_eq!(registrable_domain("news.bbc.co.uk"), "bbc.co.uk");
+        assert_eq!(registrable_domain("shop.example.com.au"), "example.com.au");
+    }
+
+    #[test]
+    fn registrable_domain_strips_www() {
+        assert_eq!(registrable_domain("www.example.com"), "example.com");
+        assert_eq!(registrable_domain("www.news.bbc.co.uk"), "bbc.co.uk");
+    }
+
+    #[test]
+    fn registrable_domain_handles_short_inputs() {
+        assert_eq!(registrable_domain(""), "");
+        assert_eq!(registrable_domain("localhost"), "localhost");
+        assert_eq!(registrable_domain("com"), "com");
+        // IPv4 — we don't have a notion of registrable for IPs, so
+        // the raw "last two labels" semantics is fine; AutoFill is
+        // very unlikely to match against raw IPs anyway.
+        assert_eq!(registrable_domain("192.168.1.1"), "1.1");
     }
 
     #[test]

@@ -338,6 +338,25 @@ impl Engine {
         // unconditionally opts in.
         conn.execute_batch("PRAGMA foreign_keys = ON")?;
 
+        // Switch to write-ahead-log journalling. WAL is materially
+        // better for concurrent reader+writer workloads — the AutoFill
+        // case (extension reads the App Group SQLite while the main
+        // app writes) is exactly the shape WAL is designed for.
+        //
+        // `journal_mode = WAL` is a persistent file-level setting: once
+        // applied, the database stays in WAL mode until something flips
+        // it back. Re-running this on every open is a no-op when the
+        // file is already WAL, so the call is idempotent and cheap.
+        //
+        // Side-effect to be aware of when debugging: WAL mode creates
+        // two sidecar files next to the main database
+        // (`<base>.sqlite-wal` and `<base>.sqlite-shm`) — these appear
+        // in the App Group container alongside `<sha256>.keys.sqlite`
+        // and are part of the on-disk state. A pre-WAL rollback-journal
+        // file (`<base>.sqlite-journal`) is dropped automatically on
+        // the first WAL-mode write.
+        conn.execute_batch("PRAGMA journal_mode = WAL")?;
+
         migrations::apply_pending(&mut conn)?;
 
         let fingerprint_key = ensure_fingerprint_key(&mut conn)?;
@@ -1291,6 +1310,41 @@ impl Engine {
     /// Returns [`EngineError::Sqlite`] on query failure.
     pub fn search(&self, query: &str, page: Pagination) -> Result<Vec<EntrySummary>, EngineError> {
         crate::reads::search(&self.conn, query, page)
+    }
+
+    /// Find entries matching an `AutoFill` service identifier.
+    ///
+    /// Powers the `AutoFill` extension's lookup path: given a service
+    /// identifier (typically a domain like `google.com` or a full URL
+    /// like `https://accounts.google.com/signin`), return the entries
+    /// most likely to match, in best-match-first order.
+    ///
+    /// # Matching tiers
+    ///
+    /// 1. Exact `url_host` match (case-insensitive).
+    /// 2. eTLD+1 match — covers `accounts.google.com` finding
+    ///    entries saved as `google.com` and vice versa. Uses a
+    ///    hand-rolled two-label suffix list (no Public Suffix List
+    ///    dependency in v1).
+    /// 3. Substring match — the identifier appears anywhere inside
+    ///    `entry.url`. Last-resort tier for unparseable URLs.
+    ///
+    /// Recycled entries are excluded. Results dedupe by uuid (best
+    /// tier wins) and sort by tier, then `last_used_at` desc, then
+    /// `modified_at` desc. Capped at `limit` rows.
+    ///
+    /// Empty / whitespace identifiers and `limit = 0` return an empty
+    /// `Vec` without touching the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn search_by_service(
+        &self,
+        identifier: &str,
+        limit: usize,
+    ) -> Result<Vec<EntrySummary>, EngineError> {
+        crate::reads::search_by_service(&self.conn, identifier, limit)
     }
 
     /// Evaluate a smart folder and return its matching entries.

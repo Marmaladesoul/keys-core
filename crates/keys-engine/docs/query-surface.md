@@ -24,6 +24,7 @@ the migration tracker.
 | `group_tree() -> Vec<GroupNode>` | 3.2 | Flat list; tree built by caller. Siblings ordered by `sort_order`. |
 | `reorder_group(uuid: Uuid, new_position: u32) -> ()` | 6.8 | Move `uuid` within its parent's child list. Emits `ChangeEvent::GroupsReordered`. |
 | `search(query: &str, page: Pagination) -> Vec<EntrySummary>` | 3.3 | FTS5-backed. |
+| `search_by_service(identifier: &str, limit: usize) -> Vec<EntrySummary>` | 7.2 | AutoFill lookup. Tiered host match — see below. |
 | `smart_folder_entries(folder_id: i64, page: Pagination) -> Vec<EntrySummary>` | 3.8 | Compiles predicate → SQL → runs. |
 | `smart_folder_count(folder_id: i64) -> u64` | 3.8 | Badge-count variant. |
 | `reveal_password(uuid: Uuid) -> SecretString` | 3.4 | Fetches wrapped blob; AEAD-opens. |
@@ -208,6 +209,40 @@ exhaustive `match` users in other crates (once they add a wildcard arm).
 seconds** in JSON, not the default `(secs, nanos)` tuple. Smart-folder
 durations are coarse-grained (days / weeks) — nanosecond precision is
 noise — and the integer form survives any JSON consumer.
+
+## `search_by_service` matching tiers
+
+Backs the AutoFill extension's per-domain lookup. Given a service
+identifier (bare host like `google.com`, or a full URL like
+`https://accounts.google.com/signin?...`), the engine extracts a host
+candidate and matches entries in three tiers, most-specific first:
+
+1. **Exact host** — case-insensitive equality with `entry.url_host`
+   (which is lowercased at ingest).
+2. **eTLD+1** — the identifier's host is reduced to its registrable
+   domain (e.g. `accounts.google.com` → `google.com`,
+   `news.bbc.co.uk` → `bbc.co.uk`). Entries whose `url_host` either
+   equals that domain or ends in `.<domain>` match. Catches both the
+   "saved at apex, identifier is subdomain" and "saved on subdomain,
+   identifier is apex" cases.
+3. **Substring** — the identifier appears anywhere inside
+   `entry.url` (case-insensitive `LIKE %id%`). Last-resort tier for
+   entries whose URL didn't parse and therefore have an empty
+   `url_host`.
+
+Recycled entries are excluded. Results are deduplicated by entry uuid
+(best tier wins), ordered by tier ascending, then `last_used_at DESC
+NULLS LAST`, then `modified_at DESC`. The caller-supplied `limit`
+caps the row count.
+
+The eTLD+1 reduction is intentionally **not** backed by the full
+Public Suffix List in v1 — a hand-curated list of two-label suffixes
+(`co.uk`, `com.au`, `co.nz`, …) covers the common AutoFill cases
+without the 200 KB `publicsuffix` dependency. The fallback when a
+suffix isn't listed is a too-aggressive eTLD+1 (e.g. `co.uk` itself);
+the exact-host tier and substring tier still function, so the worst
+case is "an irrelevant entry gets ranked below the relevant one"
+rather than "nothing matches".
 
 ## Decisions deferred to later tasks
 

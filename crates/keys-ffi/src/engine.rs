@@ -249,6 +249,21 @@ impl Engine {
         })
     }
 
+    /// See [`keys_engine::Engine::search_by_service`].
+    pub fn search_by_service(
+        &self,
+        identifier: String,
+        limit: u64,
+    ) -> Result<Vec<EngineEntrySummary>, EngineError> {
+        let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+        self.with_engine(|e| {
+            Ok(e.search_by_service(&identifier, limit_usize)?
+                .into_iter()
+                .map(Into::into)
+                .collect())
+        })
+    }
+
     // ── Smart folders ──────────────────────────────────────────────────
 
     pub fn list_smart_folders(&self) -> Result<Vec<SmartFolder>, EngineError> {
