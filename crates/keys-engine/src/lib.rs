@@ -10,6 +10,7 @@ pub mod meta;
 pub mod migrations;
 pub mod model;
 pub mod mutations;
+pub mod portable;
 pub mod predicate;
 pub mod predicate_builtin;
 pub mod predicate_sql;
@@ -39,6 +40,7 @@ pub use model::{
     HistoricEntry, IconRef, NewCustomField, NewEntryFields, NewGroupFields, Pagination,
     SmartFolder, StrengthBucket,
 };
+pub use portable::{PortableAttachment, PortableEntry};
 pub use predicate::Predicate;
 pub use predicate_builtin::{
     BUILTIN_SMART_FOLDERS, BuiltinFolderIcon, BuiltinSmartFolder, BuiltinSmartFolderKind,

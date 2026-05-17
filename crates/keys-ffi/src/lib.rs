@@ -15,6 +15,7 @@ mod engine;
 mod engine_error;
 mod engine_file_watcher;
 mod engine_observer;
+mod engine_portable;
 mod engine_types;
 mod error;
 mod merge;
@@ -35,6 +36,7 @@ pub use engine_observer::{
     ChangeEvent, EntryDeletion, EntryMoveInfo, GroupDeletion, GroupMoveInfo,
     VaultDataChangeObserver,
 };
+pub use engine_portable::EnginePortableEntry;
 pub use engine_types::{
     AttachmentRef as EngineAttachmentRef, ConflictPayloadFfi,
     CustomFieldRef as EngineCustomFieldRef, EngineEntrySummary, EntryFull,

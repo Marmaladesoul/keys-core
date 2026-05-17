@@ -34,6 +34,8 @@ the migration tracker.
 | `reveal_history_field(uuid: Uuid, history_index: u32, field_name: &str) -> SecretString` | 3.4 | Historic snapshot variant. |
 | `attachment_bytes(uuid: Uuid, attachment_name: &str) -> Vec<u8>` | 3.1 | Raw blob fetch. |
 | `history(uuid: Uuid) -> Vec<HistoricEntry>` | 3.1 | Oldest-first ordering. |
+| `export_entry(entry_uuid: Uuid) -> PortableEntry` | 6.17-F | Serialise an entry into an in-process carrier (every field, every protected slot revealed, every attachment's bytes, plus custom-icon PNG when present) suitable for cross-database move via `import_entry`. Read-only. |
+| `import_entry(portable: PortableEntry, target_group_uuid: Uuid) -> Uuid` | 6.17-F | Consume a carrier; insert as a brand new entry under `target_group_uuid` (fresh UUID + `now` timestamps). Rehomes custom icons via SHA-256 dedup into the target's pool. Emits `EntriesAdded`. |
 
 Every method returns `Result<_, EngineError>`.
 
@@ -183,6 +185,58 @@ unknown uuid.
 struct CustomFieldRef { name: String, is_protected: bool }
 struct AttachmentRef  { name: String, size: u64 }
 ```
+
+### `PortableEntry` / `PortableAttachment`
+
+In-process carrier for cross-database entry moves, produced by
+`Engine::export_entry` and consumed by `Engine::import_entry`. The flow
+is `source.export_entry(uuid)` → `target.import_entry(carrier, group)` →
+`source.delete_entry(uuid)`. The carrier is **not** `Serialize` /
+`Deserialize`: it holds revealed protected-field plaintext in
+`SecretString`s that zero on drop, so dropping the carrier wipes
+secrets even if the import path errors out mid-write.
+
+```rust
+struct PortableEntry {
+    title: String,
+    username: String,
+    url: String,
+    notes: String,
+    icon: IconRef,
+    tags: Vec<String>,
+    created_at: Option<i64>,
+    modified_at: Option<i64>,
+    accessed_at: Option<i64>,
+    last_used_at: Option<i64>,
+    expires_at: Option<i64>,
+    password: SecretString,
+    protected_fields: Vec<(String, SecretString)>,
+    custom_fields: Vec<(String, String)>,
+    attachments: Vec<PortableAttachment>,
+    custom_icon_png: Option<Vec<u8>>,
+}
+
+struct PortableAttachment {
+    name: String,
+    bytes: Vec<u8>,
+    mime: Option<String>,
+}
+```
+
+History is **not** ferried — `import_entry` mints a brand new entry and
+the source's history snapshots describe edits that happened in a
+different database. Timestamps on the carrier are retained for future
+preservation paths; today's import stamps `now` for
+`created_at`/`modified_at`/`accessed_at` (matching `create_entry`) and
+preserves `expires_at` only.
+
+Custom-icon ferrying: when the source entry references a custom icon,
+the PNG bytes ride in `custom_icon_png` so the target can
+content-hash-dedup them into its own `meta_custom_icon` pool —
+yielding either an existing UUID (cache hit) or a freshly minted one
+(cache miss). A carrier with `IconRef::Custom` but a `None`
+`custom_icon_png` is rejected with `EngineError::NotFound { entity:
+"custom_icon" }`.
 
 ## Predicate AST
 

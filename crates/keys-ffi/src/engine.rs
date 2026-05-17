@@ -59,6 +59,7 @@ use crate::db_key_provider::{BridgeDbKeyProvider, VaultDbKeyProvider};
 use crate::engine_error::EngineError;
 use crate::engine_file_watcher::{self, VaultFileWatcher};
 use crate::engine_observer::{BridgeObserver, VaultDataChangeObserver};
+use crate::engine_portable::EnginePortableEntry;
 use crate::engine_types::{
     ConflictPayloadFfi, EngineEntrySummary, EntryFull, EntryUpdate, GroupNode, GroupUpdate,
     HistoricEntry, IconRef, MergeResult, NewEntryFields, NewGroupFields, Page, Predicate,
@@ -625,6 +626,36 @@ impl Engine {
     pub fn remove_attachment(&self, uuid: String, name: String) -> Result<(), EngineError> {
         let u = parse_uuid(&uuid, "entry")?;
         self.with_engine_mut(|e| Ok(e.remove_attachment(u, &name)?))
+    }
+
+    /// See [`keys_engine::Engine::export_entry`]. Returns an opaque
+    /// [`EnginePortableEntry`] handle the caller passes to
+    /// [`Self::import_entry`] on the destination engine (or the same
+    /// engine, for a within-database copy). The carrier is **single-use**
+    /// — a second `import_entry` returns [`EngineError::Internal`].
+    pub fn export_entry(
+        &self,
+        entry_uuid: String,
+    ) -> Result<std::sync::Arc<EnginePortableEntry>, EngineError> {
+        let u = parse_uuid(&entry_uuid, "entry")?;
+        self.with_engine(|e| {
+            let portable = e.export_entry(u)?;
+            Ok(std::sync::Arc::new(EnginePortableEntry::new(portable)))
+        })
+    }
+
+    /// See [`keys_engine::Engine::import_entry`]. Consumes the carrier
+    /// produced by [`Self::export_entry`] and returns the new entry's
+    /// UUID. Custom-icon bytes (when present) are rehomed into the
+    /// target engine's icon pool via SHA-256 dedup.
+    pub fn import_entry(
+        &self,
+        portable: std::sync::Arc<EnginePortableEntry>,
+        target_group_uuid: String,
+    ) -> Result<String, EngineError> {
+        let g = parse_uuid(&target_group_uuid, "group")?;
+        let inner = portable.take()?;
+        self.with_engine_mut(|e| Ok(e.import_entry(inner, g)?.to_string()))
     }
 
     pub fn create_group(

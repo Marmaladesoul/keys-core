@@ -35,6 +35,7 @@ use crate::model::{
     NewGroupFields, Pagination, SmartFolder,
 };
 use crate::mutations;
+use crate::portable::PortableEntry;
 use crate::predicate::Predicate;
 use crate::projection;
 use crate::reconcile::{self, MergeResult};
@@ -1936,6 +1937,91 @@ impl Engine {
         )?;
         self.emit(ChangeEvent::EntriesAdded(vec![result]));
         Ok(result)
+    }
+
+    /// Serialise an entry into a [`PortableEntry`] suitable for
+    /// importing into a different (or the same) database via
+    /// [`Engine::import_entry`].
+    ///
+    /// Read-only on the source: reveals every protected field through
+    /// this engine's [`FieldProtector`], copies attachment bytes out of
+    /// the content-addressed pool, and — when the entry references a
+    /// custom icon — pulls the icon's PNG bytes so the target can
+    /// rehome it under its own UUID rather than inheriting a dangling
+    /// reference into a pool it doesn't share.
+    ///
+    /// The carrier is **in-process only**: it isn't serialised across
+    /// the wire and the protected-field plaintext sits in
+    /// [`SecretString`]s that zero on drop. The
+    /// expected flow is
+    /// `source.export_entry(uuid)` → `target.import_entry(carrier, …)` →
+    /// `source.delete_entry(uuid)` in one breath.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row
+    ///   matches.
+    /// - [`EngineError::Reveal`] if any protected-field unwrap fails.
+    /// - [`EngineError::Sqlite`] on query failure.
+    pub fn export_entry(&self, entry_uuid: Uuid) -> Result<PortableEntry, EngineError> {
+        crate::portable::export_entry(&self.conn, &*self.field_protector, entry_uuid)
+    }
+
+    /// Insert a [`PortableEntry`] (produced by [`Engine::export_entry`])
+    /// under `target_group_uuid` as a brand new entry. Returns the
+    /// freshly-minted UUID.
+    ///
+    /// Goes through the regular [`Engine::create_entry`] +
+    /// [`Engine::attach_file`] paths on the target so derived columns
+    /// (URL host, password strength, fingerprint, `has_totp`) are
+    /// recomputed against the target's per-vault fingerprint key and
+    /// every protected slot is re-sealed under the target's
+    /// [`FieldProtector`].
+    ///
+    /// **Custom-icon rehoming.** If the carrier ferries
+    /// `custom_icon_png` bytes, they land in the target's icon pool
+    /// via SHA-256 dedup ([`Engine::add_custom_icon`]); the resulting
+    /// entry's `icon_custom_uuid` points at the target's pool. A
+    /// carrier with `IconRef::Custom` but no PNG is rejected with
+    /// [`EngineError::NotFound`] (`entity = "custom_icon"`) — silently
+    /// downgrading would corrupt the user's intent.
+    ///
+    /// **Timestamps.** `created_at` / `modified_at` / `accessed_at`
+    /// stamp `now` (matching `create_entry`'s usual semantics);
+    /// `expires_at` is preserved when present.
+    ///
+    /// Emits [`ChangeEvent::EntriesAdded`] for the new uuid (via the
+    /// underlying `create_entry`), and — when the icon pool grew —
+    /// [`ChangeEvent::MetaUpdated`] for `meta.custom_icons`.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`) if
+    ///   `target_group_uuid` doesn't match a group row in the target.
+    /// - [`EngineError::NotFound`] (`entity = "custom_icon"`) if the
+    ///   carrier promised a custom icon but didn't supply its bytes.
+    /// - [`EngineError::Wrap`] / [`EngineError::SessionKey`] on wrap
+    ///   failure.
+    /// - [`EngineError::Sqlite`] on insert failure.
+    pub fn import_entry(
+        &mut self,
+        portable: PortableEntry,
+        target_group_uuid: Uuid,
+    ) -> Result<Uuid, EngineError> {
+        let (new_uuid, icon_inserted) = crate::portable::import_entry(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            target_group_uuid,
+            portable,
+        )?;
+        self.emit(ChangeEvent::EntriesAdded(vec![new_uuid]));
+        if icon_inserted {
+            self.emit(ChangeEvent::MetaUpdated {
+                keys: vec![crate::meta::KEY_CUSTOM_ICONS.to_string()],
+            });
+        }
+        Ok(new_uuid)
     }
 
     /// Update an existing entry. Each field of `update` is `Option`:
