@@ -199,6 +199,117 @@ pub(crate) fn group_tree(conn: &Connection) -> Result<Vec<GroupNode>, EngineErro
     Ok(rows)
 }
 
+/// Defensive iteration cap for `is_descendant_of`'s `parent_uuid` walk.
+///
+/// A real vault is a tree, so the walk terminates at the root after at
+/// most `<tree depth>` steps. The cap exists to guard against malformed
+/// vaults that contain a cycle (`parent_uuid` chain that never reaches
+/// `NULL`). 1024 is comfortably above any realistic group nesting depth
+/// — `KeePass` UIs become unusable long before that — and keeps the
+/// worst-case unbounded.
+const MAX_ANCESTRY_WALK: usize = 1024;
+
+/// Return the parent group's UUID for `child_uuid`, or `Ok(None)` if
+/// `child_uuid` is the root group.
+///
+/// Returns [`EngineError::NotFound`] (`entity = "group"`) if no group
+/// with that UUID exists.
+pub(crate) fn group_parent_uuid(
+    conn: &Connection,
+    child_uuid: Uuid,
+) -> Result<Option<Uuid>, EngineError> {
+    let row: Option<Option<String>> = conn
+        .query_row(
+            "SELECT parent_uuid FROM \"group\" WHERE uuid = ?1",
+            params![child_uuid.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    match row {
+        None => Err(EngineError::NotFound { entity: "group" }),
+        Some(None) => Ok(None),
+        Some(Some(s)) => Uuid::parse_str(&s).map(Some).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                .into()
+        }),
+    }
+}
+
+/// Walk `group_uuid`'s `parent_uuid` chain; return `true` if it passes
+/// through `ancestor_uuid`. Not inclusive — a group is not its own
+/// descendant.
+///
+/// Returns [`EngineError::NotFound`] (`entity = "group"`) if
+/// `group_uuid` doesn't match any row. A non-existent `ancestor_uuid`
+/// is not an error: the walk just terminates at root with `false`.
+///
+/// Capped at [`MAX_ANCESTRY_WALK`] iterations as a defensive guard
+/// against `parent_uuid` cycles in malformed user vaults; a cycle
+/// returns `false` rather than spinning.
+pub(crate) fn is_descendant_of(
+    conn: &Connection,
+    group_uuid: Uuid,
+    ancestor_uuid: Uuid,
+) -> Result<bool, EngineError> {
+    if group_uuid == ancestor_uuid {
+        // Per chosen semantics: a group is not its own descendant.
+        // Still validate that the group exists so the "not found"
+        // contract holds.
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM \"group\" WHERE uuid = ?1",
+                params![group_uuid.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        return if exists.is_some() {
+            Ok(false)
+        } else {
+            Err(EngineError::NotFound { entity: "group" })
+        };
+    }
+
+    let mut stmt = conn.prepare("SELECT parent_uuid FROM \"group\" WHERE uuid = ?1")?;
+    let mut current = group_uuid;
+
+    for _ in 0..MAX_ANCESTRY_WALK {
+        let row: Option<Option<String>> = stmt
+            .query_row(params![current.to_string()], |r| r.get(0))
+            .optional()?;
+        match row {
+            // First lookup miss → caller's `group_uuid` doesn't exist.
+            // Subsequent misses are impossible (each `parent_uuid` we
+            // followed came from an existing row); if one does happen
+            // due to a referential-integrity break, treat it as "walk
+            // ended" and return false.
+            None if current == group_uuid => {
+                return Err(EngineError::NotFound { entity: "group" });
+            }
+            // Reached the root without matching, or hit a dangling
+            // `parent_uuid` (treat the same as "walk ended").
+            None | Some(None) => return Ok(false),
+            Some(Some(parent_str)) => {
+                let parent = Uuid::parse_str(&parent_str).map_err(|e| {
+                    EngineError::from(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    ))
+                })?;
+                if parent == ancestor_uuid {
+                    return Ok(true);
+                }
+                current = parent;
+            }
+        }
+    }
+    // Cap hit — treat as "no, with a clean conscience". A real vault
+    // can't reach this; a vault with a cycle does, and `false` is the
+    // safer default than spinning or panicking.
+    Ok(false)
+}
+
 /// Full-text search across `entry_fts`, with a tag-substring fallback
 /// merged via `UNION ALL`.
 ///

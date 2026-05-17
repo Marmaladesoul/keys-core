@@ -22,6 +22,8 @@ the migration tracker.
 | `entry(uuid: Uuid) -> Option<EntryFull>` | 3.1 | `Ok(None)` if not found. |
 | `entry_count(group: Option<Uuid>) -> u64` | 3.1 | Cheap count, no rows fetched. |
 | `group_tree() -> Vec<GroupNode>` | 3.2 | Flat list; tree built by caller. Siblings ordered by `sort_order`. |
+| `group_parent_uuid(child: Uuid) -> Option<Uuid>` | 6.17-C | `None` for the root group; `NotFound` for unknown UUID. Cheap single-row `SELECT`. |
+| `is_descendant_of(group: Uuid, ancestor: Uuid) -> bool` | 6.17-C | Walks `parent_uuid` up from `group`. **Not inclusive** — a group is not its own descendant. Capped at 1024 hops to defang malformed cycles. |
 | `reorder_group(uuid: Uuid, new_position: u32) -> ()` | 6.8 | Move `uuid` within its parent's child list. Emits `ChangeEvent::GroupsReordered`. |
 | `search(query: &str, page: Pagination) -> Vec<EntrySummary>` | 3.3 | FTS5-backed. |
 | `search_by_service(identifier: &str, limit: usize) -> Vec<EntrySummary>` | 7.2 | AutoFill lookup. Tiered host match — see below. |

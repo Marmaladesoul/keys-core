@@ -200,6 +200,30 @@ impl Engine {
         self.with_engine(|e| Ok(e.group_tree()?.into_iter().map(Into::into).collect()))
     }
 
+    /// Return the parent group's UUID for `child_uuid` as a string, or
+    /// `None` if `child_uuid` is the root group.
+    ///
+    /// Mirrors the legacy `Vault::group_parent_uuid(childUuid:)` shape
+    /// so Swift call sites migrating off the in-memory `Vault` swap
+    /// the receiver and otherwise leave the call unchanged.
+    pub fn group_parent_uuid(&self, child_uuid: String) -> Result<Option<String>, EngineError> {
+        let u = parse_uuid(&child_uuid, "group")?;
+        self.with_engine(|e| Ok(e.group_parent_uuid(u)?.map(|p| p.to_string())))
+    }
+
+    /// `true` if `group_uuid` is at any depth inside the subtree
+    /// rooted at `ancestor_uuid`. Not inclusive — a group is not its
+    /// own descendant.
+    pub fn is_descendant_of(
+        &self,
+        group_uuid: String,
+        ancestor_uuid: String,
+    ) -> Result<bool, EngineError> {
+        let g = parse_uuid(&group_uuid, "group")?;
+        let a = parse_uuid(&ancestor_uuid, "group")?;
+        self.with_engine(|e| Ok(e.is_descendant_of(g, a)?))
+    }
+
     pub fn list_tags(&self) -> Result<Vec<String>, EngineError> {
         self.with_engine(|e| Ok(e.list_tags()?))
     }

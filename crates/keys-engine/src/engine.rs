@@ -1406,6 +1406,50 @@ impl Engine {
         crate::reads::group_tree(&self.conn)
     }
 
+    /// Return the parent group's UUID for `child_uuid`, or `Ok(None)`
+    /// if `child_uuid` is the root group (which has no parent).
+    ///
+    /// Trivial single-row `SELECT` against `group.parent_uuid` — much
+    /// cheaper than fetching the whole tree just to read one edge.
+    /// Mirrors the legacy `Vault::group_parent` shape so consumer
+    /// migration off the in-memory `Vault` is a direct call swap.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`) if no group
+    ///   with `child_uuid` exists.
+    /// - [`EngineError::Sqlite`] on query failure.
+    pub fn group_parent_uuid(&self, child_uuid: Uuid) -> Result<Option<Uuid>, EngineError> {
+        crate::reads::group_parent_uuid(&self.conn, child_uuid)
+    }
+
+    /// Return `true` if `group_uuid` is at any depth inside the subtree
+    /// rooted at `ancestor_uuid`. **Not inclusive** — a group is not
+    /// its own descendant, so `is_descendant_of(g, g)` returns `false`
+    /// (provided `g` exists).
+    ///
+    /// Implementation walks `parent_uuid` up from `group_uuid` until
+    /// it either hits `ancestor_uuid` (true), reaches the root with no
+    /// match (false), or trips the defensive iteration cap (false —
+    /// guards against a `parent_uuid` cycle in a malformed user vault).
+    ///
+    /// `ancestor_uuid` is not validated separately: if it doesn't
+    /// match any group, the walk simply terminates at root with
+    /// `false`, which is the natural answer.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`) if `group_uuid`
+    ///   doesn't match any group row.
+    /// - [`EngineError::Sqlite`] on query failure.
+    pub fn is_descendant_of(
+        &self,
+        group_uuid: Uuid,
+        ancestor_uuid: Uuid,
+    ) -> Result<bool, EngineError> {
+        crate::reads::is_descendant_of(&self.conn, group_uuid, ancestor_uuid)
+    }
+
     /// Full-text search across title / username / URL / notes, with
     /// a tag-substring fallback.
     ///
