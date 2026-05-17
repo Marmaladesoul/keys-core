@@ -335,6 +335,23 @@ impl Engine {
         self.with_engine(|e| Ok(e.history(u)?.into_iter().map(Into::into).collect()))
     }
 
+    // ── Attachments ────────────────────────────────────────────────────
+
+    /// Fetch the raw bytes of a named attachment on an entry.
+    ///
+    /// Sync — attachment blobs are small enough (KDBX stores them
+    /// inline) that the underlying SQLite read is sub-millisecond.
+    /// Returns the content-addressed blob bytes; clients hash + cache
+    /// out-of-band if they need to.
+    pub fn attachment_bytes(
+        &self,
+        uuid: String,
+        attachment_name: String,
+    ) -> Result<Vec<u8>, EngineError> {
+        let u = parse_uuid(&uuid, "entry")?;
+        self.with_engine(|e| Ok(e.attachment_bytes(u, &attachment_name)?))
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Mutations (sync — each is one transaction)
     // ────────────────────────────────────────────────────────────────────

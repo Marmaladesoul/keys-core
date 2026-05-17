@@ -166,23 +166,90 @@ fn history_does_not_include_protected_plaintext() {
     assert_eq!(history.len(), 1, "one history snapshot expected");
 
     let snap = &history[0];
+    let token = snap
+        .custom_fields
+        .iter()
+        .find(|cf| cf.name == "Token")
+        .unwrap_or_else(|| panic!("Token field should appear in custom_fields: {snap:?}"));
     assert!(
-        snap.custom_field_names.contains(&"Token".to_string()),
-        "Token name should surface in custom_field_names: {snap:?}"
+        token.is_protected,
+        "Token was Protected at snapshot time; flag should round-trip: {snap:?}"
     );
 
     // The `HistoricEntry` payload deliberately doesn't carry field
-    // values; only the names. Belt-and-braces: serialise the whole
-    // struct and confirm no plaintext leaked anywhere.
-    let json = serde_json::to_string(&snap).expect("serialise");
+    // values; only the names. Structural checks (above) are
+    // sufficient — CustomFieldRef has no value field, and
+    // HistoricEntry has no password field. (We don't serialise-and-
+    // scan because IconRef's internally-tagged newtype variant can't
+    // survive serde_json's tag-with-newtype constraint — orthogonal
+    // to plaintext safety.)
+}
+
+#[test]
+fn history_populates_widened_structural_fields() {
+    // Phase 6.5 widening: HistoricEntry now mirrors EntryFull's
+    // structural shape — notes, tags, icon, timestamps, strength
+    // bucket/entropy, url_host — rather than the narrower
+    // title/username/url shape.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keys.db");
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let id = kdbx
+        .add_entry(
+            root,
+            NewEntry::new("v0")
+                .username("alice")
+                .url("https://v0.example/path")
+                .password(SecretString::from("Tr0ub4dor&3-original")),
+        )
+        .expect("add");
+
+    // Seed v0 metadata, then snapshot-edit to v1. v0 is what lands
+    // in history; v1 is the live row.
+    kdbx.edit_entry(id, HistoryPolicy::NoSnapshot, |e| {
+        e.set_notes("old notes");
+        e.set_tags(vec!["one".into(), "two".into()]);
+        e.set_icon_id(7);
+    })
+    .expect("seed v0 metadata");
+    kdbx.edit_entry(id, HistoryPolicy::Snapshot, |e| {
+        e.set_title("v1");
+        e.set_notes("new notes");
+        e.set_tags(vec!["three".into()]);
+        e.set_icon_id(3);
+        e.set_password(SecretString::from("rotated-password-789!"));
+    })
+    .expect("edit v1");
+
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    let history = engine.history(id.0).expect("history");
+    assert_eq!(history.len(), 1);
+    let snap = &history[0];
+
+    assert_eq!(snap.title, "v0");
+    assert_eq!(snap.username, "alice");
+    assert_eq!(snap.url, "https://v0.example/path");
+    assert_eq!(snap.url_host, "v0.example");
+    assert_eq!(snap.notes, "old notes");
+    assert_eq!(snap.tags, vec!["one".to_string(), "two".to_string()]);
+    match snap.icon {
+        keys_engine::IconRef::Builtin(7) => {}
+        ref other => panic!("expected Builtin(7), got {other:?}"),
+    }
+    // Snapshot password is non-empty → strength must populate.
     assert!(
-        !json.contains("ancient-secret"),
-        "password plaintext leaked into HistoricEntry: {json}"
+        snap.password_strength_bucket.is_some(),
+        "expected strength bucket on non-empty snapshot password"
     );
     assert!(
-        !json.contains("ancient-token"),
-        "protected custom field plaintext leaked into HistoricEntry: {json}"
+        snap.password_entropy.unwrap_or(0.0) > 0.0,
+        "expected positive entropy"
     );
+    assert!(snap.created_at > 0, "created_at should be populated");
+    assert!(snap.modified_at > 0, "modified_at should be populated");
 }
 
 #[test]

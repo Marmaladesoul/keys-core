@@ -360,7 +360,7 @@ fn insert_entry(
     // (per the decoder doc); we use the slice index as
     // `history_index` directly.
     for (idx, hist) in entry.history.iter().enumerate() {
-        let snapshot = HistorySnapshot::from_entry(hist, session_key)?;
+        let snapshot = HistorySnapshot::from_entry(hist, session_key, binaries)?;
         let json = serde_json::to_string(&snapshot)
             .map_err(|e| EngineError::Ingest(IngestError::Json(e)))?;
         conn.execute(
@@ -482,22 +482,32 @@ fn expiry_ms(times: &keepass_core::model::Timestamps) -> Option<i64> {
 ///
 /// ```json
 /// {
-///   "title": "...", "username": "...", "url": "...", "notes": "...",
+///   "title": "...", "username": "...", "url": "...",
+///   "url_host": "...", "notes": "...",
 ///   "password": "<base64(nonce|ct|tag)>",
 ///   "tags": [...],
 ///   "created_at": ..., "modified_at": ..., "accessed_at": ...,
-///   "expires_at": ...,
+///   "last_used_at": ..., "expires_at": ...,
+///   "icon_index": 0, "icon_custom_uuid": null,
+///   "password_strength_bucket": 3, "password_entropy": 42.5,
+///   "attachments": [{ "name": "doc.txt", "size": 1234 }],
 ///   "custom_fields": {
 ///     "Token":   { "value": "<base64(nonce|ct|tag)>", "protected": true  },
 ///     "Website": { "value": "example.com",            "protected": false }
 ///   }
 /// }
 /// ```
+///
+/// Backwards compat: every field added after the initial shipped shape
+/// is `#[serde(default)]` on the read side ([`HistorySnapshotRead`]) so
+/// older JSON deserialises cleanly; on the write side every newly-
+/// snapshotted history row carries the full payload.
 #[derive(Serialize)]
 struct HistorySnapshot<'a> {
     title: &'a str,
     username: &'a str,
     url: &'a str,
+    url_host: String,
     notes: &'a str,
     /// Base64 of `seal_with_key(session_key, password_plaintext)`.
     password: String,
@@ -505,8 +515,20 @@ struct HistorySnapshot<'a> {
     created_at: i64,
     modified_at: i64,
     accessed_at: i64,
+    last_used_at: Option<i64>,
     expires_at: Option<i64>,
+    icon_index: u32,
+    icon_custom_uuid: Option<String>,
+    password_strength_bucket: Option<u8>,
+    password_entropy: Option<f64>,
+    attachments: Vec<HistoryAttachment<'a>>,
     custom_fields: HashMap<&'a str, HistoryCustomField>,
+}
+
+#[derive(Serialize)]
+struct HistoryAttachment<'a> {
+    name: &'a str,
+    size: u64,
 }
 
 #[derive(Serialize)]
@@ -518,7 +540,11 @@ struct HistoryCustomField {
 }
 
 impl<'a> HistorySnapshot<'a> {
-    fn from_entry(entry: &'a Entry, session_key: &SessionKey) -> Result<Self, EngineError> {
+    fn from_entry(
+        entry: &'a Entry,
+        session_key: &SessionKey,
+        binaries: &[&[u8]],
+    ) -> Result<Self, EngineError> {
         let mut custom_fields: HashMap<&'a str, HistoryCustomField> = HashMap::new();
         for cf in &entry.custom_fields {
             let value = if cf.protected {
@@ -538,17 +564,45 @@ impl<'a> HistorySnapshot<'a> {
         }
         let wrapped_password = seal_with_key(session_key, entry.password.as_bytes())
             .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
+        let strength_result = strength::strength(&entry.password);
+        let (bucket, entropy) = if entry.password.is_empty() {
+            (None, None)
+        } else {
+            (
+                Some(strength_result.bucket as u8),
+                Some(strength_result.entropy_bits),
+            )
+        };
+        let attachments: Vec<HistoryAttachment<'a>> = entry
+            .attachments
+            .iter()
+            .map(|att| {
+                let size = u64::try_from(binaries.get(att.ref_id as usize).map_or(0, |b| b.len()))
+                    .unwrap_or(0);
+                HistoryAttachment {
+                    name: att.name.as_str(),
+                    size,
+                }
+            })
+            .collect();
         Ok(Self {
             title: &entry.title,
             username: &entry.username,
             url: &entry.url,
+            url_host: parse_host(&entry.url),
             notes: &entry.notes,
             password: b64_encode(&wrapped_password),
             tags: &entry.tags,
             created_at: dt_to_ms_required(entry.times.creation_time),
             modified_at: dt_to_ms_required(entry.times.last_modification_time),
             accessed_at: dt_to_ms_required(entry.times.last_access_time),
+            last_used_at: entry.times.last_access_time.map(|d| d.timestamp_millis()),
             expires_at: expiry_ms(&entry.times),
+            icon_index: entry.icon_id,
+            icon_custom_uuid: entry.custom_icon_uuid.map(|u| u.to_string()),
+            password_strength_bucket: bucket,
+            password_entropy: entropy,
+            attachments,
             custom_fields,
         })
     }

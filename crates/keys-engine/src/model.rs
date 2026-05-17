@@ -238,11 +238,40 @@ pub struct HistoricEntry {
     pub username: String,
     /// URL at the time of this snapshot.
     pub url: String,
+    /// Parsed host of `url` at the time of the snapshot. Empty when
+    /// the URL was empty or unparseable.
+    pub url_host: String,
+    /// Notes (plain text) at the time of this snapshot.
+    pub notes: String,
+    /// Icon reference at the time of this snapshot.
+    pub icon: IconRef,
+    /// Created-at timestamp from the snapshot. Mirrors the entry's
+    /// own creation time; preserved per-snapshot for completeness.
+    pub created_at: i64,
     /// Modified-at timestamp of the snapshot.
     pub modified_at: i64,
-    /// Names of custom fields that existed in this snapshot. Values
-    /// fetched via [`crate::Engine::reveal_history_field`].
-    pub custom_field_names: Vec<String>,
+    /// Last-accessed timestamp at the time of the snapshot.
+    pub accessed_at: i64,
+    /// Last-used proxy (mirrors `accessed_at` when non-zero); `None`
+    /// when the snapshot had never been used.
+    pub last_used_at: Option<i64>,
+    /// Expiry timestamp at snapshot time; `None` when not set.
+    pub expires_at: Option<i64>,
+    /// Password strength bucket at snapshot time; `None` if it
+    /// wasn't recorded (older JSON or empty password).
+    pub password_strength_bucket: Option<StrengthBucket>,
+    /// Password entropy bits at snapshot time; `None` when missing.
+    pub password_entropy: Option<f64>,
+    /// Custom-field metadata at snapshot time. Values fetched via
+    /// [`crate::Engine::reveal_history_field`]. Sorted by `name`.
+    pub custom_fields: Vec<CustomFieldRef>,
+    /// Tags applied at snapshot time.
+    pub tags: Vec<String>,
+    /// Attachment metadata at snapshot time. Bytes fetched via
+    /// [`crate::Engine::attachment_bytes`] — note: snapshot
+    /// attachments share the same content-addressed pool as the
+    /// live entry, so the most recent versions are what come back.
+    pub attachments: Vec<AttachmentRef>,
 }
 
 /// A persisted smart-folder row from the `smart_folder` table.

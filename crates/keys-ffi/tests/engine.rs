@@ -651,3 +651,124 @@ fn engine_pending_conflict_unknown_id_is_none() {
     let res = engine.pending_conflict(424_242).expect("call ok");
     assert!(res.is_none(), "unknown id returns None");
 }
+
+/// Seed a fresh KDBX with one entry that owns an attachment and one
+/// snapshotted history revision. Returns the entry's UUID string, the
+/// kdbx path, and the attachment bytes the test should expect.
+fn seed_kdbx_with_attachment_and_history(kdbx_path: &std::path::Path) -> (String, Vec<u8>) {
+    use keepass_core::CompositeKey;
+    use keepass_core::kdbx::Kdbx;
+    use keepass_core::model::{HistoryPolicy, NewEntry};
+    use secrecy::SecretString;
+    let composite = CompositeKey::from_password(KDBX_PASSWORD.as_bytes());
+    let mut kdbx = Kdbx::create_empty_v4(&composite, "test").expect("create");
+    let root = kdbx.vault().root.id;
+    let attachment_bytes = b"hello-attachment-payload".to_vec();
+    let id = kdbx
+        .add_entry(
+            root,
+            NewEntry::new("v0")
+                .username("alice-v0")
+                .url("https://v0.example/login")
+                .password(SecretString::from("initial-password-A!")),
+        )
+        .expect("add");
+    // Seed metadata + attachment on v0 (no snapshot).
+    {
+        let bytes = attachment_bytes.clone();
+        kdbx.edit_entry(id, HistoryPolicy::NoSnapshot, move |e| {
+            e.set_notes("v0 notes");
+            e.set_tags(vec!["alpha".into()]);
+            e.set_icon_id(11);
+            e.attach("doc.txt", bytes, false);
+        })
+        .expect("seed v0");
+    }
+    // Snapshot the v0 state into history, then mutate to v1.
+    kdbx.edit_entry(id, HistoryPolicy::Snapshot, |e| {
+        e.set_title("v1");
+        e.set_notes("v1 notes");
+        e.set_tags(vec!["beta".into(), "gamma".into()]);
+        e.set_icon_id(2);
+        e.set_password(SecretString::from("rotated-password-B!"));
+    })
+    .expect("edit v1");
+    let bytes_out = kdbx.save_to_bytes().expect("save bytes");
+    std::fs::write(kdbx_path, bytes_out).expect("write");
+    (id.0.to_string(), attachment_bytes)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_attachment_bytes_via_ffi() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    let (uuid, expected_bytes) = seed_kdbx_with_attachment_and_history(&kdbx_path);
+    let engine = open_fresh_engine(&db_path);
+    engine
+        .ingest_from_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("ingest");
+
+    let read = engine
+        .attachment_bytes(uuid.clone(), "doc.txt".to_owned())
+        .expect("attachment_bytes via FFI");
+    assert_eq!(read, expected_bytes);
+
+    // NotFound for missing attachment name.
+    let err = engine
+        .attachment_bytes(uuid, "missing.bin".to_owned())
+        .expect_err("missing attachment should NotFound");
+    matches!(err, EngineError::NotFound { ref entity } if entity == "attachment")
+        .then_some(())
+        .expect("NotFound attachment");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_history_widening_round_trip_via_ffi() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    let (uuid, _expected_bytes) = seed_kdbx_with_attachment_and_history(&kdbx_path);
+    let engine = open_fresh_engine(&db_path);
+    engine
+        .ingest_from_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("ingest");
+
+    let history = engine.history(uuid).expect("history via FFI");
+    assert_eq!(history.len(), 1, "one snapshot expected");
+    let snap = &history[0];
+
+    // Confirm the new widened fields populate at the FFI boundary.
+    assert_eq!(snap.title, "v0");
+    assert_eq!(snap.username, "alice-v0");
+    assert_eq!(snap.url, "https://v0.example/login");
+    assert_eq!(snap.url_host, "v0.example");
+    assert_eq!(snap.notes, "v0 notes");
+    assert_eq!(snap.tags, vec!["alpha".to_string()]);
+    match snap.icon {
+        IconRef::Builtin { index: 11 } => {}
+        ref other => panic!("expected Builtin {{ index: 11 }}, got {other:?}"),
+    }
+    assert!(
+        snap.password_strength_bucket.is_some(),
+        "snapshot password is non-empty → strength bucket must surface"
+    );
+    assert!(
+        snap.password_entropy.unwrap_or(0.0) > 0.0,
+        "expected positive entropy on snapshot password"
+    );
+    assert!(
+        snap.attachments.iter().any(|a| a.name == "doc.txt"),
+        "snapshot should record the attachment metadata: {snap:?}"
+    );
+    assert!(snap.created_at > 0);
+    assert!(snap.modified_at > 0);
+}

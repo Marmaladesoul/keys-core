@@ -366,15 +366,51 @@ pub(crate) fn history(conn: &Connection, uuid: Uuid) -> Result<Vec<HistoricEntry
     for (idx, json) in rows {
         let snap: HistorySnapshotRead = serde_json::from_str(&json)
             .map_err(|e| EngineError::Reveal(crate::error::RevealError::Json(e)))?;
-        let mut custom_field_names: Vec<String> = snap.custom_fields.into_keys().collect();
-        custom_field_names.sort();
+        // Build CustomFieldRef list sorted by name for deterministic
+        // ordering (matches EntryFull.custom_fields).
+        let mut custom_fields: Vec<CustomFieldRef> = snap
+            .custom_fields
+            .into_iter()
+            .map(|(name, raw)| CustomFieldRef {
+                name,
+                is_protected: raw.protected.unwrap_or(false),
+            })
+            .collect();
+        custom_fields.sort_by(|a, b| a.name.cmp(&b.name));
+        let icon_custom_uuid = snap
+            .icon_custom_uuid
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok());
+        let icon = icon_ref_from(snap.icon_index.map(i64::from), icon_custom_uuid);
+        let attachments: Vec<AttachmentRef> = snap
+            .attachments
+            .into_iter()
+            .map(|a| AttachmentRef {
+                name: a.name,
+                size: a.size,
+            })
+            .collect();
         out.push(HistoricEntry {
             history_index: u32::try_from(idx).unwrap_or(u32::MAX),
             title: snap.title,
             username: snap.username,
             url: snap.url,
+            url_host: snap.url_host,
+            notes: snap.notes,
+            icon,
+            created_at: snap.created_at,
             modified_at: snap.modified_at,
-            custom_field_names,
+            accessed_at: snap.accessed_at,
+            last_used_at: snap.last_used_at,
+            expires_at: snap.expires_at,
+            password_strength_bucket: snap
+                .password_strength_bucket
+                .map(i64::from)
+                .and_then(strength_bucket_from_i64),
+            password_entropy: snap.password_entropy,
+            custom_fields,
+            tags: snap.tags,
+            attachments,
         });
     }
     Ok(out)
@@ -405,18 +441,63 @@ pub(crate) fn attachment_bytes(
 }
 
 /// Deserialise side of the shape written by
-/// `crate::ingest::HistorySnapshot`. Only the fields surfaced through
-/// [`HistoricEntry`] are pulled out; the protected/wrapped values
-/// stay in the JSON and are only touched by
+/// `crate::ingest::HistorySnapshot`. Every field added after the
+/// initial shipped shape is `#[serde(default)]` so older JSON
+/// (pre-history-widening) deserialises cleanly: those snapshots simply
+/// surface zero/empty defaults for the newer fields, which is correct
+/// because the data genuinely wasn't recorded at write time. The
+/// protected/wrapped values stay in the JSON and are only touched by
 /// [`crate::reveal::reveal_history_field`].
 #[derive(Deserialize)]
 struct HistorySnapshotRead {
     title: String,
     username: String,
     url: String,
+    #[serde(default)]
+    url_host: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    created_at: i64,
     modified_at: i64,
     #[serde(default)]
-    custom_fields: HashMap<String, serde_json::Value>,
+    accessed_at: i64,
+    #[serde(default)]
+    last_used_at: Option<i64>,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    icon_index: Option<u32>,
+    #[serde(default)]
+    icon_custom_uuid: Option<String>,
+    #[serde(default)]
+    password_strength_bucket: Option<u8>,
+    #[serde(default)]
+    password_entropy: Option<f64>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    attachments: Vec<HistoryAttachmentRead>,
+    #[serde(default)]
+    custom_fields: HashMap<String, HistoryCustomFieldRead>,
+}
+
+#[derive(Deserialize)]
+struct HistoryAttachmentRead {
+    name: String,
+    #[serde(default)]
+    size: u64,
+}
+
+/// Mirrors the write-side `HistoryCustomField` but only carries the
+/// `protected` flag — value bytes stay opaque on this read path
+/// (`reveal_history_field` parses them separately). `protected` is
+/// `Option<bool>` to remain compatible with future shape changes; we
+/// default it to `false` if missing.
+#[derive(Deserialize)]
+struct HistoryCustomFieldRead {
+    #[serde(default)]
+    protected: Option<bool>,
 }
 
 // ────────────────────────── helpers ──────────────────────────

@@ -95,14 +95,30 @@ Flat tree node:
 
 ### `HistoricEntry`
 
+Mirrors `EntryFull`'s structural shape minus things that don't exist
+in a snapshot (`uuid`, `group_uuid`, `is_recycled`, `history_count`)
+and minus protected-field plaintext. Protected values still come back
+via `reveal_history_field(uuid, history_index, field_name)`.
+
 | field | type | notes |
 |---|---|---|
 | `history_index` | `u32` | 0 = oldest |
 | `title` | `String` | |
 | `username` | `String` | |
 | `url` | `String` | |
+| `url_host` | `String` | parsed at snapshot time |
+| `notes` | `String` | |
+| `icon` | `IconRef` | snapshot-time icon |
+| `created_at` | `i64` ms | |
 | `modified_at` | `i64` ms | |
-| `custom_field_names` | `Vec<String>` | names for `reveal_history_field` |
+| `accessed_at` | `i64` ms | |
+| `last_used_at` | `Option<i64>` ms | mirrors `accessed_at` proxy |
+| `expires_at` | `Option<i64>` ms | |
+| `password_strength_bucket` | `Option<StrengthBucket>` | computed at ingest |
+| `password_entropy` | `Option<f64>` | bits |
+| `custom_fields` | `Vec<CustomFieldRef>` | name + `is_protected`, sorted by name |
+| `tags` | `Vec<String>` | |
+| `attachments` | `Vec<AttachmentRef>` | metadata only; bytes via `attachment_bytes` |
 
 ### `StrengthBucket`
 

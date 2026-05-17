@@ -320,14 +320,30 @@ impl From<eng::GroupNode> for GroupNode {
 }
 
 /// Historic snapshot of an entry.
+///
+/// Mirrors `EntryFull`'s structural shape minus things that don't
+/// exist in a snapshot (`uuid`, `group_uuid`, `is_recycled`,
+/// `history_count`) and minus protected-field plaintext (still
+/// fetched via `reveal_history_field`).
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct HistoricEntry {
     pub history_index: u32,
     pub title: String,
     pub username: String,
     pub url: String,
+    pub url_host: String,
+    pub notes: String,
+    pub icon: IconRef,
+    pub created_at: i64,
     pub modified_at: i64,
-    pub custom_field_names: Vec<String>,
+    pub accessed_at: i64,
+    pub last_used_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub password_strength_bucket: Option<StrengthBucket>,
+    pub password_entropy: Option<f64>,
+    pub custom_fields: Vec<CustomFieldRef>,
+    pub tags: Vec<String>,
+    pub attachments: Vec<AttachmentRef>,
 }
 
 impl From<eng::HistoricEntry> for HistoricEntry {
@@ -337,8 +353,19 @@ impl From<eng::HistoricEntry> for HistoricEntry {
             title: h.title,
             username: h.username,
             url: h.url,
+            url_host: h.url_host,
+            notes: h.notes,
+            icon: h.icon.into(),
+            created_at: h.created_at,
             modified_at: h.modified_at,
-            custom_field_names: h.custom_field_names,
+            accessed_at: h.accessed_at,
+            last_used_at: h.last_used_at,
+            expires_at: h.expires_at,
+            password_strength_bucket: h.password_strength_bucket.map(Into::into),
+            password_entropy: h.password_entropy,
+            custom_fields: h.custom_fields.into_iter().map(Into::into).collect(),
+            tags: h.tags,
+            attachments: h.attachments.into_iter().map(Into::into).collect(),
         }
     }
 }
