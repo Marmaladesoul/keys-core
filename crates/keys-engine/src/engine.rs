@@ -1159,6 +1159,96 @@ impl Engine {
         crate::reads::list_tags(&self.conn)
     }
 
+    /// Uuid of the recycle-bin group, or `None` if no bin exists.
+    ///
+    /// Sourced from the `group` table's `is_recycle_bin = 1` row — the
+    /// authoritative location for the bin identity. Backs the Swift-side
+    /// recycle-bin uuid accessor (Phase 6.17 retires the in-memory
+    /// `Vault::recycleBinUuid()` shim in favour of this).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn recycle_bin_uuid(&self) -> Result<Option<String>, EngineError> {
+        crate::meta::read_recycle_bin_uuid(&self.conn)
+    }
+
+    /// Whether the recycle-bin feature is enabled for this vault.
+    ///
+    /// Sourced from the explicit `meta.recycle_bin_enabled` setting row
+    /// written by ingest. Falls back to "does a bin group exist?" for
+    /// legacy DBs that predate that setting — matches the same
+    /// derivation [`Engine::project_to_vault`] uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn recycle_bin_enabled(&self) -> Result<bool, EngineError> {
+        crate::meta::read_recycle_bin_enabled(&self.conn)
+    }
+
+    /// Per-entry history retention count cap.
+    ///
+    /// Sourced from `setting` row `meta.history_max_items`. Returns the
+    /// keepass-core default (`10`) when the row is absent — matches
+    /// `Meta::default()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure, or
+    /// [`EngineError::Projection`] if the persisted blob is the wrong
+    /// width.
+    pub fn history_max_items(&self) -> Result<i32, EngineError> {
+        crate::meta::read_history_max_items(&self.conn)
+    }
+
+    /// Per-entry history retention size cap in bytes.
+    ///
+    /// Sourced from `setting` row `meta.history_max_size`. Returns the
+    /// keepass-core default (`6 * 1024 * 1024`) when the row is absent
+    /// — matches `Meta::default()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure, or
+    /// [`EngineError::Projection`] if the persisted blob is the wrong
+    /// width.
+    pub fn history_max_size(&self) -> Result<i64, EngineError> {
+        crate::meta::read_history_max_size(&self.conn)
+    }
+
+    /// Set the per-entry history retention count cap.
+    ///
+    /// Persists `meta.history_max_items` and emits
+    /// [`ChangeEvent::MetaUpdated`] with that key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on write failure.
+    pub fn set_history_max_items(&mut self, max: i32) -> Result<(), EngineError> {
+        crate::meta::write_history_max_items(&self.conn, max).map_err(EngineError::Sqlite)?;
+        self.emit(ChangeEvent::MetaUpdated {
+            keys: vec![crate::meta::KEY_HISTORY_MAX_ITEMS.to_string()],
+        });
+        Ok(())
+    }
+
+    /// Set the per-entry history retention size cap in bytes.
+    ///
+    /// Persists `meta.history_max_size` and emits
+    /// [`ChangeEvent::MetaUpdated`] with that key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on write failure.
+    pub fn set_history_max_size(&mut self, max: i64) -> Result<(), EngineError> {
+        crate::meta::write_history_max_size(&self.conn, max).map_err(EngineError::Sqlite)?;
+        self.emit(ChangeEvent::MetaUpdated {
+            keys: vec![crate::meta::KEY_HISTORY_MAX_SIZE.to_string()],
+        });
+        Ok(())
+    }
+
     /// Return the full group tree as a flat list.
     ///
     /// Tree shape is reconstructed by the caller from each

@@ -183,6 +183,79 @@ pub(crate) fn clear_meta_tables(conn: &Connection) -> Result<(), rusqlite::Error
     Ok(())
 }
 
+// ─────────────────────── public meta accessors ───────────────────────
+//
+// Standalone get/set helpers for the small handful of meta scalars the
+// frontend reads outside of a full vault projection (recycle-bin pair,
+// history caps). These bypass `read_meta_into` / `write_meta` so the
+// caller doesn't have to round-trip a whole `Meta` to touch a single
+// field.
+
+/// Read `meta.recycle_bin_uuid` from the `group` table — i.e. the uuid
+/// of the group flagged `is_recycle_bin = 1`, or `None` if no bin
+/// exists.
+///
+/// The recycle-bin uuid isn't stored in `setting` (the bin group is
+/// identified by its `is_recycle_bin` column, not a meta scalar); this
+/// helper hides that detail behind a meta-shaped accessor.
+pub(crate) fn read_recycle_bin_uuid(conn: &Connection) -> Result<Option<String>, EngineError> {
+    conn.query_row(
+        "SELECT uuid FROM \"group\" WHERE is_recycle_bin = 1 LIMIT 1",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(EngineError::Sqlite)
+}
+
+/// Read `meta.recycle_bin_enabled` from the explicit setting row.
+///
+/// Falls back to "does a bin group exist?" if the row is missing —
+/// matching the projection-side semantics in
+/// [`crate::projection`].
+pub(crate) fn read_recycle_bin_enabled(conn: &Connection) -> Result<bool, EngineError> {
+    let result: Result<Vec<u8>, rusqlite::Error> = conn.query_row(
+        "SELECT value FROM setting WHERE key = 'meta.recycle_bin_enabled'",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    );
+    match result {
+        Ok(bytes) if bytes.len() == 1 => Ok(bytes[0] != 0),
+        Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => {
+            // Fall back to derived: does a bin group exist?
+            Ok(read_recycle_bin_uuid(conn)?.is_some())
+        }
+        Err(err) => Err(EngineError::Sqlite(err)),
+    }
+}
+
+/// Read `meta.history_max_items`. Returns the keepass-core default
+/// (`10`) when the row is absent — matches `Meta::default()`.
+pub(crate) fn read_history_max_items(conn: &Connection) -> Result<i32, EngineError> {
+    Ok(get_i32(conn, KEY_HISTORY_MAX_ITEMS)?.unwrap_or_else(|| Meta::default().history_max_items))
+}
+
+/// Read `meta.history_max_size`. Returns the keepass-core default
+/// (`6 * 1024 * 1024`) when the row is absent — matches `Meta::default()`.
+pub(crate) fn read_history_max_size(conn: &Connection) -> Result<i64, EngineError> {
+    Ok(get_i64(conn, KEY_HISTORY_MAX_SIZE)?.unwrap_or_else(|| Meta::default().history_max_size))
+}
+
+/// Write `meta.history_max_items`. Caller is responsible for emitting
+/// the change event after the surrounding transaction commits.
+pub(crate) fn write_history_max_items(
+    conn: &Connection,
+    value: i32,
+) -> Result<(), rusqlite::Error> {
+    set_i32(conn, KEY_HISTORY_MAX_ITEMS, value)
+}
+
+/// Write `meta.history_max_size`. Caller is responsible for emitting
+/// the change event after the surrounding transaction commits.
+pub(crate) fn write_history_max_size(conn: &Connection, value: i64) -> Result<(), rusqlite::Error> {
+    set_i64(conn, KEY_HISTORY_MAX_SIZE, value)
+}
+
 // ─────────────────────── read path ───────────────────────
 
 /// Read every persisted Meta field and merge onto `meta`. Fields that

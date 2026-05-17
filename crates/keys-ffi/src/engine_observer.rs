@@ -101,6 +101,11 @@ pub enum ChangeEvent {
     },
     VaultLocked,
     VaultUnlocked,
+    /// One or more meta scalars were updated. Carries the affected
+    /// setting keys (e.g. `"meta.history_max_items"`).
+    MetaUpdated {
+        keys: Vec<String>,
+    },
 }
 
 #[derive(uniffi::Record, Debug, Clone)]
@@ -213,6 +218,7 @@ impl From<EngChangeEvent> for ChangeEvent {
             EngChangeEvent::ConflictDetected(p) => Self::ConflictDetected { id: p.id },
             EngChangeEvent::VaultLocked => Self::VaultLocked,
             EngChangeEvent::VaultUnlocked => Self::VaultUnlocked,
+            EngChangeEvent::MetaUpdated { keys } => Self::MetaUpdated { keys },
             // `#[non_exhaustive]` upstream catch-all. Future variants
             // collapse to `SaveCompleted` (a conservative "something
             // happened, re-fetch" signal) rather than panicking.

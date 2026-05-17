@@ -88,6 +88,15 @@ pub enum ChangeEvent {
     /// payload (keyed by [`ConflictPayload::id`]) for a later
     /// `apply_conflict_resolution` call (task 4.7).
     ConflictDetected(ConflictPayload),
+    /// One or more meta scalars were updated. Carries the setting-row
+    /// keys whose value just changed (e.g.
+    /// `"meta.history_max_items"`), so observers can subscribe to a
+    /// specific subset rather than re-reading every meta value on each
+    /// emission.
+    MetaUpdated {
+        /// Setting keys whose value just changed.
+        keys: Vec<String>,
+    },
     /// The vault was locked. Not wired yet — reserved for a future
     /// explicit lock path.
     VaultLocked,

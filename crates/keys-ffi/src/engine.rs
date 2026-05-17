@@ -204,6 +204,38 @@ impl Engine {
         self.with_engine(|e| Ok(e.list_tags()?))
     }
 
+    // ── Meta surface ───────────────────────────────────────────────────
+
+    /// See [`keys_engine::Engine::recycle_bin_uuid`].
+    pub fn recycle_bin_uuid(&self) -> Result<Option<String>, EngineError> {
+        self.with_engine(|e| Ok(e.recycle_bin_uuid()?))
+    }
+
+    /// See [`keys_engine::Engine::recycle_bin_enabled`].
+    pub fn recycle_bin_enabled(&self) -> Result<bool, EngineError> {
+        self.with_engine(|e| Ok(e.recycle_bin_enabled()?))
+    }
+
+    /// See [`keys_engine::Engine::history_max_items`].
+    pub fn history_max_items(&self) -> Result<i32, EngineError> {
+        self.with_engine(|e| Ok(e.history_max_items()?))
+    }
+
+    /// See [`keys_engine::Engine::history_max_size`].
+    pub fn history_max_size(&self) -> Result<i64, EngineError> {
+        self.with_engine(|e| Ok(e.history_max_size()?))
+    }
+
+    /// See [`keys_engine::Engine::set_history_max_items`].
+    pub fn set_history_max_items(&self, max: i32) -> Result<(), EngineError> {
+        self.with_engine_mut(|e| Ok(e.set_history_max_items(max)?))
+    }
+
+    /// See [`keys_engine::Engine::set_history_max_size`].
+    pub fn set_history_max_size(&self, max: i64) -> Result<(), EngineError> {
+        self.with_engine_mut(|e| Ok(e.set_history_max_size(max)?))
+    }
+
     pub fn search(
         &self,
         query: String,
