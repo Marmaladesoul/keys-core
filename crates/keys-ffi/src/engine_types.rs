@@ -317,6 +317,8 @@ pub struct GroupNode {
     pub icon: IconRef,
     pub entry_count_direct: u32,
     pub is_recycle_bin: bool,
+    /// Position within the parent group's child list. Lower = earlier.
+    pub sort_order: u32,
 }
 
 impl From<eng::GroupNode> for GroupNode {
@@ -328,6 +330,7 @@ impl From<eng::GroupNode> for GroupNode {
             icon: g.icon.into(),
             entry_count_direct: g.entry_count_direct,
             is_recycle_bin: g.is_recycle_bin,
+            sort_order: g.sort_order,
         }
     }
 }

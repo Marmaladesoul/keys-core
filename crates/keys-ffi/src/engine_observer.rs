@@ -64,6 +64,9 @@ pub enum ChangeEvent {
     GroupsMoved {
         moves: Vec<GroupMoveInfo>,
     },
+    GroupsReordered {
+        uuids: Vec<String>,
+    },
     GroupsRecycled {
         uuids: Vec<String>,
     },
@@ -186,6 +189,7 @@ impl From<EngChangeEvent> for ChangeEvent {
             EngChangeEvent::GroupsMoved(m) => Self::GroupsMoved {
                 moves: m.into_iter().map(Into::into).collect(),
             },
+            EngChangeEvent::GroupsReordered(u) => Self::GroupsReordered { uuids: uuid_vec(u) },
             EngChangeEvent::GroupsRecycled(u) => Self::GroupsRecycled { uuids: uuid_vec(u) },
             EngChangeEvent::GroupsRestored(u) => Self::GroupsRestored { uuids: uuid_vec(u) },
             EngChangeEvent::ProtectedFieldChanged {

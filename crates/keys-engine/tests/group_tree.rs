@@ -93,16 +93,17 @@ fn group_tree_returns_nested_hierarchy() {
     assert_eq!(tree[0].uuid, root.0);
     assert_eq!(tree[0].parent_uuid, None);
 
-    // Remaining ordered alphabetically by name.
     let by_uuid = |u: uuid::Uuid| tree.iter().find(|n| n.uuid == u).expect("present");
     assert_eq!(by_uuid(a.0).parent_uuid, Some(root.0));
     assert_eq!(by_uuid(b.0).parent_uuid, Some(root.0));
     assert_eq!(by_uuid(a1.0).parent_uuid, Some(a.0));
 
-    let non_root_names: Vec<&str> = tree.iter().skip(1).map(|n| n.name.as_str()).collect();
-    let mut sorted = non_root_names.clone();
-    sorted.sort_unstable();
-    assert_eq!(non_root_names, sorted, "siblings sorted alphabetically");
+    // Siblings come back in the KDBX positional order written by
+    // ingest — A was added before B, so A precedes B.
+    assert_eq!(by_uuid(a.0).sort_order, 0);
+    assert_eq!(by_uuid(b.0).sort_order, 1);
+    // A1 is the first (and only) child of A.
+    assert_eq!(by_uuid(a1.0).sort_order, 0);
 }
 
 #[test]
@@ -207,8 +208,10 @@ fn group_tree_returns_stable_order() {
     let second = engine.group_tree().expect("second");
     assert_eq!(first, second, "two calls return identical ordering");
 
+    // KDBX positional order is what we wrote on insert; the engine
+    // preserves it across migration 0004.
     let names: Vec<&str> = first.iter().skip(1).map(|n| n.name.as_str()).collect();
-    assert_eq!(names, ["Alpha", "Bravo", "Charlie"]);
+    assert_eq!(names, ["Charlie", "Alpha", "Bravo"]);
 }
 
 #[test]

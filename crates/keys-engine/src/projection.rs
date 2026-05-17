@@ -221,6 +221,12 @@ struct GroupRow {
     modified_at: i64,
     expires_at: Option<i64>,
     is_recycle_bin: bool,
+    /// Persisted sibling order. Not consumed by `build_subtree` —
+    /// child ordering is fixed at query time by the `ORDER BY` clause
+    /// in [`load_group_rows`]. Kept on the row for completeness /
+    /// future read paths that want positional metadata.
+    #[allow(dead_code)]
+    sort_order: u32,
 }
 
 /// Read the explicit `meta.recycle_bin_enabled` setting row written by
@@ -242,12 +248,20 @@ fn load_recycle_bin_enabled(conn: &Connection) -> Result<Option<bool>, EngineErr
 }
 
 fn load_group_rows(conn: &Connection) -> Result<Vec<GroupRow>, EngineError> {
+    // Order by `sort_order, name, uuid` so the build_subtree pass below
+    // emits children in the persisted positional order. The
+    // `parent_uuid` column ordering is only used by `build_group_tree`
+    // to bucket rows by parent — the iteration order over rows there
+    // is what determines child order on the projected `Vault`.
     let mut stmt = conn.prepare(
         "SELECT uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
-                created_at, modified_at, expires_at, is_recycle_bin FROM \"group\"",
+                created_at, modified_at, expires_at, is_recycle_bin, sort_order \
+         FROM \"group\" \
+         ORDER BY sort_order ASC, name ASC, uuid ASC",
     )?;
     let rows = stmt
         .query_map([], |row| {
+            let sort_order_i64: i64 = row.get(10)?;
             Ok(GroupRow {
                 uuid: parse_uuid_col(row, 0)?,
                 parent_uuid: row
@@ -279,6 +293,7 @@ fn load_group_rows(conn: &Connection) -> Result<Vec<GroupRow>, EngineError> {
                 modified_at: row.get(7)?,
                 expires_at: row.get(8)?,
                 is_recycle_bin: row.get::<_, i64>(9)? != 0,
+                sort_order: u32::try_from(sort_order_i64).unwrap_or(0),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

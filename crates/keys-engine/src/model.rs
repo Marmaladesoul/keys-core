@@ -233,6 +233,10 @@ pub struct GroupNode {
     pub entry_count_direct: u32,
     /// `true` if this is the database's recycle bin group.
     pub is_recycle_bin: bool,
+    /// Position within the parent group's child list. Lower values
+    /// come first. Siblings sharing a value are tie-broken by `name`
+    /// (legacy default from before migration 0004) and then `uuid`.
+    pub sort_order: u32,
 }
 
 /// One historical snapshot of an entry, as exposed by

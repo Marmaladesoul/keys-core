@@ -158,8 +158,10 @@ pub(crate) fn entry(conn: &Connection, uuid: Uuid) -> Result<Option<EntryFull>, 
 }
 
 /// Return the full group tree as a flat list, ordered so the root
-/// group (NULL `parent_uuid`) comes first, then siblings alphabetically
-/// by name.
+/// group (NULL `parent_uuid`) comes first, then siblings by
+/// `sort_order` (with `name` as a tie-breaker for legacy rows that
+/// haven't been re-ingested since migration 0004 and therefore all
+/// share the default `sort_order = 0`).
 ///
 /// `entry_count_direct` counts entries whose `group_uuid` matches the
 /// row, with one wrinkle: for the recycle bin group itself we **do**
@@ -169,23 +171,26 @@ pub(crate) fn entry(conn: &Connection, uuid: Uuid) -> Result<Option<EntryFull>, 
 pub(crate) fn group_tree(conn: &Connection) -> Result<Vec<GroupNode>, EngineError> {
     let mut stmt = conn.prepare(
         "SELECT uuid, parent_uuid, name, icon_index, icon_custom_uuid, is_recycle_bin, \
+                sort_order, \
                 (SELECT COUNT(*) FROM entry \
                  WHERE entry.group_uuid = \"group\".uuid \
                    AND (entry.is_recycled = 0 OR \"group\".is_recycle_bin = 1)) \
                     AS entry_count_direct \
          FROM \"group\" \
-         ORDER BY (parent_uuid IS NOT NULL), name ASC, uuid ASC",
+         ORDER BY (parent_uuid IS NOT NULL), sort_order ASC, name ASC, uuid ASC",
     )?;
 
     let rows = stmt
         .query_map([], |r| {
-            let count_i64: i64 = r.get(6)?;
+            let sort_order_i64: i64 = r.get(6)?;
+            let count_i64: i64 = r.get(7)?;
             Ok(GroupNode {
                 uuid: parse_uuid_col(r, 0)?,
                 parent_uuid: parse_optional_uuid_col(r, 1)?,
                 name: r.get(2)?,
                 icon: icon_ref_from(r.get(3)?, parse_optional_uuid_col(r, 4)?),
                 is_recycle_bin: r.get::<_, i64>(5)? != 0,
+                sort_order: u32::try_from(sort_order_i64).unwrap_or(0),
                 entry_count_direct: u32::try_from(count_i64).unwrap_or(u32::MAX),
             })
         })?

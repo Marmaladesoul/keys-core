@@ -46,6 +46,11 @@ pub enum ChangeEvent {
     GroupsDeleted(Vec<GroupDeletionInfo>),
     /// One or more groups changed parent.
     GroupsMoved(Vec<GroupMove>),
+    /// Sibling groups under a common parent were reordered in place.
+    /// Carries every uuid whose `sort_order` was rewritten, in the new
+    /// order. The frontend can either re-fetch [`crate::Engine::group_tree`]
+    /// or reuse this list directly to update its in-memory order.
+    GroupsReordered(Vec<Uuid>),
     /// One or more groups were soft-recycled.
     GroupsRecycled(Vec<Uuid>),
     /// One or more recycled groups were restored.

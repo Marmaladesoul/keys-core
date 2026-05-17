@@ -21,7 +21,8 @@ the migration tracker.
 | `list_entries(group: Option<Uuid>, page: Pagination) -> Vec<EntrySummary>` | 3.1 | Paginated. `group = None` → global. |
 | `entry(uuid: Uuid) -> Option<EntryFull>` | 3.1 | `Ok(None)` if not found. |
 | `entry_count(group: Option<Uuid>) -> u64` | 3.1 | Cheap count, no rows fetched. |
-| `group_tree() -> Vec<GroupNode>` | 3.2 | Flat list; tree built by caller. |
+| `group_tree() -> Vec<GroupNode>` | 3.2 | Flat list; tree built by caller. Siblings ordered by `sort_order`. |
+| `reorder_group(uuid: Uuid, new_position: u32) -> ()` | 6.8 | Move `uuid` within its parent's child list. Emits `ChangeEvent::GroupsReordered`. |
 | `search(query: &str, page: Pagination) -> Vec<EntrySummary>` | 3.3 | FTS5-backed. |
 | `smart_folder_entries(folder_id: i64, page: Pagination) -> Vec<EntrySummary>` | 3.8 | Compiles predicate → SQL → runs. |
 | `smart_folder_count(folder_id: i64) -> u64` | 3.8 | Badge-count variant. |
@@ -92,6 +93,14 @@ Flat tree node:
 | `icon` | `IconRef` |
 | `entry_count_direct` | `u32` |
 | `is_recycle_bin` | `bool` |
+| `sort_order` | `u32` (position within parent's child list) |
+
+### `ChangeEvent::GroupsReordered(Vec<Uuid>)`
+
+Emitted by `reorder_group`. Carries every sibling under the affected
+parent in their new `sort_order` order — observers can either re-fetch
+`group_tree` or splice the list directly. Cross-parent moves still go
+through `ChangeEvent::GroupsMoved` via `move_group`.
 
 ### `HistoricEntry`
 

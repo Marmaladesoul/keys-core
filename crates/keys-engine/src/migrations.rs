@@ -47,6 +47,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "meta",
         sql: include_str!("migrations/0003_meta.sql"),
     },
+    Migration {
+        version: 4,
+        name: "group_sort_order",
+        sql: include_str!("migrations/0004_group_sort_order.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.

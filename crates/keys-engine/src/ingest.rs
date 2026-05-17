@@ -94,8 +94,10 @@ pub(crate) fn ingest(
 
     let mut outcome = IngestOutcome::default();
 
-    // Walk groups first so entries' FK references resolve.
-    walk_groups(&tx, &vault.root, None, recycle_bin_uuid, &mut outcome)?;
+    // Walk groups first so entries' FK references resolve. The root
+    // group has no parent and therefore no meaningful sibling
+    // position; we record it with `sort_order = 0` for consistency.
+    walk_groups(&tx, &vault.root, None, 0, recycle_bin_uuid, &mut outcome)?;
 
     // Index the binary pool by ref_id so attachment lookups are O(1).
     // KDBX `ref_id` is the index into `Vault::binaries`.
@@ -137,10 +139,16 @@ fn clear_vault_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
 }
 
 /// Recursive group walk. `parent_uuid = None` for the root group.
+///
+/// `sort_order` is the position of `group` within its parent's
+/// `groups` vec. KDBX XML stores child groups positionally; we
+/// preserve that order so a user's manual drag-reorder survives
+/// save/load.
 fn walk_groups(
     conn: &Connection,
     group: &Group,
     parent_uuid: Option<Uuid>,
+    sort_order: u32,
     recycle_bin_uuid: Option<GroupId>,
     outcome: &mut IngestOutcome,
 ) -> Result<(), rusqlite::Error> {
@@ -151,8 +159,8 @@ fn walk_groups(
     conn.execute(
         "INSERT INTO \"group\" (\
             uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
-            created_at, modified_at, expires_at, is_recycle_bin\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            created_at, modified_at, expires_at, is_recycle_bin, sort_order\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             uuid_str,
             parent_str,
@@ -164,12 +172,21 @@ fn walk_groups(
             dt_to_ms(group.times.last_modification_time),
             expiry_ms(&group.times),
             i64::from(is_recycle_bin),
+            i64::from(sort_order),
         ],
     )?;
 
     outcome.group_uuids.push(group.id.0);
-    for child in &group.groups {
-        walk_groups(conn, child, Some(group.id.0), recycle_bin_uuid, outcome)?;
+    for (idx, child) in group.groups.iter().enumerate() {
+        let child_pos = u32::try_from(idx).unwrap_or(u32::MAX);
+        walk_groups(
+            conn,
+            child,
+            Some(group.id.0),
+            child_pos,
+            recycle_bin_uuid,
+            outcome,
+        )?;
     }
     Ok(())
 }

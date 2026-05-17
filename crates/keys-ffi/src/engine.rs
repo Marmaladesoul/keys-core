@@ -491,6 +491,11 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.move_group(u, p)?))
     }
 
+    pub fn reorder_group(&self, uuid: String, new_position: u32) -> Result<(), EngineError> {
+        let u = parse_uuid(&uuid, "group")?;
+        self.with_engine_mut(|e| Ok(e.reorder_group(u, new_position)?))
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Slow ops (async — dispatched on tokio multi-thread runtime)
     // ────────────────────────────────────────────────────────────────────

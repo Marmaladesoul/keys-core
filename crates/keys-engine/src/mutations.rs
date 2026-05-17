@@ -52,6 +52,17 @@ pub(crate) struct MoveGroupOutcome {
     pub to_parent: Uuid,
 }
 
+/// Outcome of [`reorder_group`] — carries the full ordered list of
+/// sibling uuids under the affected parent so the engine can publish
+/// a `GroupsReordered` event covering every row whose `sort_order`
+/// just changed.
+#[derive(Debug)]
+pub(crate) struct ReorderGroupOutcome {
+    /// All siblings under the target's parent (including the target
+    /// itself) in their new `sort_order` order, lowest first.
+    pub siblings_in_order: Vec<Uuid>,
+}
+
 /// Outcome of [`delete_group`] — carries the full cascade so the engine
 /// can fold a single combined `GroupsDeleted` + `EntriesDeleted` pair
 /// of events.
@@ -651,11 +662,19 @@ pub(crate) fn create_group(
     if !group_exists(&tx, &parent_str)? {
         return Err(EngineError::NotFound { entity: "group" });
     }
+    // Append after the parent's existing children. `MAX(sort_order)`
+    // is NULL on an empty parent — COALESCE-to-(-1) gives us 0 for
+    // the first child and `max + 1` thereafter.
+    let next_sort_order: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM \"group\" WHERE parent_uuid = ?1",
+        params![parent_str],
+        |r| r.get(0),
+    )?;
     tx.execute(
         "INSERT INTO \"group\" (\
             uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
-            created_at, modified_at, expires_at, is_recycle_bin\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 0)",
+            created_at, modified_at, expires_at, is_recycle_bin, sort_order\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 0, ?9)",
         params![
             new_uuid_str,
             parent_str,
@@ -665,6 +684,7 @@ pub(crate) fn create_group(
             fields.notes,
             now,
             now,
+            next_sort_order,
         ],
     )?;
     tx.commit()?;
@@ -891,13 +911,129 @@ pub(crate) fn move_group(
             .flatten();
     }
 
+    // Append at the end of the new parent's children. `MAX(sort_order)`
+    // is NULL when the destination is empty; COALESCE-to-(-1) makes the
+    // first child land at 0.
+    let next_sort_order: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM \"group\" WHERE parent_uuid = ?1",
+        params![new_parent_str],
+        |r| r.get(0),
+    )?;
     tx.execute(
-        "UPDATE \"group\" SET parent_uuid = ?1, modified_at = ?2 WHERE uuid = ?3",
-        params![new_parent_str, now_ms(), uuid_str],
+        "UPDATE \"group\" \
+         SET parent_uuid = ?1, sort_order = ?2, modified_at = ?3 \
+         WHERE uuid = ?4",
+        params![new_parent_str, next_sort_order, now_ms(), uuid_str],
     )?;
     tx.commit()?;
     Ok(MoveGroupOutcome {
         from_parent,
         to_parent: new_parent_uuid,
     })
+}
+
+/// Reorder `uuid` within its current parent's child list. `new_position`
+/// is the 0-based final index in the parent's sibling sequence; values
+/// past the last index clamp to the end.
+///
+/// Returns the full ordered list of sibling uuids under the parent so
+/// the engine can publish a [`crate::events::ChangeEvent::GroupsReordered`]
+/// event covering every row whose `sort_order` changed.
+///
+/// Strategy: pull all sibling uuids ordered by current `sort_order`,
+/// remove the target from its old slot, splice it at `new_position`,
+/// then rewrite every sibling's `sort_order` as its new index.
+/// Renumbering everything is the simplest correct approach and is
+/// trivially cheap — a single parent rarely holds more than a few
+/// dozen direct children.
+///
+/// Cross-parent moves go through [`move_group`] instead; this method
+/// refuses to alter parentage.
+pub(crate) fn reorder_group(
+    conn: &mut Connection,
+    uuid: Uuid,
+    new_position: u32,
+) -> Result<ReorderGroupOutcome, EngineError> {
+    let uuid_str = uuid.to_string();
+    let tx = conn.transaction()?;
+
+    // Look up the target group + its parent. The root group has
+    // `parent_uuid IS NULL` and cannot be reordered (it has no siblings
+    // by construction); we reject that case as a no-op error rather
+    // than silently doing nothing.
+    let parent_str: Option<String> = match tx
+        .query_row(
+            "SELECT parent_uuid FROM \"group\" WHERE uuid = ?1",
+            params![uuid_str],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+    {
+        Some(p) => p,
+        None => return Err(EngineError::NotFound { entity: "group" }),
+    };
+    let Some(parent_str) = parent_str else {
+        // The root group has no siblings — reordering it is degenerate.
+        // Treat as not-found rather than introducing a new error
+        // variant; the FFI layer maps that cleanly to a foreign error
+        // and the surface stays minimal.
+        return Err(EngineError::NotFound { entity: "group" });
+    };
+
+    // Pull current sibling order (ascending by sort_order, with the
+    // same tie-breakers as `group_tree` so the read and write paths
+    // agree on order when sort_order values collide).
+    let mut siblings: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT uuid FROM \"group\" \
+             WHERE parent_uuid = ?1 \
+             ORDER BY sort_order ASC, name ASC, uuid ASC",
+        )?;
+        stmt.query_map(params![parent_str], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    // Splice the target into its new position. Position values past
+    // the end clamp to "last" — drag-reorder UIs often pass
+    // `siblings.len()` to mean "put it at the end".
+    let Some(current_idx) = siblings.iter().position(|s| s == &uuid_str) else {
+        // The row exists (we read its parent above) but isn't under
+        // its own parent in the sibling list — impossible without
+        // schema corruption. Surface as not-found rather than panicking.
+        return Err(EngineError::NotFound { entity: "group" });
+    };
+    let target = siblings.remove(current_idx);
+    let clamped = (new_position as usize).min(siblings.len());
+    siblings.insert(clamped, target);
+
+    // Rewrite every sibling's sort_order to its new index. A single
+    // statement per row keeps the SQL trivial; bulk-update via a CTE
+    // would be cleverer but not measurably faster at these row counts.
+    let now = now_ms();
+    for (idx, sibling_uuid) in siblings.iter().enumerate() {
+        let pos = i64::try_from(idx).unwrap_or(i64::MAX);
+        tx.execute(
+            "UPDATE \"group\" SET sort_order = ?1 WHERE uuid = ?2",
+            params![pos, sibling_uuid],
+        )?;
+    }
+    // Bump modified_at only on the row the user actually moved; the
+    // other siblings keep their original modified_at because their
+    // logical contents didn't change.
+    tx.execute(
+        "UPDATE \"group\" SET modified_at = ?1 WHERE uuid = ?2",
+        params![now, uuid_str],
+    )?;
+    tx.commit()?;
+
+    let siblings_in_order = siblings
+        .into_iter()
+        .map(|s| {
+            Uuid::parse_str(&s).map_err(|e| {
+                EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ReorderGroupOutcome { siblings_in_order })
 }

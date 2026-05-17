@@ -1816,6 +1816,28 @@ impl Engine {
         Ok(())
     }
 
+    /// Reorder `uuid` within its current parent's child list.
+    /// `new_position` is the 0-based final index in the sibling
+    /// sequence; values past the last index clamp to the end.
+    ///
+    /// Cross-parent moves use [`Engine::move_group`] instead — that
+    /// path appends to the new parent. `reorder_group` only rewrites
+    /// `sort_order` values; it never changes parentage.
+    ///
+    /// Emits [`ChangeEvent::GroupsReordered`] carrying the full ordered
+    /// sibling list under the parent.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`) if no group
+    ///   with that UUID exists or the target is the root group.
+    /// - [`EngineError::Sqlite`].
+    pub fn reorder_group(&mut self, uuid: Uuid, new_position: u32) -> Result<(), EngineError> {
+        let outcome = mutations::reorder_group(&mut self.conn, uuid, new_position)?;
+        self.emit(ChangeEvent::GroupsReordered(outcome.siblings_in_order));
+        Ok(())
+    }
+
     /// Return the historical snapshots of an entry.
     ///
     /// Ordered oldest-first (`history_index` ascending). Empty vector
