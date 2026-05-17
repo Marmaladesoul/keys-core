@@ -1147,10 +1147,10 @@ impl Engine {
     /// alphabetically. Empty if no entries are tagged.
     ///
     /// Backs the Swift-side tag list (Phase 6.13 retires the in-memory
-    /// `TagListStore` in favour of this engine method). Only tags
-    /// joined to at least one entry are returned — orphan rows left in
-    /// the `tag` table by `set_tags` (which deletes from `entry_tag`
-    /// but not `tag`) are filtered out.
+    /// `TagListStore` in favour of this engine method). Mutations that
+    /// can orphan a tag (`set_tags`, `delete_entry`, `delete_group`)
+    /// run an in-transaction GC sweep, so the `tag` table is
+    /// authoritative — no zombie filtering required here.
     ///
     /// # Errors
     ///

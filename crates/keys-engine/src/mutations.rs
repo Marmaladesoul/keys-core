@@ -150,6 +150,21 @@ fn recycle_bin_uuid(tx: &Transaction<'_>) -> Result<Option<String>, EngineError>
     Ok(row)
 }
 
+/// Garbage-collect `tag` rows that no `entry_tag` row references.
+///
+/// Must be called inside the same transaction as a mutation that may
+/// have removed the last `entry_tag` referencing a tag (i.e. `set_tags`,
+/// `delete_entry`, and the `delete_group` cascade). Keeping the GC in
+/// the same transaction means it can never desync from the mutation
+/// that caused the orphan.
+fn gc_orphan_tags(tx: &Transaction<'_>) -> Result<(), EngineError> {
+    tx.execute(
+        "DELETE FROM tag WHERE id NOT IN (SELECT DISTINCT tag_id FROM entry_tag)",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Insert (or no-op) a tag name and return its row id.
 fn upsert_tag(tx: &Transaction<'_>, name: &str) -> Result<i64, EngineError> {
     tx.execute(
@@ -433,6 +448,7 @@ pub(crate) fn delete_entry(
     let previous_group = Uuid::parse_str(&previous_group_str)
         .map_err(|e| EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
     tx.execute("DELETE FROM entry WHERE uuid = ?1", params![uuid_str])?;
+    gc_orphan_tags(&tx)?;
     tx.commit()?;
     Ok(DeleteEntryOutcome { previous_group })
 }
@@ -586,6 +602,7 @@ pub(crate) fn set_tags(
     )?;
     insert_tags(&tx, &uuid_str, &tags)?;
     bump_modified(&tx, &uuid_str)?;
+    gc_orphan_tags(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -816,6 +833,12 @@ pub(crate) fn delete_group(
 
     let mut outcome = DeleteGroupOutcome::default();
     delete_group_recursive(&tx, &uuid_str, previous_parent, &mut outcome)?;
+    // The recursive cascade may have deleted entries that were the
+    // last referencers of one or more tag rows. Sweep here once at the
+    // end of the cascade rather than per recursive frame — every
+    // `entry_tag` row affected by the cascade has already been removed
+    // (cascade from `entry`), so a single pass cleans the lot.
+    gc_orphan_tags(&tx)?;
     tx.commit()?;
     Ok(outcome)
 }

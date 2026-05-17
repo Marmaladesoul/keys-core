@@ -323,20 +323,16 @@ fn escape_like(s: &str) -> String {
 /// alphabetically (case-sensitive `ORDER BY name ASC`, matching the
 /// `tag.name` collation).
 ///
-/// "In use" means joined to at least one `entry_tag` row. Tags can
-/// linger in the `tag` table after `set_tags` removes every entry
-/// referencing them — `set_tags` deletes `entry_tag` rows but leaves
-/// the `tag` rows in place — so a plain `SELECT FROM tag` would
-/// surface zombies. Joining via `entry_tag` filters them out.
+/// The `tag` table is authoritative: every mutation that can orphan a
+/// tag row (`set_tags`, `delete_entry`, `delete_group`) runs an
+/// in-transaction GC sweep, so a plain `SELECT name FROM tag` cannot
+/// surface zombies — if it's in `tag`, at least one `entry_tag` row
+/// references it.
 ///
 /// Tag names are normalised at ingest time (whitespace stripped,
 /// empties dropped, deduplicated) so this method doesn't re-normalise.
 pub(crate) fn list_tags(conn: &Connection) -> Result<Vec<String>, EngineError> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT t.name FROM tag t \
-         JOIN entry_tag et ON et.tag_id = t.id \
-         ORDER BY t.name ASC",
-    )?;
+    let mut stmt = conn.prepare("SELECT name FROM tag ORDER BY name ASC")?;
     let rows = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
