@@ -43,6 +43,15 @@ impl VaultDbKeyProvider for WrongDbKey {
     }
 }
 
+struct FailingDbKey;
+impl VaultDbKeyProvider for FailingDbKey {
+    fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError> {
+        Err(VaultDbKeyProviderError::KeyUnavailable(
+            "synthetic keychain-locked failure".into(),
+        ))
+    }
+}
+
 struct FixedProtector;
 impl VaultFieldProtector for FixedProtector {
     fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
@@ -98,6 +107,41 @@ fn engine_open_close_round_trip() {
     matches!(err, EngineError::NotFound { ref entity } if entity == "engine")
         .then_some(())
         .expect("NotFound engine");
+}
+
+/// Regression: when a foreign-implemented `VaultDbKeyProvider` throws
+/// `KeyUnavailable`, uniffi must be able to **lift** the error across
+/// the FFI boundary. Prior to removing `#[uniffi(flat_error)]` from
+/// `VaultDbKeyProviderError`, this path panicked at runtime with
+/// "Can't lift flat errors" — flat-error enums can only be lowered
+/// (Rust-throws-to-foreign), not lifted (foreign-throws-to-Rust).
+///
+/// The bug was latent because in-process Rust callers like this test
+/// also exercise the lift path via the `BridgeDbKeyProvider` adapter,
+/// so a regression here catches it without needing the full Swift
+/// round-trip. The original panic surfaced from the macOS app's
+/// xcodebuild sandbox where the Keychain write was denied and the
+/// Swift `SqliteKeyProvider` threw `KeyUnavailable`.
+#[test]
+fn engine_open_surfaces_db_key_provider_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let err = Engine::open(
+        db_path.to_string_lossy().into_owned(),
+        Arc::new(FailingDbKey),
+        Arc::new(FixedProtector),
+        None,
+    )
+    .expect_err("open must surface the provider failure, not panic");
+    match err {
+        EngineError::KeyProvider(msg) => {
+            assert!(
+                msg.contains("synthetic keychain-locked failure"),
+                "key-provider error must carry the implementation-supplied detail; got: {msg}",
+            );
+        }
+        other => panic!("expected EngineError::KeyProvider, got {other:?}"),
+    }
 }
 
 #[test]
