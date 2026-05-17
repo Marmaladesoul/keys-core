@@ -490,7 +490,9 @@ fn expiry_ms(times: &keepass_core::model::Timestamps) -> Option<i64> {
 ///   "last_used_at": ..., "expires_at": ...,
 ///   "icon_index": 0, "icon_custom_uuid": null,
 ///   "password_strength_bucket": 3, "password_entropy": 42.5,
-///   "attachments": [{ "name": "doc.txt", "size": 1234 }],
+///   "attachments": [
+///     { "name": "doc.txt", "size": 1234, "sha256_hex": "<hex>" }
+///   ],
 ///   "custom_fields": {
 ///     "Token":   { "value": "<base64(nonce|ct|tag)>", "protected": true  },
 ///     "Website": { "value": "example.com",            "protected": false }
@@ -529,6 +531,16 @@ struct HistorySnapshot<'a> {
 struct HistoryAttachment<'a> {
     name: &'a str,
     size: u64,
+    /// Hex-encoded SHA-256 of the attachment bytes. Lets the read side
+    /// resolve a snapshot's attachment to the content-addressed blob in
+    /// `attachment_blob` without relying on the live `entry_attachment`
+    /// link row (which may have been overwritten by a later edit).
+    ///
+    /// Newly added field — older `snapshot_json` rows have no
+    /// `sha256_hex`, so the read-side mirror marks it `#[serde(default)]`.
+    /// Pre-widening rows surface an empty string here; lookups against
+    /// `attachment_blob` skip those, and the caller sees `NotFound`.
+    sha256_hex: String,
 }
 
 #[derive(Serialize)]
@@ -577,11 +589,20 @@ impl<'a> HistorySnapshot<'a> {
             .attachments
             .iter()
             .map(|att| {
-                let size = u64::try_from(binaries.get(att.ref_id as usize).map_or(0, |b| b.len()))
-                    .unwrap_or(0);
+                let bytes = binaries.get(att.ref_id as usize).copied().unwrap_or(&[]);
+                let size = u64::try_from(bytes.len()).unwrap_or(0);
+                let mut hasher = Sha256::new();
+                hasher.update(bytes);
+                let sha = hasher.finalize();
+                let sha256_hex = sha.iter().fold(String::with_capacity(64), |mut acc, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut acc, "{b:02x}");
+                    acc
+                });
                 HistoryAttachment {
                     name: att.name.as_str(),
                     size,
+                    sha256_hex,
                 }
             })
             .collect();

@@ -1405,6 +1405,34 @@ impl Engine {
         crate::reads::attachment_bytes(&self.conn, uuid, attachment_name)
     }
 
+    /// Fetch the bytes of an attachment as it existed in a specific
+    /// history snapshot of an entry.
+    ///
+    /// Resolves the snapshot's `attachments` list to find the named
+    /// attachment's content-addressed SHA-256, then joins through
+    /// `attachment_blob` for the raw bytes. The blob row survives even
+    /// if later edits to the live entry replace or drop the attachment,
+    /// so a snapshot's bytes remain retrievable as long as some entry
+    /// (live or historical) still references that SHA.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "attachment"`) for every
+    ///   miss along the chain: missing entry, missing history index,
+    ///   missing attachment name in the snapshot, pre-widening snapshot
+    ///   that didn't record the SHA-256, or dangling blob reference.
+    /// - [`EngineError::Sqlite`] for query failure.
+    /// - [`EngineError::Reveal`] (`Json`) if the snapshot JSON fails
+    ///   to deserialise — shouldn't happen for engine-written rows.
+    pub fn history_attachment_bytes(
+        &self,
+        uuid: Uuid,
+        history_index: u32,
+        attachment_name: &str,
+    ) -> Result<Vec<u8>, EngineError> {
+        crate::reads::history_attachment_bytes(&self.conn, uuid, history_index, attachment_name)
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Mutation API — Phase 4 tasks 4.1 / 4.3.
     //

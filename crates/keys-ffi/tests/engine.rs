@@ -743,6 +743,46 @@ async fn engine_attachment_bytes_via_ffi() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn engine_history_attachment_bytes_via_ffi() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    let (uuid, expected_bytes) = seed_kdbx_with_attachment_and_history(&kdbx_path);
+    let engine = open_fresh_engine(&db_path);
+    engine
+        .ingest_from_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("ingest");
+
+    // Happy path — the v0 snapshot recorded the attachment, so the
+    // history-bytes lookup must return the same bytes the live entry
+    // surfaced before the rename.
+    let read = engine
+        .history_attachment_bytes(uuid.clone(), 0, "doc.txt".to_owned())
+        .expect("history_attachment_bytes via FFI");
+    assert_eq!(read, expected_bytes);
+
+    // NotFound for a name that's not in this snapshot.
+    let err = engine
+        .history_attachment_bytes(uuid.clone(), 0, "missing.bin".to_owned())
+        .expect_err("missing attachment name should NotFound");
+    matches!(err, EngineError::NotFound { ref entity } if entity == "attachment")
+        .then_some(())
+        .expect("NotFound attachment for missing name");
+
+    // NotFound for a history index that doesn't exist.
+    let err = engine
+        .history_attachment_bytes(uuid, 99, "doc.txt".to_owned())
+        .expect_err("missing history index should NotFound");
+    matches!(err, EngineError::NotFound { ref entity } if entity == "attachment")
+        .then_some(())
+        .expect("NotFound attachment for missing history index");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn engine_history_widening_round_trip_via_ffi() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("keys.db");

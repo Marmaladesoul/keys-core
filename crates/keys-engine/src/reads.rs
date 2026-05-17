@@ -440,6 +440,99 @@ pub(crate) fn attachment_bytes(
     })
 }
 
+/// Fetch the raw bytes of a named attachment as it existed in a
+/// specific history snapshot of an entry.
+///
+/// Resolution chain:
+///
+/// 1. Look up `entry_history.snapshot_json` for `(entry_uuid,
+///    history_index)`.
+/// 2. Deserialise its `attachments` list, find the named attachment,
+///    grab its `sha256_hex`.
+/// 3. Look up `attachment_blob` by that SHA-256 → bytes.
+///
+/// `EngineError::NotFound { entity: "attachment" }` for every miss
+/// along the chain — missing entry, missing history index, missing
+/// attachment name in the snapshot, empty `sha256_hex` (pre-widening
+/// snapshots), or a dangling blob reference. Callers don't need to
+/// distinguish; the UI surface treats all of them the same way.
+pub(crate) fn history_attachment_bytes(
+    conn: &Connection,
+    uuid: Uuid,
+    history_index: u32,
+    attachment_name: &str,
+) -> Result<Vec<u8>, EngineError> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT snapshot_json FROM entry_history \
+             WHERE entry_uuid = ?1 AND history_index = ?2",
+            params![uuid.to_string(), i64::from(history_index)],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(json) = json else {
+        return Err(EngineError::NotFound {
+            entity: "attachment",
+        });
+    };
+    let snap: HistorySnapshotRead = serde_json::from_str(&json)
+        .map_err(|e| EngineError::Reveal(crate::error::RevealError::Json(e)))?;
+    let Some(att) = snap
+        .attachments
+        .into_iter()
+        .find(|a| a.name == attachment_name)
+    else {
+        return Err(EngineError::NotFound {
+            entity: "attachment",
+        });
+    };
+    if att.sha256_hex.is_empty() {
+        // Pre-widening snapshot — sha256 wasn't recorded, so the bytes
+        // can't be resolved deterministically. Treat as missing.
+        return Err(EngineError::NotFound {
+            entity: "attachment",
+        });
+    }
+    let sha_bytes = hex_to_bytes(&att.sha256_hex).ok_or(EngineError::NotFound {
+        entity: "attachment",
+    })?;
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT bytes FROM attachment_blob WHERE sha256 = ?1",
+            params![sha_bytes],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    bytes.ok_or(EngineError::NotFound {
+        entity: "attachment",
+    })
+}
+
+/// Decode a lowercase hex string into bytes. Returns `None` for any
+/// invalid input (odd length, non-hex chars). Kept private — only the
+/// history attachment lookup needs it.
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for chunk in s.as_bytes().chunks_exact(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Deserialise side of the shape written by
 /// `crate::ingest::HistorySnapshot`. Every field added after the
 /// initial shipped shape is `#[serde(default)]` so older JSON
@@ -487,6 +580,13 @@ struct HistoryAttachmentRead {
     name: String,
     #[serde(default)]
     size: u64,
+    /// Hex-encoded SHA-256 of the attachment bytes. Added after the
+    /// initial widening (PR #75) so older `snapshot_json` rows omit it —
+    /// `#[serde(default)]` surfaces an empty string in that case. The
+    /// list-side `history()` reader doesn't use this field; only the
+    /// per-snapshot byte fetch needs it.
+    #[serde(default)]
+    sha256_hex: String,
 }
 
 /// Mirrors the write-side `HistoryCustomField` but only carries the

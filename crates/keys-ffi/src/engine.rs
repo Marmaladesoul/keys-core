@@ -352,6 +352,20 @@ impl Engine {
         self.with_engine(|e| Ok(e.attachment_bytes(u, &attachment_name)?))
     }
 
+    /// Fetch the bytes of an attachment as it existed in a specific
+    /// history snapshot of an entry. See
+    /// [`keys_engine::Engine::history_attachment_bytes`] for the full
+    /// resolution chain.
+    pub fn history_attachment_bytes(
+        &self,
+        uuid: String,
+        history_index: u32,
+        attachment_name: String,
+    ) -> Result<Vec<u8>, EngineError> {
+        let u = parse_uuid(&uuid, "entry")?;
+        self.with_engine(|e| Ok(e.history_attachment_bytes(u, history_index, &attachment_name)?))
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Mutations (sync — each is one transaction)
     // ────────────────────────────────────────────────────────────────────
