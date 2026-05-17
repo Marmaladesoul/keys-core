@@ -44,13 +44,22 @@
 //! [`EngineError::ResolutionMismatch`] via the `MergeError` Display.
 
 use keepass_core::kdbx::{Kdbx, Unlocked};
-use keepass_core::model::Vault;
+use keepass_core::model::{Group, Vault};
 use keepass_merge::{MergeOutcome, Resolution};
+use secrecy::SecretString;
+use uuid::Uuid;
 
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::events::{ChangeEvent, ConflictPayload};
 use crate::reconcile::MergeStats;
+
+/// Canonical KDBX field name for an entry's password slot.
+///
+/// Matched against `field_name` in [`reveal_conflict_field_from_vault`]
+/// to route password reveals through [`keepass_core::model::Entry::password`]
+/// rather than [`keepass_core::model::Entry::custom_fields`].
+const PASSWORD_FIELD: &str = "Password";
 
 /// Internal stash entry siblinged with a public [`ConflictPayload`].
 ///
@@ -168,4 +177,90 @@ pub(crate) fn apply_conflict_resolution(
     engine.emit(ChangeEvent::ExternalChangeMerged { applied });
 
     Ok(())
+}
+
+/// Reveal a single field on the local side of a stashed conflict.
+///
+/// Pulled out of [`Engine`] so the method body stays narrow; mirrors
+/// [`apply_conflict_resolution`]'s placement. See the engine method
+/// [`Engine::reveal_conflict_local_field`] for the public contract.
+pub(crate) fn reveal_conflict_local_field(
+    engine: &Engine,
+    conflict_id: i64,
+    entry_uuid: Uuid,
+    field_name: &str,
+) -> Result<SecretString, EngineError> {
+    let guard = engine.pending_conflict_contexts_lock();
+    let ctx = guard.get(&conflict_id).ok_or(EngineError::NotFound {
+        entity: "conflict_payload",
+    })?;
+    reveal_conflict_field_from_vault(&ctx.local_vault, entry_uuid, field_name)
+}
+
+/// Reveal a single field on the remote side of a stashed conflict.
+///
+/// Sibling of [`reveal_conflict_local_field`]; routes through the
+/// stash's `remote_vault` instead.
+pub(crate) fn reveal_conflict_remote_field(
+    engine: &Engine,
+    conflict_id: i64,
+    entry_uuid: Uuid,
+    field_name: &str,
+) -> Result<SecretString, EngineError> {
+    let guard = engine.pending_conflict_contexts_lock();
+    let ctx = guard.get(&conflict_id).ok_or(EngineError::NotFound {
+        entity: "conflict_payload",
+    })?;
+    reveal_conflict_field_from_vault(&ctx.remote_vault, entry_uuid, field_name)
+}
+
+/// Find `entry_uuid` in `vault` and return `field_name` as a
+/// [`SecretString`].
+///
+/// ## Plaintext invariant
+///
+/// Both vaults stashed in [`PendingConflictContext`] hold protected
+/// fields as **plaintext** by construction: `local_vault` is produced
+/// by [`Engine::project_to_vault`] (which unwraps `entry_protected`
+/// rows under the session key on projection) and `remote_vault` by
+/// [`keepass_core::kdbx::Kdbx::vault_with_unwrapped_protected`] (same
+/// post-unwrap shape). No protector / session-key acquisition is
+/// needed here — the values already sit in `Entry::password` /
+/// `CustomField::value` ready to read.
+///
+/// `field_name == "Password"` reads [`keepass_core::model::Entry::password`];
+/// any other name reads from [`keepass_core::model::Entry::custom_fields`].
+fn reveal_conflict_field_from_vault(
+    vault: &Vault,
+    entry_uuid: Uuid,
+    field_name: &str,
+) -> Result<SecretString, EngineError> {
+    let entry = find_entry_in_group(&vault.root, entry_uuid)
+        .ok_or(EngineError::NotFound { entity: "entry" })?;
+    let value = if field_name == PASSWORD_FIELD {
+        entry.password.clone()
+    } else {
+        entry
+            .custom_fields
+            .iter()
+            .find(|cf| cf.key == field_name)
+            .map(|cf| cf.value.clone())
+            .ok_or(EngineError::NotFound {
+                entity: "custom_field",
+            })?
+    };
+    Ok(SecretString::from(value))
+}
+
+/// Walk `group` (and its descendants) for an entry whose UUID matches
+/// `target`. Sibling of `engine::find_entry_parent_group` but returns
+/// the entry itself rather than its parent group.
+fn find_entry_in_group(group: &Group, target: Uuid) -> Option<&keepass_core::model::Entry> {
+    if let Some(e) = group.entries.iter().find(|e| e.id.0 == target) {
+        return Some(e);
+    }
+    group
+        .groups
+        .iter()
+        .find_map(|child| find_entry_in_group(child, target))
 }

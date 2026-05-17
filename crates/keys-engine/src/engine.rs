@@ -823,6 +823,19 @@ impl Engine {
         self.pending_conflict_contexts.lock().unwrap().remove(&id)
     }
 
+    /// Crate-internal: borrow the stashed-context map under its mutex
+    /// without consuming any entry. Used by
+    /// [`crate::conflict_resolution::reveal_conflict_local_field`] /
+    /// `_remote_field` to read the per-side vault for a peek-reveal —
+    /// the stash stays in place so subsequent reveal calls (and the
+    /// eventual `apply_conflict_resolution`) still see it.
+    pub(crate) fn pending_conflict_contexts_lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<i64, crate::conflict_resolution::PendingConflictContext>>
+    {
+        self.pending_conflict_contexts.lock().unwrap()
+    }
+
     /// Apply a user-resolved [`keepass_merge::Resolution`] to a
     /// previously-stashed conflict.
     ///
@@ -863,6 +876,88 @@ impl Engine {
         resolution: &keepass_merge::Resolution,
     ) -> Result<(), EngineError> {
         crate::conflict_resolution::apply_conflict_resolution(self, id, resolution)
+    }
+
+    /// Reveal a single field on the **local** side of a stashed
+    /// conflict as plaintext.
+    ///
+    /// Companion to [`Self::pending_conflict`] for the resolver UI's
+    /// hover-reveal: the public [`ConflictPayload`] carries field-level
+    /// diffs but redacts protected values; this method lets a frontend
+    /// fetch the cleartext for one field on one side on demand.
+    ///
+    /// Both sides of the stashed conflict are full
+    /// [`keepass_core::model::Vault`]s with protected fields already
+    /// unwrapped (the local vault is produced by
+    /// [`Self::project_to_vault`], which decrypts the
+    /// `entry_protected` rows under the field-protector session key;
+    /// the remote vault is produced by
+    /// [`keepass_core::kdbx::Kdbx::vault_with_unwrapped_protected`],
+    /// which does the same on the disk side). No session-key
+    /// acquisition happens here — the cleartext sits on the stashed
+    /// [`keepass_core::model::Entry`] ready to read. Plaintext crosses
+    /// the boundary in a [`SecretString`] so it zeroes on drop.
+    ///
+    /// `field_name == "Password"` reads the canonical password slot;
+    /// any other name reads from the entry's `custom_fields`.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "conflict_payload"`) if
+    ///   no conflict is stashed under `conflict_id` (typo, already
+    ///   consumed by [`Self::apply_conflict_resolution`], or evicted
+    ///   by engine drop).
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry
+    ///   with `entry_uuid` exists in the local-side vault.
+    /// - [`EngineError::NotFound`] (`entity = "custom_field"`) if the
+    ///   entry exists but doesn't carry a custom field named
+    ///   `field_name` (and `field_name != "Password"`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine's internal stash `Mutex` is poisoned —
+    /// see [`Self::last_self_write`] for the same caveat.
+    pub fn reveal_conflict_local_field(
+        &self,
+        conflict_id: i64,
+        entry_uuid: Uuid,
+        field_name: &str,
+    ) -> Result<SecretString, EngineError> {
+        crate::conflict_resolution::reveal_conflict_local_field(
+            self,
+            conflict_id,
+            entry_uuid,
+            field_name,
+        )
+    }
+
+    /// Reveal a single field on the **remote** side of a stashed
+    /// conflict as plaintext.
+    ///
+    /// Sibling of [`Self::reveal_conflict_local_field`]; reads from
+    /// the stash's remote-side vault. See that method's docs for the
+    /// full contract.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`Self::reveal_conflict_local_field`] but `entry`
+    /// / `custom_field` `NotFound`s refer to the remote-side vault.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine's internal stash `Mutex` is poisoned.
+    pub fn reveal_conflict_remote_field(
+        &self,
+        conflict_id: i64,
+        entry_uuid: Uuid,
+        field_name: &str,
+    ) -> Result<SecretString, EngineError> {
+        crate::conflict_resolution::reveal_conflict_remote_field(
+            self,
+            conflict_id,
+            entry_uuid,
+            field_name,
+        )
     }
 
     /// Crate-internal: re-ingest a merged [`Kdbx`] into `SQLite`.

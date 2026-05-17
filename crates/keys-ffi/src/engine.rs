@@ -332,6 +332,48 @@ impl Engine {
         })
     }
 
+    /// Reveal a single field on the local side of a stashed conflict.
+    ///
+    /// Companion to [`Self::pending_conflict`] for the resolver UI's
+    /// hover-reveal: the peek payload carries field-level diffs but
+    /// redacts protected values; this method lets the frontend fetch
+    /// cleartext for one field on the local side on demand. Plaintext
+    /// crosses as a `String` — uniffi can't preserve zeroize-on-drop
+    /// into Swift/Kotlin strings, so the caller is responsible for
+    /// clearing copies aggressively (same caveat as
+    /// [`Self::reveal_password`]).
+    pub fn reveal_conflict_local_field(
+        &self,
+        conflict_id: i64,
+        entry_uuid: String,
+        field_name: String,
+    ) -> Result<String, EngineError> {
+        let u = parse_uuid(&entry_uuid, "entry")?;
+        self.with_engine(|e| {
+            Ok(e.reveal_conflict_local_field(conflict_id, u, &field_name)?
+                .expose_secret()
+                .to_owned())
+        })
+    }
+
+    /// Reveal a single field on the remote side of a stashed conflict.
+    ///
+    /// Sibling of [`Self::reveal_conflict_local_field`]; reads from
+    /// the remote-side vault in the stash. Same zeroize caveat applies.
+    pub fn reveal_conflict_remote_field(
+        &self,
+        conflict_id: i64,
+        entry_uuid: String,
+        field_name: String,
+    ) -> Result<String, EngineError> {
+        let u = parse_uuid(&entry_uuid, "entry")?;
+        self.with_engine(|e| {
+            Ok(e.reveal_conflict_remote_field(conflict_id, u, &field_name)?
+                .expose_secret()
+                .to_owned())
+        })
+    }
+
     // ── History ────────────────────────────────────────────────────────
 
     pub fn history(&self, uuid: String) -> Result<Vec<HistoricEntry>, EngineError> {

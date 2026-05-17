@@ -18,7 +18,7 @@ use keys_engine::{
     AttachmentChoice, ChangeEvent, ConflictResolution, ConflictSide, DataChangeObserver, DbKey,
     DeleteEditChoice, Engine, EngineError, KeyProvider, KeyProviderError, MergeResult,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
 // ── Fixtures ──────────────────────────────────────────────────────────
@@ -762,5 +762,231 @@ fn pending_conflict_parent_groups_covers_every_conflict_entry() {
         // The seed entry is alive on both sides in this fixture.
         assert!(entry.local.is_some(), "local parent resolved");
         assert!(entry.remote.is_some(), "remote parent resolved");
+    }
+}
+
+// ── Per-side conflict-field reveal ───────────────────────────────────
+
+/// Drive a Password-field conflict on the seed entry. Engine sets
+/// local password via `update_entry`; disk sets via `edit_entry` /
+/// `set_password`. We also bump the Title on both sides because
+/// `reconcile_with_disk`'s cheap-equivalence short-circuit only
+/// compares `(title, username, url, notes)` — a password-only diff
+/// would short-circuit to `NoChange` and we'd never reach the
+/// conflict path. Returns the stash id.
+fn drive_password_conflict(f: &mut Fixture, local_pw: &str, disk_pw: &str) -> i64 {
+    f.engine
+        .update_entry(
+            f.seed_uuid,
+            keys_engine::EntryUpdate {
+                title: Some("local-pw".into()),
+                password: Some(SecretString::from(local_pw.to_owned())),
+                ..Default::default()
+            },
+        )
+        .expect("local pw edit");
+
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    let disk_pw_owned = disk_pw.to_string();
+    external
+        .edit_entry(EntryId(f.seed_uuid), HistoryPolicy::Snapshot, |e| {
+            e.set_title("disk-pw");
+            e.set_password(SecretString::from(disk_pw_owned.clone()));
+        })
+        .expect("disk pw edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    match f
+        .engine
+        .reconcile_with_disk(&f.kdbx_path, &composite())
+        .expect("reconcile")
+    {
+        MergeResult::Conflict(payload) => payload.id,
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn reveal_conflict_local_field_returns_local_plaintext() {
+    let mut f = fixture();
+    let id = drive_password_conflict(&mut f, "old-secret", "new-secret");
+
+    let local = f
+        .engine
+        .reveal_conflict_local_field(id, f.seed_uuid, "Password")
+        .expect("local reveal");
+    assert_eq!(local.expose_secret(), "old-secret");
+}
+
+#[test]
+fn reveal_conflict_remote_field_returns_remote_plaintext() {
+    let mut f = fixture();
+    let id = drive_password_conflict(&mut f, "old-secret", "new-secret");
+
+    let remote = f
+        .engine
+        .reveal_conflict_remote_field(id, f.seed_uuid, "Password")
+        .expect("remote reveal");
+    assert_eq!(remote.expose_secret(), "new-secret");
+}
+
+#[test]
+fn reveal_conflict_local_field_returns_not_found_for_missing_conflict_id() {
+    let mut f = fixture();
+    let _ = drive_password_conflict(&mut f, "old-secret", "new-secret");
+
+    // Use an id we know was never handed out: the stash counter is
+    // monotonic, so a far-future id is guaranteed absent.
+    let err = f
+        .engine
+        .reveal_conflict_local_field(9_999_999, f.seed_uuid, "Password")
+        .expect_err("expected NotFound");
+    match err {
+        EngineError::NotFound { entity } => assert_eq!(entity, "conflict_payload"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn reveal_conflict_local_field_returns_not_found_for_missing_entry() {
+    let mut f = fixture();
+    let id = drive_password_conflict(&mut f, "old-secret", "new-secret");
+
+    let bogus = Uuid::from_bytes([0xab; 16]);
+    let err = f
+        .engine
+        .reveal_conflict_local_field(id, bogus, "Password")
+        .expect_err("expected NotFound");
+    match err {
+        EngineError::NotFound { entity } => assert_eq!(entity, "entry"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn reveal_conflict_local_field_returns_not_found_for_missing_field_name() {
+    let mut f = fixture();
+    let id = drive_password_conflict(&mut f, "old-secret", "new-secret");
+
+    let err = f
+        .engine
+        .reveal_conflict_local_field(id, f.seed_uuid, "NoSuchField")
+        .expect_err("expected NotFound");
+    match err {
+        EngineError::NotFound { entity } => assert_eq!(entity, "custom_field"),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[test]
+fn reveal_conflict_field_handles_protected_custom_field() {
+    // Seed a protected custom field on both sides via a save round-
+    // trip (engine has no protected-custom-field mutator today; we
+    // seed via the disk side then re-ingest before each side edits).
+    let mut f = fixture();
+
+    // Seed: write a protected custom field on the disk via the
+    // editor's CustomFieldValue::Protected route, then ingest so the
+    // engine sees the same baseline.
+    let mut seeder = reopen_kdbx(&f.kdbx_path);
+    seeder
+        .edit_entry(EntryId(f.seed_uuid), HistoryPolicy::Snapshot, |e| {
+            e.set_custom_field(
+                "OTP",
+                CustomFieldValue::Protected(SecretString::from("seed-totp")),
+            );
+        })
+        .expect("seed protected cf");
+    let bytes = seeder.save_to_bytes().expect("save seed");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write seed");
+    let seed_reread = reopen_kdbx(&f.kdbx_path);
+    f.engine
+        .ingest_from_kdbx(&seed_reread)
+        .expect("re-ingest seed");
+
+    // Engine bumps the entry title — touching a standard field so the
+    // reconcile's cheap-equivalence short-circuit doesn't fire — and
+    // we'll let the disk side edit the protected custom field with a
+    // fresh value. That gives us a conflict bucket whose `field_name`
+    // surfaces "OTP" on the disk side; the local side carries the
+    // seeded value, the remote side carries the new value.
+    f.engine
+        .update_entry(
+            f.seed_uuid,
+            keys_engine::EntryUpdate {
+                title: Some("local-otp".into()),
+                ..Default::default()
+            },
+        )
+        .expect("local title bump");
+
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .edit_entry(EntryId(f.seed_uuid), HistoryPolicy::Snapshot, |e| {
+            e.set_title("disk-otp");
+            e.set_custom_field(
+                "OTP",
+                CustomFieldValue::Protected(SecretString::from("rotated-totp")),
+            );
+        })
+        .expect("disk otp edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    let id = match f
+        .engine
+        .reconcile_with_disk(&f.kdbx_path, &composite())
+        .expect("reconcile")
+    {
+        MergeResult::Conflict(p) => p.id,
+        other => panic!("expected Conflict, got {other:?}"),
+    };
+
+    let local = f
+        .engine
+        .reveal_conflict_local_field(id, f.seed_uuid, "OTP")
+        .expect("local OTP reveal");
+    assert_eq!(local.expose_secret(), "seed-totp");
+    let remote = f
+        .engine
+        .reveal_conflict_remote_field(id, f.seed_uuid, "OTP")
+        .expect("remote OTP reveal");
+    assert_eq!(remote.expose_secret(), "rotated-totp");
+}
+
+#[test]
+fn reveal_conflict_field_after_apply_resolution_returns_not_found() {
+    let mut f = fixture();
+    let id = drive_password_conflict(&mut f, "old-secret", "new-secret");
+
+    // Reveal works before apply.
+    let _ = f
+        .engine
+        .reveal_conflict_local_field(id, f.seed_uuid, "Password")
+        .expect("pre-apply reveal");
+
+    // Apply the resolution — pick Local side for both conflicting
+    // fields (Title + Password; see `drive_password_conflict` for why
+    // Title is in there).
+    let mut fields: HashMap<String, ConflictSide> = HashMap::new();
+    fields.insert("Title".into(), ConflictSide::Local);
+    fields.insert("Password".into(), ConflictSide::Local);
+    let mut resolution = ConflictResolution::default();
+    resolution
+        .entry_field_choices
+        .insert(EntryId(f.seed_uuid), fields);
+    f.engine
+        .apply_conflict_resolution(id, &resolution)
+        .expect("apply");
+
+    // Reveal now returns NotFound — the stash was consumed.
+    let err = f
+        .engine
+        .reveal_conflict_local_field(id, f.seed_uuid, "Password")
+        .expect_err("post-apply reveal should fail");
+    match err {
+        EngineError::NotFound { entity } => assert_eq!(entity, "conflict_payload"),
+        other => panic!("expected NotFound, got {other:?}"),
     }
 }
