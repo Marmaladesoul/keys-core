@@ -319,6 +319,30 @@ fn escape_like(s: &str) -> String {
     out
 }
 
+/// Return every unique tag name in use across the vault, sorted
+/// alphabetically (case-sensitive `ORDER BY name ASC`, matching the
+/// `tag.name` collation).
+///
+/// "In use" means joined to at least one `entry_tag` row. Tags can
+/// linger in the `tag` table after `set_tags` removes every entry
+/// referencing them — `set_tags` deletes `entry_tag` rows but leaves
+/// the `tag` rows in place — so a plain `SELECT FROM tag` would
+/// surface zombies. Joining via `entry_tag` filters them out.
+///
+/// Tag names are normalised at ingest time (whitespace stripped,
+/// empties dropped, deduplicated) so this method doesn't re-normalise.
+pub(crate) fn list_tags(conn: &Connection) -> Result<Vec<String>, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT t.name FROM tag t \
+         JOIN entry_tag et ON et.tag_id = t.id \
+         ORDER BY t.name ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 pub(crate) fn entry_count(conn: &Connection, group: Option<Uuid>) -> Result<u64, EngineError> {
     let count: i64 = if let Some(uuid) = group {
         conn.query_row(

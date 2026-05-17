@@ -1048,6 +1048,22 @@ impl Engine {
         crate::reads::entry_count(&self.conn, group)
     }
 
+    /// Return every unique tag name in use across the vault, sorted
+    /// alphabetically. Empty if no entries are tagged.
+    ///
+    /// Backs the Swift-side tag list (Phase 6.13 retires the in-memory
+    /// `TagListStore` in favour of this engine method). Only tags
+    /// joined to at least one entry are returned — orphan rows left in
+    /// the `tag` table by `set_tags` (which deletes from `entry_tag`
+    /// but not `tag`) are filtered out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn list_tags(&self) -> Result<Vec<String>, EngineError> {
+        crate::reads::list_tags(&self.conn)
+    }
+
     /// Return the full group tree as a flat list.
     ///
     /// Tree shape is reconstructed by the caller from each

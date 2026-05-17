@@ -200,6 +200,10 @@ impl Engine {
         self.with_engine(|e| Ok(e.group_tree()?.into_iter().map(Into::into).collect()))
     }
 
+    pub fn list_tags(&self) -> Result<Vec<String>, EngineError> {
+        self.with_engine(|e| Ok(e.list_tags()?))
+    }
+
     pub fn search(
         &self,
         query: String,
