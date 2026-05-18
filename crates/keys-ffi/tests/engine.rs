@@ -59,6 +59,15 @@ impl VaultFieldProtector for FixedProtector {
     }
 }
 
+struct FailingProtector;
+impl VaultFieldProtector for FailingProtector {
+    fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
+        Err(VaultProtectorError::KeyUnavailable(
+            "synthetic field-protector failure".into(),
+        ))
+    }
+}
+
 fn open_fresh_engine(db_path: &std::path::Path) -> Arc<Engine> {
     Engine::open(
         db_path.to_string_lossy().into_owned(),
@@ -141,6 +150,49 @@ fn engine_open_surfaces_db_key_provider_failure() {
             );
         }
         other => panic!("expected EngineError::KeyProvider, got {other:?}"),
+    }
+}
+
+/// Regression: when a foreign-implemented `VaultFieldProtector` throws
+/// `KeyUnavailable`, uniffi must be able to **lift** the error across
+/// the FFI boundary. Prior to removing `#[uniffi(flat_error)]` from
+/// `VaultProtectorError`, this path panicked at runtime with
+/// "Can't lift flat errors" — flat-error enums can only be lowered
+/// (Rust-throws-to-foreign), not lifted (foreign-throws-to-Rust).
+///
+/// Sibling fix to PR #89 (which addressed `VaultDbKeyProviderError`);
+/// the protector trait has the same `with_foreign` + flat_error shape
+/// and the same latent panic. Driven via `ingest_from_kdbx` because
+/// that's the first surface that wraps protected fields under the
+/// session key.
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_ingest_surfaces_field_protector_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    seed_kdbx(&kdbx_path);
+    let engine = Engine::open(
+        db_path.to_string_lossy().into_owned(),
+        Arc::new(FixedDbKey),
+        Arc::new(FailingProtector),
+        None,
+    )
+    .expect("open engine");
+    let err = engine
+        .ingest_from_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect_err("ingest must surface the protector failure, not panic");
+    match err {
+        EngineError::FieldProtector(msg) | EngineError::Internal(msg) => {
+            assert!(
+                msg.contains("synthetic field-protector failure"),
+                "protector error must carry the implementation-supplied detail; got: {msg}",
+            );
+        }
+        other => panic!("expected EngineError::FieldProtector or Internal, got {other:?}"),
     }
 }
 

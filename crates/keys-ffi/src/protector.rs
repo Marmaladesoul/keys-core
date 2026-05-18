@@ -66,10 +66,14 @@ pub trait VaultFieldProtector: Send + Sync {
 
 /// FFI-facing parallel of `keepass_core::protector::ProtectorError`.
 ///
-/// `flat_error` keeps the wire shape simple — Swift sees one variant
-/// plus the stringified detail.
+/// Deliberately NOT `#[uniffi(flat_error)]`: this enum is the error
+/// type for a `with_foreign` trait method, so uniffi must be able to
+/// **lift** it (foreign-throws-to-Rust). `flat_error` enums can only
+/// be lowered (Rust-throws-to-foreign); attempting to lift one panics
+/// at runtime with "Can't lift flat errors". The Swift side still sees
+/// a `KeyUnavailable(...)` case with the stringified detail — only
+/// the wire representation differs.
 #[derive(thiserror::Error, Debug, uniffi::Error)]
-#[uniffi(flat_error)]
 #[non_exhaustive]
 pub enum VaultProtectorError {
     /// The implementation could not produce the session key.
