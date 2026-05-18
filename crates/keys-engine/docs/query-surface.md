@@ -34,6 +34,7 @@ the migration tracker.
 | `reveal_history_field(uuid: Uuid, history_index: u32, field_name: &str) -> SecretString` | 3.4 | Historic snapshot variant. |
 | `attachment_bytes(uuid: Uuid, attachment_name: &str) -> Vec<u8>` | 3.1 | Raw blob fetch. |
 | `history(uuid: Uuid) -> Vec<HistoricEntry>` | 3.1 | Oldest-first ordering. |
+| `delete_history_at(entry_uuid: Uuid, history_index: u32) -> ()` | 6.17-H follow-up | Remove a single history snapshot. Renumbers surviving snapshots to stay dense (`0..N`). Does **not** bump `entry.modified_at` (bookkeeping, not a content edit). Emits `EntriesUpdated`. Mirrors legacy `Vault::delete_history_at` semantics. |
 | `export_entry(entry_uuid: Uuid) -> PortableEntry` | 6.17-F | Serialise an entry into an in-process carrier (every field, every protected slot revealed, every attachment's bytes, plus custom-icon PNG when present) suitable for cross-database move via `import_entry`. Read-only. |
 | `import_entry(portable: PortableEntry, target_group_uuid: Uuid) -> Uuid` | 6.17-F | Consume a carrier; insert as a brand new entry under `target_group_uuid` (fresh UUID + `now` timestamps). Rehomes custom icons via SHA-256 dedup into the target's pool. Emits `EntriesAdded`. |
 

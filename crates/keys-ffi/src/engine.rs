@@ -628,6 +628,16 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.remove_attachment(u, &name)?))
     }
 
+    /// See [`keys_engine::Engine::delete_history_at`].
+    pub fn delete_history_at(
+        &self,
+        entry_uuid: String,
+        history_index: u32,
+    ) -> Result<(), EngineError> {
+        let u = parse_uuid(&entry_uuid, "entry")?;
+        self.with_engine_mut(|e| Ok(e.delete_history_at(u, history_index)?))
+    }
+
     /// See [`keys_engine::Engine::export_entry`]. Returns an opaque
     /// [`EnginePortableEntry`] handle the caller passes to
     /// [`Self::import_entry`] on the destination engine (or the same

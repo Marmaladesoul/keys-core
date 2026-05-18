@@ -2400,6 +2400,33 @@ impl Engine {
     pub fn history(&self, uuid: Uuid) -> Result<Vec<HistoricEntry>, EngineError> {
         crate::reads::history(&self.conn, uuid)
     }
+
+    /// Delete a single history snapshot from an entry without touching
+    /// the live entry. Surviving snapshots are renumbered so
+    /// `history_index` stays a dense `0..N` sequence.
+    ///
+    /// Mirrors the legacy `Vault::delete_history_at` contract: the live
+    /// entry's `modified_at` is **not** bumped (deleting a history
+    /// record is metadata, not a content edit). Emits
+    /// [`ChangeEvent::EntriesUpdated`] so detail views re-pull the
+    /// history listing.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry
+    ///   with that uuid exists.
+    /// - [`EngineError::NotFound`] (`entity = "history_snapshot"`) if
+    ///   `history_index` is outside `0..N` for that entry's history.
+    /// - [`EngineError::Sqlite`] on storage failure.
+    pub fn delete_history_at(
+        &mut self,
+        entry_uuid: Uuid,
+        history_index: u32,
+    ) -> Result<(), EngineError> {
+        mutations::delete_history_at(&mut self.conn, entry_uuid, history_index)?;
+        self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
+        Ok(())
+    }
 }
 
 /// Apply the raw 32-byte key via `PRAGMA key = "x'<hex>'"`.

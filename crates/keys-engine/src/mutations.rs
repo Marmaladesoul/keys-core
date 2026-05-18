@@ -806,6 +806,59 @@ pub(crate) fn attach_file(
     Ok(())
 }
 
+/// Delete a single history snapshot from an entry.
+///
+/// Removes the row at `(entry_uuid, history_index)` from `entry_history`
+/// and re-numbers the surviving snapshots so `history_index` stays a
+/// dense `0..N` sequence (matching what [`crate::ingest`] writes on a
+/// fresh load and what the [`crate::reads::history`] reader expects).
+///
+/// Deleting a history snapshot is bookkeeping, not a content edit on the
+/// live entry — `entry.modified_at` is **not** bumped, mirroring the
+/// legacy `Vault::delete_history_at` semantics
+/// (`HistoryPolicy::NoSnapshot` in `keepass_core`).
+///
+/// # Errors
+///
+/// - [`EngineError::NotFound`] (`entity = "entry"`) if the entry uuid
+///   isn't in `entry`.
+/// - [`EngineError::NotFound`] (`entity = "history_snapshot"`) if the
+///   index is outside `0..N` for that entry's history.
+pub(crate) fn delete_history_at(
+    conn: &mut Connection,
+    uuid: Uuid,
+    history_index: u32,
+) -> Result<(), EngineError> {
+    let uuid_str = uuid.to_string();
+    let tx = conn.transaction()?;
+    if !entry_exists(&tx, &uuid_str)? {
+        return Err(EngineError::NotFound { entity: "entry" });
+    }
+    let removed = tx.execute(
+        "DELETE FROM entry_history \
+         WHERE entry_uuid = ?1 AND history_index = ?2",
+        params![uuid_str, i64::from(history_index)],
+    )?;
+    if removed == 0 {
+        return Err(EngineError::NotFound {
+            entity: "history_snapshot",
+        });
+    }
+    // Re-pack `history_index` so the remaining rows stay dense. Shift
+    // every row whose index sat above the deleted slot down by one. The
+    // PRIMARY KEY on `(entry_uuid, history_index)` makes this a no-op
+    // for empty-tail deletes (nothing matched the WHERE) and a
+    // single-pass renumber otherwise.
+    tx.execute(
+        "UPDATE entry_history \
+         SET history_index = history_index - 1 \
+         WHERE entry_uuid = ?1 AND history_index > ?2",
+        params![uuid_str, i64::from(history_index)],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub(crate) fn remove_attachment(
     conn: &mut Connection,
     uuid: Uuid,
