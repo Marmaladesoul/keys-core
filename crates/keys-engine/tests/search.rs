@@ -163,6 +163,49 @@ fn search_ranks_better_matches_first() {
 }
 
 #[test]
+fn search_prefix_wildcard_matches_partial_tokens() {
+    // FTS5's `word*` prefix syntax must survive our escape layer.
+    // The Keys clients append `*` to each plain-word token so typing
+    // "hell" finds "Hello" and a single "a" finds anything with an
+    // a-prefixed token. Regression test for the bug where the escape
+    // layer quoted `*` and collapsed the prefix into a literal token.
+    let (engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("aaaa")).expect("add");
+        kdbx.add_entry(root, NewEntry::new("Hello sheme"))
+            .expect("add");
+        kdbx.add_entry(
+            root,
+            NewEntry::new("Marmalade Mail account").username("user@example.com"),
+        )
+        .expect("add");
+        kdbx.add_entry(root, NewEntry::new("zzz unrelated"))
+            .expect("add");
+    });
+
+    let single_a = engine.search("a*", Pagination::all()).expect("search a*");
+    let single_a_titles: Vec<&str> = single_a.iter().map(|r| r.title.as_str()).collect();
+    assert!(single_a_titles.contains(&"aaaa"), "a* should match aaaa");
+    assert!(
+        single_a_titles.contains(&"Marmalade Mail account"),
+        "a* should match a token in 'Marmalade Mail account' (got {single_a_titles:?})",
+    );
+    assert!(
+        !single_a_titles.contains(&"zzz unrelated"),
+        "a* should not match z-only entries",
+    );
+
+    let hell = engine
+        .search("hell*", Pagination::all())
+        .expect("search hell*");
+    let hell_titles: Vec<&str> = hell.iter().map(|r| r.title.as_str()).collect();
+    assert!(
+        hell_titles.contains(&"Hello sheme"),
+        "hell* should match Hello (got {hell_titles:?})",
+    );
+}
+
+#[test]
 fn search_handles_special_characters() {
     // @ is not an FTS5 syntax character; unicode61 treats it as a
     // token separator, so "user@example" tokenises to "user" and

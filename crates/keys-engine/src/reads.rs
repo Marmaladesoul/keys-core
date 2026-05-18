@@ -560,19 +560,28 @@ const TWO_LABEL_PUBLIC_SUFFIXES: &[&str] = &[
 /// Escape user input for use as an FTS5 `MATCH` argument.
 ///
 /// FTS5's query grammar treats a wide range of ASCII punctuation as
-/// syntax (`"`, `*`, `:`, `^`, `(`, `)`, `-`, `+`, `@`, and others
-/// flagged by its tokenizer). Rather than enumerate the full set and
-/// hope FTS5 doesn't grow more, we take the conservative line: if
-/// the query is *anything other than* alphanumerics, spaces, and the
-/// ASCII underscore, wrap it as a quoted phrase. Plain word(s) pass
+/// syntax (`"`, `:`, `^`, `(`, `)`, `-`, `+`, `@`, and others flagged
+/// by its tokenizer). Rather than enumerate the full set and hope
+/// FTS5 doesn't grow more, we take the conservative line: if the
+/// query is *anything other than* alphanumerics, spaces, the ASCII
+/// underscore, and an optional trailing `*` on each whitespace-
+/// separated token, wrap it as a quoted phrase. Plain word(s) pass
 /// through verbatim so users keep FTS5's implicit-AND and
 /// prefix-search (`word*`) semantics.
 ///
+/// The trailing-`*` allowance is what makes prefix matching survive
+/// this layer: a caller wanting "hell" to match "hello" must pass
+/// `hell*`, and we must not quote it (quoted phrases tokenise `*`
+/// away, so `"hell*"` collapses to the literal token `hell`).
+///
 /// Embedded `"` characters are doubled per FTS5's escape rule.
 pub(crate) fn escape_fts5_query(query: &str) -> String {
-    let safe = query
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == ' ' || c == '_');
+    let mut saw_token = false;
+    let safe = query.split_whitespace().all(|tok| {
+        saw_token = true;
+        let body = tok.strip_suffix('*').unwrap_or(tok);
+        !body.is_empty() && body.chars().all(|c| c.is_alphanumeric() || c == '_')
+    }) && saw_token;
     if safe {
         query.to_string()
     } else {
@@ -1128,11 +1137,27 @@ mod tests {
     }
 
     #[test]
+    fn escape_fts5_query_passes_trailing_star_through_for_prefix_search() {
+        // Quoting `hell*` would collapse it to the literal token `hell`
+        // inside an FTS5 phrase — callers asking for prefix matching
+        // need the wildcard to survive this layer.
+        assert_eq!(escape_fts5_query("hell*"), "hell*");
+        assert_eq!(escape_fts5_query("a*"), "a*");
+        assert_eq!(escape_fts5_query("two* words*"), "two* words*");
+        assert_eq!(escape_fts5_query("mixed term*"), "mixed term*");
+    }
+
+    #[test]
     fn escape_fts5_query_quotes_anything_with_punctuation() {
         assert_eq!(escape_fts5_query("user@example"), "\"user@example\"");
         assert_eq!(escape_fts5_query("a:b"), "\"a:b\"");
         assert_eq!(escape_fts5_query("(x)"), "\"(x)\"");
-        assert_eq!(escape_fts5_query("prefix*"), "\"prefix*\"");
+        // Internal `*` (not as a token suffix) is still treated as
+        // punctuation and quoted.
+        assert_eq!(escape_fts5_query("he*lo"), "\"he*lo\"");
+        // A bare `*` token has an empty body — not a valid prefix
+        // term, so we fall back to quoting.
+        assert_eq!(escape_fts5_query("*"), "\"*\"");
         assert_eq!(
             escape_fts5_query("he said \"hi\""),
             "\"he said \"\"hi\"\"\""
