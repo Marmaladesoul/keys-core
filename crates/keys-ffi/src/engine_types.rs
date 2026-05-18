@@ -79,6 +79,28 @@ impl From<eng::KdbxStateSignature> for KdbxStateSignatureFfi {
 // Enums
 // ────────────────────────────────────────────────────────────────────────
 
+/// Scope of an [`crate::Engine::search`] query.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchScope {
+    /// Title + username + url + notes + tags.
+    #[default]
+    AnyField,
+    /// Title only.
+    TitleOnly,
+    /// Notes only.
+    NotesOnly,
+}
+
+impl From<SearchScope> for eng::SearchScope {
+    fn from(s: SearchScope) -> Self {
+        match s {
+            SearchScope::AnyField => Self::AnyField,
+            SearchScope::TitleOnly => Self::TitleOnly,
+            SearchScope::NotesOnly => Self::NotesOnly,
+        }
+    }
+}
+
 /// Password strength bucket. See [`keys_engine::StrengthBucket`].
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrengthBucket {

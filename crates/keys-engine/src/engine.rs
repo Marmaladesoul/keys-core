@@ -32,7 +32,7 @@ use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
 use crate::model::{
     EntryFull, EntrySummary, EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, NewEntryFields,
-    NewGroupFields, Pagination, SmartFolder,
+    NewGroupFields, Pagination, SearchScope, SmartFolder,
 };
 use crate::mutations;
 use crate::portable::PortableEntry;
@@ -1627,23 +1627,32 @@ impl Engine {
     /// a tag-substring fallback.
     ///
     /// Backed by the FTS5 virtual table built in migration 0001.
-    /// Primary hits are ranked by FTS5's `bm25` (lower = more
-    /// relevant); a `UNION ALL` of `tag.name LIKE %query%` matches
-    /// (de-duplicated against the FTS bucket) is appended after,
-    /// alphabetised by title. Results are paginated by `page`.
+    /// Case-insensitive substring search across entry fields, scoped
+    /// by `scope`.
+    ///
+    /// The query is split on whitespace into tokens; an entry matches
+    /// when every token appears as a substring of at least one
+    /// in-scope field (tokens AND, fields OR). Scope controls which
+    /// fields participate: [`SearchScope::AnyField`] matches title,
+    /// username, url, notes, and tags; [`SearchScope::TitleOnly`] and
+    /// [`SearchScope::NotesOnly`] restrict to a single field.
+    ///
+    /// Results are alphabetised by title (case-insensitive) with uuid
+    /// as a deterministic tie-breaker, then paginated by `page`.
     ///
     /// Empty / whitespace-only queries return an empty Vec without
     /// touching the database.
     ///
-    /// FTS5 special characters in the query are handled by wrapping
-    /// the input in a quoted phrase when needed — see
-    /// `escape_fts5_query` in the `reads` module for details.
-    ///
     /// # Errors
     ///
     /// Returns [`EngineError::Sqlite`] on query failure.
-    pub fn search(&self, query: &str, page: Pagination) -> Result<Vec<EntrySummary>, EngineError> {
-        crate::reads::search(&self.conn, query, page)
+    pub fn search(
+        &self,
+        query: &str,
+        scope: SearchScope,
+        page: Pagination,
+    ) -> Result<Vec<EntrySummary>, EngineError> {
+        crate::reads::search(&self.conn, query, scope, page)
     }
 
     /// Find entries matching an `AutoFill` service identifier.

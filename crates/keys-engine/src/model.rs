@@ -71,6 +71,23 @@ pub enum StrengthBucket {
     VeryStrong = 4,
 }
 
+/// Which entry fields a search query should match against.
+///
+/// Used by [`crate::Engine::search`] to scope the query. `AnyField`
+/// matches against title, username, url, notes, and tags; the
+/// narrower scopes restrict matching to a single field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchScope {
+    /// Title + username + url + notes + tags.
+    #[default]
+    AnyField,
+    /// Title only.
+    TitleOnly,
+    /// Notes only.
+    NotesOnly,
+}
+
 /// Reference to an entry / group icon.
 ///
 /// KDBX stores icons either as a built-in index (0–68) into `KeePass`'s

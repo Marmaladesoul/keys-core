@@ -63,7 +63,8 @@ use crate::engine_portable::EnginePortableEntry;
 use crate::engine_types::{
     ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull, EntryUpdate,
     GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi, MergeResult,
-    NewEntryFields, NewGroupFields, Page, Predicate, SmartFolder, VaultState, parse_uuid,
+    NewEntryFields, NewGroupFields, Page, Predicate, SearchScope, SmartFolder, VaultState,
+    parse_uuid,
 };
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
@@ -346,10 +347,11 @@ impl Engine {
     pub fn search(
         &self,
         query: String,
+        scope: SearchScope,
         page: Page,
     ) -> Result<Vec<EngineEntrySummary>, EngineError> {
         self.with_engine(|e| {
-            Ok(e.search(&query, page.into())?
+            Ok(e.search(&query, scope.into(), page.into())?
                 .into_iter()
                 .map(Into::into)
                 .collect())

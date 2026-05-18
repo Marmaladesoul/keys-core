@@ -41,7 +41,7 @@ use uuid::Uuid;
 use crate::error::EngineError;
 use crate::model::{
     AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, GroupNode, HistoricEntry, IconRef,
-    Pagination, StrengthBucket,
+    Pagination, SearchScope, StrengthBucket,
 };
 
 /// SQL fragment listing the columns `EntrySummary` needs, plus the
@@ -311,41 +311,42 @@ pub(crate) fn is_descendant_of(
     Ok(false)
 }
 
-/// Full-text search across `entry_fts`, with a tag-substring fallback
-/// merged via `UNION ALL`.
+/// Case-insensitive substring search across entry fields, scoped by
+/// [`SearchScope`].
 ///
-/// # Ranking
+/// # Matching semantics
 ///
-/// Primary FTS5 hits are ordered by `bm25(entry_fts)` ascending (lower
-/// is more relevant). Tag-fallback hits land after the FTS hits and
-/// are alphabetised by title (deterministic, no relevance signal
-/// because tag substring match is binary). The ordering is achieved
-/// with a synthetic `bucket` column (0 = FTS hit, 1 = tag fallback)
-/// then `rank ASC, title ASC, uuid ASC`.
+/// The query is trimmed and split on whitespace into tokens. An entry
+/// matches when **every** token appears as a case-insensitive
+/// substring of at least one in-scope field — i.e. tokens AND, fields
+/// OR. This is what users intuitively expect from a text box:
+/// typing `manag` finds entries titled `Management` and typing `one
+/// two` finds an entry titled `Tone and Atwog`.
 ///
-/// # Deduplication
+/// # Scope
 ///
-/// An entry that matches both FTS and the tag fallback appears only
-/// in its FTS bucket — the tag fallback excludes any rowid already
-/// in the FTS match set.
+/// - [`SearchScope::AnyField`] — title, username, url, notes, and tag
+///   names.
+/// - [`SearchScope::TitleOnly`] — title only.
+/// - [`SearchScope::NotesOnly`] — notes only.
+///
+/// Protected fields (passwords, custom protected fields) are never
+/// searched.
 ///
 /// # Empty query
 ///
 /// Empty / whitespace-only queries return an empty Vec without
-/// touching the database. FTS5 raises a syntax error on empty
-/// `MATCH` strings.
+/// touching the database.
 ///
-/// # Sanitisation
+/// # Ordering
 ///
-/// User input is run through [`escape_fts5_query`] — if the string
-/// contains any FTS5-special character (`"`, `*`, `:`, `^`, `(`, `)`)
-/// we wrap the whole thing in a quoted phrase so it tokenises
-/// literally and never trips a syntax error. Plain word(s) pass
-/// through, so users can still use FTS5's `word*` prefix and
-/// implicit-AND-of-tokens semantics.
+/// Alphabetical by title (case-insensitive), then by uuid for
+/// determinism. There's no relevance ranking — substring match is
+/// binary and the client re-sorts by user preference anyway.
 pub(crate) fn search(
     conn: &Connection,
     query: &str,
+    scope: SearchScope,
     page: Pagination,
 ) -> Result<Vec<EntrySummary>, EngineError> {
     let trimmed = query.trim();
@@ -353,43 +354,62 @@ pub(crate) fn search(
         return Ok(Vec::new());
     }
 
-    let fts_query = escape_fts5_query(trimmed);
-    let tag_like = format!("%{}%", escape_like(trimmed));
+    let tokens: Vec<String> = trimmed
+        .split_whitespace()
+        .map(|t| format!("%{}%", escape_like(t)))
+        .collect();
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let (limit, offset) = clamp_page(page);
 
-    // The CTE `fts_hits` captures rowids matched by FTS5 (so the tag
-    // fallback can exclude them) along with their bm25 ranks.
-    //
-    // Bucket 0 = FTS hit (ranked by bm25 asc).
-    // Bucket 1 = tag-only hit (alphabetised by title).
+    // Build a per-token clause that ANDs across tokens, ORs across
+    // fields inside the scope. `?n` placeholders for each token's
+    // LIKE pattern; trailing two placeholders are limit/offset.
+    let per_token_clause: &str = match scope {
+        SearchScope::AnyField => {
+            "(entry.title    LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
+              OR entry.username LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
+              OR entry.url      LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
+              OR entry.notes    LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
+              OR EXISTS ( \
+                  SELECT 1 FROM entry_tag et \
+                  JOIN tag t ON t.id = et.tag_id \
+                  WHERE et.entry_uuid = entry.uuid \
+                    AND t.name LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
+              ))"
+        }
+        SearchScope::TitleOnly => "(entry.title LIKE ?{n} ESCAPE '\\' COLLATE NOCASE)",
+        SearchScope::NotesOnly => "(entry.notes LIKE ?{n} ESCAPE '\\' COLLATE NOCASE)",
+    };
+
+    let where_clause = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, _)| per_token_clause.replace("?{n}", &format!("?{}", i + 1)))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    let limit_placeholder = tokens.len() + 1;
+    let offset_placeholder = tokens.len() + 2;
+
     let sql = format!(
-        "WITH fts_hits AS ( \
-             SELECT rowid AS rid, bm25(entry_fts) AS rank \
-             FROM entry_fts WHERE entry_fts MATCH ?1 \
-         ), \
-         tag_hits AS ( \
-             SELECT DISTINCT entry.rowid AS rid \
-             FROM entry \
-             JOIN entry_tag et ON et.entry_uuid = entry.uuid \
-             JOIN tag t       ON t.id = et.tag_id \
-             WHERE t.name LIKE ?2 ESCAPE '\\' \
-               AND entry.rowid NOT IN (SELECT rid FROM fts_hits) \
-         ), \
-         hits AS ( \
-             SELECT rid, 0 AS bucket, rank FROM fts_hits \
-             UNION ALL \
-             SELECT rid, 1 AS bucket, 0.0 AS rank FROM tag_hits \
-         ) \
-         SELECT {SUMMARY_COLUMNS} \
+        "SELECT {SUMMARY_COLUMNS} \
          FROM entry \
-         JOIN hits ON hits.rid = entry.rowid \
-         ORDER BY hits.bucket ASC, hits.rank ASC, entry.title ASC, entry.uuid ASC \
-         LIMIT ?3 OFFSET ?4"
+         WHERE {where_clause} \
+         ORDER BY entry.title COLLATE NOCASE ASC, entry.uuid ASC \
+         LIMIT ?{limit_placeholder} OFFSET ?{offset_placeholder}"
     );
 
     let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> =
+        tokens.iter().map(|t| t as &dyn rusqlite::ToSql).collect();
+    params.push(&limit);
+    params.push(&offset);
+
     let rows = stmt
-        .query_map(params![fts_query, tag_like, limit, offset], row_to_summary)?
+        .query_map(rusqlite::params_from_iter(params), row_to_summary)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -556,39 +576,6 @@ const TWO_LABEL_PUBLIC_SUFFIXES: &[&str] = &[
     "go.jp", "co.kr", "or.kr", "co.za", "org.za", "com.br", "net.br", "org.br", "com.mx", "com.ar",
     "com.sg", "com.hk", "com.tw", "com.tr", "co.in", "co.id", "co.il",
 ];
-
-/// Escape user input for use as an FTS5 `MATCH` argument.
-///
-/// FTS5's query grammar treats a wide range of ASCII punctuation as
-/// syntax (`"`, `:`, `^`, `(`, `)`, `-`, `+`, `@`, and others flagged
-/// by its tokenizer). Rather than enumerate the full set and hope
-/// FTS5 doesn't grow more, we take the conservative line: if the
-/// query is *anything other than* alphanumerics, spaces, the ASCII
-/// underscore, and an optional trailing `*` on each whitespace-
-/// separated token, wrap it as a quoted phrase. Plain word(s) pass
-/// through verbatim so users keep FTS5's implicit-AND and
-/// prefix-search (`word*`) semantics.
-///
-/// The trailing-`*` allowance is what makes prefix matching survive
-/// this layer: a caller wanting "hell" to match "hello" must pass
-/// `hell*`, and we must not quote it (quoted phrases tokenise `*`
-/// away, so `"hell*"` collapses to the literal token `hell`).
-///
-/// Embedded `"` characters are doubled per FTS5's escape rule.
-pub(crate) fn escape_fts5_query(query: &str) -> String {
-    let mut saw_token = false;
-    let safe = query.split_whitespace().all(|tok| {
-        saw_token = true;
-        let body = tok.strip_suffix('*').unwrap_or(tok);
-        !body.is_empty() && body.chars().all(|c| c.is_alphanumeric() || c == '_')
-    }) && saw_token;
-    if safe {
-        query.to_string()
-    } else {
-        let escaped = query.replace('"', "\"\"");
-        format!("\"{escaped}\"")
-    }
-}
 
 /// Escape a string for use in a `LIKE` pattern with `ESCAPE '\\'`.
 /// `%` and `_` are LIKE-wildcards; `\` is the chosen escape character.
@@ -1127,41 +1114,6 @@ mod tests {
             Some(StrengthBucket::VeryStrong)
         );
         assert_eq!(strength_bucket_from_i64(99), None);
-    }
-
-    #[test]
-    fn escape_fts5_query_passes_plain_words_through() {
-        assert_eq!(escape_fts5_query("banking"), "banking");
-        assert_eq!(escape_fts5_query("two words"), "two words");
-        assert_eq!(escape_fts5_query("with_underscore"), "with_underscore");
-    }
-
-    #[test]
-    fn escape_fts5_query_passes_trailing_star_through_for_prefix_search() {
-        // Quoting `hell*` would collapse it to the literal token `hell`
-        // inside an FTS5 phrase — callers asking for prefix matching
-        // need the wildcard to survive this layer.
-        assert_eq!(escape_fts5_query("hell*"), "hell*");
-        assert_eq!(escape_fts5_query("a*"), "a*");
-        assert_eq!(escape_fts5_query("two* words*"), "two* words*");
-        assert_eq!(escape_fts5_query("mixed term*"), "mixed term*");
-    }
-
-    #[test]
-    fn escape_fts5_query_quotes_anything_with_punctuation() {
-        assert_eq!(escape_fts5_query("user@example"), "\"user@example\"");
-        assert_eq!(escape_fts5_query("a:b"), "\"a:b\"");
-        assert_eq!(escape_fts5_query("(x)"), "\"(x)\"");
-        // Internal `*` (not as a token suffix) is still treated as
-        // punctuation and quoted.
-        assert_eq!(escape_fts5_query("he*lo"), "\"he*lo\"");
-        // A bare `*` token has an empty body — not a valid prefix
-        // term, so we fall back to quoting.
-        assert_eq!(escape_fts5_query("*"), "\"*\"");
-        assert_eq!(
-            escape_fts5_query("he said \"hi\""),
-            "\"he said \"\"hi\"\"\""
-        );
     }
 
     #[test]

@@ -1,7 +1,8 @@
-//! Integration tests for [`Engine::search`] (task 3.3).
+//! Integration tests for [`Engine::search`].
 //!
 //! Builds in-memory KDBX vaults, ingests them, then exercises the
-//! FTS5-backed search surface plus the tag-substring fallback.
+//! LIKE-based substring search across the three [`SearchScope`]
+//! variants.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +11,7 @@ use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::NewEntry;
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
-use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError, Pagination};
+use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError, Pagination, SearchScope};
 use secrecy::SecretString;
 
 // ── test wiring ────────────────────────────────────────────────────────
@@ -62,6 +63,10 @@ where
     (engine, dir)
 }
 
+fn titles(rows: &[keys_engine::EntrySummary]) -> Vec<&str> {
+    rows.iter().map(|r| r.title.as_str()).collect()
+}
+
 // ── tests ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -71,146 +76,215 @@ fn search_empty_query_returns_empty() {
         kdbx.add_entry(root, NewEntry::new("banking")).expect("add");
     });
 
-    let rows = engine.search("", Pagination::all()).expect("search");
+    let rows = engine
+        .search("", SearchScope::AnyField, Pagination::all())
+        .expect("search");
     assert!(rows.is_empty());
-    // Whitespace-only is also empty.
-    let rows = engine.search("   ", Pagination::all()).expect("search ws");
+    let rows = engine
+        .search("   ", SearchScope::AnyField, Pagination::all())
+        .expect("search ws");
     assert!(rows.is_empty());
 }
 
 #[test]
-fn search_matches_title() {
+fn search_substring_matches_mid_word() {
+    // The headline reason this slice exists: FTS5 only matched at
+    // word starts, so `a` did not find "Marmalade". Substring search
+    // does.
     let (engine, _dir) = engine_with(|kdbx| {
         let root = kdbx.vault().root.id;
-        kdbx.add_entry(root, NewEntry::new("banking site"))
+        kdbx.add_entry(root, NewEntry::new("aaaa")).expect("add");
+        kdbx.add_entry(root, NewEntry::new("Marmalade"))
             .expect("add");
-        kdbx.add_entry(root, NewEntry::new("other thing"))
+        kdbx.add_entry(root, NewEntry::new("VicServices").notes("admin portal"))
             .expect("add");
+        kdbx.add_entry(root, NewEntry::new("Getting Started"))
+            .expect("add");
+        kdbx.add_entry(root, NewEntry::new("zzz")).expect("add");
     });
 
-    let rows = engine.search("banking", Pagination::all()).expect("search");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].title, "banking site");
+    let rows = engine
+        .search("a", SearchScope::AnyField, Pagination::all())
+        .expect("search");
+    let t = titles(&rows);
+    assert!(t.contains(&"aaaa"));
+    assert!(t.contains(&"Marmalade"));
+    assert!(t.contains(&"VicServices"));
+    assert!(t.contains(&"Getting Started"));
+    assert!(!t.contains(&"zzz"), "got {t:?}");
 }
 
 #[test]
-fn search_matches_url() {
+fn search_matches_mid_word_token() {
+    // `manag` should find entries titled "Management" — a prefix that
+    // FTS5's whole-token matcher would miss.
     let (engine, _dir) = engine_with(|kdbx| {
         let root = kdbx.vault().root.id;
-        kdbx.add_entry(
-            root,
-            NewEntry::new("login").url("https://login.example.com/path"),
-        )
-        .expect("add");
-        kdbx.add_entry(root, NewEntry::new("other")).expect("add");
-    });
-
-    let rows = engine.search("example", Pagination::all()).expect("search");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].title, "login");
-}
-
-#[test]
-fn search_matches_notes() {
-    let (engine, _dir) = engine_with(|kdbx| {
-        let root = kdbx.vault().root.id;
-        kdbx.add_entry(root, NewEntry::new("with notes").notes("my work email"))
+        kdbx.add_entry(root, NewEntry::new("Account Management"))
             .expect("add");
-        kdbx.add_entry(root, NewEntry::new("plain")).expect("add");
+        kdbx.add_entry(root, NewEntry::new("Management Console"))
+            .expect("add");
+        kdbx.add_entry(root, NewEntry::new("unrelated"))
+            .expect("add");
     });
 
-    let rows = engine.search("email", Pagination::all()).expect("search");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].title, "with notes");
+    let rows = engine
+        .search("manag", SearchScope::AnyField, Pagination::all())
+        .expect("search");
+    let t = titles(&rows);
+    assert_eq!(t.len(), 2);
+    assert!(t.contains(&"Account Management"));
+    assert!(t.contains(&"Management Console"));
 }
 
 #[test]
 fn search_is_case_insensitive() {
-    // unicode61 tokenizer folds case by default.
     let (engine, _dir) = engine_with(|kdbx| {
         let root = kdbx.vault().root.id;
         kdbx.add_entry(root, NewEntry::new("Banking")).expect("add");
     });
 
-    let rows = engine.search("banking", Pagination::all()).expect("search");
-    assert_eq!(rows.len(), 1);
-    let rows = engine.search("BANKING", Pagination::all()).expect("search");
-    assert_eq!(rows.len(), 1);
+    for q in &["banking", "BANKING", "BaNkInG"] {
+        let rows = engine
+            .search(q, SearchScope::AnyField, Pagination::all())
+            .expect("search");
+        assert_eq!(rows.len(), 1, "case-insensitive miss for {q}");
+    }
 }
 
 #[test]
-fn search_ranks_better_matches_first() {
-    // Both entries contain "banking", but the second has it three times
-    // — bm25 should rank it higher (lower score).
+fn search_multi_token_ands_with_field_or() {
+    // Both tokens must appear, but each token may appear in a
+    // different field: `one two` matches "Tone and Atwog" because
+    // both substrings exist somewhere in the in-scope fields.
     let (engine, _dir) = engine_with(|kdbx| {
         let root = kdbx.vault().root.id;
-        kdbx.add_entry(root, NewEntry::new("banking site"))
-            .expect("add a");
-        kdbx.add_entry(
-            root,
-            NewEntry::new("my banking site for everything banking").notes("banking notes here"),
-        )
-        .expect("add b");
+        kdbx.add_entry(root, NewEntry::new("Tone and Atwog"))
+            .expect("add");
+        kdbx.add_entry(root, NewEntry::new("only one"))
+            .expect("add only-one");
+        kdbx.add_entry(root, NewEntry::new("only two"))
+            .expect("add only-two");
     });
 
-    let rows = engine.search("banking", Pagination::all()).expect("search");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(
-        rows[0].title, "my banking site for everything banking",
-        "denser match should rank first",
-    );
-    assert_eq!(rows[1].title, "banking site");
+    let rows = engine
+        .search("one two", SearchScope::AnyField, Pagination::all())
+        .expect("search");
+    let t = titles(&rows);
+    assert_eq!(t, vec!["Tone and Atwog"], "got {t:?}");
 }
 
 #[test]
-fn search_prefix_wildcard_matches_partial_tokens() {
-    // FTS5's `word*` prefix syntax must survive our escape layer.
-    // The Keys clients append `*` to each plain-word token so typing
-    // "hell" finds "Hello" and a single "a" finds anything with an
-    // a-prefixed token. Regression test for the bug where the escape
-    // layer quoted `*` and collapsed the prefix into a literal token.
+fn search_anyfield_spans_multiple_fields() {
     let (engine, _dir) = engine_with(|kdbx| {
         let root = kdbx.vault().root.id;
-        kdbx.add_entry(root, NewEntry::new("aaaa")).expect("add");
-        kdbx.add_entry(root, NewEntry::new("Hello sheme"))
-            .expect("add");
         kdbx.add_entry(
             root,
-            NewEntry::new("Marmalade Mail account").username("user@example.com"),
+            NewEntry::new("title-hit").notes("matching is in notes"),
+        )
+        .expect("add notes");
+        kdbx.add_entry(
+            root,
+            NewEntry::new("url-hit").url("https://acme.example.com"),
+        )
+        .expect("add url");
+        kdbx.add_entry(root, NewEntry::new("u-hit").username("alice"))
+            .expect("add username");
+    });
+
+    // Notes
+    let rows = engine
+        .search("matching", SearchScope::AnyField, Pagination::all())
+        .expect("search");
+    assert_eq!(titles(&rows), vec!["title-hit"]);
+    // URL
+    let rows = engine
+        .search("acme", SearchScope::AnyField, Pagination::all())
+        .expect("search");
+    assert_eq!(titles(&rows), vec!["url-hit"]);
+    // Username
+    let rows = engine
+        .search("alice", SearchScope::AnyField, Pagination::all())
+        .expect("search");
+    assert_eq!(titles(&rows), vec!["u-hit"]);
+}
+
+#[test]
+fn search_anyfield_matches_tag() {
+    let (engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("acme").tags(vec!["banking".into()]))
+            .expect("add");
+        kdbx.add_entry(root, NewEntry::new("other")).expect("add");
+    });
+
+    let rows = engine
+        .search("banking", SearchScope::AnyField, Pagination::all())
+        .expect("search");
+    assert_eq!(titles(&rows), vec!["acme"]);
+}
+
+#[test]
+fn search_title_only_excludes_other_fields() {
+    let (engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(
+            root,
+            NewEntry::new("plain").notes("the word banking appears here"),
         )
         .expect("add");
-        kdbx.add_entry(root, NewEntry::new("zzz unrelated"))
+        kdbx.add_entry(root, NewEntry::new("Banking site"))
             .expect("add");
     });
 
-    let single_a = engine.search("a*", Pagination::all()).expect("search a*");
-    let single_a_titles: Vec<&str> = single_a.iter().map(|r| r.title.as_str()).collect();
-    assert!(single_a_titles.contains(&"aaaa"), "a* should match aaaa");
-    assert!(
-        single_a_titles.contains(&"Marmalade Mail account"),
-        "a* should match a token in 'Marmalade Mail account' (got {single_a_titles:?})",
-    );
-    assert!(
-        !single_a_titles.contains(&"zzz unrelated"),
-        "a* should not match z-only entries",
-    );
+    let rows = engine
+        .search("banking", SearchScope::TitleOnly, Pagination::all())
+        .expect("search");
+    assert_eq!(titles(&rows), vec!["Banking site"]);
+}
 
-    let hell = engine
-        .search("hell*", Pagination::all())
-        .expect("search hell*");
-    let hell_titles: Vec<&str> = hell.iter().map(|r| r.title.as_str()).collect();
-    assert!(
-        hell_titles.contains(&"Hello sheme"),
-        "hell* should match Hello (got {hell_titles:?})",
+#[test]
+fn search_notes_only_excludes_other_fields() {
+    let (engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("banking")).expect("add");
+        kdbx.add_entry(
+            root,
+            NewEntry::new("plain").notes("banking-related material"),
+        )
+        .expect("add");
+    });
+
+    let rows = engine
+        .search("banking", SearchScope::NotesOnly, Pagination::all())
+        .expect("search");
+    assert_eq!(titles(&rows), vec!["plain"]);
+}
+
+#[test]
+fn search_results_are_sorted_alphabetically() {
+    let (engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("zzz banking"))
+            .expect("add z");
+        kdbx.add_entry(root, NewEntry::new("aaa banking"))
+            .expect("add a");
+        kdbx.add_entry(root, NewEntry::new("Mmm banking"))
+            .expect("add m");
+    });
+
+    let rows = engine
+        .search("banking", SearchScope::AnyField, Pagination::all())
+        .expect("search");
+    assert_eq!(
+        titles(&rows),
+        vec!["aaa banking", "Mmm banking", "zzz banking"],
+        "title COLLATE NOCASE ASC",
     );
 }
 
 #[test]
-fn search_handles_special_characters() {
-    // @ is not an FTS5 syntax character; unicode61 treats it as a
-    // token separator, so "user@example" tokenises to "user" and
-    // "example". Either token-match suffices. The point of the test
-    // is that we don't crash on user-supplied punctuation.
+fn search_handles_special_characters_without_error() {
     let (engine, _dir) = engine_with(|kdbx| {
         let root = kdbx.vault().root.id;
         kdbx.add_entry(
@@ -222,17 +296,10 @@ fn search_handles_special_characters() {
         .expect("add");
     });
 
-    // The point of the test is that we don't crash on punctuation.
-    // `user@example` gets quoted into a phrase, which FTS5 tokenises
-    // as the sequence `user example` — that does not appear in any
-    // indexed column here, so a 0-row result is expected. The
-    // important thing is the call succeeds.
-    let _ = engine
-        .search("user@example", Pagination::all())
-        .expect("search must not raise FTS5 syntax error");
-
-    // Other FTS5-special chars: ensure these don't error.
+    // Any of these would have tripped FTS5's grammar. With LIKE,
+    // they're just substring needles — no syntax to honour.
     for q in &[
+        "user@example",
         "a:b",
         "(paren)",
         "star*",
@@ -240,11 +307,31 @@ fn search_handles_special_characters() {
         "^caret",
         "a-b",
         "+plus",
+        "50%",
+        "a_b",
     ] {
         let _ = engine
-            .search(q, Pagination::all())
-            .expect("no syntax error");
+            .search(q, SearchScope::AnyField, Pagination::all())
+            .expect("no error");
     }
+}
+
+#[test]
+fn search_like_wildcards_in_query_are_escaped() {
+    // `%` and `_` are SQL LIKE wildcards. A user typing `50%`
+    // should match a literal "50%" — not "anything-50-anything".
+    let (engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("50% off coupon"))
+            .expect("add");
+        kdbx.add_entry(root, NewEntry::new("50 something"))
+            .expect("add");
+    });
+
+    let rows = engine
+        .search("50%", SearchScope::AnyField, Pagination::all())
+        .expect("search");
+    assert_eq!(titles(&rows), vec!["50% off coupon"]);
 }
 
 #[test]
@@ -260,6 +347,7 @@ fn search_paginates() {
     let p1 = engine
         .search(
             "banking",
+            SearchScope::AnyField,
             Pagination {
                 offset: 0,
                 limit: 2,
@@ -269,6 +357,7 @@ fn search_paginates() {
     let p2 = engine
         .search(
             "banking",
+            SearchScope::AnyField,
             Pagination {
                 offset: 2,
                 limit: 2,
@@ -278,6 +367,7 @@ fn search_paginates() {
     let p3 = engine
         .search(
             "banking",
+            SearchScope::AnyField,
             Pagination {
                 offset: 4,
                 limit: 2,
@@ -300,43 +390,6 @@ fn search_paginates() {
 }
 
 #[test]
-fn search_matches_tag() {
-    // Tag-fallback: an entry whose title/username/url/notes don't
-    // contain "banking" but whose tag does should still match.
-    let (engine, _dir) = engine_with(|kdbx| {
-        let root = kdbx.vault().root.id;
-        kdbx.add_entry(root, NewEntry::new("acme").tags(vec!["banking".into()]))
-            .expect("add");
-        kdbx.add_entry(root, NewEntry::new("other")).expect("add");
-    });
-
-    let rows = engine.search("banking", Pagination::all()).expect("search");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].title, "acme");
-}
-
-#[test]
-fn search_tag_fallback_ranks_after_fts_hits() {
-    // FTS hit on title and tag-only hit on a separate entry — FTS
-    // hit must come first, regardless of insertion order.
-    let (engine, _dir) = engine_with(|kdbx| {
-        let root = kdbx.vault().root.id;
-        kdbx.add_entry(
-            root,
-            NewEntry::new("zzz tagged only").tags(vec!["banking".into()]),
-        )
-        .expect("add tag-only");
-        kdbx.add_entry(root, NewEntry::new("aaa banking in title"))
-            .expect("add fts");
-    });
-
-    let rows = engine.search("banking", Pagination::all()).expect("search");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].title, "aaa banking in title");
-    assert_eq!(rows[1].title, "zzz tagged only");
-}
-
-#[test]
 fn search_returns_empty_for_no_matches() {
     let (engine, _dir) = engine_with(|kdbx| {
         let root = kdbx.vault().root.id;
@@ -344,7 +397,7 @@ fn search_returns_empty_for_no_matches() {
     });
 
     let rows = engine
-        .search("nonexistentterm", Pagination::all())
+        .search("nonexistentterm", SearchScope::AnyField, Pagination::all())
         .expect("search");
     assert!(rows.is_empty());
 }
@@ -372,7 +425,9 @@ fn search_perf_877() {
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
 
     let start = std::time::Instant::now();
-    let rows = engine.search("banking", Pagination::all()).expect("search");
+    let rows = engine
+        .search("banking", SearchScope::AnyField, Pagination::all())
+        .expect("search");
     let elapsed = start.elapsed();
     eprintln!("877-entry search took {elapsed:?}, {} hits", rows.len());
     assert_eq!(rows.len(), 877);

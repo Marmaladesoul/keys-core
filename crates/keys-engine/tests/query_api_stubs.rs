@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
-use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError, Pagination};
+use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError, Pagination, SearchScope};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -68,7 +68,7 @@ fn surface_methods_compile_against_real_engine() {
         let _: Result<_, _> = engine.entry(uuid);
         let _: Result<_, _> = engine.entry_count(None);
         let _: Result<_, _> = engine.group_tree();
-        let _: Result<_, _> = engine.search("query", Pagination::all());
+        let _: Result<_, _> = engine.search("query", SearchScope::AnyField, Pagination::all());
         let _: Result<_, _> = engine.smart_folder_entries(0, Pagination::all());
         let _: Result<_, _> = engine.smart_folder_count(0);
         let _: Result<_, _> = engine.reveal_password(uuid);

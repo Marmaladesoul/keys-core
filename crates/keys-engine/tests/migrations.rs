@@ -34,8 +34,7 @@ fn protector() -> Arc<dyn FieldProtector> {
     Arc::new(TestProtector([0x5a; 32]))
 }
 
-/// Tables, indices, triggers and the FTS5 virtual table we expect
-/// after running every shipped migration.
+/// Tables and indices we expect after running every shipped migration.
 const EXPECTED_TABLES: &[&str] = &[
     "schema_version",
     "group",
@@ -49,7 +48,6 @@ const EXPECTED_TABLES: &[&str] = &[
     "entry_tag",
     "smart_folder",
     "setting",
-    "entry_fts",
 ];
 
 const EXPECTED_INDICES: &[&str] = &[
@@ -63,8 +61,6 @@ const EXPECTED_INDICES: &[&str] = &[
     "idx_entry_custom_field_entry_uuid",
     "idx_entry_tag_tag_id",
 ];
-
-const EXPECTED_TRIGGERS: &[&str] = &["entry_ai", "entry_au", "entry_ad"];
 
 fn object_exists(conn: &Connection, kind: &str, name: &str) -> bool {
     let n: i64 = conn
@@ -92,12 +88,6 @@ fn apply_pending_on_fresh_db_creates_all_tables() {
         assert!(
             object_exists(&conn, "index", i),
             "expected index `{i}` after migrations",
-        );
-    }
-    for tg in EXPECTED_TRIGGERS {
-        assert!(
-            object_exists(&conn, "trigger", tg),
-            "expected trigger `{tg}` after migrations",
         );
     }
 }
@@ -141,66 +131,6 @@ fn apply_pending_rejects_newer_schema() {
         }
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }
-}
-
-/// Helper: insert a group and an entry. Returns the entry uuid.
-fn insert_group_and_entry(conn: &Connection, title: &str) -> (String, String) {
-    let gid = "g00000000-0000-0000-0000-000000000001".to_string();
-    let eid = "e00000000-0000-0000-0000-000000000001".to_string();
-    conn.execute(
-        "INSERT INTO \"group\"(uuid, parent_uuid, name, created_at, modified_at) \
-         VALUES (?1, NULL, 'Root', 0, 0)",
-        params![gid],
-    )
-    .expect("insert group");
-    conn.execute(
-        "INSERT INTO entry(uuid, group_uuid, title, created_at, modified_at, accessed_at) \
-         VALUES (?1, ?2, ?3, 0, 0, 0)",
-        params![eid, gid, title],
-    )
-    .expect("insert entry");
-    (gid, eid)
-}
-
-fn fts_match_count(conn: &Connection, query: &str) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM entry_fts WHERE entry_fts MATCH ?1",
-        params![query],
-        |r| r.get(0),
-    )
-    .expect("fts match query")
-}
-
-#[test]
-fn fts5_trigger_keeps_index_synced() {
-    let mut conn = Connection::open_in_memory().expect("open");
-    conn.execute_batch("PRAGMA foreign_keys = ON")
-        .expect("fks on");
-    migrations::apply_pending(&mut conn).expect("apply");
-
-    let (_gid, eid) = insert_group_and_entry(&conn, "banking site");
-
-    assert_eq!(fts_match_count(&conn, "banking"), 1, "after insert");
-    assert_eq!(fts_match_count(&conn, "media"), 0, "no media yet");
-
-    conn.execute(
-        "UPDATE entry SET title = 'media site' WHERE uuid = ?1",
-        params![eid],
-    )
-    .expect("update");
-
-    assert_eq!(fts_match_count(&conn, "banking"), 0, "banking gone");
-    assert_eq!(fts_match_count(&conn, "media"), 1, "media present");
-
-    conn.execute("DELETE FROM entry WHERE uuid = ?1", params![eid])
-        .expect("delete");
-
-    assert_eq!(
-        fts_match_count(&conn, "banking"),
-        0,
-        "all gone after delete"
-    );
-    assert_eq!(fts_match_count(&conn, "media"), 0, "all gone after delete");
 }
 
 #[test]

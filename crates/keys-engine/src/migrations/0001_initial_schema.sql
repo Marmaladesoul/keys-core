@@ -148,33 +148,8 @@ CREATE TABLE setting (
     value BLOB NOT NULL
 );
 
--- FTS5 mirror of entry text columns. External-content table: the FTS5
--- index stores tokenisations only and reads original columns from
--- `entry` by rowid. Triggers below keep the index in sync — FTS5 does
--- not auto-sync external-content tables.
-CREATE VIRTUAL TABLE entry_fts USING fts5(
-    title,
-    username,
-    url,
-    notes,
-    content='entry',
-    content_rowid='rowid',
-    tokenize='porter unicode61'
-);
-
-CREATE TRIGGER entry_ai AFTER INSERT ON entry BEGIN
-    INSERT INTO entry_fts (rowid, title, username, url, notes)
-    VALUES (new.rowid, new.title, new.username, new.url, new.notes);
-END;
-
-CREATE TRIGGER entry_au AFTER UPDATE ON entry BEGIN
-    INSERT INTO entry_fts (entry_fts, rowid, title, username, url, notes)
-    VALUES ('delete', old.rowid, old.title, old.username, old.url, old.notes);
-    INSERT INTO entry_fts (rowid, title, username, url, notes)
-    VALUES (new.rowid, new.title, new.username, new.url, new.notes);
-END;
-
-CREATE TRIGGER entry_ad AFTER DELETE ON entry BEGIN
-    INSERT INTO entry_fts (entry_fts, rowid, title, username, url, notes)
-    VALUES ('delete', old.rowid, old.title, old.username, old.url, old.notes);
-END;
+-- Entry text search is plain LIKE-based substring matching across
+-- `title`, `username`, `url`, `notes`, and tag names — see
+-- `reads::search`. No FTS5 index: prefix-only matching surprised
+-- users (typing `a` did not find `Marmalade`), and on the entry
+-- counts this app deals with (<10k) a `LIKE %x%` scan is fast enough.

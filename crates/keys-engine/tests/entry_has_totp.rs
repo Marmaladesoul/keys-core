@@ -19,7 +19,7 @@ use keepass_core::model::CustomField as KcCustomField;
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{
     DbKey, Engine, EntryUpdate, IconRef, KeyProvider, KeyProviderError, NewCustomField,
-    NewEntryFields, Pagination, Predicate,
+    NewEntryFields, Pagination, Predicate, SearchScope,
 };
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -280,8 +280,10 @@ fn all_summary_paths_carry_has_totp() {
     assert!(find(&list, a_uuid).has_totp);
     assert!(!find(&list, b_uuid).has_totp);
 
-    // search (FTS)
-    let search = engine.search("acme", Pagination::all()).expect("search");
+    // search
+    let search = engine
+        .search("acme", SearchScope::AnyField, Pagination::all())
+        .expect("search");
     assert!(find(&search, a_uuid).has_totp);
     assert!(!find(&search, b_uuid).has_totp);
 

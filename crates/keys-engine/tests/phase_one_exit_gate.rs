@@ -131,7 +131,7 @@ fn phase_one_exit_gate_full_lifecycle() {
 }
 
 #[test]
-fn phase_one_exit_gate_full_lifecycle_with_fts() {
+fn phase_one_exit_gate_full_lifecycle_with_search() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.db");
 
@@ -144,11 +144,10 @@ fn phase_one_exit_gate_full_lifecycle_with_fts() {
         .close()
         .expect("close after fresh open");
 
-    let gid = "g00000000-0000-0000-0000-0000000000aa";
-    let eid = "e00000000-0000-0000-0000-0000000000bb";
+    let gid = "00000000-0000-0000-0000-0000000000aa";
+    let eid = "00000000-0000-0000-0000-0000000000bb";
 
-    // Insert a group + an entry whose title should be FTS-indexed by
-    // the `entry_ai` trigger.
+    // Insert a group + an entry directly via SQLCipher.
     {
         let raw = open_raw_with_key(&path, &key_bytes);
         raw.execute(
@@ -165,20 +164,17 @@ fn phase_one_exit_gate_full_lifecycle_with_fts() {
         .expect("insert entry");
     }
 
-    // Reopen the engine, then verify FTS query still finds the entry —
-    // proving migrations + triggers stay coherent across close/reopen.
-    Engine::open(&path, &provider, protector(), None)
-        .expect("reopen with same key")
-        .close()
-        .expect("close after reopen");
-
-    let raw = open_raw_with_key(&path, &key_bytes);
-    let hits: i64 = raw
-        .query_row(
-            "SELECT COUNT(*) FROM entry_fts WHERE entry_fts MATCH ?1",
-            params!["banking"],
-            |r| r.get(0),
+    // Reopen the engine, then verify search finds the entry — proving
+    // migrations + storage stay coherent across close/reopen.
+    let engine = Engine::open(&path, &provider, protector(), None).expect("reopen with same key");
+    let hits = engine
+        .search(
+            "banking",
+            keys_engine::SearchScope::AnyField,
+            keys_engine::Pagination::all(),
         )
-        .expect("fts query");
-    assert_eq!(hits, 1, "FTS index survived close/reopen");
+        .expect("search");
+    assert_eq!(hits.len(), 1, "search hits survived close/reopen");
+    assert_eq!(hits[0].title, "banking site");
+    engine.close().expect("close after reopen");
 }
