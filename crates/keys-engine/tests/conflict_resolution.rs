@@ -110,7 +110,7 @@ fn fixture() -> Fixture {
         Engine::open(&db_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open engine");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("initial save");
     let kdbx_reread = reopen_kdbx(&kdbx_path);
     engine
@@ -279,7 +279,7 @@ fn apply_resolution_with_custom_field_choice() {
         .expect("seed custom field");
     let mut sync_kdbx = reopen_kdbx(&f.kdbx_path);
     f.engine
-        .save_to_kdbx(&f.kdbx_path, &mut sync_kdbx)
+        .save_to_kdbx(&f.kdbx_path, &mut sync_kdbx, None)
         .expect("sync save");
     let sync_reread = reopen_kdbx(&f.kdbx_path);
     f.engine.ingest_from_kdbx(&sync_reread).expect("re-ingest");

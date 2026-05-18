@@ -783,18 +783,30 @@ impl Engine {
     /// Project SQLite state into a KDBX at `kdbx_path` (the file at
     /// `kdbx_path` is used as the crypto envelope template — it must
     /// already exist and decrypt under `password`).
+    ///
+    /// `temp_dir`, when supplied, is used as the directory for the
+    /// atomic-write tempfile instead of `kdbx_path`'s parent. macOS
+    /// callers saving to iCloud Drive should pass
+    /// `NSTemporaryDirectory()` here: the sandbox's security-scoped
+    /// bookmark grants write to the kdbx file but not its surrounding
+    /// folder, so the default sibling-tempfile path fails with EPERM.
+    /// The override must live on the same filesystem volume as
+    /// `kdbx_path` (rename is not cross-volume atomic). Pass `None`
+    /// on non-sandboxed platforms to keep the historical behaviour.
     pub async fn save_to_kdbx(
         &self,
         kdbx_path: String,
         password: String,
+        temp_dir: Option<String>,
     ) -> Result<(), EngineError> {
         let path = PathBuf::from(kdbx_path);
         let pw = SecretString::from(password);
+        let temp_dir = temp_dir.map(PathBuf::from);
         let path_for_open = path.clone();
         let mut kdbx = tokio::task::spawn_blocking(move || open_unlocked(&path_for_open, &pw))
             .await
             .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
-        self.with_engine_mut(|e| Ok(e.save_to_kdbx(&path, &mut kdbx)?))
+        self.with_engine_mut(|e| Ok(e.save_to_kdbx(&path, &mut kdbx, temp_dir.as_deref())?))
     }
 
     /// Reconcile SQLite against the on-disk KDBX at `kdbx_path`.

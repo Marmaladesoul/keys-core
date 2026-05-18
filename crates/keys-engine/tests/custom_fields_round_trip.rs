@@ -181,7 +181,7 @@ fn projection_recovers_non_protected_custom_field() {
 
     let mut kdbx = kdbx;
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("save_to_kdbx");
     drop(engine);
     drop(kdbx);
@@ -267,7 +267,7 @@ fn round_trip_preserves_non_protected_custom_fields() {
 
     let mut kdbx = kdbx;
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("save_to_kdbx");
     drop(engine);
     drop(kdbx);

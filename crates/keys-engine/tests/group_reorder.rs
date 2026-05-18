@@ -247,7 +247,7 @@ fn save_writes_groups_in_sort_order() {
     engine.reorder_group(b.0, 0).expect("reorder");
     // Save back to disk.
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("save_to_kdbx");
     drop(engine);
     drop(kdbx);

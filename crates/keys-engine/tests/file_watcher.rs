@@ -242,7 +242,9 @@ fn self_write_signature_suppresses_engine_reconcile_callback() {
     )
     .expect("create empty kdbx");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save");
 
     assert!(
         engine.last_self_write().is_some(),
@@ -330,7 +332,9 @@ fn engine_open_without_file_watcher_works() {
     )
     .expect("create");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save");
     assert!(engine.last_self_write().is_some());
 }
 

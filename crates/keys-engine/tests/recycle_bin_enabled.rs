@@ -210,7 +210,7 @@ fn round_trip_preserves_enabled_true_with_no_bin_group() {
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     let mut kdbx_mut = kdbx;
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx_mut)
+        .save_to_kdbx(&kdbx_path, &mut kdbx_mut, None)
         .expect("save_to_kdbx");
     drop(engine);
     drop(kdbx_mut);

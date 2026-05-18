@@ -86,7 +86,7 @@ fn save_persists_last_saved_kdbx_bytes() {
     let mut engine = open_engine(&db_path);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("save_to_kdbx");
 
     let stored = engine
@@ -111,7 +111,7 @@ fn subsequent_save_overwrites_last_saved_kdbx_bytes() {
     let mut engine = open_engine(&db_path);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("first save");
     let first = engine
         .last_saved_kdbx_bytes()
@@ -132,7 +132,7 @@ fn subsequent_save_overwrites_last_saved_kdbx_bytes() {
     engine.ingest_from_kdbx(&kdbx).expect("re-ingest");
 
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("second save");
     let second = engine
         .last_saved_kdbx_bytes()
@@ -155,7 +155,7 @@ fn last_saved_kdbx_bytes_survives_engine_close_and_reopen() {
         let mut engine = open_engine(&db_path);
         engine.ingest_from_kdbx(&kdbx).expect("ingest");
         engine
-            .save_to_kdbx(&kdbx_path, &mut kdbx)
+            .save_to_kdbx(&kdbx_path, &mut kdbx, None)
             .expect("save_to_kdbx");
         let bytes = engine
             .last_saved_kdbx_bytes()
@@ -205,7 +205,7 @@ fn last_saved_kdbx_bytes_decodes_via_keepass_core() {
     let mut engine = open_engine(&db_path);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("save_to_kdbx");
 
     let stored = engine
@@ -257,7 +257,7 @@ fn large_vault_round_trips_through_setting() {
 
     let started = std::time::Instant::now();
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("save_to_kdbx");
     eprintln!("877-entry save_to_kdbx took {:?}", started.elapsed());
 

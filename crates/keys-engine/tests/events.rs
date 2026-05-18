@@ -378,7 +378,9 @@ fn save_to_kdbx_emits_save_completed() {
         Engine::open(&db_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     let observer = install_observer(&mut engine);
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save");
     let events = observer.snapshot();
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0], ChangeEvent::SaveCompleted));

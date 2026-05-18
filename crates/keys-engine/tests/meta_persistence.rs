@@ -477,7 +477,7 @@ fn round_trip_preserves_full_meta() {
     let mut engine = ingested_engine(&kdbx, &engine_path);
     let mut kdbx = kdbx;
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("save_to_kdbx");
     drop(engine);
     drop(kdbx);
@@ -551,7 +551,7 @@ fn save_to_kdbx_without_live_handle_preserves_meta() {
     );
 
     engine
-        .save_to_kdbx(&kdbx_path, &mut fresh_kdbx)
+        .save_to_kdbx(&kdbx_path, &mut fresh_kdbx, None)
         .expect("save_to_kdbx via fresh handle");
 
     drop(engine);

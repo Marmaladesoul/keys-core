@@ -235,7 +235,7 @@ fn history_round_trip_through_kdbx_preserves_protected_fields() {
     // Save engine → KDBX on disk; reopen the KDBX; re-ingest; reveal.
     let kdbx_path = dir.path().join("out.kdbx");
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("save_to_kdbx");
 
     let reopened = Kdbx::open(&kdbx_path)

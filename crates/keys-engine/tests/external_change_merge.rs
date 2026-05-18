@@ -113,7 +113,7 @@ fn fixture() -> Fixture {
     // precision that disk-round-tripped entries don't, so the
     // merge sees a phantom timestamp divergence on every entry.
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("initial save");
     let kdbx_reread = reopen_kdbx(&kdbx_path);
     engine
@@ -500,7 +500,7 @@ fn reconcile_round_trip_with_file_watcher() {
     .expect("open engine");
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("initial save");
 
     let observer = Arc::new(CaptureObserver::default());

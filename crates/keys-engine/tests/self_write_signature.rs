@@ -77,7 +77,9 @@ fn consume_matches_after_save_and_returns_true() {
     let mut kdbx = fresh_kdbx();
     let mut engine = open_engine(&db_path);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save");
 
     let (mtime, size) = stat(&kdbx_path);
     let sig = engine.last_self_write().expect("sig recorded");
@@ -96,7 +98,9 @@ fn consume_clears_signature() {
     let mut kdbx = fresh_kdbx();
     let mut engine = open_engine(&db_path);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save");
     let (mtime, size) = stat(&kdbx_path);
 
     assert!(engine.consume_self_write_signature(mtime, size));
@@ -116,7 +120,9 @@ fn consume_returns_false_on_mtime_mismatch() {
     let mut kdbx = fresh_kdbx();
     let mut engine = open_engine(&db_path);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save");
     let (mtime, size) = stat(&kdbx_path);
     let wrong_mtime = mtime + Duration::from_secs(60);
 
@@ -137,7 +143,9 @@ fn consume_returns_false_on_size_mismatch() {
     let mut kdbx = fresh_kdbx();
     let mut engine = open_engine(&db_path);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save");
     let (mtime, size) = stat(&kdbx_path);
 
     assert!(!engine.consume_self_write_signature(mtime, size.wrapping_add(1)));
@@ -157,7 +165,9 @@ fn save_after_consume_records_new_signature() {
     let mut engine = open_engine(&db_path);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
 
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save 1");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save 1");
     let (mtime1, size1) = stat(&kdbx_path);
     assert!(engine.consume_self_write_signature(mtime1, size1));
     assert!(engine.last_self_write().is_none());
@@ -166,7 +176,9 @@ fn save_after_consume_records_new_signature() {
     // filesystems with coarse timestamp granularity.
     std::thread::sleep(Duration::from_millis(20));
 
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save 2");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save 2");
     let new_sig = engine
         .last_self_write()
         .expect("new signature after second save");

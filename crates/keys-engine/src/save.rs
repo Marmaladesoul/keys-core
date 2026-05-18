@@ -19,13 +19,20 @@
 //!
 //! ## Atomic write
 //!
-//! Bytes go to a sibling tempfile (`tempfile::NamedTempFile::new_in`)
-//! and are flushed + `sync_all`'d before
+//! Bytes go to a tempfile (`tempfile::NamedTempFile::new_in`) and are
+//! flushed + `sync_all`'d before
 //! [`NamedTempFile::persist`](tempfile::NamedTempFile::persist) renames
-//! over the destination. The parent directory is then opened and
-//! `sync_all`'d so the rename survives a power loss between the file
-//! sync and a hypothetical follow-up crash. After the rename we `stat`
-//! the destination to capture mtime + size for the self-write
+//! over the destination. The tempfile is created in the destination's
+//! parent directory by default; callers that need to override this
+//! (e.g. sandboxed macOS frontends saving to iCloud Drive, where the
+//! security-scoped bookmark grants write access to the kdbx *file* but
+//! not its surrounding folder) can pass an explicit `temp_dir` through
+//! [`Engine::save_to_kdbx`]. Same-volume rename is still required for
+//! atomicity; on darwin both iCloud Drive and `NSTemporaryDirectory()`
+//! live on the user's home volume. The parent directory is then opened
+//! and `sync_all`'d so the rename survives a power loss between the
+//! file sync and a hypothetical follow-up crash. After the rename we
+//! `stat` the destination to capture mtime + size for the self-write
 //! signature.
 
 use std::fs::File;
@@ -107,6 +114,7 @@ pub(crate) fn save(
     engine: &mut Engine,
     path: &Path,
     kdbx: &mut Kdbx<Unlocked>,
+    temp_dir: Option<&Path>,
 ) -> Result<(), EngineError> {
     // 1. Project the SQLite mirror back to a Vault. After migration
     //    0003, the projection reconstitutes the full `Meta` and
@@ -123,7 +131,7 @@ pub(crate) fn save(
         .map_err(|e| EngineError::Serialise(e.to_string()))?;
 
     // 4. Atomic write.
-    let signature = atomic_write(path, &bytes)?;
+    let signature = atomic_write(path, &bytes, temp_dir)?;
 
     // 5. Record signature.
     engine.set_last_self_write(signature);
@@ -148,14 +156,26 @@ pub(crate) fn save(
 
 /// Write `bytes` to `path` atomically.
 ///
-/// 1. Create a sibling `NamedTempFile` in the parent directory.
+/// 1. Create a `NamedTempFile` in `temp_dir` (when supplied) or the
+///    destination's parent directory.
 /// 2. Write all bytes, flush, `sync_all`.
 /// 3. `persist` (rename) over the destination — POSIX guarantees
-///    atomicity.
+///    atomicity for same-volume renames.
 /// 4. Open the parent directory and `sync_all` so the directory entry
 ///    survives a power loss.
 /// 5. Stat the destination for the self-write signature.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<SelfWriteSignature, EngineError> {
+///
+/// `temp_dir`, when supplied, must live on the same filesystem volume
+/// as `path` — `rename(2)` is not cross-volume atomic and will fail
+/// with `EXDEV`. The override exists so sandboxed callers whose
+/// security-scoped bookmark covers only the kdbx file (not its parent
+/// directory) can route the tempfile through a known-writable
+/// sandbox-friendly location.
+fn atomic_write(
+    path: &Path,
+    bytes: &[u8],
+    temp_dir: Option<&Path>,
+) -> Result<SelfWriteSignature, EngineError> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -166,7 +186,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<SelfWriteSignature, EngineE
     // `tempfile::NamedTempFile::new_in` picks a random suffix and
     // creates the file with O_CREAT|O_EXCL, so there's no collision
     // with concurrent saves.
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    let tmp_in = temp_dir.unwrap_or(parent);
+    let mut tmp = tempfile::NamedTempFile::new_in(tmp_in)?;
     tmp.as_file_mut().write_all(bytes)?;
     tmp.as_file_mut().flush()?;
     tmp.as_file_mut().sync_all()?;

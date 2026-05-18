@@ -506,10 +506,19 @@ impl Engine {
     ///
     /// ## Atomic write
     ///
-    /// Bytes are written to a sibling tempfile, flushed and
-    /// `sync_all`'d, then `rename(2)`'d over `path`. The parent
+    /// Bytes are written to a tempfile, flushed and `sync_all`'d, then
+    /// `rename(2)`'d over `path`. The tempfile lives in `temp_dir` when
+    /// supplied, otherwise in `path`'s parent directory. The parent
     /// directory is then `sync_all`'d on a best-effort basis to make
     /// the directory entry durable.
+    ///
+    /// Pass `Some(temp_dir)` when the caller can write the destination
+    /// file but not arbitrary siblings of it — e.g. sandboxed macOS
+    /// frontends saving to iCloud Drive, where the security-scoped
+    /// bookmark grants write to the kdbx file only. The override must
+    /// live on the same filesystem volume as `path` (rename is not
+    /// cross-volume atomic). Pass `None` for non-sandboxed callers to
+    /// keep the historical sibling-tempfile behaviour.
     ///
     /// # Errors
     ///
@@ -522,8 +531,9 @@ impl Engine {
         &mut self,
         path: &Path,
         kdbx: &mut Kdbx<Unlocked>,
+        temp_dir: Option<&Path>,
     ) -> Result<(), EngineError> {
-        save::save(self, path, kdbx)?;
+        save::save(self, path, kdbx, temp_dir)?;
         self.emit(ChangeEvent::SaveCompleted);
         Ok(())
     }

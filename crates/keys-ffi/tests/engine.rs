@@ -506,6 +506,7 @@ async fn engine_async_save_completes() {
         .save_to_kdbx(
             kdbx_path.to_string_lossy().into_owned(),
             KDBX_PASSWORD.to_owned(),
+            None,
         )
         .await
         .expect("save");
@@ -530,6 +531,7 @@ async fn engine_async_reconcile_completes() {
         .save_to_kdbx(
             kdbx_path.to_string_lossy().into_owned(),
             KDBX_PASSWORD.to_owned(),
+            None,
         )
         .await
         .expect("save");
@@ -636,6 +638,7 @@ async fn engine_pending_conflict_peek_then_apply() {
         .save_to_kdbx(
             kdbx_path.to_string_lossy().into_owned(),
             KDBX_PASSWORD.to_owned(),
+            None,
         )
         .await
         .expect("save");

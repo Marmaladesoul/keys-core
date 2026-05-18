@@ -113,7 +113,9 @@ fn save_to_kdbx_records_signature_automatically() {
 
     // Save (engine writes the kdbx and should record the signature
     // for the just-written file).
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save");
 
     let (mtime_ms, byte_count) = stat_as_signature(&kdbx_path);
     let sig = engine
@@ -158,7 +160,9 @@ fn signature_updates_on_re_save() {
     let mut kdbx = fresh_kdbx_at(&kdbx_path);
     let mut engine = open_engine(&db_path);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save 1");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save 1");
     let sig1 = engine
         .kdbx_state_signature()
         .expect("query")
@@ -168,7 +172,9 @@ fn signature_updates_on_re_save() {
     // filesystems with coarse timestamp granularity.
     std::thread::sleep(Duration::from_millis(20));
 
-    engine.save_to_kdbx(&kdbx_path, &mut kdbx).expect("save 2");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save 2");
     let sig2 = engine
         .kdbx_state_signature()
         .expect("query")

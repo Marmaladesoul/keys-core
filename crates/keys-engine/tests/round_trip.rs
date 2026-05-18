@@ -287,7 +287,7 @@ fn assert_kdbx_round_trips(kdbx: Kdbx<Unlocked>, label: &str) {
     //    pre-save vault via the snapshot captured in step 1.
     let mut kdbx = kdbx;
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("save_to_kdbx");
 
     drop(engine);
@@ -942,7 +942,7 @@ fn round_trip_keepass_core_fixture() {
 
     let mut kdbx = kdbx;
     engine
-        .save_to_kdbx(&kdbx_path, &mut kdbx)
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("save_to_kdbx");
     drop(engine);
     drop(kdbx);
