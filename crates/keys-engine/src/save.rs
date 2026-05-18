@@ -52,6 +52,55 @@ pub struct SelfWriteSignature {
     pub size: u64,
 }
 
+/// `(mtime, size)` of the KDBX file whose contents the engine's
+/// `SQLite` mirror currently corresponds to.
+///
+/// Recorded after a successful
+/// [`Engine::ingest_from_kdbx`](crate::engine::Engine::ingest_from_kdbx)
+/// (via [`Engine::record_kdbx_state_signature`](crate::engine::Engine::record_kdbx_state_signature))
+/// and after a successful [`Engine::save_to_kdbx`](crate::engine::Engine::save_to_kdbx)
+/// (automatic — the save path already has the path on hand). Persisted
+/// in the `setting` table so the value survives engine close + reopen.
+///
+/// Distinct from [`SelfWriteSignature`]: that one is consumed by the
+/// file-watcher self-write suppression on a single match (consume-on-match)
+/// and would lose its meaning if shared with the ingest path. This
+/// signature is a stable "what does my `SQLite` state correspond to on
+/// disk?" indicator that Keys-Mac uses to skip re-ingest on unlock when
+/// the on-disk KDBX hasn't changed since the last sync.
+///
+/// Shape mirrors `SelfWriteSignature` semantically but uses
+/// `mtime_ms: i64` (milliseconds since Unix epoch) for cross-FFI
+/// compatibility — Swift consumers compute the same value from
+/// `FileManager`'s `modificationDate.timeIntervalSince1970 * 1000`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdbxStateSignature {
+    /// `modified` timestamp of the KDBX file at the moment the signature
+    /// was recorded, in milliseconds since the Unix epoch.
+    pub mtime_ms: i64,
+    /// Byte length of the KDBX file.
+    pub byte_count: u64,
+}
+
+impl KdbxStateSignature {
+    /// Stat `path` and build a signature from its `(mtime, size)`.
+    pub(crate) fn from_path(path: &Path) -> Result<Self, EngineError> {
+        let meta = std::fs::metadata(path)?;
+        let mtime = meta.modified()?;
+        let mtime_ms = match mtime.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+            Err(e) => {
+                // Pre-1970 mtime — clamp to negative ms.
+                -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX)
+            }
+        };
+        Ok(Self {
+            mtime_ms,
+            byte_count: meta.len(),
+        })
+    }
+}
+
 /// Engine-internal entry point. Called from
 /// [`Engine::save_to_kdbx`](crate::engine::Engine::save_to_kdbx).
 pub(crate) fn save(
@@ -85,6 +134,14 @@ pub(crate) fn save(
     //    KDBX is already internally compressed, so gzip would buy <5%
     //    at the cost of an extra moving part.
     engine.set_last_saved_kdbx_bytes(&bytes)?;
+
+    // 7. Record the kdbx-state signature so Keys-Mac can skip re-ingest
+    //    on the next unlock if SQLite already matches the on-disk KDBX.
+    //    Stored separately from the self-write signature because that
+    //    one is consume-on-match (file-watcher suppression) — sharing
+    //    would let an ingest's signature swallow a real subsequent
+    //    external-change event.
+    engine.record_kdbx_state_signature(path)?;
 
     Ok(())
 }

@@ -57,5 +57,5 @@ pub use reconcile::{MergeResult, MergeStats};
 pub use keepass_merge::{
     AttachmentChoice, ConflictSide, DeleteEditChoice, Resolution as ConflictResolution,
 };
-pub use save::SelfWriteSignature;
+pub use save::{KdbxStateSignature, SelfWriteSignature};
 pub use strength::{Strength, strength};

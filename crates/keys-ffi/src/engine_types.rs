@@ -54,6 +54,27 @@ impl From<Page> for eng::Pagination {
     }
 }
 
+/// `(mtime, size)` signature of the KDBX file whose contents the
+/// engine's SQLite mirror currently corresponds to. See
+/// [`crate::Engine::kdbx_state_signature`].
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdbxStateSignatureFfi {
+    /// `modified` timestamp of the KDBX file, in milliseconds since the
+    /// Unix epoch.
+    pub mtime_ms: i64,
+    /// Byte length of the KDBX file.
+    pub byte_count: u64,
+}
+
+impl From<eng::KdbxStateSignature> for KdbxStateSignatureFfi {
+    fn from(s: eng::KdbxStateSignature) -> Self {
+        Self {
+            mtime_ms: s.mtime_ms,
+            byte_count: s.byte_count,
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Enums
 // ────────────────────────────────────────────────────────────────────────

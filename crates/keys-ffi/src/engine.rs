@@ -62,8 +62,8 @@ use crate::engine_observer::{BridgeObserver, VaultDataChangeObserver};
 use crate::engine_portable::EnginePortableEntry;
 use crate::engine_types::{
     ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull, EntryUpdate,
-    GroupNode, GroupUpdate, HistoricEntry, IconRef, MergeResult, NewEntryFields, NewGroupFields,
-    Page, Predicate, SmartFolder, VaultState, parse_uuid,
+    GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi, MergeResult,
+    NewEntryFields, NewGroupFields, Page, Predicate, SmartFolder, VaultState, parse_uuid,
 };
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
@@ -138,6 +138,23 @@ impl Engine {
     /// Current lifecycle/health state.
     pub fn state(&self) -> Result<VaultState, EngineError> {
         self.with_engine(|e| Ok(e.state().into()))
+    }
+
+    /// The `(mtime, size)` signature of the KDBX file whose contents the
+    /// engine's SQLite mirror currently corresponds to, or `None` if
+    /// no ingest / save has happened yet on this database.
+    ///
+    /// Recorded automatically after a successful `ingest_from_kdbx` or
+    /// `save_to_kdbx` call. Persisted in the SQLite settings table so
+    /// the value survives engine close + reopen.
+    ///
+    /// Frontends use this on unlock to skip re-ingest when the on-disk
+    /// KDBX hasn't changed since the last sync (`stat` the file, build
+    /// the same `(mtime_ms, byte_count)`, compare). Swift: take
+    /// `FileManager.attributesOfItem(atPath:)`'s `.modificationDate`
+    /// (`* 1000` for ms) and `.fileSizeKey`.
+    pub fn kdbx_state_signature(&self) -> Result<Option<KdbxStateSignatureFfi>, EngineError> {
+        self.with_engine(|e| Ok(e.kdbx_state_signature()?.map(Into::into)))
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -745,10 +762,22 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let path = PathBuf::from(kdbx_path);
         let pw = SecretString::from(password);
-        let result = tokio::task::spawn_blocking(move || open_unlocked(&path, &pw))
+        let path_for_open = path.clone();
+        let result = tokio::task::spawn_blocking(move || open_unlocked(&path_for_open, &pw))
             .await
             .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
-        self.with_engine_mut(|e| Ok(e.ingest_from_kdbx(&result)?))
+        self.with_engine_mut(|e| {
+            e.ingest_from_kdbx(&result)?;
+            // Record the post-ingest kdbx-state signature so the
+            // frontend can skip re-ingest on a later unlock when the
+            // on-disk KDBX hasn't changed. `save_to_kdbx` records the
+            // same signature internally; only `ingest_from_kdbx` needs
+            // the path threaded through here (the engine method
+            // doesn't take one — kept that way to avoid churning every
+            // existing call site).
+            e.record_kdbx_state_signature(&path)?;
+            Ok(())
+        })
     }
 
     /// Project SQLite state into a KDBX at `kdbx_path` (the file at

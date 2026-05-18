@@ -629,6 +629,90 @@ impl Engine {
         Ok(())
     }
 
+    /// The `(mtime, size)` of the KDBX file whose contents this engine's
+    /// `SQLite` mirror currently corresponds to, or `None` if neither
+    /// [`Engine::ingest_from_kdbx`] nor [`Engine::save_to_kdbx`] has
+    /// been paired with a [`Engine::record_kdbx_state_signature`] call
+    /// on this database yet.
+    ///
+    /// Used by Keys-Mac on unlock: stat the KDBX file and compare; if
+    /// the signature matches, skip `ingest_from_kdbx` (the 1–4s
+    /// wall-clock dominator on big vaults) because `SQLite` is already
+    /// in sync with disk.
+    ///
+    /// Persisted in the `setting` table (keys
+    /// `kdbx_state_signature_mtime_ms`, `kdbx_state_signature_byte_count`)
+    /// so the value survives engine close + reopen. Distinct from
+    /// [`Engine::last_self_write`]: that one is consumed by the
+    /// file-watcher self-write suppression and would lose its meaning
+    /// if shared with the ingest path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn kdbx_state_signature(&self) -> Result<Option<crate::KdbxStateSignature>, EngineError> {
+        let mtime_ms: Option<i64> = match self.conn.query_row(
+            "SELECT value FROM setting WHERE key = 'kdbx_state_signature_mtime_ms'",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(EngineError::Sqlite(err)),
+        };
+        let byte_count: Option<i64> = match self.conn.query_row(
+            "SELECT value FROM setting WHERE key = 'kdbx_state_signature_byte_count'",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(EngineError::Sqlite(err)),
+        };
+        match (mtime_ms, byte_count) {
+            (Some(mtime_ms), Some(byte_count)) => Ok(Some(crate::KdbxStateSignature {
+                mtime_ms,
+                // SQLite stores INTEGER as i64; size always fits but
+                // we coerce defensively.
+                byte_count: u64::try_from(byte_count).unwrap_or(0),
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// Record the `(mtime, size)` of the KDBX file at `path` as the
+    /// signature corresponding to the engine's current `SQLite` state.
+    ///
+    /// Frontends should call this after a successful
+    /// [`Engine::ingest_from_kdbx`]. [`Engine::save_to_kdbx`] calls it
+    /// automatically (the save path already has the file path on hand).
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Io`] if `path` can't be stat'd or its mtime
+    ///   can't be read.
+    /// - [`EngineError::Sqlite`] on persistence failure.
+    pub fn record_kdbx_state_signature(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), EngineError> {
+        let sig = crate::KdbxStateSignature::from_path(path)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO setting(key, value) VALUES ('kdbx_state_signature_mtime_ms', ?1)",
+            rusqlite::params![sig.mtime_ms],
+        )?;
+        // Store as i64 — SQLite has no native u64. Sizes up to
+        // i64::MAX (8 exabytes) fit; KDBX files in practice are <100MB.
+        let byte_count_i64 = i64::try_from(sig.byte_count).unwrap_or(i64::MAX);
+        tx.execute(
+            "INSERT OR REPLACE INTO setting(key, value) VALUES ('kdbx_state_signature_byte_count', ?1)",
+            rusqlite::params![byte_count_i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Reconcile the engine's `SQLite` state against the current
     /// on-disk KDBX file at `kdbx_path`.
     ///
