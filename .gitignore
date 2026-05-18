@@ -15,6 +15,7 @@ Cargo.lock.bak
 /swift-harness/Sources/KeysCoreFFI/
 /swift-harness/KeysCoreFFI.xcframework/
 /swift-harness/.build/
+/swift-harness/build/
 /swift-harness/.swiftpm/
 /swift-harness/Package.resolved
 
