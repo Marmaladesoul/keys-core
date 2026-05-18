@@ -638,6 +638,16 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.delete_history_at(u, history_index)?))
     }
 
+    /// See [`keys_engine::Engine::restore_entry_from_history`].
+    pub fn restore_entry_from_history(
+        &self,
+        entry_uuid: String,
+        history_index: u32,
+    ) -> Result<(), EngineError> {
+        let u = parse_uuid(&entry_uuid, "entry")?;
+        self.with_engine_mut(|e| Ok(e.restore_entry_from_history(u, history_index)?))
+    }
+
     /// See [`keys_engine::Engine::export_entry`]. Returns an opaque
     /// [`EnginePortableEntry`] handle the caller passes to
     /// [`Self::import_entry`] on the destination engine (or the same

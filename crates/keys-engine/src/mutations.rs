@@ -15,13 +15,17 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
+use std::collections::HashMap;
+
+use keepass_core::protector::{FieldProtector, SessionKey, open_with_key, seal_with_key};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use secrecy::{ExposeSecret, SecretString};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
-use crate::error::EngineError;
+use crate::error::{EngineError, RevealError};
 use crate::fingerprint;
 use crate::model::{EntryUpdate, GroupUpdate, IconRef, NewEntryFields, NewGroupFields};
 use crate::strength;
@@ -857,6 +861,568 @@ pub(crate) fn delete_history_at(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Restore an entry to the state captured in one of its history
+/// snapshots, preserving the snapshot in the history list and pushing
+/// the pre-restore live state as a brand new snapshot at the tail.
+///
+/// Mirrors the legacy `Vault::restore_entry_from_history` /
+/// `keepass_core::Kdbx::restore_entry_from_history` contract under
+/// `HistoryPolicy::Snapshot`:
+///
+/// * Snapshot at `history_index` is **cloned** out (not consumed); the
+///   list grows by one and the targeted snapshot stays put.
+/// * A fresh snapshot capturing the **pre-restore live entry** is
+///   appended at the tail (`history_index = old_max + 1`). Future
+///   undoes can return to that pre-restore state.
+/// * The live `entry` row is overwritten field-by-field from the
+///   snapshot (title, username, url, notes, icon, tags, attachments,
+///   custom fields, protected fields, timestamps).
+/// * `modified_at` is bumped to `now()` — the restore is a real
+///   content edit. `created_at`, `accessed_at`, `last_used_at`,
+///   `expires_at` are restored verbatim from the snapshot.
+/// * Derived columns are recomputed from the restored content:
+///   `password_strength_bucket`, `password_entropy`,
+///   `password_fingerprint`, `url_host`, `has_totp`.
+/// * Optional inline `history_max_items` trim drops oldest snapshots
+///   first (matching `keepass_core::truncate_history`'s item-budget
+///   pass). `history_max_size` is left to the next round-trip through
+///   keepass-core's save path — the engine doesn't model serialised
+///   byte budgets here.
+///
+/// Protected-field wrapping reuses the bytes already in the snapshot
+/// JSON: those blobs were sealed under the engine's session key at
+/// ingest time, and the current `entry_protected` rows are sealed
+/// under that same key, so a verbatim copy keeps the cipher chain
+/// intact. The password plaintext is briefly unwrapped (held in a
+/// `Zeroizing` buffer that wipes on drop) only to compute the new
+/// `password_fingerprint` HMAC, which needs plaintext bytes.
+///
+/// # Errors
+///
+/// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry with
+///   that uuid exists.
+/// - [`EngineError::NotFound`] (`entity = "history_snapshot"`) if
+///   `history_index` is outside `0..N` for that entry's history.
+/// - [`EngineError::Reveal`] / [`EngineError::Wrap`] /
+///   [`EngineError::SessionKey`] on protector failure.
+/// - [`EngineError::Sqlite`] on storage failure.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn restore_entry_from_history(
+    conn: &mut Connection,
+    fingerprint_key: &[u8; 32],
+    protector: &dyn FieldProtector,
+    uuid: Uuid,
+    history_index: u32,
+    history_max_items: i32,
+) -> Result<(), EngineError> {
+    let uuid_str = uuid.to_string();
+    let session = session_key(protector)?;
+    let tx = conn.transaction()?;
+
+    if !entry_exists(&tx, &uuid_str)? {
+        return Err(EngineError::NotFound { entity: "entry" });
+    }
+
+    // ── 1. Load the target snapshot JSON ─────────────────────────────
+    let target_json: Option<String> = tx
+        .query_row(
+            "SELECT snapshot_json FROM entry_history \
+             WHERE entry_uuid = ?1 AND history_index = ?2",
+            params![uuid_str, i64::from(history_index)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(target_json) = target_json else {
+        return Err(EngineError::NotFound {
+            entity: "history_snapshot",
+        });
+    };
+    let snap: HistorySnapshotIo = serde_json::from_str(&target_json)
+        .map_err(|e| EngineError::Reveal(RevealError::Json(e)))?;
+
+    // ── 2. Capture pre-restore live state as a new snapshot ──────────
+    let pre_restore = build_live_snapshot(&tx, &uuid_str)?;
+    let pre_restore_json = serde_json::to_string(&pre_restore)
+        .map_err(|e| EngineError::Reveal(RevealError::Json(e)))?;
+
+    // ── 3. Unwrap snapshot password to recompute derived columns ─────
+    let wrapped_pw_bytes =
+        b64_decode(&snap.password).map_err(|e| EngineError::Reveal(RevealError::Unwrap(e)))?;
+    let pw_plain = open_with_key(&session, &wrapped_pw_bytes)
+        .map(Zeroizing::new)
+        .map_err(|e| EngineError::Reveal(RevealError::Unwrap(e.to_string())))?;
+    let pw_plain_str = std::str::from_utf8(&pw_plain).map_err(|e| {
+        EngineError::Reveal(RevealError::Unwrap(format!("non-utf8 plaintext: {e}")))
+    })?;
+    let (bucket, entropy, fp) = password_columns(pw_plain_str, fingerprint_key);
+    let fp_param: Option<&[u8]> = fp.as_ref().map(|b| &b[..]);
+
+    // ── 4. Overwrite the live entry row ──────────────────────────────
+    let now = now_ms();
+    let url_host = parse_host(&snap.url);
+    let icon_index_i64 = snap.icon_index.map(i64::from);
+    tx.execute(
+        "UPDATE entry SET \
+            title = ?1, username = ?2, url = ?3, url_host = ?4, notes = ?5, \
+            icon_index = ?6, icon_custom_uuid = ?7, \
+            created_at = ?8, modified_at = ?9, accessed_at = ?10, \
+            last_used_at = ?11, expires_at = ?12, \
+            password_strength_bucket = ?13, password_entropy = ?14, password_fingerprint = ?15 \
+         WHERE uuid = ?16",
+        params![
+            snap.title,
+            snap.username,
+            snap.url,
+            url_host,
+            snap.notes,
+            icon_index_i64,
+            snap.icon_custom_uuid,
+            snap.created_at,
+            now,
+            snap.accessed_at,
+            snap.last_used_at,
+            snap.expires_at,
+            i64::from(bucket),
+            entropy,
+            fp_param,
+            uuid_str,
+        ],
+    )?;
+
+    // ── 5. Replace entry_protected with the snapshot's set ───────────
+    tx.execute(
+        "DELETE FROM entry_protected WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    // Canonical Password slot — wrapped bytes copied verbatim from the
+    // snapshot (sealed under the same session key as live entries).
+    tx.execute(
+        "INSERT INTO entry_protected (entry_uuid, field_name, wrapped_blob) \
+         VALUES (?1, ?2, ?3)",
+        params![uuid_str, PASSWORD_FIELD, wrapped_pw_bytes],
+    )?;
+    drop(pw_plain);
+    drop(session);
+
+    // ── 6. Replace entry_custom_field + protected custom fields ──────
+    tx.execute(
+        "DELETE FROM entry_custom_field WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    for (name, cf) in &snap.custom_fields {
+        if name == PASSWORD_FIELD {
+            // Mirrors ingest / create_entry policy: never duplicate the
+            // canonical Password slot via a custom-field row.
+            continue;
+        }
+        if cf.protected {
+            let bytes =
+                b64_decode(&cf.value).map_err(|e| EngineError::Reveal(RevealError::Unwrap(e)))?;
+            tx.execute(
+                "INSERT INTO entry_protected (entry_uuid, field_name, wrapped_blob) \
+                 VALUES (?1, ?2, ?3)",
+                params![uuid_str, name, bytes],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO entry_custom_field (entry_uuid, field_name, value) \
+                 VALUES (?1, ?2, ?3)",
+                params![uuid_str, name, cf.value],
+            )?;
+        }
+    }
+
+    // ── 7. Replace entry_attachment links via sha256_hex resolution ──
+    tx.execute(
+        "DELETE FROM entry_attachment WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    for att in &snap.attachments {
+        if att.sha256_hex.is_empty() {
+            // Pre-widening snapshot row — bytes can't be resolved.
+            // Skip rather than insert a dangling row.
+            continue;
+        }
+        let Some(sha_bytes) = hex_to_bytes(&att.sha256_hex) else {
+            continue;
+        };
+        // Confirm the blob still lives in attachment_blob. Skip if it
+        // was GC'd out from under us — the alternative is a FK violation
+        // that aborts the whole restore.
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM attachment_blob WHERE sha256 = ?1",
+                params![sha_bytes],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO entry_attachment (entry_uuid, attachment_name, blob_sha256) \
+             VALUES (?1, ?2, ?3)",
+            params![uuid_str, att.name, sha_bytes],
+        )?;
+    }
+
+    // ── 8. Replace entry_tag set ─────────────────────────────────────
+    tx.execute(
+        "DELETE FROM entry_tag WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    insert_tags(&tx, &uuid_str, &snap.tags)?;
+
+    // ── 9. Recompute has_totp from the freshly restored state ────────
+    recompute_has_totp(&tx, &uuid_str)?;
+
+    // ── 10. Append pre-restore snapshot at the tail ──────────────────
+    let max_idx: Option<i64> = tx
+        .query_row(
+            "SELECT MAX(history_index) FROM entry_history WHERE entry_uuid = ?1",
+            params![uuid_str],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let next_idx = max_idx.map_or(0, |i| i + 1);
+    tx.execute(
+        "INSERT INTO entry_history (entry_uuid, history_index, snapshot_json) \
+         VALUES (?1, ?2, ?3)",
+        params![uuid_str, next_idx, pre_restore_json],
+    )?;
+
+    // ── 11. Trim oldest snapshots if history_max_items is exceeded ───
+    // Matches the item-count budget pass in
+    // `keepass_core::truncate_history`. Size budget is intentionally
+    // left to the next save/round-trip — modelling serialised XML
+    // bytes from inside the engine duplicates keepass-core's logic
+    // and is brittle in the face of format changes.
+    if history_max_items >= 0 {
+        let cap = i64::from(history_max_items);
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM entry_history WHERE entry_uuid = ?1",
+            params![uuid_str],
+            |r| r.get(0),
+        )?;
+        if count > cap {
+            let to_drop = count - cap;
+            // Drop the `to_drop` rows with the lowest history_index,
+            // then renumber survivors to a dense `0..N`.
+            tx.execute(
+                "DELETE FROM entry_history \
+                 WHERE rowid IN ( \
+                    SELECT rowid FROM entry_history \
+                    WHERE entry_uuid = ?1 \
+                    ORDER BY history_index ASC \
+                    LIMIT ?2 \
+                 )",
+                params![uuid_str, to_drop],
+            )?;
+            // Re-pack remaining indices. Single pass: shift every
+            // surviving row's index down by `to_drop`. Safe even when
+            // the shift produces a transient PK collision because the
+            // shift order is monotonic (smallest index moves to 0).
+            tx.execute(
+                "UPDATE entry_history \
+                 SET history_index = history_index - ?2 \
+                 WHERE entry_uuid = ?1",
+                params![uuid_str, to_drop],
+            )?;
+        }
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+/// Build a `HistorySnapshotIo` from the **current live** state of an
+/// entry — mirrors `crate::ingest::HistorySnapshot::from_entry` but
+/// reads from SQL rather than an in-memory `Entry`. Used by
+/// [`restore_entry_from_history`] to capture the pre-restore state as
+/// a brand new history row.
+///
+/// Protected-field wrapped bytes (the canonical `Password` slot and any
+/// custom protected field) are copied verbatim from `entry_protected`
+/// and re-encoded as base64 — they were already sealed under the
+/// engine's session key, and the new history JSON inherits that
+/// cipher chain, so no unwrap/re-wrap is needed here.
+#[allow(clippy::too_many_lines)]
+fn build_live_snapshot(
+    tx: &Transaction<'_>,
+    uuid_str: &str,
+) -> Result<HistorySnapshotIo, EngineError> {
+    // Scalar columns on `entry`.
+    #[allow(clippy::type_complexity)]
+    let row: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<f64>,
+    ) = tx.query_row(
+        "SELECT title, username, url, url_host, notes, \
+                icon_index, icon_custom_uuid, \
+                created_at, modified_at, accessed_at, last_used_at, expires_at, \
+                password_strength_bucket, password_entropy \
+         FROM entry WHERE uuid = ?1",
+        params![uuid_str],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+                r.get(13)?,
+            ))
+        },
+    )?;
+    let (
+        title,
+        username,
+        url,
+        url_host,
+        notes,
+        icon_index,
+        icon_custom_uuid,
+        created_at,
+        modified_at,
+        accessed_at,
+        last_used_at,
+        expires_at,
+        password_strength_bucket,
+        password_entropy,
+    ) = row;
+
+    // Protected fields → wrapped-blob bytes, b64-encoded into JSON.
+    let mut password_b64 = String::new();
+    let mut custom_fields: HashMap<String, HistoryCustomFieldIo> = HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT field_name, wrapped_blob FROM entry_protected WHERE entry_uuid = ?1",
+        )?;
+        let mut rows = stmt.query(params![uuid_str])?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(0)?;
+            let blob: Vec<u8> = r.get(1)?;
+            if name == PASSWORD_FIELD {
+                password_b64 = b64_encode(&blob);
+            } else {
+                custom_fields.insert(
+                    name,
+                    HistoryCustomFieldIo {
+                        value: b64_encode(&blob),
+                        protected: true,
+                    },
+                );
+            }
+        }
+    }
+
+    // Non-protected custom fields → plaintext.
+    {
+        let mut stmt =
+            tx.prepare("SELECT field_name, value FROM entry_custom_field WHERE entry_uuid = ?1")?;
+        let mut rows = stmt.query(params![uuid_str])?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(0)?;
+            let value: String = r.get(1)?;
+            custom_fields.insert(
+                name,
+                HistoryCustomFieldIo {
+                    value,
+                    protected: false,
+                },
+            );
+        }
+    }
+
+    // Tags.
+    let mut tags: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT t.name FROM entry_tag et \
+             JOIN tag t ON t.id = et.tag_id \
+             WHERE et.entry_uuid = ?1 \
+             ORDER BY t.name ASC",
+        )?;
+        let rows = stmt.query_map(params![uuid_str], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    // Defensive: dedupe in case ingest somehow allowed duplicates.
+    tags.sort();
+    tags.dedup();
+
+    // Attachments → resolve size + sha256 via the content-addressed blob.
+    let attachments: Vec<HistoryAttachmentIo> = {
+        let mut stmt = tx.prepare(
+            "SELECT ea.attachment_name, ab.sha256, ab.size \
+             FROM entry_attachment ea \
+             JOIN attachment_blob ab ON ab.sha256 = ea.blob_sha256 \
+             WHERE ea.entry_uuid = ?1",
+        )?;
+        let rows = stmt.query_map(params![uuid_str], |r| {
+            let name: String = r.get(0)?;
+            let sha: Vec<u8> = r.get(1)?;
+            let size: i64 = r.get(2)?;
+            Ok((name, sha, size))
+        })?;
+        rows.filter_map(Result::ok)
+            .map(|(name, sha, size)| HistoryAttachmentIo {
+                name,
+                size: u64::try_from(size).unwrap_or(0),
+                sha256_hex: bytes_to_hex(&sha),
+            })
+            .collect()
+    };
+
+    Ok(HistorySnapshotIo {
+        title,
+        username,
+        url,
+        url_host,
+        notes,
+        password: password_b64,
+        tags,
+        created_at,
+        modified_at,
+        accessed_at,
+        last_used_at,
+        expires_at,
+        icon_index: icon_index.map(|i| u32::try_from(i).unwrap_or(0)),
+        icon_custom_uuid,
+        password_strength_bucket: password_strength_bucket.map(|i| u8::try_from(i).unwrap_or(0)),
+        password_entropy,
+        attachments,
+        custom_fields,
+    })
+}
+
+/// Round-trip shape for `entry_history.snapshot_json`. Symmetric with
+/// the write-side `crate::ingest::HistorySnapshot` and the read-side
+/// `crate::reads::HistorySnapshotRead` — kept private here because
+/// [`restore_entry_from_history`] needs both ends in one place.
+#[derive(Serialize, Deserialize)]
+struct HistorySnapshotIo {
+    title: String,
+    username: String,
+    url: String,
+    #[serde(default)]
+    url_host: String,
+    #[serde(default)]
+    notes: String,
+    /// Base64 of the AES-GCM-sealed password under the engine's session
+    /// key. Empty string only for pre-widening snapshots that predated
+    /// the canonical password slot — restore copies verbatim into
+    /// `entry_protected`, so an empty value means "no password row",
+    /// not "empty-string password" (the seal of an empty string would
+    /// still be a non-empty base64 blob).
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    created_at: i64,
+    #[serde(default)]
+    modified_at: i64,
+    #[serde(default)]
+    accessed_at: i64,
+    #[serde(default)]
+    last_used_at: Option<i64>,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    icon_index: Option<u32>,
+    #[serde(default)]
+    icon_custom_uuid: Option<String>,
+    #[serde(default)]
+    password_strength_bucket: Option<u8>,
+    #[serde(default)]
+    password_entropy: Option<f64>,
+    #[serde(default)]
+    attachments: Vec<HistoryAttachmentIo>,
+    #[serde(default)]
+    custom_fields: HashMap<String, HistoryCustomFieldIo>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HistoryAttachmentIo {
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    sha256_hex: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HistoryCustomFieldIo {
+    value: String,
+    #[serde(default)]
+    protected: bool,
+}
+
+fn b64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| format!("base64 decode: {e}"))
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+            let _ = write!(&mut acc, "{b:02x}");
+            acc
+        })
+}
+
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for chunk in s.as_bytes().chunks_exact(2) {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 pub(crate) fn remove_attachment(

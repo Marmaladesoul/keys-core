@@ -2427,6 +2427,64 @@ impl Engine {
         self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
         Ok(())
     }
+
+    /// Restore an entry to the state captured in one of its history
+    /// snapshots, preserving the snapshot in the history list and
+    /// pushing the pre-restore live state as a new snapshot at the
+    /// tail.
+    ///
+    /// Semantics match the legacy
+    /// `Vault::restore_entry_from_history` /
+    /// `keepass_core::Kdbx::restore_entry_from_history` contract under
+    /// `HistoryPolicy::Snapshot`: the snapshot at `history_index` is
+    /// **not consumed** — the entry's history grows by one record, the
+    /// targeted snapshot stays at its original index, and a fresh
+    /// snapshot of the pre-restore live state is appended so the
+    /// restore is itself reversible via a subsequent call.
+    ///
+    /// `entry.modified_at` is bumped to `now()` (the restore is a real
+    /// content edit). `created_at`, `accessed_at`, `last_used_at`, and
+    /// `expires_at` are restored verbatim from the snapshot, and
+    /// derived columns (`password_strength_bucket`, `password_entropy`,
+    /// `password_fingerprint`, `url_host`, `has_totp`) are recomputed
+    /// from the restored content. Tags, attachments (resolved via the
+    /// snapshot's `sha256_hex`), custom fields, and protected fields
+    /// are replaced wholesale.
+    ///
+    /// If the resulting history list exceeds the vault's
+    /// `meta.history_max_items` budget, the oldest snapshots are
+    /// dropped inline (matching the item-budget pass of
+    /// `keepass_core::truncate_history`). The `history_max_size` byte
+    /// budget is left to the next save round-trip through keepass-core.
+    ///
+    /// Emits [`ChangeEvent::EntriesUpdated`] for `entry_uuid`.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry
+    ///   with that uuid exists.
+    /// - [`EngineError::NotFound`] (`entity = "history_snapshot"`) if
+    ///   `history_index` is outside `0..N` for that entry's history.
+    /// - [`EngineError::Reveal`] / [`EngineError::Wrap`] /
+    ///   [`EngineError::SessionKey`] on protector failure.
+    /// - [`EngineError::Sqlite`] on storage failure.
+    pub fn restore_entry_from_history(
+        &mut self,
+        entry_uuid: Uuid,
+        history_index: u32,
+    ) -> Result<(), EngineError> {
+        let max_items = crate::meta::read_history_max_items(&self.conn)?;
+        mutations::restore_entry_from_history(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            entry_uuid,
+            history_index,
+            max_items,
+        )?;
+        self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
+        Ok(())
+    }
 }
 
 /// Apply the raw 32-byte key via `PRAGMA key = "x'<hex>'"`.
