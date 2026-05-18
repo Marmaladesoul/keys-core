@@ -75,6 +75,18 @@ impl From<eng::KdbxStateSignature> for KdbxStateSignatureFfi {
     }
 }
 
+/// `(tag_name, count)` pair returned by
+/// [`crate::Engine::tag_usage_counts`]. Uniffi can't return a tuple
+/// from a method elegantly, so this is the FFI carrier.
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct TagUsageCount {
+    /// Tag name as stored in the `tag` table.
+    pub name: String,
+    /// Number of entries referencing this tag, including recycle-bin
+    /// entries.
+    pub count: u64,
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Enums
 // ────────────────────────────────────────────────────────────────────────

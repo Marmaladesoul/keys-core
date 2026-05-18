@@ -1273,6 +1273,27 @@ impl Engine {
         crate::reads::list_tags(&self.conn)
     }
 
+    /// Return `(tag_name, entry_count)` pairs for every tag in use,
+    /// sorted by tag name `COLLATE NOCASE`.
+    ///
+    /// Counts include recycle-bin entries — matches the legacy Swift
+    /// `TagListStore::usageCount` behaviour, which was fed
+    /// `allEntriesIncludingRecycleBin`. Tags with zero referencing
+    /// entries don't appear (an `INNER JOIN` against `entry_tag`
+    /// filters them naturally).
+    ///
+    /// Backs the Settings → Tags usage column: one SQL `GROUP BY`
+    /// replaces an O(N×M) walk that previously hydrated every entry
+    /// (including Secure-Enclave reveals for custom fields) just to
+    /// count tag references.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn tag_usage_counts(&self) -> Result<Vec<(String, u64)>, EngineError> {
+        crate::reads::tag_usage_counts(&self.conn)
+    }
+
     /// Uuid of the recycle-bin group, or `None` if no bin exists.
     ///
     /// Sourced from the `group` table's `is_recycle_bin = 1` row — the

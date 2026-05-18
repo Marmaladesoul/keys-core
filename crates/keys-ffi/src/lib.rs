@@ -42,7 +42,7 @@ pub use engine_types::{
     CustomFieldRef as EngineCustomFieldRef, EngineEntrySummary, EntryFull,
     EntryUpdate as EngineEntryUpdate, GroupNode, GroupUpdate as EngineGroupUpdate, HistoricEntry,
     IconRef, MergeResult, MergeStats, NewCustomField, NewEntryFields, NewGroupFields, Page,
-    Predicate, SearchScope, SmartFolder, StrengthBucket, VaultState,
+    Predicate, SearchScope, SmartFolder, StrengthBucket, TagUsageCount, VaultState,
 };
 pub use error::VaultError;
 pub use merge::{

@@ -610,6 +610,33 @@ pub(crate) fn list_tags(conn: &Connection) -> Result<Vec<String>, EngineError> {
     Ok(rows)
 }
 
+/// Return `(tag_name, entry_count)` pairs for every tag with at least
+/// one referencing entry, sorted by tag name `COLLATE NOCASE`.
+///
+/// Includes recycle-bin entries in the count — preserves the legacy
+/// Swift `TagListStore::usageCount` behaviour. The `INNER JOIN` against
+/// `entry_tag` naturally drops tags with zero references; orphan-row GC
+/// in `set_tags`/`delete_entry`/`delete_group` keeps the `tag` table
+/// authoritative, but the JOIN is defensive regardless.
+pub(crate) fn tag_usage_counts(conn: &Connection) -> Result<Vec<(String, u64)>, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT t.name, COUNT(et.entry_uuid) AS n \
+         FROM tag t \
+         JOIN entry_tag et ON et.tag_id = t.id \
+         JOIN entry e ON e.uuid = et.entry_uuid \
+         GROUP BY t.id \
+         ORDER BY t.name COLLATE NOCASE ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let name: String = r.get(0)?;
+            let count: i64 = r.get(1)?;
+            Ok((name, u64::try_from(count).unwrap_or(0)))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 pub(crate) fn entry_count(conn: &Connection, group: Option<Uuid>) -> Result<u64, EngineError> {
     let count: i64 = if let Some(uuid) = group {
         conn.query_row(

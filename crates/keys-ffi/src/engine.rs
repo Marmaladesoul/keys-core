@@ -63,8 +63,8 @@ use crate::engine_portable::EnginePortableEntry;
 use crate::engine_types::{
     ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull, EntryUpdate,
     GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi, MergeResult,
-    NewEntryFields, NewGroupFields, Page, Predicate, SearchScope, SmartFolder, VaultState,
-    parse_uuid,
+    NewEntryFields, NewGroupFields, Page, Predicate, SearchScope, SmartFolder, TagUsageCount,
+    VaultState, parse_uuid,
 };
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
@@ -245,6 +245,16 @@ impl Engine {
 
     pub fn list_tags(&self) -> Result<Vec<String>, EngineError> {
         self.with_engine(|e| Ok(e.list_tags()?))
+    }
+
+    /// See [`keys_engine::Engine::tag_usage_counts`].
+    pub fn tag_usage_counts(&self) -> Result<Vec<TagUsageCount>, EngineError> {
+        self.with_engine(|e| {
+            Ok(e.tag_usage_counts()?
+                .into_iter()
+                .map(|(name, count)| TagUsageCount { name, count })
+                .collect())
+        })
     }
 
     // ── Meta surface ───────────────────────────────────────────────────
