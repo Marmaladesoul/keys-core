@@ -66,6 +66,17 @@ pub(crate) const KEY_HEADER_HASH: &str = "meta.header_hash";
 pub(crate) const KEY_MEMORY_PROTECTION: &str = "meta.memory_protection";
 pub(crate) const KEY_UNKNOWN_XML: &str = "meta.unknown_xml";
 
+// KDBX outer-header facts. Not part of `Meta` (they live on the
+// envelope, not the XML payload) but persisted as `meta.*` setting rows
+// so the engine's `database_metadata` accessor can render the Info-tab
+// cipher and KDF strings without holding a live `Kdbx` handle. Written
+// at ingest time from the outer header; absent on engines created
+// pre-Phase-6.17-I-3c, in which case `database_metadata` falls back to
+// "Unknown" displays.
+pub(crate) const KEY_KDBX_CIPHER_OID: &str = "meta.kdbx_cipher_oid";
+pub(crate) const KEY_KDBX_KDF_PARAMETERS: &str = "meta.kdbx_kdf_parameters";
+pub(crate) const KEY_KDBX_TRANSFORM_ROUNDS: &str = "meta.kdbx_transform_rounds";
+
 // ─────────────────────── write path ───────────────────────
 
 /// Persist every field of `meta` into the `setting` table and the
@@ -309,6 +320,202 @@ pub(crate) fn write_history_max_items(
 /// the change event after the surrounding transaction commits.
 pub(crate) fn write_history_max_size(conn: &Connection, value: i64) -> Result<(), rusqlite::Error> {
     set_i64(conn, KEY_HISTORY_MAX_SIZE, value)
+}
+
+// ─────────────────────── kdbx outer-header accessors ───────────────────────
+//
+// Cipher + KDF live on the encrypted envelope, not in the XML payload
+// that becomes `Meta`. Persist the three relevant outer-header fields
+// at ingest time so the engine can render the Info-tab strings without
+// re-parsing the file. Display formatting lives below in
+// [`format_cipher_display`] / [`format_kdf_display`].
+
+/// Read-only facts about the encrypted database envelope and binary
+/// pool that back the "database properties" Info-tab in the frontend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseMetadata {
+    /// Generator string written into the KDBX `Meta` block by whoever
+    /// last saved the file — e.g. `"Keys"`, `"KeePassXC"`. Empty if
+    /// never set.
+    pub generator: String,
+    /// Display label for the outer cipher — `"AES-256-CBC"`,
+    /// `"ChaCha20"`, `"Twofish-CBC"`, or `"Unknown"` for a cipher UUID
+    /// this build doesn't recognise / hasn't been persisted yet.
+    pub cipher_display: String,
+    /// Single-line display string for the KDF parameters — e.g.
+    /// `"Argon2id (64 MB · 2 iter · 4 threads)"`,
+    /// `"AES-KDF (6,000,000 rounds)"`, or `"Unknown KDF"` for a
+    /// blob we couldn't decode / a vault ingested before this surface
+    /// existed.
+    pub kdf_display: String,
+    /// Distinct attachment blobs in the content-addressed pool.
+    pub attachment_total_count: u32,
+    /// Sum of `attachment_blob.size` across the pool, in bytes.
+    pub attachment_total_bytes: u64,
+}
+
+/// Persist the three outer-header facts needed for cipher / KDF
+/// display. Caller is responsible for clearing stale rows first
+/// (`clear_meta_tables` does this via the `meta.%` wildcard).
+pub(crate) fn write_kdbx_outer_header_facts(
+    conn: &Connection,
+    cipher_id_bytes: [u8; 16],
+    kdf_parameters: Option<&[u8]>,
+    transform_rounds: Option<u64>,
+) -> Result<(), rusqlite::Error> {
+    set_blob(conn, KEY_KDBX_CIPHER_OID, &cipher_id_bytes)?;
+    if let Some(blob) = kdf_parameters {
+        set_blob(conn, KEY_KDBX_KDF_PARAMETERS, blob)?;
+    } else {
+        conn.execute(
+            "DELETE FROM setting WHERE key = ?1",
+            params![KEY_KDBX_KDF_PARAMETERS],
+        )?;
+    }
+    if let Some(rounds) = transform_rounds {
+        // Store as i64 little-endian. `transform_rounds` is u64 in
+        // keepass-core; reinterpret bits — round counts that actually
+        // fit a u64 but not an i64 are far beyond anything practical
+        // and would just round-trip the bit pattern unchanged.
+        #[allow(clippy::cast_possible_wrap)]
+        set_i64(conn, KEY_KDBX_TRANSFORM_ROUNDS, rounds as i64)?;
+    } else {
+        conn.execute(
+            "DELETE FROM setting WHERE key = ?1",
+            params![KEY_KDBX_TRANSFORM_ROUNDS],
+        )?;
+    }
+    Ok(())
+}
+
+/// Read `Engine::database_metadata`'s read-only payload.
+///
+/// Generator: from `meta.generator` (already persisted by `write_meta`).
+/// Cipher / KDF: from the outer-header facts written at ingest. Absent
+/// rows surface as `"Unknown"` displays — see the field docs on
+/// [`DatabaseMetadata`].
+/// Attachment count + bytes: SQL over `attachment_blob`.
+pub(crate) fn read_database_metadata(conn: &Connection) -> Result<DatabaseMetadata, EngineError> {
+    let generator = get_text(conn, KEY_GENERATOR)?.unwrap_or_default();
+    let cipher_display = read_cipher_display(conn)?;
+    let kdf_display = read_kdf_display(conn)?;
+    let (attachment_total_count, attachment_total_bytes) = read_attachment_pool_stats(conn)?;
+    Ok(DatabaseMetadata {
+        generator,
+        cipher_display,
+        kdf_display,
+        attachment_total_count,
+        attachment_total_bytes,
+    })
+}
+
+fn read_cipher_display(conn: &Connection) -> Result<String, EngineError> {
+    use keepass_core::format::{CipherId, KnownCipher};
+    let Some(bytes) = get_blob(conn, KEY_KDBX_CIPHER_OID)? else {
+        return Ok("Unknown".to_owned());
+    };
+    let array: [u8; 16] = match bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return Ok("Unknown".to_owned()),
+    };
+    let cipher = CipherId(Uuid::from_bytes(array));
+    let label = match cipher.well_known() {
+        Some(KnownCipher::Aes256Cbc) => "AES-256-CBC",
+        Some(KnownCipher::ChaCha20) => "ChaCha20",
+        Some(KnownCipher::TwofishCbc) => "Twofish-CBC",
+        _ => "Unknown",
+    };
+    Ok(label.to_owned())
+}
+
+fn read_kdf_display(conn: &Connection) -> Result<String, EngineError> {
+    use keepass_core::format::KdfParams;
+    use keepass_core::format::var_dictionary::VarDictionary;
+
+    // KDBX4: VarDictionary in `meta.kdbx_kdf_parameters`.
+    if let Some(blob) = get_blob(conn, KEY_KDBX_KDF_PARAMETERS)? {
+        if let Ok(dict) = VarDictionary::parse(&blob)
+            && let Ok(params) = KdfParams::from_var_dictionary(&dict)
+        {
+            return Ok(format_kdf_params(&params));
+        }
+    }
+    // KDBX3: rounds + seed in their own outer-header fields.
+    if let Some(rounds_i64) = get_i64(conn, KEY_KDBX_TRANSFORM_ROUNDS)? {
+        // We stored u64 as i64 bits; reinterpret the same way.
+        #[allow(clippy::cast_sign_loss)]
+        let rounds = rounds_i64 as u64;
+        let formatted = format_with_thousands(rounds);
+        return Ok(format!("AES-KDF ({formatted} rounds)"));
+    }
+    Ok("Unknown KDF".to_owned())
+}
+
+fn read_attachment_pool_stats(conn: &Connection) -> Result<(u32, u64), EngineError> {
+    // `attachment_blob` is content-addressed; one row per distinct
+    // payload. Mirrors `Vault::binaries.len()` / sum-of-bytes on the
+    // legacy in-memory pool.
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM attachment_blob",
+        [],
+        |row| {
+            let count: i64 = row.get(0)?;
+            let total: i64 = row.get(1)?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let count_u32 = u32::try_from(count.max(0)).unwrap_or(u32::MAX);
+            #[allow(clippy::cast_sign_loss)]
+            let total_u64 = total.max(0) as u64;
+            Ok((count_u32, total_u64))
+        },
+    )
+    .map_err(EngineError::Sqlite)
+}
+
+/// Format a parsed [`keepass_core::format::KdfParams`] as a single-line
+/// display string. Argon2 variants render as
+/// `"<name> (<mib> MB · <iter> iter · <threads> threads)"`; AES-KDF as
+/// `"AES-KDF (<rounds> rounds)"` with thousands separators. Mirrors the
+/// legacy `Vault::kdf_display` formatter so the Info-tab string is
+/// byte-identical to what the in-memory shim produced.
+fn format_kdf_params(params: &keepass_core::format::KdfParams) -> String {
+    use keepass_core::format::{Argon2Variant, KdfParams};
+    match params {
+        KdfParams::AesKdf { rounds, .. } => {
+            let formatted = format_with_thousands(*rounds);
+            format!("AES-KDF ({formatted} rounds)")
+        }
+        KdfParams::Argon2 {
+            variant,
+            memory_bytes,
+            iterations,
+            parallelism,
+            ..
+        } => {
+            let name = match variant {
+                Argon2Variant::Argon2d => "Argon2d",
+                Argon2Variant::Argon2id => "Argon2id",
+                _ => "Argon2",
+            };
+            let mib = memory_bytes / (1024 * 1024);
+            format!("{name} ({mib} MB \u{00B7} {iterations} iter \u{00B7} {parallelism} threads)")
+        }
+        _ => "Unknown KDF".to_owned(),
+    }
+}
+
+/// Format an integer with comma thousands separators (e.g. 6000000 →
+/// "6,000,000"). Used by the AES-KDF branch.
+fn format_with_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*ch as char);
+    }
+    out
 }
 
 // ─────────────────────── custom-icon accessors ───────────────────────

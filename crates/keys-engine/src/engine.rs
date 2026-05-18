@@ -1207,6 +1207,39 @@ impl Engine {
         crate::meta::read_recycle_bin_enabled(&self.conn)
     }
 
+    /// Read-only facts about the encrypted database envelope and the
+    /// content-addressed attachment pool, packaged for the frontend's
+    /// "database properties" Info-tab.
+    ///
+    /// Sources:
+    ///
+    /// * `generator` — `setting`/`meta.generator` (written by
+    ///   the engine's meta writer at ingest).
+    /// * `cipher_display` — derived from
+    ///   `setting`/`meta.kdbx_cipher_oid` (a 16-byte UUID written at
+    ///   ingest from the live outer header).
+    /// * `kdf_display` — derived from
+    ///   `setting`/`meta.kdbx_kdf_parameters` (KDBX4 `VarDictionary`
+    ///   blob) or `setting`/`meta.kdbx_transform_rounds` (KDBX3
+    ///   fallback) — both written at ingest.
+    /// * `attachment_total_count` /
+    ///   `attachment_total_bytes` — `SELECT COUNT(*), SUM(size)
+    ///   FROM attachment_blob`. The pool is content-addressed, so
+    ///   stats are over distinct payloads (matches the legacy
+    ///   in-memory `Vault::binaries` semantics).
+    ///
+    /// Cipher / KDF facts are absent on engines created before this
+    /// surface existed; in that case the corresponding fields render
+    /// as `"Unknown"` / `"Unknown KDF"`. They become populated on the
+    /// next ingest (every save → reopen → ingest cycle refreshes them).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn database_metadata(&self) -> Result<crate::meta::DatabaseMetadata, EngineError> {
+        crate::meta::read_database_metadata(&self.conn)
+    }
+
     /// Per-entry history retention count cap.
     ///
     /// Sourced from `setting` row `meta.history_max_items`. Returns the

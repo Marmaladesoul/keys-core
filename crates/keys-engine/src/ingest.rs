@@ -78,6 +78,20 @@ pub(crate) fn ingest(
     meta::write_meta(&tx, &vault.meta)?;
     meta::write_deleted_objects(&tx, &vault.deleted_objects)?;
 
+    // Persist the three outer-header facts the engine's
+    // `database_metadata` accessor needs to render the Info-tab cipher /
+    // KDF strings. Not part of `Meta` (they live on the encrypted
+    // envelope, not the XML payload), but persisted as `meta.*` setting
+    // rows so the engine doesn't have to hold a live `Kdbx` handle to
+    // surface them.
+    let header = kdbx.outer_header();
+    meta::write_kdbx_outer_header_facts(
+        &tx,
+        *header.cipher_id.0.as_bytes(),
+        header.kdf_parameters.as_deref(),
+        header.transform_rounds,
+    )?;
+
     // Persist `Meta::recycle_bin_enabled` explicitly. The `is_recycle_bin`
     // column on `group` can only tell us "enabled" when a bin group
     // already exists; KeePassXC happily ships vaults with

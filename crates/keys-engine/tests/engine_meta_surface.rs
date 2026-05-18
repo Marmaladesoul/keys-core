@@ -416,6 +416,177 @@ fn set_history_max_items_emits_meta_updated_event() {
     }
 }
 
+// ─────────────────────── database_metadata ───────────────────────
+
+#[test]
+fn database_metadata_reports_generator_from_meta() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let mut kdbx = fresh_kdbx("gen");
+    let mut vault = kdbx.vault().clone();
+    vault.meta.generator = "Keys".into();
+    kdbx.replace_vault(vault);
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    let md = engine.database_metadata().expect("read");
+    assert_eq!(md.generator, "Keys");
+}
+
+#[test]
+fn database_metadata_generator_empty_when_meta_absent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let kdbx = fresh_kdbx("no-gen");
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    let md = engine.database_metadata().expect("read");
+    // `Meta::default().generator` is empty.
+    assert_eq!(md.generator, "");
+}
+
+#[test]
+fn database_metadata_reports_aes_cipher_for_fresh_v4_vault() {
+    // `create_empty_v4` always uses AES-256-CBC as the outer cipher.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let kdbx = fresh_kdbx("cipher");
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    let md = engine.database_metadata().expect("read");
+    assert_eq!(md.cipher_display, "AES-256-CBC");
+}
+
+#[test]
+fn database_metadata_reports_argon2d_kdf_for_fresh_v4_vault() {
+    // `create_empty_v4` defaults: Argon2d, 64 MiB, 2 iter, 8 parallelism.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let kdbx = fresh_kdbx("kdf");
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    let md = engine.database_metadata().expect("read");
+    assert_eq!(
+        md.kdf_display,
+        "Argon2d (64 MB \u{00B7} 2 iter \u{00B7} 8 threads)"
+    );
+}
+
+#[test]
+fn database_metadata_attachment_pool_starts_empty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let kdbx = fresh_kdbx("att-empty");
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    let md = engine.database_metadata().expect("read");
+    assert_eq!(md.attachment_total_count, 0);
+    assert_eq!(md.attachment_total_bytes, 0);
+}
+
+#[test]
+fn database_metadata_counts_attachment_pool_dedup() {
+    use keepass_core::model::{Attachment, Binary, Entry, EntryId};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let mut kdbx = fresh_kdbx("att-dedup");
+
+    // Two entries, three attachment references — two of them share
+    // bytes so the pool dedupes to two distinct blobs.
+    let mut vault = kdbx.vault().clone();
+    let shared_bytes = vec![0x11u8; 100];
+    let unique_bytes = vec![0x22u8; 250];
+
+    // ref_id 0: shared; ref_id 1: unique.
+    vault
+        .binaries
+        .push(Binary::new(shared_bytes.clone(), false));
+    vault
+        .binaries
+        .push(Binary::new(unique_bytes.clone(), false));
+
+    let e1_id = EntryId(Uuid::new_v4());
+    let mut e1 = Entry::empty(e1_id);
+    e1.title = "one".into();
+    e1.attachments.push(Attachment::new("shared.txt", 0));
+    e1.attachments.push(Attachment::new("unique.txt", 1));
+    let e2_id = EntryId(Uuid::new_v4());
+    let mut e2 = Entry::empty(e2_id);
+    e2.title = "two".into();
+    // Same payload as e1's first attachment — content-addressed dedup
+    // should keep the pool at two rows total.
+    e2.attachments.push(Attachment::new("shared.txt", 0));
+    vault.root.entries.push(e1);
+    vault.root.entries.push(e2);
+    kdbx.replace_vault(vault);
+
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    let md = engine.database_metadata().expect("read");
+    assert_eq!(md.attachment_total_count, 2);
+    assert_eq!(
+        md.attachment_total_bytes,
+        (shared_bytes.len() + unique_bytes.len()) as u64
+    );
+}
+
+#[test]
+fn database_metadata_round_trips_close_and_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let mut kdbx = fresh_kdbx("round-trip");
+    let mut vault = kdbx.vault().clone();
+    vault.meta.generator = "Keys".into();
+    kdbx.replace_vault(vault);
+
+    {
+        let mut engine = open_engine(&path);
+        engine.ingest_from_kdbx(&kdbx).expect("ingest");
+        engine.close().expect("close");
+    }
+    let engine = open_engine(&path);
+    let md = engine.database_metadata().expect("read");
+    assert_eq!(md.generator, "Keys");
+    assert_eq!(md.cipher_display, "AES-256-CBC");
+    assert_eq!(
+        md.kdf_display,
+        "Argon2d (64 MB \u{00B7} 2 iter \u{00B7} 8 threads)"
+    );
+}
+
+#[test]
+fn database_metadata_unknown_displays_when_outer_header_rows_absent() {
+    // A pre-Phase-6.17-I-3c engine wouldn't have the cipher / KDF rows
+    // written. Simulate by deleting them after ingest.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let kdbx = fresh_kdbx("legacy");
+    {
+        let mut engine = open_engine(&path);
+        engine.ingest_from_kdbx(&kdbx).expect("ingest");
+        engine.close().expect("close");
+    }
+    let conn = raw_open(&path);
+    conn.execute(
+        "DELETE FROM setting WHERE key IN \
+         ('meta.kdbx_cipher_oid', 'meta.kdbx_kdf_parameters', 'meta.kdbx_transform_rounds')",
+        [],
+    )
+    .expect("delete");
+    drop(conn);
+
+    let engine = open_engine(&path);
+    let md = engine.database_metadata().expect("read");
+    assert_eq!(md.cipher_display, "Unknown");
+    assert_eq!(md.kdf_display, "Unknown KDF");
+}
+
 #[test]
 fn set_history_max_size_emits_meta_updated_event() {
     let dir = tempfile::tempdir().expect("tempdir");

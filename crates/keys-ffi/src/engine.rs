@@ -61,9 +61,9 @@ use crate::engine_file_watcher::{self, VaultFileWatcher};
 use crate::engine_observer::{BridgeObserver, VaultDataChangeObserver};
 use crate::engine_portable::EnginePortableEntry;
 use crate::engine_types::{
-    ConflictPayloadFfi, EngineEntrySummary, EntryFull, EntryUpdate, GroupNode, GroupUpdate,
-    HistoricEntry, IconRef, MergeResult, NewEntryFields, NewGroupFields, Page, Predicate,
-    SmartFolder, VaultState, parse_uuid,
+    ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull, EntryUpdate,
+    GroupNode, GroupUpdate, HistoricEntry, IconRef, MergeResult, NewEntryFields, NewGroupFields,
+    Page, Predicate, SmartFolder, VaultState, parse_uuid,
 };
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
@@ -244,6 +244,14 @@ impl Engine {
     /// See [`keys_engine::Engine::history_max_items`].
     pub fn history_max_items(&self) -> Result<i32, EngineError> {
         self.with_engine(|e| Ok(e.history_max_items()?))
+    }
+
+    /// See [`keys_engine::Engine::database_metadata`]. Backs the
+    /// Keys-Mac `DatabaseEditorView` properties pane (generator,
+    /// cipher, KDF, attachment-pool stats) — final retirement of
+    /// `DatabaseDocument.ffiVault` in Phase 6.17-I-3d.
+    pub fn database_metadata(&self) -> Result<EngineDatabaseMetadata, EngineError> {
+        self.with_engine(|e| Ok(e.database_metadata()?.into()))
     }
 
     /// See [`keys_engine::Engine::history_max_size`].

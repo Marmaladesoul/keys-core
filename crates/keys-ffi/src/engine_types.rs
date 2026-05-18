@@ -827,6 +827,41 @@ pub struct ConflictPayloadFfi {
     pub delete_edit_conflicts: Vec<crate::merge::DeleteEditConflictFfi>,
 }
 
+/// Read-only facts about the encrypted database envelope and the
+/// content-addressed attachment pool, packaged for the frontend's
+/// "database properties" Info-tab. Mirror of
+/// [`keys_engine::DatabaseMetadata`].
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct EngineDatabaseMetadata {
+    /// Generator string written into the KDBX `Meta` block — e.g.
+    /// `"Keys"`, `"KeePassXC"`. Empty if never set.
+    pub generator: String,
+    /// Display label for the outer cipher — `"AES-256-CBC"`,
+    /// `"ChaCha20"`, `"Twofish-CBC"`, or `"Unknown"`.
+    pub cipher_display: String,
+    /// Single-line KDF display — e.g.
+    /// `"Argon2id (64 MB · 2 iter · 4 threads)"`,
+    /// `"AES-KDF (6,000,000 rounds)"`, or `"Unknown KDF"`.
+    pub kdf_display: String,
+    /// Distinct attachment blobs in the content-addressed pool.
+    pub attachment_total_count: u32,
+    /// Sum of attachment-blob sizes, in bytes.
+    pub attachment_total_bytes: u64,
+}
+
+impl From<eng::DatabaseMetadata> for EngineDatabaseMetadata {
+    fn from(m: eng::DatabaseMetadata) -> Self {
+        Self {
+            generator: m.generator,
+            cipher_display: m.cipher_display,
+            kdf_display: m.kdf_display,
+            attachment_total_count: m.attachment_total_count,
+            attachment_total_bytes: m.attachment_total_bytes,
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────

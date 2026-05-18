@@ -34,6 +34,7 @@ pub use file_watcher::{
 };
 pub use fingerprint::fingerprint;
 pub use key_provider::{DbKey, KeyProvider, KeyProviderError};
+pub use meta::DatabaseMetadata;
 pub use migrations::MigrationError;
 pub use model::{
     AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, EntryUpdate, GroupNode, GroupUpdate,
