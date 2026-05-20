@@ -17,7 +17,7 @@ fn fixture(rel: &str) -> String {
 fn open_basic() -> Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
-        "test-basic-002".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("open")
@@ -204,7 +204,7 @@ fn save_fires_saved() {
     fs::copy(fixture("keepassxc/kdbx3-basic.kdbx"), &dest).unwrap();
     let vault = Vault::new(
         dest.to_string_lossy().into_owned(),
-        "test-basic-002".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .unwrap();

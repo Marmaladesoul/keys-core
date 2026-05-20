@@ -26,7 +26,7 @@ fn fixture(rel: &str) -> String {
 fn opens_kdbx3_basic_fixture() {
     let vault = Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
-        "test-basic-002".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("kdbx3 fixture should open");
@@ -37,7 +37,7 @@ fn opens_kdbx3_basic_fixture() {
 fn opens_kdbx4_recycle_fixture() {
     let vault = Vault::new(
         fixture("pykeepass/recycle.kdbx"),
-        "test-recycle-102".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("kdbx4 fixture should open");
@@ -95,7 +95,7 @@ fn missing_path_returns_io() {
 fn lock_clears_state_and_is_idempotent() {
     let vault = Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
-        "test-basic-002".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("fixture should open");
@@ -114,8 +114,8 @@ fn lock_clears_state_and_is_idempotent() {
 #[test]
 fn path_survives_lock() {
     let path = fixture("keepassxc/kdbx3-basic.kdbx");
-    let vault =
-        Vault::new(path.clone(), "test-basic-002".to_owned(), None).expect("fixture should open");
+    let vault = Vault::new(path.clone(), "tëst pässwörd 🔑/\\".to_owned(), None)
+        .expect("fixture should open");
     assert_eq!(vault.path(), path);
 
     vault.lock().expect("lock");

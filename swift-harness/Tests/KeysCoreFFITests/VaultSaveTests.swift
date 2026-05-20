@@ -29,7 +29,7 @@ final class VaultSaveTests: XCTestCase {
             at: URL(fileURLWithPath: Self.fixture("keepassxc/kdbx3-basic.kdbx")),
             to: dest
         )
-        let vault = try Vault(path: dest.path, password: "test-basic-002")
+        let vault = try Vault(path: dest.path, password: "tëst pässwörd 🔑/\\")
         return (vault, tmp)
     }
 
@@ -38,7 +38,7 @@ final class VaultSaveTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tmp) }
         let path = vault.path()
         try vault.save()
-        let reopened = try Vault(path: path, password: "test-basic-002")
+        let reopened = try Vault(path: path, password: "tëst pässwörd 🔑/\\")
         XCTAssertFalse(reopened.isLocked())
     }
 
@@ -61,7 +61,7 @@ final class VaultSaveTests: XCTestCase {
         XCTAssertFalse(reopened.isLocked())
 
         // Reopen with old password fails.
-        XCTAssertThrowsError(try Vault(path: path, password: "test-basic-002")) { error in
+        XCTAssertThrowsError(try Vault(path: path, password: "tëst pässwörd 🔑/\\")) { error in
             guard case VaultError.WrongKey = error else {
                 return XCTFail("expected WrongKey, got \(error)")
             }

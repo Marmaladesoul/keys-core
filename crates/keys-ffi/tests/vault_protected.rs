@@ -24,7 +24,7 @@ fn fixture(rel: &str) -> String {
 fn open_custom() -> Arc<Vault> {
     Vault::new(
         fixture("pykeepass/custom-fields.kdbx"),
-        "test-custom-104".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("custom-fields fixture should open")
@@ -135,7 +135,7 @@ fn set_password_round_trips_through_save_and_reopen() {
     );
 
     // Then a save-and-reopen round-trip.
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-custom-104");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     assert_eq!(
         reopened.reveal_field(uuid, "Password".to_owned()).unwrap(),
         "newpw-42"
@@ -155,7 +155,7 @@ fn set_protected_custom_field_round_trips() {
         )
         .expect("set API Secret");
 
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-custom-104");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     assert_eq!(
         reopened
             .reveal_field(uuid, "API Secret".to_owned())
@@ -224,7 +224,7 @@ fn set_protected_field_records_history_snapshot() {
     // History introspection isn't exposed at the FFI yet (slice 8) —
     // assert via a save/reopen and check that the entry's
     // last_modified_ms advanced relative to its original value.
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-custom-104");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     let entry_before = open_custom().get_entry(uuid.clone()).unwrap();
     let entry_after = reopened.get_entry(uuid.clone()).unwrap();
     assert!(
@@ -261,7 +261,7 @@ fn clear_protected_custom_field_removes_it() {
     assert!(entry.custom_fields.iter().all(|f| f.name != "API Secret"));
 
     // Round-trip through save/reopen — also gone there.
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-custom-104");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     let entry = reopened.get_entry(uuid.clone()).unwrap();
     assert!(entry.custom_fields.iter().all(|f| f.name != "API Secret"));
 
@@ -294,7 +294,7 @@ fn clear_password_sets_to_empty_string() {
     );
 
     // Round-trip preserves the empty-Password representation.
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-custom-104");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     assert_eq!(
         reopened.reveal_field(uuid, "Password".to_owned()).unwrap(),
         ""

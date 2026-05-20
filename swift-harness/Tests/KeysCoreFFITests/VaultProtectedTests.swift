@@ -24,7 +24,7 @@ final class VaultProtectedTests: XCTestCase {
     private func openCustom() throws -> Vault {
         try Vault(
             path: Self.fixture("pykeepass/custom-fields.kdbx"),
-            password: "test-custom-104"
+            password: "tëst pässwörd 🔑/\\"
         )
     }
 

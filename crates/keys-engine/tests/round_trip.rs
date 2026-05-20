@@ -916,7 +916,7 @@ fn round_trip_keepass_core_fixture() {
         return;
     }
 
-    let composite = CompositeKey::from_password(b"test-basic-002");
+    let composite = CompositeKey::from_password("tëst pässwörd 🔑/\\".as_bytes());
     let kdbx = Kdbx::open(&fixture)
         .expect("open fixture")
         .read_header()

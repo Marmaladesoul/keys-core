@@ -21,7 +21,7 @@ fn fixture(rel: &str) -> String {
 fn open_basic() -> Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
-        "test-basic-002".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("kdbx3-basic should open")
@@ -30,7 +30,7 @@ fn open_basic() -> Arc<Vault> {
 fn open_recycle() -> Arc<Vault> {
     Vault::new(
         fixture("pykeepass/recycle.kdbx"),
-        "test-recycle-102".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("recycle fixture should open")
@@ -148,7 +148,7 @@ fn update_group_icon_id_sets_value_and_round_trips() {
         .unwrap();
     assert_eq!(g.icon_id, 48);
 
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     let g2 = reopened
         .list_groups()
         .unwrap()
@@ -277,7 +277,7 @@ fn delete_group_removes_it_and_persists() {
         "deleted in memory",
     );
 
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     assert!(
         reopened
             .list_groups()
@@ -435,7 +435,7 @@ fn set_recycle_bin_round_trips_disabled_with_group() {
     vault
         .set_recycle_bin(false, Some(bin.clone()))
         .expect("set");
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     // We can't directly inspect meta; instead, re-enable in the
     // reopened vault and verify recycle_entry uses our bin.
     reopened
@@ -481,7 +481,7 @@ fn meta_setters_round_trip_through_save() {
     // No public read API for meta yet — round-trip through
     // save_to_bytes + reopen and re-set the same values
     // (idempotent setter; this exercises the write path at least).
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     reopened
         .set_database_name("Renamed Vault".to_owned())
         .expect("re-set after reopen");
@@ -513,7 +513,7 @@ fn history_max_items_round_trips_through_save() {
         .expect("set history_max_items");
     assert_eq!(vault.history_max_items().expect("read"), 5);
 
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     assert_eq!(reopened.history_max_items().expect("read after reopen"), 5);
 }
 
@@ -526,7 +526,7 @@ fn history_max_size_round_trips_through_save() {
         .expect("set history_max_size");
     assert_eq!(vault.history_max_size().expect("read"), target);
 
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     assert_eq!(
         reopened.history_max_size().expect("read after reopen"),
         target
@@ -574,7 +574,7 @@ fn unreferenced_custom_icon_is_gc_d_at_save() {
     let id = vault.add_custom_icon(b"PNG-ish".to_vec()).expect("add");
     // Visible in-memory before save.
     assert!(vault.custom_icon(id.clone()).expect("get").is_some());
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     // Gone after save: orphan icons get pruned by `gc_custom_icons_pool`.
     assert!(reopened.custom_icon(id).expect("get").is_none());
 }

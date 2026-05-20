@@ -18,7 +18,7 @@ use keys_ffi::{
 };
 use tempfile::TempDir;
 
-const PASSWORD: &str = "test-basic-002";
+const PASSWORD: &str = "tëst pässwörd 🔑/\\";
 
 fn fixture(rel: &str) -> String {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

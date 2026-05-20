@@ -16,7 +16,7 @@ fn fixture(rel: &str) -> String {
 fn open_basic() -> std::sync::Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
-        "test-basic-002".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("kdbx3-basic should open")
@@ -160,7 +160,7 @@ fn custom_fields_pass_through_keepass_core_order_without_resegregating() {
     // route (here, just `keepass_core` directly) and comparing.
     let vault = Vault::new(
         fixture("pykeepass/custom-fields.kdbx"),
-        "test-custom-104".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("custom-fields fixture should open");
@@ -193,7 +193,7 @@ fn custom_fields_pass_through_keepass_core_order_without_resegregating() {
 fn protected_custom_fields_carry_is_protected_flag() {
     let vault = Vault::new(
         fixture("pykeepass/custom-fields.kdbx"),
-        "test-custom-104".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("custom-fields fixture should open");
@@ -285,7 +285,7 @@ fn read_methods_return_locked_after_lock() {
 fn open_editor_fields() -> std::sync::Arc<Vault> {
     Vault::new(
         fixture("pykeepass/editor-fields.kdbx"),
-        "test-editor-107".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("editor-fields fixture should open")
@@ -339,7 +339,7 @@ fn group_surfaces_editor_fields() {
 fn open_kdbx4_attachments() -> std::sync::Arc<Vault> {
     Vault::new(
         fixture("kdbxweb/kdbx4-attachments.kdbx"),
-        "test-keeweb-202".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("kdbx4-attachments fixture should open")
@@ -449,7 +449,7 @@ fn entry_attachments_kdbx3_round_trips_via_meta_binaries() {
     // declares one entry per fixture attachment with a known sha256.
     let vault = Vault::new(
         fixture("keepassxc/kdbx3-attachments.kdbx"),
-        "test-att-004".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("kdbx3-attachments should open");
@@ -478,7 +478,7 @@ fn entry_attachment_bytes_kdbx3_round_trips() {
     use sha2::{Digest, Sha256};
     let vault = Vault::new(
         fixture("keepassxc/kdbx3-attachments.kdbx"),
-        "test-att-004".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("kdbx3-attachments should open");
@@ -582,7 +582,7 @@ fn database_name_round_trips_from_fixture() {
     // group's name, not the meta DatabaseName, so use kdbxweb here.)
     let vault = Vault::new(
         fixture("kdbxweb/kdbx4-basic.kdbx"),
-        "test-keeweb-201".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("kdbxweb basic should open");
@@ -610,7 +610,7 @@ fn recycle_bin_group_uuid_present_when_fixture_has_one() {
     // pykeepass/recycle.kdbx has a populated recycle bin per its sidecar.
     let vault = Vault::new(
         fixture("pykeepass/recycle.kdbx"),
-        "test-recycle-102".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("recycle fixture should open");

@@ -22,7 +22,7 @@ final class VaultEntryTests: XCTestCase {
     private func openBasic() throws -> Vault {
         try Vault(
             path: Self.fixture("keepassxc/kdbx3-basic.kdbx"),
-            password: "test-basic-002"
+            password: "tëst pässwörd 🔑/\\"
         )
     }
 

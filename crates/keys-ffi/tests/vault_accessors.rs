@@ -22,7 +22,7 @@ fn fixture(rel: &str) -> String {
 fn open_custom_icons() -> std::sync::Arc<Vault> {
     Vault::new(
         fixture("pykeepass/custom-icons.kdbx"),
-        "test-icons-109".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("custom-icons fixture should open")
@@ -31,7 +31,7 @@ fn open_custom_icons() -> std::sync::Arc<Vault> {
 fn open_basic() -> std::sync::Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
-        "test-basic-002".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("basic fixture should open")
@@ -40,7 +40,7 @@ fn open_basic() -> std::sync::Arc<Vault> {
 fn open_deep_groups() -> std::sync::Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-deep-groups.kdbx"),
-        "test-deep-006".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("deep-groups fixture should open")

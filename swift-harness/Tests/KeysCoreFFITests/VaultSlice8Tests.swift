@@ -20,14 +20,14 @@ final class VaultSlice8Tests: XCTestCase {
     private func openBasic() throws -> Vault {
         try Vault(
             path: Self.fixture("keepassxc/kdbx3-basic.kdbx"),
-            password: "test-basic-002"
+            password: "tëst pässwörd 🔑/\\"
         )
     }
 
     private func openCustom() throws -> Vault {
         try Vault(
             path: Self.fixture("pykeepass/custom-fields.kdbx"),
-            password: "test-custom-104"
+            password: "tëst pässwörd 🔑/\\"
         )
     }
 

@@ -24,7 +24,7 @@ fn fixture(rel: &str) -> String {
 fn open_basic() -> Arc<Vault> {
     Vault::new(
         fixture("keepassxc/kdbx3-basic.kdbx"),
-        "test-basic-002".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("kdbx3-basic should open")
@@ -33,7 +33,7 @@ fn open_basic() -> Arc<Vault> {
 fn open_custom() -> Arc<Vault> {
     Vault::new(
         fixture("pykeepass/custom-fields.kdbx"),
-        "test-custom-104".to_owned(),
+        "tëst pässwörd 🔑/\\".to_owned(),
         None,
     )
     .expect("custom-fields fixture should open")
@@ -142,7 +142,7 @@ fn create_entry_round_trips_through_save() {
         .create_entry(make_create(group.clone(), "Persistent"))
         .expect("create");
 
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     let entry = reopened.get_entry(new_uuid).expect("get after reopen");
     assert_eq!(entry.title, "Persistent");
     assert_eq!(entry.group_uuid, group);
@@ -299,7 +299,7 @@ fn delete_entry_removes_from_listing_and_persists() {
         "entry gone in-memory",
     );
 
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     assert!(
         reopened
             .list_entries(None)
@@ -484,7 +484,7 @@ fn add_entry_attachment_round_trips_through_save() {
         )
         .expect("attach");
 
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     let bytes = reopened
         .entry_attachment_bytes(entry_uuid, "persist.bin".to_owned())
         .expect("read after reopen");
@@ -674,7 +674,7 @@ fn update_icon_id_sets_value_and_round_trips() {
         .expect("update");
     assert_eq!(vault.get_entry(entry_uuid.clone()).unwrap().icon_id, 42);
 
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     assert_eq!(reopened.get_entry(entry_uuid).unwrap().icon_id, 42);
 }
 
@@ -785,7 +785,7 @@ fn update_expiry_time_ms_enables_expires_and_round_trips() {
     assert_eq!(after.expiry_time_ms, Some(target_ms));
 
     // Round-trip through save.
-    let (reopened, _tmp) = save_and_reopen(&vault, "test-basic-002");
+    let (reopened, _tmp) = save_and_reopen(&vault, "tëst pässwörd 🔑/\\");
     let after_reopen = reopened.get_entry(entry_uuid).unwrap();
     assert!(after_reopen.expires);
     assert_eq!(after_reopen.expiry_time_ms, Some(target_ms));

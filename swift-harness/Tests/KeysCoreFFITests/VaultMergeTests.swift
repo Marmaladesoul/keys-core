@@ -3,7 +3,7 @@ import XCTest
 
 /// Slice 7.5a — `mergeExternal` end-to-end through the Swift binding.
 final class VaultMergeTests: XCTestCase {
-    private static let password = "test-basic-002"
+    private static let password = "tëst pässwörd 🔑/\\"
 
     private static func fixture(_ rel: String) -> String {
         let here = URL(fileURLWithPath: #file)
