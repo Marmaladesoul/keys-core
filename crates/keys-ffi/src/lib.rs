@@ -69,12 +69,54 @@ pub fn ping() -> String {
     "keys-ffi alive".to_owned()
 }
 
+/// Number of words in the EFF Large Diceware word list. Always 7,776.
+#[uniffi::export]
+#[must_use]
+#[allow(clippy::missing_panics_doc)] // statically-sized list, fits in u32 by construction
+pub fn eff_word_count() -> u32 {
+    // The list is statically 7,776 words — fits comfortably in u32.
+    u32::try_from(keys_engine::eff_wordlist::word_count()).expect("EFF word list size fits in u32")
+}
+
+/// Indexed lookup into the EFF Large Diceware word list. Returns `None`
+/// if `index` is out of range.
+#[uniffi::export]
+#[must_use]
+pub fn eff_word_at(index: u32) -> Option<String> {
+    keys_engine::eff_wordlist::word_at(index as usize).map(str::to_owned)
+}
+
+/// A uniformly random word from the EFF Large Diceware word list, drawn
+/// from the OS CSPRNG.
+#[uniffi::export]
+#[must_use]
+pub fn eff_random_word() -> String {
+    keys_engine::eff_wordlist::random_word().to_owned()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ping;
+    use super::{eff_random_word, eff_word_at, eff_word_count, ping};
 
     #[test]
     fn ping_returns_expected_string() {
         assert_eq!(ping(), "keys-ffi alive");
+    }
+
+    #[test]
+    fn eff_word_count_is_7776() {
+        assert_eq!(eff_word_count(), 7776);
+    }
+
+    #[test]
+    fn eff_word_at_bounds() {
+        assert_eq!(eff_word_at(0).as_deref(), Some("abacus"));
+        assert_eq!(eff_word_at(7775).as_deref(), Some("zoom"));
+        assert_eq!(eff_word_at(7776), None);
+    }
+
+    #[test]
+    fn eff_random_word_is_non_empty() {
+        assert!(!eff_random_word().is_empty());
     }
 }

@@ -1,4 +1,5 @@
 pub mod conflict_resolution;
+pub mod eff_wordlist;
 pub mod engine;
 pub mod error;
 pub mod events;
