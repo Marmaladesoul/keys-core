@@ -147,6 +147,31 @@ impl From<StrengthBucket> for eng::StrengthBucket {
     }
 }
 
+/// Password strength result: raw character-class entropy plus the
+/// derived bucket. Mirrors [`keys_engine::Strength`].
+///
+/// Used by callers that want to show live strength on an unsaved
+/// password (e.g. the password generator preview), where querying the
+/// engine's persisted `password_strength_bucket` column isn't an
+/// option because the entry doesn't exist yet.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq)]
+pub struct Strength {
+    /// `len * log2(pool_size)` in bits. Zero for empty password.
+    pub entropy_bits: f64,
+    /// Discrete bucket derived from `entropy_bits` per the engine's
+    /// fixed boundaries.
+    pub bucket: StrengthBucket,
+}
+
+impl From<eng::Strength> for Strength {
+    fn from(s: eng::Strength) -> Self {
+        Self {
+            entropy_bits: s.entropy_bits,
+            bucket: s.bucket.into(),
+        }
+    }
+}
+
 /// Reference to an entry/group icon. UUIDs cross as strings.
 #[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
 pub enum IconRef {

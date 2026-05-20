@@ -43,7 +43,7 @@ pub use engine_types::{
     CustomFieldRef as EngineCustomFieldRef, EngineEntrySummary, EntryFull,
     EntryUpdate as EngineEntryUpdate, GroupNode, GroupUpdate as EngineGroupUpdate, HistoricEntry,
     IconRef, MergeResult, MergeStats, NewCustomField, NewEntryFields, NewGroupFields, Page,
-    Predicate, SearchScope, SmartFolder, StrengthBucket, TagUsageCount, VaultState,
+    Predicate, SearchScope, SmartFolder, Strength, StrengthBucket, TagUsageCount, VaultState,
 };
 pub use error::VaultError;
 pub use merge::{
@@ -99,9 +99,26 @@ pub fn eff_random_word() -> String {
     keys_engine::eff_wordlist::random_word().to_owned()
 }
 
+/// Compute the character-class entropy and strength bucket of a password.
+///
+/// Pure function; no engine instance required. Used by the password
+/// generator preview (where the password isn't persisted yet) and by
+/// any client wanting to score an arbitrary string. For entries that
+/// already exist in a vault, prefer the persisted
+/// `password_strength_bucket` / `password_entropy` columns on
+/// [`EngineEntrySummary`] / [`EntryFull`] — same algorithm, no
+/// recomputation.
+#[uniffi::export]
+#[must_use]
+pub fn password_strength(password: &str) -> Strength {
+    keys_engine::strength(password).into()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{eff_random_word, eff_word_at, eff_word_count, ping};
+    use super::{
+        StrengthBucket, eff_random_word, eff_word_at, eff_word_count, password_strength, ping,
+    };
 
     #[test]
     fn ping_returns_expected_string() {
@@ -123,5 +140,27 @@ mod tests {
     #[test]
     fn eff_random_word_is_non_empty() {
         assert!(!eff_random_word().is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // the engine documents an exact 0.0 return for empty input
+    fn empty_password_is_very_weak_zero_entropy() {
+        let s = password_strength("");
+        assert_eq!(s.entropy_bits, 0.0);
+        assert_eq!(s.bucket, StrengthBucket::VeryWeak);
+    }
+
+    #[test]
+    fn short_lowercase_is_weak() {
+        let s = password_strength("abcdef");
+        assert!(s.entropy_bits > 0.0 && s.entropy_bits < 50.0);
+        assert_eq!(s.bucket, StrengthBucket::Weak);
+    }
+
+    #[test]
+    fn long_mixed_is_very_strong() {
+        let s = password_strength("Tr0ub4dor&3-Correct-Horse-Battery-Staple");
+        assert!(s.entropy_bits >= 100.0);
+        assert_eq!(s.bucket, StrengthBucket::VeryStrong);
     }
 }

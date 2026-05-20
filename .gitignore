@@ -32,3 +32,4 @@ Cargo.lock.bak
 *.swo
 *~
 _localdocs/
+.claude/
