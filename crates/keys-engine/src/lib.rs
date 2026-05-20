@@ -60,3 +60,8 @@ pub use keepass_merge::{
 };
 pub use save::{KdbxStateSignature, SelfWriteSignature};
 pub use strength::{Strength, strength};
+pub use totp::{
+    TotpAlgorithm, TotpParams, base32_decode as totp_base32_decode,
+    generate_code as totp_generate_code, parse_uri as totp_parse_uri, progress as totp_progress,
+    seconds_remaining as totp_seconds_remaining,
+};

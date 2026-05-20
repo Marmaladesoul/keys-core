@@ -22,6 +22,7 @@ mod merge;
 mod observer;
 mod portable;
 mod protector;
+mod totp;
 mod vault;
 
 pub use db_key_provider::{VaultDbKeyProvider, VaultDbKeyProviderError};
@@ -55,6 +56,10 @@ pub use merge::{
 pub use observer::{VaultChange, VaultObserver};
 pub use portable::PortableEntry;
 pub use protector::{VaultFieldProtector, VaultProtectorError};
+pub use totp::{
+    TotpAlgorithm, TotpParams, totp_base32_decode, totp_generate_code, totp_parse_uri,
+    totp_progress, totp_seconds_remaining,
+};
 pub use vault::Vault;
 
 uniffi::setup_scaffolding!();
