@@ -22,6 +22,7 @@ pub mod reveal;
 pub mod save;
 pub mod smart_folder;
 pub mod strength;
+pub mod syllable_generator;
 pub mod totp;
 
 pub use engine::{DisconnectReason, Engine, ReconcileTrigger, VaultState};

@@ -114,10 +114,43 @@ pub fn password_strength(password: &str) -> Strength {
     keys_engine::strength(password).into()
 }
 
+/// Options for generating a pronounceable password. Mirrors
+/// [`keys_engine::syllable_generator::SyllableOptions`].
+#[derive(uniffi::Record, Debug, Clone, Copy)]
+pub struct SyllableOptions {
+    pub syllable_count: u32,
+    pub capitalise_one: bool,
+}
+
+impl From<SyllableOptions> for keys_engine::syllable_generator::SyllableOptions {
+    fn from(o: SyllableOptions) -> Self {
+        Self {
+            syllable_count: o.syllable_count,
+            capitalise_one: o.capitalise_one,
+        }
+    }
+}
+
+/// Generate a pronounceable password from random syllables.
+#[uniffi::export]
+#[must_use]
+pub fn syllable_generate(options: SyllableOptions) -> String {
+    keys_engine::syllable_generator::generate(&options.into())
+}
+
+/// Estimate the entropy (in bits) of a pronounceable password generated
+/// with the given options.
+#[uniffi::export]
+#[must_use]
+pub fn syllable_estimate_entropy(options: SyllableOptions) -> f64 {
+    keys_engine::syllable_generator::estimate_entropy(&options.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        StrengthBucket, eff_random_word, eff_word_at, eff_word_count, password_strength, ping,
+        StrengthBucket, SyllableOptions, eff_random_word, eff_word_at, eff_word_count,
+        password_strength, ping, syllable_estimate_entropy, syllable_generate,
     };
 
     #[test]
@@ -162,5 +195,23 @@ mod tests {
         let s = password_strength("Tr0ub4dor&3-Correct-Horse-Battery-Staple");
         assert!(s.entropy_bits >= 100.0);
         assert_eq!(s.bucket, StrengthBucket::VeryStrong);
+    }
+
+    #[test]
+    fn syllable_generate_returns_non_empty() {
+        let s = syllable_generate(SyllableOptions {
+            syllable_count: 4,
+            capitalise_one: true,
+        });
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn syllable_entropy_is_positive() {
+        let bits = syllable_estimate_entropy(SyllableOptions {
+            syllable_count: 4,
+            capitalise_one: true,
+        });
+        assert!(bits > 0.0);
     }
 }
