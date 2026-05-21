@@ -146,11 +146,23 @@ pub fn syllable_estimate_entropy(options: SyllableOptions) -> f64 {
     keys_engine::syllable_generator::estimate_entropy(&options.into())
 }
 
+/// Produce candidate domains for `AutoFill` matching from a service
+/// identifier (URL or bare host). Returns most-specific first, walking
+/// back to the registrable domain per the Mozilla Public Suffix List.
+///
+/// Returns an empty vector for inputs that cannot be parsed.
+#[uniffi::export]
+#[must_use]
+pub fn url_domain_candidates(service_identifier: &str) -> Vec<String> {
+    keys_engine::url_matcher::domain_candidates(service_identifier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         StrengthBucket, SyllableOptions, eff_random_word, eff_word_at, eff_word_count,
         password_strength, ping, syllable_estimate_entropy, syllable_generate,
+        url_domain_candidates,
     };
 
     #[test]
@@ -213,5 +225,21 @@ mod tests {
             capitalise_one: true,
         });
         assert!(bits > 0.0);
+    }
+
+    #[test]
+    fn url_domain_candidates_smoke() {
+        assert_eq!(
+            url_domain_candidates("dash.cloudflare.com"),
+            vec![
+                "dash.cloudflare.com".to_owned(),
+                "cloudflare.com".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn url_domain_candidates_empty() {
+        assert!(url_domain_candidates("").is_empty());
     }
 }

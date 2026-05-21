@@ -24,6 +24,7 @@ pub mod smart_folder;
 pub mod strength;
 pub mod syllable_generator;
 pub mod totp;
+pub mod url_matcher;
 
 pub use engine::{DisconnectReason, Engine, ReconcileTrigger, VaultState};
 pub use error::{EngineError, IngestError, ProjectionError, RevealError};
