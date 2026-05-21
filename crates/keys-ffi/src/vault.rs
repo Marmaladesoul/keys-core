@@ -2319,17 +2319,28 @@ impl Vault {
 /// (so wrong-key / I/O classify as their familiar variants). The three
 /// resolution-validation variants surface as
 /// [`VaultError::Merge`] — caller-error class, distinct from
-/// [`VaultError::NotFound`]. Any unmapped future variant panics so a
-/// merge-crate addition trips CI on the first run.
+/// [`VaultError::NotFound`]. `MergeError` is `#[non_exhaustive]`
+/// upstream; the wildcard arm degrades to [`VaultError::Unexpected`]
+/// and `debug_assert!`s, so CI catches a new variant the first time a
+/// test trips it without risking a UB panic across the FFI boundary in
+/// release builds.
 fn merge_err_to_vault_err(err: keepass_merge::MergeError) -> VaultError {
     match err {
         keepass_merge::MergeError::Model(e) => VaultError::from(e),
         e @ (keepass_merge::MergeError::UnknownEntryInResolution { .. }
         | keepass_merge::MergeError::UnknownFieldInResolution { .. }
-        | keepass_merge::MergeError::MissingResolutionForConflict { .. }) => {
+        | keepass_merge::MergeError::MissingResolutionForConflict { .. }
+        | keepass_merge::MergeError::UnknownAttachmentInResolution { .. }
+        | keepass_merge::MergeError::KeepBothNotPermittedForKind { .. }) => {
             VaultError::Merge(e.to_string())
         }
-        other => panic!("unmapped keepass_merge::MergeError variant in keys-ffi facade: {other:?}"),
+        other => {
+            debug_assert!(
+                false,
+                "unmapped keepass_merge::MergeError variant in keys-ffi facade: {other:?}"
+            );
+            VaultError::Unexpected(format!("unmapped MergeError: {other}"))
+        }
     }
 }
 
@@ -2462,4 +2473,70 @@ fn format_with_thousands(n: u64) -> String {
         out.push(*ch as char);
     }
     out
+}
+
+#[cfg(test)]
+mod merge_err_to_vault_err_tests {
+    //! Pin every currently-known `MergeError` variant to its intended
+    //! `VaultError` collapse. The wildcard arm degrades to
+    //! `VaultError::Unexpected` (with a `debug_assert!` so CI catches
+    //! a new upstream variant the first time a test trips it) — that
+    //! removes the FFI-UB hazard of the previous `panic!` while
+    //! preserving the "forced code review on new variant" property.
+    use super::*;
+    use keepass_core::model::EntryId;
+    use uuid::Uuid;
+
+    #[test]
+    fn model_inner_collapses_via_keepass_core_error() {
+        let inner = keepass_core::Error::Format(keepass_core::format::FormatError::BadSignature1);
+        let v = merge_err_to_vault_err(keepass_merge::MergeError::Model(inner));
+        assert!(matches!(v, VaultError::Format));
+    }
+
+    #[test]
+    fn unknown_entry_in_resolution_surfaces_as_merge() {
+        let v = merge_err_to_vault_err(keepass_merge::MergeError::UnknownEntryInResolution {
+            entry: EntryId(Uuid::nil()),
+        });
+        assert!(matches!(v, VaultError::Merge(_)));
+    }
+
+    #[test]
+    fn unknown_field_in_resolution_surfaces_as_merge() {
+        let v = merge_err_to_vault_err(keepass_merge::MergeError::UnknownFieldInResolution {
+            entry: EntryId(Uuid::nil()),
+            field: "Title".into(),
+        });
+        assert!(matches!(v, VaultError::Merge(_)));
+    }
+
+    #[test]
+    fn missing_resolution_for_conflict_surfaces_as_merge() {
+        let v = merge_err_to_vault_err(keepass_merge::MergeError::MissingResolutionForConflict {
+            entry: EntryId(Uuid::nil()),
+        });
+        assert!(matches!(v, VaultError::Merge(_)));
+    }
+
+    #[test]
+    fn unknown_attachment_in_resolution_surfaces_as_merge() {
+        // Regression guard: this variant previously fell through to the
+        // panic arm (UB across the FFI boundary).
+        let v = merge_err_to_vault_err(keepass_merge::MergeError::UnknownAttachmentInResolution {
+            entry: EntryId(Uuid::nil()),
+            attachment: "attached.pdf".into(),
+        });
+        assert!(matches!(v, VaultError::Merge(_)));
+    }
+
+    #[test]
+    fn keep_both_not_permitted_for_kind_surfaces_as_merge() {
+        // Regression guard: also previously fell through to panic.
+        let v = merge_err_to_vault_err(keepass_merge::MergeError::KeepBothNotPermittedForKind {
+            entry: EntryId(Uuid::nil()),
+            attachment: "x.bin".into(),
+        });
+        assert!(matches!(v, VaultError::Merge(_)));
+    }
 }

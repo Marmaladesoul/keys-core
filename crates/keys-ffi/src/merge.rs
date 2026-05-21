@@ -399,6 +399,12 @@ pub enum AttachmentDeltaKindFfi {
     /// Both sides hold it but the bytes differ; ancestor doesn't
     /// match either side cleanly.
     BothDiffer,
+    /// A future `keepass_merge::AttachmentDeltaKind` variant that this
+    /// build of the FFI facade doesn't yet recognise. Surfaced rather
+    /// than panicked across the FFI boundary so consumers can prompt
+    /// the user to update Keys instead of crashing on an unknown
+    /// classification.
+    Unknown,
 }
 
 impl From<KmAttachmentDeltaKind> for AttachmentDeltaKindFfi {
@@ -407,9 +413,13 @@ impl From<KmAttachmentDeltaKind> for AttachmentDeltaKindFfi {
             KmAttachmentDeltaKind::LocalOnly => Self::LocalOnly,
             KmAttachmentDeltaKind::RemoteOnly => Self::RemoteOnly,
             KmAttachmentDeltaKind::BothDiffer => Self::BothDiffer,
-            other => panic!(
-                "unmapped keepass_merge::AttachmentDeltaKind variant in keys-ffi facade: {other:?}"
-            ),
+            other => {
+                debug_assert!(
+                    false,
+                    "unmapped keepass_merge::AttachmentDeltaKind variant in keys-ffi facade: {other:?}"
+                );
+                Self::Unknown
+            }
         }
     }
 }
@@ -442,6 +452,12 @@ pub enum FieldDeltaKindFfi {
     RemoteOnly,
     /// Both sides have the field but the values differ.
     BothDiffer,
+    /// A future `keepass_merge::FieldDeltaKind` variant that this
+    /// build of the FFI facade doesn't yet recognise. Surfaced rather
+    /// than panicked across the FFI boundary so consumers can prompt
+    /// the user to update Keys instead of crashing on an unknown
+    /// classification.
+    Unknown,
 }
 
 impl From<KmFieldDeltaKind> for FieldDeltaKindFfi {
@@ -450,9 +466,13 @@ impl From<KmFieldDeltaKind> for FieldDeltaKindFfi {
             KmFieldDeltaKind::LocalOnly => Self::LocalOnly,
             KmFieldDeltaKind::RemoteOnly => Self::RemoteOnly,
             KmFieldDeltaKind::BothDiffer => Self::BothDiffer,
-            other => panic!(
-                "unmapped keepass_merge::FieldDeltaKind variant in keys-ffi facade: {other:?}"
-            ),
+            other => {
+                debug_assert!(
+                    false,
+                    "unmapped keepass_merge::FieldDeltaKind variant in keys-ffi facade: {other:?}"
+                );
+                Self::Unknown
+            }
         }
     }
 }
@@ -811,4 +831,73 @@ fn find_entry_in(group: &KcGroup, target: EntryId) -> Option<&keepass_core::mode
         .groups
         .iter()
         .find_map(|child| find_entry_in(child, target))
+}
+
+#[cfg(test)]
+mod delta_kind_mapping_tests {
+    //! Pin every currently-known `KmFieldDeltaKind` / `KmAttachmentDeltaKind`
+    //! variant to its FFI counterpart. The wildcard arm degrades to
+    //! the new `Unknown` variant rather than panicking across the FFI
+    //! boundary; CI catches a new upstream variant via the
+    //! `debug_assert!` inside that arm.
+    use super::*;
+
+    #[test]
+    fn field_delta_local_only_round_trips() {
+        assert_eq!(
+            FieldDeltaKindFfi::from(KmFieldDeltaKind::LocalOnly),
+            FieldDeltaKindFfi::LocalOnly,
+        );
+    }
+
+    #[test]
+    fn field_delta_remote_only_round_trips() {
+        assert_eq!(
+            FieldDeltaKindFfi::from(KmFieldDeltaKind::RemoteOnly),
+            FieldDeltaKindFfi::RemoteOnly,
+        );
+    }
+
+    #[test]
+    fn field_delta_both_differ_round_trips() {
+        assert_eq!(
+            FieldDeltaKindFfi::from(KmFieldDeltaKind::BothDiffer),
+            FieldDeltaKindFfi::BothDiffer,
+        );
+    }
+
+    #[test]
+    fn attachment_delta_local_only_round_trips() {
+        assert_eq!(
+            AttachmentDeltaKindFfi::from(KmAttachmentDeltaKind::LocalOnly),
+            AttachmentDeltaKindFfi::LocalOnly,
+        );
+    }
+
+    #[test]
+    fn attachment_delta_remote_only_round_trips() {
+        assert_eq!(
+            AttachmentDeltaKindFfi::from(KmAttachmentDeltaKind::RemoteOnly),
+            AttachmentDeltaKindFfi::RemoteOnly,
+        );
+    }
+
+    #[test]
+    fn attachment_delta_both_differ_round_trips() {
+        assert_eq!(
+            AttachmentDeltaKindFfi::from(KmAttachmentDeltaKind::BothDiffer),
+            AttachmentDeltaKindFfi::BothDiffer,
+        );
+    }
+
+    #[test]
+    fn unknown_variant_exists_as_safe_fallback() {
+        // Structural assertion only: the wildcard arm needs a target
+        // and `Unknown` is it. We can't construct an
+        // "unknown future upstream variant" to drive the fallthrough,
+        // so the per-variant pins above are what makes a new upstream
+        // variant landing without a test addition visible in CI.
+        let _: AttachmentDeltaKindFfi = AttachmentDeltaKindFfi::Unknown;
+        let _: FieldDeltaKindFfi = FieldDeltaKindFfi::Unknown;
+    }
 }

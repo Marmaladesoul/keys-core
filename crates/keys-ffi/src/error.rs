@@ -95,26 +95,48 @@ pub enum VaultError {
     /// stringly-matching the message.
     #[error("field protector failed: {0}")]
     Protector(String),
+
+    /// A new variant of an upstream `#[non_exhaustive]` error enum
+    /// (`keepass_core::model::ModelError`, `keepass_merge::MergeError`)
+    /// reached the FFI facade without an explicit mapping in this
+    /// crate. Debug builds (and therefore CI) `debug_assert!` on this
+    /// path so the gap is caught the first time a test exercises the
+    /// new variant; release builds degrade safely to surfacing this
+    /// variant rather than aborting across the FFI boundary (which
+    /// would be UB on the Swift consumer side).
+    ///
+    /// Treat this variant as "Keys binary is older than the database /
+    /// merge crate it's reading" — the binding should prompt the user
+    /// to update.
+    #[error("unexpected internal error: {0}")]
+    Unexpected(String),
 }
 
 /// Map a [`ModelError`] from any mutation call onto [`VaultError`].
 ///
-/// Every variant the FFI surface can hit today collapses to
-/// [`VaultError::NotFound`] — the entry, group, or destination wasn't
-/// where the caller said it was. The `_ =>` arm **panics with a clear
-/// message** so a future `keepass-core` validation variant trips CI on
-/// the first run instead of silently collapsing to `NotFound`. That's
-/// the forced code-review the carry-forward note from #R8 was after.
+/// Every currently-known variant collapses to a specific [`VaultError`]
+/// variant. `ModelError` is `#[non_exhaustive]` upstream, so a wildcard
+/// arm is unavoidable — but rather than panic across the FFI boundary
+/// (UB on the Swift side), the wildcard surfaces
+/// [`VaultError::Unexpected`] and trips a `debug_assert!` so CI catches
+/// the mapping gap on the first test that exercises the new variant.
+/// That preserves the "forced code review" intent of the original
+/// `panic!` (per the #R8 carry-forward) while removing the UB.
 pub(crate) fn model_err_to_vault_err(err: ModelError) -> VaultError {
     match err {
         ModelError::EntryNotFound(_)
         | ModelError::GroupNotFound(_)
         | ModelError::CircularMove { .. }
-        | ModelError::DuplicateUuid(_) => VaultError::NotFound,
+        | ModelError::DuplicateUuid(_)
+        | ModelError::CannotDeleteRoot => VaultError::NotFound,
         ModelError::HistoryIndexOutOfRange { .. } => VaultError::IndexOutOfRange,
         ModelError::Protector(e) => VaultError::Protector(e.to_string()),
         other => {
-            panic!("unmapped keepass_core::model::ModelError variant in keys-ffi facade: {other:?}")
+            debug_assert!(
+                false,
+                "unmapped keepass_core::model::ModelError variant in keys-ffi facade: {other:?}"
+            );
+            VaultError::Unexpected(format!("unmapped ModelError: {other}"))
         }
     }
 }
@@ -129,5 +151,84 @@ impl From<keepass_core::Error> for VaultError {
             keepass_core::Error::Protector(e) => Self::Protector(e.to_string()),
             _ => Self::WrongKey,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! These tests pin every currently-known `ModelError` variant to its
+    //! intended `VaultError` collapse. When `keepass-core` adds a new
+    //! `ModelError` variant, the wildcard arm in `model_err_to_vault_err`
+    //! degrades to `VaultError::Unexpected` (rather than panicking across
+    //! the FFI boundary) — but the `debug_assert!` inside that arm makes
+    //! `cargo test` panic in debug builds, which is how CI catches the
+    //! mapping gap before a release ships.
+    //!
+    //! Note: we *can't* directly construct an "unknown future variant" to
+    //! exercise the fallthrough path — the upstream enum is
+    //! `#[non_exhaustive]` but every existing variant is mapped. The
+    //! presence of these per-variant pinning tests is what makes the
+    //! `debug_assert!` actionable: a new upstream variant landing without
+    //! a corresponding test failure here means a CI gap, not a code gap.
+    use super::*;
+    use keepass_core::model::{EntryId, GroupId};
+    use uuid::Uuid;
+
+    #[test]
+    fn entry_not_found_collapses_to_not_found() {
+        let v = model_err_to_vault_err(ModelError::EntryNotFound(EntryId(Uuid::nil())));
+        assert!(matches!(v, VaultError::NotFound));
+    }
+
+    #[test]
+    fn group_not_found_collapses_to_not_found() {
+        let v = model_err_to_vault_err(ModelError::GroupNotFound(GroupId(Uuid::nil())));
+        assert!(matches!(v, VaultError::NotFound));
+    }
+
+    #[test]
+    fn circular_move_collapses_to_not_found() {
+        let v = model_err_to_vault_err(ModelError::CircularMove {
+            moving: GroupId(Uuid::nil()),
+            new_parent: GroupId(Uuid::nil()),
+        });
+        assert!(matches!(v, VaultError::NotFound));
+    }
+
+    #[test]
+    fn duplicate_uuid_collapses_to_not_found() {
+        let v = model_err_to_vault_err(ModelError::DuplicateUuid(Uuid::nil()));
+        assert!(matches!(v, VaultError::NotFound));
+    }
+
+    #[test]
+    fn cannot_delete_root_collapses_to_not_found() {
+        // Regression guard: prior to the audit fix this variant fell
+        // through to the panic arm, which would UB across the FFI.
+        let v = model_err_to_vault_err(ModelError::CannotDeleteRoot);
+        assert!(matches!(v, VaultError::NotFound));
+    }
+
+    #[test]
+    fn history_index_out_of_range_collapses_to_index_out_of_range() {
+        let v = model_err_to_vault_err(ModelError::HistoryIndexOutOfRange {
+            id: EntryId(Uuid::nil()),
+            index: 5,
+            len: 2,
+        });
+        assert!(matches!(v, VaultError::IndexOutOfRange));
+    }
+
+    #[test]
+    fn unexpected_variant_renders_actionable_display() {
+        // Spot-check the Display surface so binding-side logs stay
+        // useful; the actual fallthrough is exercised in debug builds
+        // by the `debug_assert!` and in release by structural
+        // construction here.
+        let v = VaultError::Unexpected("unmapped ModelError: SomethingNew".into());
+        assert_eq!(
+            v.to_string(),
+            "unexpected internal error: unmapped ModelError: SomethingNew",
+        );
     }
 }
