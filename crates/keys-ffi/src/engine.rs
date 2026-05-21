@@ -483,6 +483,20 @@ impl Engine {
         })
     }
 
+    /// Read the value of a non-protected custom field. Counterpart to
+    /// [`Self::reveal_custom_field`] for fields stored in plaintext in
+    /// `entry_custom_field`. Returns `None` when no row matches
+    /// `(uuid, field_name)` — either the field is protected (use
+    /// `reveal_custom_field` instead) or doesn't exist.
+    pub fn non_protected_custom_field(
+        &self,
+        uuid: String,
+        field_name: String,
+    ) -> Result<Option<String>, EngineError> {
+        let u = parse_uuid(&uuid, "entry")?;
+        self.with_engine(|e| Ok(e.non_protected_custom_field(u, &field_name)?))
+    }
+
     /// Reveal a field on a historical snapshot.
     pub fn reveal_history_field(
         &self,

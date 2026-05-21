@@ -1962,6 +1962,30 @@ impl Engine {
         crate::reveal::reveal_custom_field(&self.conn, &*self.field_protector, uuid, field_name)
     }
 
+    /// Read the value of a non-protected custom field by name.
+    ///
+    /// Counterpart to [`Engine::reveal_custom_field`] for fields stored
+    /// in the `entry_custom_field` table (migration 0002) — values are
+    /// plaintext and no AES-GCM unwrap is involved. Returns `None` if
+    /// the entry has no matching row (i.e. the field is protected, or
+    /// doesn't exist at all).
+    ///
+    /// `EntryFull::custom_fields` lists every custom field's `name` and
+    /// `is_protected`, but doesn't carry values; callers fetch values
+    /// on demand via this method (non-protected) or
+    /// [`Engine::reveal_custom_field`] (protected).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn non_protected_custom_field(
+        &self,
+        uuid: Uuid,
+        field_name: &str,
+    ) -> Result<Option<String>, EngineError> {
+        crate::reads::non_protected_custom_field(&self.conn, uuid, field_name)
+    }
+
     /// Reveal the cleartext value of a field in a historic snapshot of
     /// an entry.
     ///

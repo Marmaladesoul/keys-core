@@ -414,6 +414,39 @@ fn set_non_protected_custom_field_upserts() {
             .iter()
             .any(|c| c.name == "Website" && !c.is_protected)
     );
+    // Round-trip the value through the dedicated reader.
+    assert_eq!(
+        engine
+            .non_protected_custom_field(uuid, "Website")
+            .expect("read"),
+        Some("new.example.com".to_owned())
+    );
+}
+
+#[test]
+fn non_protected_custom_field_returns_none_for_absent_or_protected() {
+    let (mut engine, root, _dir) = engine_with_empty_vault();
+    let uuid = engine
+        .create_entry(root, new_entry("x", "p"))
+        .expect("create");
+    // Missing row → None.
+    assert_eq!(
+        engine
+            .non_protected_custom_field(uuid, "Nope")
+            .expect("read"),
+        None
+    );
+    // Protected field lives in entry_protected; the non-protected
+    // reader must not see it.
+    engine
+        .set_protected_field(uuid, "Secret", SecretString::from("shh"))
+        .expect("set protected");
+    assert_eq!(
+        engine
+            .non_protected_custom_field(uuid, "Secret")
+            .expect("read"),
+        None
+    );
 }
 
 #[test]

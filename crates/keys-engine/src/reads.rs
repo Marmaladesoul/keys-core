@@ -1041,6 +1041,27 @@ fn load_custom_fields_for(
     Ok(rows)
 }
 
+/// Read the value of a single non-protected custom field by name.
+///
+/// Queries `entry_custom_field` directly (no AES-GCM unwrap). Returns
+/// `Ok(None)` when the row is absent — either because the field is
+/// protected (stored in `entry_protected` instead) or doesn't exist.
+pub(crate) fn non_protected_custom_field(
+    conn: &Connection,
+    uuid: Uuid,
+    field_name: &str,
+) -> Result<Option<String>, EngineError> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM entry_custom_field \
+             WHERE entry_uuid = ?1 AND field_name = ?2",
+            params![uuid.to_string(), field_name],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(value)
+}
+
 fn load_history_count_for(conn: &Connection, entry_uuid: &str) -> Result<u32, EngineError> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM entry_history WHERE entry_uuid = ?1",
