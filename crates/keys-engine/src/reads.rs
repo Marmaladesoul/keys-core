@@ -191,8 +191,8 @@ pub(crate) fn group_tree(conn: &Connection) -> Result<Vec<GroupNode>, EngineErro
                 name: r.get(2)?,
                 icon: icon_ref_from(r.get(3)?, parse_optional_uuid_col(r, 4)?),
                 is_recycle_bin: r.get::<_, i64>(5)? != 0,
-                sort_order: u32::try_from(sort_order_i64).unwrap_or(0),
-                entry_count_direct: u32::try_from(count_i64).unwrap_or(u32::MAX),
+                sort_order: u32_from_db_column(sort_order_i64, 6)?,
+                entry_count_direct: u32_from_db_column(count_i64, 7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -631,7 +631,7 @@ pub(crate) fn tag_usage_counts(conn: &Connection) -> Result<Vec<(String, u64)>, 
         .query_map([], |r| {
             let name: String = r.get(0)?;
             let count: i64 = r.get(1)?;
-            Ok((name, u64::try_from(count).unwrap_or(0)))
+            Ok((name, u64_from_db_column(count, 1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
@@ -647,7 +647,7 @@ pub(crate) fn entry_count(conn: &Connection, group: Option<Uuid>) -> Result<u64,
     } else {
         conn.query_row("SELECT COUNT(*) FROM entry", [], |r| r.get(0))?
     };
-    Ok(u64::try_from(count).unwrap_or(0))
+    Ok(u64_from_db_column(count, 0)?)
 }
 
 /// Return the historical snapshots of an entry, ordered oldest-first.
@@ -714,7 +714,7 @@ pub(crate) fn history(conn: &Connection, uuid: Uuid) -> Result<Vec<HistoricEntry
             })
             .collect();
         out.push(HistoricEntry {
-            history_index: u32::try_from(idx).unwrap_or(u32::MAX),
+            history_index: u32_from_db_column(idx, 0)?,
             title: snap.title,
             username: snap.username,
             url: snap.url,
@@ -965,7 +965,7 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySum
             .and_then(strength_bucket_from_i64),
         password_entropy: r.get(12)?,
         icon: icon_ref_from(r.get(13)?, parse_optional_uuid_col(r, 14)?),
-        attachment_count: u32::try_from(attachment_count_i64).unwrap_or(u32::MAX),
+        attachment_count: u32_from_db_column(attachment_count_i64, 15)?,
         has_totp: has_totp_i64 != 0,
     })
 }
@@ -1000,7 +1000,7 @@ fn load_attachments_for(
             let size: i64 = r.get(1)?;
             Ok(AttachmentRef {
                 name,
-                size: u64::try_from(size).unwrap_or(0),
+                size: u64_from_db_column(size, 1)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1068,7 +1068,7 @@ fn load_history_count_for(conn: &Connection, entry_uuid: &str) -> Result<u32, En
         params![entry_uuid],
         |r| r.get(0),
     )?;
-    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    Ok(u32_from_db_column(count, 0)?)
 }
 
 fn parse_uuid_col(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Uuid> {
@@ -1076,6 +1076,25 @@ fn parse_uuid_col(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Uuid>
     Uuid::parse_str(&s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
     })
+}
+
+/// Decode an `i64` column value as `u32`, surfacing out-of-range as a
+/// `rusqlite::Error::IntegralValueOutOfRange` so the caller's `?`
+/// converts it (via the workspace's `From<rusqlite::Error> for EngineError`
+/// impl) into a typed corruption signal rather than the previous silent
+/// `unwrap_or(sentinel)` substitution.
+///
+/// `column` is the column index for diagnostic context; pass the
+/// `query_map` column the value originated from.
+pub(crate) fn u32_from_db_column(value: i64, column: usize) -> rusqlite::Result<u32> {
+    u32::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
+}
+
+/// `u64` flavour of [`u32_from_db_column`] — used for `COUNT(*)` and
+/// attachment-size columns where the legitimate range is the non-negative
+/// half of `i64`.
+pub(crate) fn u64_from_db_column(value: i64, column: usize) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
 
 fn parse_optional_uuid_col(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<Uuid>> {
@@ -1104,10 +1123,21 @@ fn icon_ref_from(icon_index: Option<i64>, icon_custom_uuid: Option<Uuid>) -> Ico
     // overrides the built-in index for rendering). Otherwise fall back
     // to the built-in index, defaulting to 0 (the standard "key" icon)
     // when both columns are NULL.
+    //
+    // Out-of-range `icon_index` values are *not* corruption-class — the
+    // KDBX builtin set is small (currently 0–68) and ingest already
+    // bounded the value into `u32` at write time, so this saturate
+    // models "we got something weird, fall back to the default icon"
+    // rather than masking a data-loss bug. `debug_assert!` so anything
+    // that does smuggle a negative value past ingest trips CI.
     if let Some(uuid) = icon_custom_uuid {
         IconRef::Custom(uuid)
     } else {
         let idx = icon_index.unwrap_or(0);
+        debug_assert!(
+            (0..=i64::from(u32::MAX)).contains(&idx),
+            "icon_index {idx} out of u32 range — ingest invariant violated",
+        );
         IconRef::Builtin(u32::try_from(idx).unwrap_or(0))
     }
 }
@@ -1221,5 +1251,77 @@ mod tests {
         assert_eq!(icon_ref_from(Some(5), Some(u)), IconRef::Custom(u));
         assert_eq!(icon_ref_from(Some(5), None), IconRef::Builtin(5));
         assert_eq!(icon_ref_from(None, None), IconRef::Builtin(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Corruption-class column decoders.
+    //
+    // Replace the prior `u32::try_from(i64).unwrap_or(sentinel)` pattern,
+    // which silently masked DB corruption as either 0 or u32::MAX.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn u32_from_db_column_accepts_zero() {
+        assert_eq!(u32_from_db_column(0, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn u32_from_db_column_accepts_max() {
+        assert_eq!(
+            u32_from_db_column(i64::from(u32::MAX), 0).unwrap(),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn u32_from_db_column_rejects_negative() {
+        let err = u32_from_db_column(-1, 7).unwrap_err();
+        match err {
+            rusqlite::Error::IntegralValueOutOfRange(col, val) => {
+                assert_eq!(col, 7);
+                assert_eq!(val, -1);
+            }
+            other => panic!("expected IntegralValueOutOfRange; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u32_from_db_column_rejects_above_u32_max() {
+        let just_over = i64::from(u32::MAX) + 1;
+        let err = u32_from_db_column(just_over, 7).unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::IntegralValueOutOfRange(7, v) if v == just_over,
+        ));
+    }
+
+    #[test]
+    fn u64_from_db_column_accepts_zero_and_max() {
+        assert_eq!(u64_from_db_column(0, 0).unwrap(), 0);
+        assert_eq!(u64_from_db_column(i64::MAX, 0).unwrap(), i64::MAX as u64);
+    }
+
+    #[test]
+    fn u64_from_db_column_rejects_negative_count() {
+        // `COUNT(*)` in SQLite is always non-negative — a negative value
+        // here means the column was hand-set to something out of range,
+        // i.e. DB corruption. Pin the error shape so the surfaced
+        // diagnostic doesn't regress.
+        let err = u64_from_db_column(-5, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            rusqlite::Error::IntegralValueOutOfRange(1, -5),
+        ));
+    }
+
+    /// Pinned upstream guarantee: `From<rusqlite::Error> for EngineError`
+    /// must wrap `IntegralValueOutOfRange` as `EngineError::Sqlite`, so
+    /// the typed-corruption signal threads cleanly through the public
+    /// surface. If that wrapping ever changes, this test catches it.
+    #[test]
+    fn integral_value_out_of_range_threads_through_engine_error() {
+        let r = u32_from_db_column(-1, 0);
+        let engine: Result<u32, EngineError> = r.map_err(EngineError::from);
+        assert!(matches!(engine, Err(EngineError::Sqlite(_))));
     }
 }

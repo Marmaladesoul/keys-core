@@ -293,7 +293,7 @@ fn load_group_rows(conn: &Connection) -> Result<Vec<GroupRow>, EngineError> {
                 modified_at: row.get(7)?,
                 expires_at: row.get(8)?,
                 is_recycle_bin: row.get::<_, i64>(9)? != 0,
-                sort_order: u32::try_from(sort_order_i64).unwrap_or(0),
+                sort_order: crate::reads::u32_from_db_column(sort_order_i64, 10)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -351,7 +351,17 @@ fn build_subtree(
     let mut group = Group::empty(GroupId(row.uuid));
     group.name = row.name;
     group.notes = row.notes;
-    group.icon_id = row.icon_index.map_or(0, |i| u32::try_from(i).unwrap_or(0));
+    // Saturating, not corruption-class: ingest bounded `icon_index` into
+    // `u32` at write time, so a value outside that range here would be
+    // an ingest invariant violation. `debug_assert!` so CI catches it;
+    // production falls back to the default icon rather than aborting a
+    // projection.
+    let icon_idx = row.icon_index.unwrap_or(0);
+    debug_assert!(
+        (0..=i64::from(u32::MAX)).contains(&icon_idx),
+        "group icon_index {icon_idx} out of u32 range — ingest invariant violated",
+    );
+    group.icon_id = u32::try_from(icon_idx).unwrap_or(0);
     group.custom_icon_uuid = row.icon_custom_uuid;
     group.times = build_times(
         row.created_at,
@@ -440,7 +450,15 @@ fn build_entry_from_row(row: &EntryRow) -> Entry {
     entry.username.clone_from(&row.username);
     entry.url.clone_from(&row.url);
     entry.notes.clone_from(&row.notes);
-    entry.icon_id = row.icon_index.map_or(0, |i| u32::try_from(i).unwrap_or(0));
+    // See group-side note in `build_subtree` — saturating with a
+    // `debug_assert!` rather than surfacing a typed error, because
+    // ingest bounded this into `u32` at write time.
+    let icon_idx = row.icon_index.unwrap_or(0);
+    debug_assert!(
+        (0..=i64::from(u32::MAX)).contains(&icon_idx),
+        "entry icon_index {icon_idx} out of u32 range — ingest invariant violated",
+    );
+    entry.icon_id = u32::try_from(icon_idx).unwrap_or(0);
     entry.custom_icon_uuid = row.icon_custom_uuid;
     entry.times = build_times(
         row.created_at,
