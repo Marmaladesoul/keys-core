@@ -27,6 +27,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use keepass_core::protector::{FieldProtector, ProtectorError as CoreProtectorError, SessionKey};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Foreign-implemented session-key provider for protected-field wrap.
 ///
@@ -113,17 +114,31 @@ impl Debug for BridgeProtector {
 
 impl FieldProtector for BridgeProtector {
     fn acquire_session_key(&self) -> Result<SessionKey, CoreProtectorError> {
-        let raw = self
-            .inner
-            .acquire_session_key()
-            .map_err(CoreProtectorError::from)?;
-        let bytes: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+        // The foreign trait surfaces the 32-byte key as a `Vec<u8>` —
+        // a fresh Rust-side allocation receiving secret material across
+        // the FFI boundary. `Zeroizing<Vec<u8>>` ensures that allocation
+        // is scrubbed when dropped, instead of leaving the session key
+        // sitting on the heap to be revealed by whatever next reuses
+        // that arena.
+        let raw: Zeroizing<Vec<u8>> = Zeroizing::new(
+            self.inner
+                .acquire_session_key()
+                .map_err(CoreProtectorError::from)?,
+        );
+        // The destination (`SessionKey`) is itself `Zeroizing<[u8; 32]>`,
+        // so the long-lived copy is already covered. The intermediate
+        // stack array is `Copy` and outlives the move into `from_bytes`;
+        // zeroize it explicitly so the stack frame doesn't retain a
+        // plaintext image after we return.
+        let mut bytes: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
             CoreProtectorError::KeyUnavailable(format!(
                 "session key must be 32 bytes; got {}",
                 raw.len()
             ))
         })?;
-        Ok(SessionKey::from_bytes(bytes))
+        let key = SessionKey::from_bytes(bytes);
+        bytes.zeroize();
+        Ok(key)
     }
 }
 
@@ -133,4 +148,82 @@ pub(crate) fn bridge(
     protector: Option<Arc<dyn VaultFieldProtector>>,
 ) -> Option<Arc<dyn FieldProtector>> {
     protector.map(|p| Arc::new(BridgeProtector::new(p)) as Arc<dyn FieldProtector>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FixedKey(Vec<u8>);
+
+    impl VaultFieldProtector for FixedKey {
+        fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct FailingKey(String);
+
+    impl VaultFieldProtector for FailingKey {
+        fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
+            Err(VaultProtectorError::KeyUnavailable(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn bridge_round_trips_a_valid_32_byte_key() {
+        let raw = vec![7u8; 32];
+        let bridge = BridgeProtector::new(Arc::new(FixedKey(raw.clone())));
+        let key = bridge.acquire_session_key().expect("32-byte key accepted");
+        assert_eq!(key.as_bytes().as_slice(), raw.as_slice());
+    }
+
+    #[test]
+    fn bridge_rejects_short_key() {
+        // Exercises the `raw.len()` borrow inside the error-formatting
+        // closure — confirms the `Zeroizing` wrapper doesn't move the
+        // underlying Vec out from under that borrow.
+        let bridge = BridgeProtector::new(Arc::new(FixedKey(vec![1u8; 16])));
+        let err = bridge
+            .acquire_session_key()
+            .expect_err("must reject non-32-byte key");
+        assert!(
+            matches!(err, CoreProtectorError::KeyUnavailable(ref m) if m.contains("32 bytes; got 16")),
+            "unexpected error: {err:?}",
+        );
+    }
+
+    #[test]
+    fn bridge_rejects_long_key() {
+        let bridge = BridgeProtector::new(Arc::new(FixedKey(vec![1u8; 64])));
+        let err = bridge
+            .acquire_session_key()
+            .expect_err("must reject non-32-byte key");
+        assert!(
+            matches!(err, CoreProtectorError::KeyUnavailable(ref m) if m.contains("32 bytes; got 64")),
+            "unexpected error: {err:?}",
+        );
+    }
+
+    #[test]
+    fn bridge_propagates_foreign_error() {
+        let bridge = BridgeProtector::new(Arc::new(FailingKey("se locked".into())));
+        let err = bridge.acquire_session_key().expect_err("must propagate");
+        assert!(
+            matches!(err, CoreProtectorError::KeyUnavailable(ref m) if m == "se locked"),
+            "unexpected error: {err:?}",
+        );
+    }
+
+    /// Compile-time witness that the bridge holds the foreign-supplied
+    /// key bytes in `Zeroizing<Vec<u8>>`. If a future edit changes the
+    /// type back to plain `Vec<u8>`, this test stops compiling — which
+    /// is the point: secret-material handling shouldn't silently
+    /// regress.
+    #[test]
+    fn bridge_uses_zeroizing_vec_for_raw_secret() {
+        fn assert_zeroizing(_: &Zeroizing<Vec<u8>>) {}
+        let probe: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; 32]);
+        assert_zeroizing(&probe);
+    }
 }

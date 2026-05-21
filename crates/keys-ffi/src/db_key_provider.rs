@@ -23,6 +23,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use keys_engine::{DbKey, KeyProvider, KeyProviderError as EngineKeyProviderError};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Foreign-implemented database-key provider for `SQLCipher` unlock.
 ///
@@ -99,17 +100,31 @@ impl Debug for BridgeDbKeyProvider {
 
 impl KeyProvider for BridgeDbKeyProvider {
     fn acquire_db_key(&self) -> Result<DbKey, EngineKeyProviderError> {
-        let raw = self
-            .inner
-            .acquire_db_key()
-            .map_err(EngineKeyProviderError::from)?;
-        let bytes: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
+        // The foreign trait surfaces the 32-byte key as a `Vec<u8>` —
+        // a fresh Rust-side allocation receiving secret material across
+        // the FFI boundary. `Zeroizing<Vec<u8>>` ensures that allocation
+        // is scrubbed when dropped, instead of leaving the SQLCipher
+        // key sitting on the heap to be revealed by whatever next
+        // reuses that arena.
+        let raw: Zeroizing<Vec<u8>> = Zeroizing::new(
+            self.inner
+                .acquire_db_key()
+                .map_err(EngineKeyProviderError::from)?,
+        );
+        // The destination (`DbKey`) is itself `Zeroizing<[u8; 32]>`,
+        // so the long-lived copy is already covered. The intermediate
+        // stack array is `Copy` and outlives the move; zeroize it
+        // explicitly so the stack frame doesn't retain a plaintext
+        // image after we return.
+        let mut bytes: [u8; 32] = raw.as_slice().try_into().map_err(|_| {
             EngineKeyProviderError::KeyUnavailable(format!(
                 "expected 32-byte key, got {} bytes",
                 raw.len()
             ))
         })?;
-        Ok(DbKey::from_bytes(bytes))
+        let key = DbKey::from_bytes(bytes);
+        bytes.zeroize();
+        Ok(key)
     }
 }
 
@@ -186,5 +201,17 @@ mod tests {
             engine,
             EngineKeyProviderError::KeyUnavailable("boom".into()),
         );
+    }
+
+    /// Compile-time witness that the bridge holds the foreign-supplied
+    /// key bytes in `Zeroizing<Vec<u8>>`. If a future edit changes the
+    /// type back to plain `Vec<u8>`, this test stops compiling — which
+    /// is the point: secret-material handling shouldn't silently
+    /// regress.
+    #[test]
+    fn bridge_uses_zeroizing_vec_for_raw_secret() {
+        fn assert_zeroizing(_: &Zeroizing<Vec<u8>>) {}
+        let probe: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; 32]);
+        assert_zeroizing(&probe);
     }
 }

@@ -30,6 +30,11 @@ uniffi = { version = "0.28", features = ["tokio"] }
 # the UI thread free while a save runs.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 secrecy = "0.10"
+# Scrub the bridge-layer Vec<u8>/[u8;32] copies of the AES-256 session key
+# and the SQLCipher database key on drop. The destination wrappers
+# (`SessionKey`, `DbKey`) already zeroize; this covers the intermediate
+# Rust-side allocations the bridge holds across the FFI boundary.
+zeroize = "1"
 sha2 = "0.10"
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }

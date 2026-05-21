@@ -1094,6 +1094,7 @@ dependencies = [
  "tokio",
  "uniffi",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
