@@ -57,6 +57,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "entry_has_totp",
         sql: include_str!("migrations/0005_entry_has_totp.sql"),
     },
+    Migration {
+        version: 6,
+        name: "entry_custom_data",
+        sql: include_str!("migrations/0006_entry_custom_data.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.

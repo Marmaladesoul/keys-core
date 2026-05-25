@@ -34,7 +34,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::Kdbx;
-use keepass_core::model::Vault;
+use keepass_core::model::{EntryId, Vault};
+use keepass_merge::FIELD_CONFLICT_CUSTOM_DATA_KEY;
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -95,6 +96,52 @@ pub struct MergeStats {
     pub groups_deleted: usize,
     /// Groups that changed parent. Always `0` in v0.1.
     pub groups_moved: usize,
+}
+
+/// Outcome of a successful
+/// [`Engine::reconcile_with_disk_park_conflicts`] call.
+///
+/// Mirrors [`MergeResult`] for the non-conflict cases (`NoChange`,
+/// `Merged`); the third variant is `Parked` rather than `Conflict`
+/// because the conflicting entries have been resolved into local's
+/// `<History>` with `keys.field_conflict.v1` markers attached — sync
+/// never blocks. The user reviews via the resolver UI at their leisure.
+///
+/// `applied` reflects the same per-bucket stats as
+/// [`MergeResult::Merged`]; `parked` lists the entry UUIDs whose
+/// conflicts were parked plus the auto-handled categories from
+/// [`keepass_merge::ParkedConflictsReport`] for downstream UX.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ParkConflictsResult {
+    /// Engine state and disk were already equivalent. The ancestor
+    /// is refreshed; nothing else changes.
+    NoChange,
+    /// Non-conflicting changes applied; any conflicts the merge
+    /// surfaced were parked rather than reported.
+    Applied {
+        /// Per-bucket counts of merge mutations applied to `SQLite`.
+        applied: MergeStats,
+        /// Per-bucket lists of entries the parker touched.
+        parked: ParkedConflictsSummary,
+    },
+}
+
+/// Wire-friendly mirror of
+/// [`keepass_merge::ParkedConflictsReport`] in `Vec<String>` form so
+/// the FFI boundary doesn't have to round-trip `EntryId`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParkedConflictsSummary {
+    /// UUIDs of entries whose conflict was parked into history with
+    /// a `keys.field_conflict.v1` marker.
+    pub entries_with_parked_conflict: Vec<String>,
+    /// UUIDs of entries restored from a remote tombstone under the
+    /// edit-wins rule.
+    pub entries_restored_from_deletion: Vec<String>,
+    /// UUIDs of entries where attachment-both-differ was resolved
+    /// via the keep-both rename path.
+    pub attachments_kept_both: Vec<String>,
 }
 
 /// Source of unique-id assignment for [`ConflictPayload`]. Each
@@ -217,6 +264,117 @@ pub(crate) fn reconcile_with_disk(
     Ok(MergeResult::Merged { applied: stats })
 }
 
+/// Park-conflicts variant of [`reconcile_with_disk`].
+///
+/// Identical disk read / parse / project / merge prefix, but
+/// continues past genuine conflicts by calling
+/// [`keepass_merge::apply_merge_park_conflicts`]. The conflicting
+/// entries' remote-side snapshots are pushed into local's `<History>`
+/// with `keys.field_conflict.v1` markers attached; local's current
+/// state is unchanged for those entries; sync never blocks.
+///
+/// The engine's `SQLite` mirror is re-populated from the merged
+/// vault (markers and any unioned `keys.history_tombstones.v1`
+/// tombstones survive thanks to the migration-0006 entry-level
+/// `custom_data` persistence and the history JSON shape extension).
+pub(crate) fn reconcile_with_disk_park_conflicts(
+    engine: &mut Engine,
+    kdbx_path: &Path,
+    composite_key: &CompositeKey,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ParkConflictsResult, EngineError> {
+    // Steps 1–4: same prefix as `reconcile_with_disk`.
+    let disk_bytes = std::fs::read(kdbx_path)?;
+    let disk_kdbx = Kdbx::open_from_bytes(disk_bytes.clone())
+        .map_err(|e| EngineError::Serialise(format!("open disk kdbx: {e}")))?
+        .read_header()
+        .map_err(|e| EngineError::Serialise(format!("read disk header: {e}")))?
+        .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
+        .map_err(|e| EngineError::Serialise(format!("unlock disk kdbx: {e}")))?;
+
+    let local_vault = engine.project_to_vault()?;
+    let remote_vault = disk_kdbx
+        .vault_with_unwrapped_protected()
+        .map_err(|e| EngineError::Serialise(format!("unwrap disk protected: {e}")))?;
+
+    if vaults_equivalent(&local_vault, &remote_vault) {
+        engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
+        return Ok(ParkConflictsResult::NoChange);
+    }
+
+    let outcome = keepass_merge::merge(&local_vault, &remote_vault)
+        .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
+
+    // Stats reflect the non-conflicting buckets. Conflict-bucket
+    // entries are NOT counted as "updated" — they're parked, leaving
+    // local's current state untouched (the additions live only in
+    // history).
+    let stats = MergeStats {
+        entries_added: outcome.added_on_disk.len(),
+        entries_updated: outcome.disk_only_changes.len() + outcome.local_only_changes.len(),
+        entries_deleted: outcome.deleted_on_disk.len(),
+        entries_moved: 0,
+        groups_added: count_groups_remote_only(&local_vault, &remote_vault),
+        groups_updated: 0,
+        groups_deleted: count_groups_tombstoned(&local_vault, &remote_vault),
+        groups_moved: 0,
+    };
+
+    let mut merged = local_vault;
+    let report = keepass_merge::apply_merge_park_conflicts(
+        &mut merged,
+        &remote_vault,
+        &outcome,
+        &keepass_merge::ParkConflictsConfig::with_now(now),
+    )
+    .map_err(|e| EngineError::Serialise(format!("apply_merge_park_conflicts: {e}")))?;
+    keepass_merge::reconcile_timestamps(&mut merged, &remote_vault);
+
+    // Re-ingest the merged vault into SQLite via the same `ingest_merged`
+    // path the standard reconcile uses. The migration-0006
+    // entry_custom_data table plus the history JSON shape extension
+    // round-trip both `keys.history_tombstones.v1` (on the live entry)
+    // and `keys.field_conflict.v1` (on parked history records) so
+    // markers + tombstones survive the SQLite mirror.
+    let mut disk_kdbx = Kdbx::open_from_bytes(disk_bytes.clone())
+        .map_err(|e| EngineError::Serialise(format!("re-open disk kdbx: {e}")))?
+        .read_header()
+        .map_err(|e| EngineError::Serialise(format!("re-read disk header: {e}")))?
+        .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
+        .map_err(|e| EngineError::Serialise(format!("re-unlock disk kdbx: {e}")))?;
+    disk_kdbx.replace_vault(merged);
+    engine.ingest_merged(&disk_kdbx)?;
+
+    engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
+
+    let parked = ParkedConflictsSummary {
+        entries_with_parked_conflict: report
+            .entries_with_parked_conflict
+            .iter()
+            .map(|id| id.0.to_string())
+            .collect(),
+        entries_restored_from_deletion: report
+            .entries_restored_from_deletion
+            .iter()
+            .map(|id| id.0.to_string())
+            .collect(),
+        attachments_kept_both: report
+            .attachments_kept_both
+            .iter()
+            .map(|id| id.0.to_string())
+            .collect(),
+    };
+
+    engine.emit(ChangeEvent::ExternalChangeMerged {
+        applied: stats.clone(),
+    });
+
+    Ok(ParkConflictsResult::Applied {
+        applied: stats,
+        parked,
+    })
+}
+
 /// Cheap structural-equivalence check between two vaults at merge
 /// time. Used to short-circuit a reconcile when the disk file and
 /// the engine's projection carry the same content (e.g. when the
@@ -330,4 +488,143 @@ fn collect_group_ids(
     for sub in &group.groups {
         collect_group_ids(sub, out);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parked-conflict surface — queries + marker-clearing.
+// ---------------------------------------------------------------------------
+
+/// Return the UUIDs of every entry that has at least one history
+/// record carrying the parked-conflict marker
+/// (`keys.field_conflict.v1`).
+///
+/// Backed by a direct scan of `entry_history.snapshot_json` for the
+/// marker key. The marker key is unique enough that a substring scan
+/// is exact for any vault that didn't somehow stash the literal
+/// string in plaintext custom-field values — which would be both an
+/// abuse case and harmless: the false positive surfaces as an entry
+/// in the resolver list and the resolver immediately recovers when
+/// it finds no marker-bearing history records to act on. Optimising
+/// further (e.g. a generated column + index) is dead weight given
+/// the rarity of conflicts.
+pub(crate) fn entries_with_parked_conflict(
+    engine: &Engine,
+) -> Result<Vec<uuid::Uuid>, EngineError> {
+    let conn = engine.conn_ref();
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT entry_uuid FROM entry_history \
+         WHERE snapshot_json LIKE '%' || ?1 || '%' \
+         ORDER BY entry_uuid",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![FIELD_CONFLICT_CUSTOM_DATA_KEY], |row| {
+        let s: String = row.get(0)?;
+        Ok(s)
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let s = r?;
+        if let Ok(u) = uuid::Uuid::parse_str(&s) {
+            out.push(u);
+        }
+    }
+    Ok(out)
+}
+
+/// Clear every parked-conflict marker on the named entry by
+/// tombstoning the marker-bearing history records and re-ingesting.
+///
+/// For each history record on `entry_uuid` whose `custom_data`
+/// contains [`FIELD_CONFLICT_CUSTOM_DATA_KEY`], we call
+/// [`keepass_merge::add_history_tombstone`] (which removes the record
+/// from `<History>` AND writes a `keys.history_tombstones.v1`
+/// tombstone onto the entry's own `custom_data` — both atomic from the
+/// caller's view). The merged vault is then re-ingested via the same
+/// path the reconcile flow uses, so the new state (tombstone present,
+/// marker history record gone) lands in `SQLite`.
+///
+/// Idempotent: calling on an entry without markers is a no-op
+/// (returns 0 cleared).
+///
+/// Returns the number of marker records cleared.
+pub(crate) fn clear_parked_conflict_marker(
+    engine: &mut Engine,
+    entry_uuid: uuid::Uuid,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<u32, EngineError> {
+    let mut vault = engine.project_to_vault()?;
+    let id = EntryId(entry_uuid);
+
+    // Find the entry; if it doesn't exist, surface NotFound rather
+    // than silently succeeding — the caller asked about an entry we
+    // can't find.
+    let Some(entry) = find_entry_mut(&mut vault.root, id) else {
+        return Err(EngineError::NotFound { entity: "entry" });
+    };
+
+    // Collect every marker-bearing history record as owned clones —
+    // we need them out of the borrow before we can mutate the entry
+    // via `add_history_tombstone`. The clone is cheap (single Entry)
+    // and there are at most a handful per entry in practice.
+    let marker_records: Vec<keepass_core::model::Entry> = entry
+        .history
+        .iter()
+        .filter(|h| {
+            h.custom_data
+                .iter()
+                .any(|cd| cd.key == FIELD_CONFLICT_CUSTOM_DATA_KEY)
+        })
+        .cloned()
+        .collect();
+
+    if marker_records.is_empty() {
+        return Ok(0);
+    }
+
+    let cleared = u32::try_from(marker_records.len()).unwrap_or(u32::MAX);
+
+    // `add_history_tombstone` does the dual write: drops the matching
+    // record from `entry.history` AND adds the (mtime, hash) entry to
+    // the entry's `keys.history_tombstones.v1` list. Binaries are
+    // unused for the marker case (parked-remote snapshots clone
+    // attachment refs but the hash inputs include attachment bytes
+    // for cross-binary-pool stability — see entry_content_hash).
+    for record in &marker_records {
+        keepass_merge::add_history_tombstone(
+            entry,
+            record,
+            &vault.binaries,
+            keepass_merge::TombstoneReason::ConflictCleanup,
+            None,
+            now,
+        )
+        .map_err(|e| EngineError::Serialise(format!("add_history_tombstone: {e}")))?;
+    }
+
+    // Re-ingest the mutated vault directly. The KDBX envelope on
+    // disk hasn't changed (we haven't touched the file), so the
+    // `meta.*` outer-header rows already in SQLite remain accurate
+    // and `ingest_vault` skips re-persisting them.
+    engine.ingest_vault(&vault)?;
+    engine.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
+
+    Ok(cleared)
+}
+
+/// Walk the group tree looking for the live entry with `id`. Returns
+/// the mutable borrow on first match. Mirrors the same helper in
+/// `keepass-merge::auto`; kept private here to avoid a public re-
+/// export from a sibling crate.
+fn find_entry_mut(
+    group: &mut keepass_core::model::Group,
+    id: EntryId,
+) -> Option<&mut keepass_core::model::Entry> {
+    if let Some(idx) = group.entries.iter().position(|e| e.id == id) {
+        return Some(&mut group.entries[idx]);
+    }
+    for sub in &mut group.groups {
+        if let Some(e) = find_entry_mut(sub, id) {
+            return Some(e);
+        }
+    }
+    None
 }

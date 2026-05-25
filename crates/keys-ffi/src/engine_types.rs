@@ -366,6 +366,27 @@ pub struct EntryFull {
     pub tags: Vec<String>,
     pub attachments: Vec<AttachmentRef>,
     pub history_count: u32,
+    /// Per-entry `<CustomData>` items. Carries Keys-namespaced
+    /// extensions like `keys.history_tombstones.v1`. Sorted by `key`.
+    pub custom_data: Vec<CustomDataItemFfi>,
+}
+
+/// Wire-friendly mirror of [`keys_engine::CustomDataItemRef`].
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct CustomDataItemFfi {
+    pub key: String,
+    pub value: String,
+    pub last_modified_at: Option<i64>,
+}
+
+impl From<eng::CustomDataItemRef> for CustomDataItemFfi {
+    fn from(c: eng::CustomDataItemRef) -> Self {
+        Self {
+            key: c.key,
+            value: c.value,
+            last_modified_at: c.last_modified_at,
+        }
+    }
 }
 
 impl From<eng::EntryFull> for EntryFull {
@@ -391,6 +412,7 @@ impl From<eng::EntryFull> for EntryFull {
             tags: e.tags,
             attachments: e.attachments.into_iter().map(Into::into).collect(),
             history_count: e.history_count,
+            custom_data: e.custom_data.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -447,6 +469,10 @@ pub struct HistoricEntry {
     pub custom_fields: Vec<CustomFieldRef>,
     pub tags: Vec<String>,
     pub attachments: Vec<AttachmentRef>,
+    /// Per-snapshot `<CustomData>` items. Carries the parked-conflict
+    /// marker (`keys.field_conflict.v1`) for the resolver UI to key
+    /// off. Sorted by `key`.
+    pub custom_data: Vec<CustomDataItemFfi>,
 }
 
 impl From<eng::HistoricEntry> for HistoricEntry {
@@ -469,6 +495,7 @@ impl From<eng::HistoricEntry> for HistoricEntry {
             custom_fields: h.custom_fields.into_iter().map(Into::into).collect(),
             tags: h.tags,
             attachments: h.attachments.into_iter().map(Into::into).collect(),
+            custom_data: h.custom_data.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -846,6 +873,56 @@ impl From<eng::MergeResult> for MergeResult {
                 let _ = other;
                 Self::NoChange
             }
+        }
+    }
+}
+
+/// Outcome of a successful
+/// [`crate::Engine::reconcile_with_disk_park_conflicts`] call.
+///
+/// Slice 5b's non-blocking replacement for [`MergeResult::Conflict`]:
+/// conflicts are parked into the merged vault's history rather than
+/// stashed for a modal. The third variant carries a list of entry
+/// UUIDs the resolver UI uses to render its review list.
+#[derive(uniffi::Enum, Debug, Clone)]
+pub enum ParkConflictsResultFfi {
+    NoChange,
+    Applied {
+        applied: MergeStats,
+        parked: ParkedConflictsSummaryFfi,
+    },
+}
+
+impl From<eng::ParkConflictsResult> for ParkConflictsResultFfi {
+    fn from(r: eng::ParkConflictsResult) -> Self {
+        match r {
+            eng::ParkConflictsResult::NoChange => Self::NoChange,
+            eng::ParkConflictsResult::Applied { applied, parked } => Self::Applied {
+                applied: applied.into(),
+                parked: parked.into(),
+            },
+            other => {
+                let _ = other;
+                Self::NoChange
+            }
+        }
+    }
+}
+
+/// Wire-friendly mirror of [`keys_engine::ParkedConflictsSummary`].
+#[derive(uniffi::Record, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParkedConflictsSummaryFfi {
+    pub entries_with_parked_conflict: Vec<String>,
+    pub entries_restored_from_deletion: Vec<String>,
+    pub attachments_kept_both: Vec<String>,
+}
+
+impl From<eng::ParkedConflictsSummary> for ParkedConflictsSummaryFfi {
+    fn from(s: eng::ParkedConflictsSummary) -> Self {
+        Self {
+            entries_with_parked_conflict: s.entries_with_parked_conflict,
+            entries_restored_from_deletion: s.entries_restored_from_deletion,
+            attachments_kept_both: s.attachments_kept_both,
         }
     }
 }

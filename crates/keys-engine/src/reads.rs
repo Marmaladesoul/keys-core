@@ -131,6 +131,7 @@ pub(crate) fn entry(conn: &Connection, uuid: Uuid) -> Result<Option<EntryFull>, 
     let attachments = load_attachments_for(conn, &uuid_str)?;
     let custom_fields = load_custom_fields_for(conn, &uuid_str)?;
     let history_count = load_history_count_for(conn, &uuid_str)?;
+    let custom_data = load_entry_custom_data_for(conn, &uuid_str)?;
 
     Ok(Some(EntryFull {
         uuid: row.uuid,
@@ -155,6 +156,7 @@ pub(crate) fn entry(conn: &Connection, uuid: Uuid) -> Result<Option<EntryFull>, 
         tags,
         attachments,
         history_count,
+        custom_data,
     }))
 }
 
@@ -713,6 +715,16 @@ pub(crate) fn history(conn: &Connection, uuid: Uuid) -> Result<Vec<HistoricEntry
                 size: a.size,
             })
             .collect();
+        let mut custom_data: Vec<crate::model::CustomDataItemRef> = snap
+            .custom_data
+            .into_iter()
+            .map(|cd| crate::model::CustomDataItemRef {
+                key: cd.key,
+                value: cd.value,
+                last_modified_at: cd.last_modified_at,
+            })
+            .collect();
+        custom_data.sort_by(|a, b| a.key.cmp(&b.key));
         out.push(HistoricEntry {
             history_index: u32_from_db_column(idx, 0)?,
             title: snap.title,
@@ -734,6 +746,7 @@ pub(crate) fn history(conn: &Connection, uuid: Uuid) -> Result<Vec<HistoricEntry
             custom_fields,
             tags: snap.tags,
             attachments,
+            custom_data,
         });
     }
     Ok(out)
@@ -896,6 +909,18 @@ struct HistorySnapshotRead {
     attachments: Vec<HistoryAttachmentRead>,
     #[serde(default)]
     custom_fields: HashMap<String, HistoryCustomFieldRead>,
+    /// Per-record `<CustomData>` (migration 0006 + history JSON
+    /// shape extension). Pre-shape rows surface an empty list.
+    #[serde(default)]
+    custom_data: Vec<HistoryCustomDataItemRead>,
+}
+
+#[derive(Deserialize)]
+struct HistoryCustomDataItemRead {
+    key: String,
+    value: String,
+    #[serde(default)]
+    last_modified_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1060,6 +1085,29 @@ pub(crate) fn non_protected_custom_field(
         )
         .optional()?;
     Ok(value)
+}
+
+fn load_entry_custom_data_for(
+    conn: &Connection,
+    entry_uuid: &str,
+) -> Result<Vec<crate::model::CustomDataItemRef>, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT key, value, last_modified_at FROM entry_custom_data \
+         WHERE entry_uuid = ?1 \
+         ORDER BY key",
+    )?;
+    let rows = stmt.query_map(params![entry_uuid], |r| {
+        Ok(crate::model::CustomDataItemRef {
+            key: r.get::<_, String>(0)?,
+            value: r.get::<_, String>(1)?,
+            last_modified_at: r.get::<_, Option<i64>>(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 fn load_history_count_for(conn: &Connection, entry_uuid: &str) -> Result<u32, EngineError> {

@@ -40,9 +40,9 @@ pub use key_provider::{DbKey, KeyProvider, KeyProviderError};
 pub use meta::DatabaseMetadata;
 pub use migrations::MigrationError;
 pub use model::{
-    AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, EntryUpdate, GroupNode, GroupUpdate,
-    HistoricEntry, IconRef, NewCustomField, NewEntryFields, NewGroupFields, Pagination,
-    SearchScope, SmartFolder, StrengthBucket,
+    AttachmentRef, CustomDataItemRef, CustomFieldRef, EntryFull, EntrySummary, EntryUpdate,
+    GroupNode, GroupUpdate, HistoricEntry, IconRef, NewCustomField, NewEntryFields, NewGroupFields,
+    Pagination, SearchScope, SmartFolder, StrengthBucket,
 };
 pub use portable::{PortableAttachment, PortableEntry};
 pub use predicate::Predicate;
@@ -52,7 +52,7 @@ pub use predicate_builtin::{
     recycle_bin_contents, weak_password,
 };
 pub use predicate_sql::{CompileError, CompiledPredicate, compile as compile_predicate};
-pub use reconcile::{MergeResult, MergeStats};
+pub use reconcile::{MergeResult, MergeStats, ParkConflictsResult, ParkedConflictsSummary};
 // Re-export the keepass-merge resolution surface as the engine's
 // canonical "conflict resolution" carrier. Phase 4 task 4.7 mirrors
 // `keepass-merge`'s shape verbatim — wrapping it would be a layer of

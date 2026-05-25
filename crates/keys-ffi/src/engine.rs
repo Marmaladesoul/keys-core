@@ -63,8 +63,8 @@ use crate::engine_portable::EnginePortableEntry;
 use crate::engine_types::{
     ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull, EntryUpdate,
     GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi, MergeResult,
-    NewEntryFields, NewGroupFields, Page, Predicate, SearchScope, SmartFolder, TagUsageCount,
-    VaultState, parse_uuid,
+    NewEntryFields, NewGroupFields, Page, ParkConflictsResultFfi, Predicate, SearchScope,
+    SmartFolder, TagUsageCount, VaultState, parse_uuid,
 };
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
@@ -851,6 +851,55 @@ impl Engine {
         .await
         .map_err(|e| EngineError::Internal(format!("join: {e}")))?;
         self.with_engine_mut(|e| Ok(e.reconcile_with_disk(&path, &composite)?.into()))
+    }
+
+    /// Park-conflicts variant of [`Self::reconcile_with_disk`]. See
+    /// [`keys_engine::Engine::reconcile_with_disk_park_conflicts`].
+    ///
+    /// Returned `ParkConflictsResultFfi::Applied` carries the
+    /// per-bucket stats AND a parked-conflicts summary the frontend
+    /// reads to drive UX (e.g. "we parked 3 conflicts — review when
+    /// ready"). No `Conflict` variant: this method never blocks.
+    pub async fn reconcile_with_disk_park_conflicts(
+        &self,
+        kdbx_path: String,
+        password: String,
+    ) -> Result<ParkConflictsResultFfi, EngineError> {
+        let path = PathBuf::from(kdbx_path);
+        let pw = SecretString::from(password);
+        let composite = tokio::task::spawn_blocking(move || {
+            CompositeKey::from_password(pw.expose_secret().as_bytes())
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))?;
+        self.with_engine_mut(|e| {
+            Ok(
+                e.reconcile_with_disk_park_conflicts(&path, &composite, chrono::Utc::now())?
+                    .into(),
+            )
+        })
+    }
+
+    /// Return the UUIDs of every entry that currently has at least
+    /// one parked-conflict marker on one of its history records.
+    /// Drives Keys-Mac's vault-tile warning triangle.
+    pub fn entries_with_parked_conflict(&self) -> Result<Vec<String>, EngineError> {
+        self.with_engine(|e| {
+            Ok(e.entries_with_parked_conflict()?
+                .into_iter()
+                .map(|u| u.to_string())
+                .collect())
+        })
+    }
+
+    /// Clear every parked-conflict marker on `entry_uuid` by
+    /// tombstoning the marker-bearing history records. Called from
+    /// the resolver's Apply path after the user's per-field choices
+    /// are written back. See
+    /// [`keys_engine::Engine::clear_parked_conflict_marker`].
+    pub fn clear_parked_conflict_marker(&self, entry_uuid: String) -> Result<u32, EngineError> {
+        let u = parse_uuid(&entry_uuid, "entry")?;
+        self.with_engine_mut(|e| Ok(e.clear_parked_conflict_marker(u, chrono::Utc::now())?))
     }
 
     /// Peek the stashed [`ConflictPayloadFfi`] for `id` without

@@ -58,7 +58,58 @@ pub(crate) fn ingest(
     let vault = kdbx
         .vault_with_unwrapped_protected()
         .map_err(|e| EngineError::Ingest(IngestError::Kdbx(e.to_string())))?;
+    let header = kdbx.outer_header();
+    let cipher_id = *header.cipher_id.0.as_bytes();
+    let kdf_params = header.kdf_parameters.as_deref().map(<[u8]>::to_vec);
+    let transform_rounds = header.transform_rounds;
+    ingest_vault_with_header(
+        conn,
+        fingerprint_key,
+        protector,
+        &vault,
+        Some(&HeaderFacts {
+            cipher_id,
+            kdf_params,
+            transform_rounds,
+        }),
+    )
+}
 
+/// Outer-header facts the engine persists into `meta.*` setting rows
+/// so it doesn't have to hold a live [`Kdbx`] handle to surface them
+/// via [`crate::Engine::database_metadata`].
+struct HeaderFacts {
+    cipher_id: [u8; 16],
+    kdf_params: Option<Vec<u8>>,
+    transform_rounds: Option<u64>,
+}
+
+/// Re-ingest a pre-unwrapped [`Vault`] without going through a
+/// [`Kdbx`] envelope. Used by paths that have already mutated the
+/// in-memory vault (e.g. `clear_parked_conflict_marker`) and don't
+/// want to round-trip through KDBX encrypt + decrypt just to feed
+/// `ingest`.
+///
+/// The outer-header facts (cipher / KDF / transform-rounds) carried
+/// in `meta.*` setting rows are left as the existing ingest wrote
+/// them; the database envelope hasn't changed, only its decoded
+/// content.
+pub(crate) fn ingest_vault(
+    conn: &mut Connection,
+    fingerprint_key: &[u8; 32],
+    protector: &dyn FieldProtector,
+    vault: &Vault,
+) -> Result<IngestOutcome, EngineError> {
+    ingest_vault_with_header(conn, fingerprint_key, protector, vault, None)
+}
+
+fn ingest_vault_with_header(
+    conn: &mut Connection,
+    fingerprint_key: &[u8; 32],
+    protector: &dyn FieldProtector,
+    vault: &Vault,
+    header_facts: Option<&HeaderFacts>,
+) -> Result<IngestOutcome, EngineError> {
     // One session-key fetch per ingest call. Same discipline as the
     // keepass-core wrap pass.
     let session_key = protector
@@ -84,13 +135,19 @@ pub(crate) fn ingest(
     // envelope, not the XML payload), but persisted as `meta.*` setting
     // rows so the engine doesn't have to hold a live `Kdbx` handle to
     // surface them.
-    let header = kdbx.outer_header();
-    meta::write_kdbx_outer_header_facts(
-        &tx,
-        *header.cipher_id.0.as_bytes(),
-        header.kdf_parameters.as_deref(),
-        header.transform_rounds,
-    )?;
+    //
+    // Header-facts are absent on the [`ingest_vault`] code path —
+    // that path mutates the in-memory vault without re-wrapping the
+    // envelope, so the existing rows (written by the originating
+    // ingest call) remain accurate.
+    if let Some(facts) = header_facts {
+        meta::write_kdbx_outer_header_facts(
+            &tx,
+            facts.cipher_id,
+            facts.kdf_params.as_deref(),
+            facts.transform_rounds,
+        )?;
+    }
 
     // Persist `Meta::recycle_bin_enabled` explicitly. The `is_recycle_bin`
     // column on `group` can only tell us "enabled" when a bin group
@@ -120,7 +177,7 @@ pub(crate) fn ingest(
 
     walk_entries(
         &tx,
-        &vault,
+        vault,
         &vault.root,
         recycle_bin_uuid,
         false,
@@ -131,7 +188,6 @@ pub(crate) fn ingest(
     )?;
 
     tx.commit()?;
-    drop(vault);
     Ok(outcome)
 }
 
@@ -145,6 +201,7 @@ fn clear_vault_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute("DELETE FROM entry_history", [])?;
     conn.execute("DELETE FROM entry_protected", [])?;
     conn.execute("DELETE FROM entry_custom_field", [])?;
+    conn.execute("DELETE FROM entry_custom_data", [])?;
     conn.execute("DELETE FROM entry", [])?;
     conn.execute("DELETE FROM tag", [])?;
     conn.execute("DELETE FROM attachment_blob", [])?;
@@ -369,6 +426,23 @@ fn insert_entry(
         }
     }
 
+    // Per-entry `<CustomData>`. Migration 0006. Each `(key, value)`
+    // pair round-trips verbatim — needed for Keys-namespaced
+    // extensions like `keys.history_tombstones.v1` that must survive a
+    // reconcile→project→save cycle.
+    for cd in &entry.custom_data {
+        conn.execute(
+            "INSERT INTO entry_custom_data (entry_uuid, key, value, last_modified_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                entry_uuid,
+                cd.key,
+                cd.value,
+                cd.last_modified.map(|d| d.timestamp_millis()),
+            ],
+        )?;
+    }
+
     // Tags. `Entry::tags` is already a deduplicated Vec<String> per
     // the keepass-core decoder; we still trim and skip empties for
     // safety against hand-rolled vaults.
@@ -563,6 +637,12 @@ struct HistorySnapshot<'a> {
     password_entropy: Option<f64>,
     attachments: Vec<HistoryAttachment<'a>>,
     custom_fields: HashMap<&'a str, HistoryCustomField>,
+    /// Per-record `<CustomData>`. Round-trips the parked-conflict
+    /// marker (`keys.field_conflict.v1`) and any other client-specific
+    /// metadata attached to a history snapshot. Pre-shape rows
+    /// deserialise as an empty list via `#[serde(default)]` on the
+    /// read side.
+    custom_data: Vec<HistoryCustomDataItem<'a>>,
 }
 
 #[derive(Serialize)]
@@ -579,6 +659,15 @@ struct HistoryAttachment<'a> {
     /// Pre-widening rows surface an empty string here; lookups against
     /// `attachment_blob` skip those, and the caller sees `NotFound`.
     sha256_hex: String,
+}
+
+#[derive(Serialize)]
+struct HistoryCustomDataItem<'a> {
+    key: &'a str,
+    value: &'a str,
+    /// Milliseconds since the Unix epoch (UTC). `None` matches the
+    /// keepass-core model when KDBX3 writers omit `<LastModificationTime>`.
+    last_modified_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -663,6 +752,15 @@ impl<'a> HistorySnapshot<'a> {
             password_entropy: entropy,
             attachments,
             custom_fields,
+            custom_data: entry
+                .custom_data
+                .iter()
+                .map(|cd| HistoryCustomDataItem {
+                    key: cd.key.as_str(),
+                    value: cd.value.as_str(),
+                    last_modified_at: cd.last_modified.map(|d| d.timestamp_millis()),
+                })
+                .collect(),
         })
     }
 }

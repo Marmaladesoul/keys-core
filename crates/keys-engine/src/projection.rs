@@ -44,7 +44,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, TimeZone, Utc};
 use keepass_core::model::{
-    Attachment, Binary, CustomField, Entry, EntryId, Group, GroupId, Timestamps, Vault,
+    Attachment, Binary, CustomDataItem, CustomField, Entry, EntryId, Group, GroupId, Timestamps,
+    Vault,
 };
 use keepass_core::protector::{FieldProtector, SessionKey, open_with_key};
 use rusqlite::Connection;
@@ -60,6 +61,7 @@ const PASSWORD_FIELD: &str = "Password";
 
 /// Top-level projection entry point. Runs every read inside a single
 /// immediate transaction so the snapshot is consistent.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn project(
     conn: &Connection,
     protector: &dyn FieldProtector,
@@ -88,6 +90,7 @@ pub(crate) fn project(
     let attachments = load_attachments(conn)?;
     let tags = load_tags(conn)?;
     let history = load_history(conn)?;
+    let entry_custom_data = load_entry_custom_data(conn)?;
 
     // 4. Materialise the binary pool. We assign a fresh ref_id per
     //    distinct attachment blob, populated lazily as we walk entries
@@ -162,6 +165,19 @@ pub(crate) fn project(
         // Tags.
         if let Some(rows) = tags.get(&entry_uuid) {
             entry.tags.clone_from(rows);
+        }
+
+        // Per-entry `<CustomData>` (migration 0006). Round-trips
+        // Keys-namespaced extensions like `keys.history_tombstones.v1`
+        // that need to survive a reconcile→project→save cycle.
+        if let Some(rows) = entry_custom_data.get(&entry_uuid) {
+            for (key, value, last_modified_ms) in rows {
+                entry.custom_data.push(CustomDataItem::new(
+                    key.clone(),
+                    value.clone(),
+                    last_modified_ms.and_then(ms_to_dt),
+                ));
+            }
         }
 
         // History. Protected snapshot fields (password + protected
@@ -573,6 +589,29 @@ fn load_tags(conn: &Connection) -> Result<HashMap<Uuid, Vec<String>>, EngineErro
     Ok(out)
 }
 
+type EntryCustomDataRows = HashMap<Uuid, Vec<(String, String, Option<i64>)>>;
+
+fn load_entry_custom_data(conn: &Connection) -> Result<EntryCustomDataRows, EngineError> {
+    let mut stmt = conn.prepare(
+        "SELECT entry_uuid, key, value, last_modified_at FROM entry_custom_data \
+         ORDER BY entry_uuid, key",
+    )?;
+    let mut out: EntryCustomDataRows = HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            parse_uuid_col(row, 0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    for r in rows {
+        let (uuid, key, value, last_mod) = r?;
+        out.entry(uuid).or_default().push((key, value, last_mod));
+    }
+    Ok(out)
+}
+
 fn load_history(conn: &Connection) -> Result<HashMap<Uuid, Vec<HistorySnapshot>>, EngineError> {
     let mut stmt = conn.prepare(
         "SELECT entry_uuid, snapshot_json FROM entry_history ORDER BY entry_uuid, history_index",
@@ -607,12 +646,24 @@ struct HistorySnapshot {
     accessed_at: i64,
     expires_at: Option<i64>,
     custom_fields: HashMap<String, HistoryCustomField>,
+    /// Per-record `<CustomData>`. Pre-shape rows (history JSON written
+    /// before migration 0006 shipped) deserialise as an empty list.
+    #[serde(default)]
+    custom_data: Vec<HistoryCustomDataItem>,
 }
 
 #[derive(Deserialize)]
 struct HistoryCustomField {
     value: String,
     protected: bool,
+}
+
+#[derive(Deserialize)]
+struct HistoryCustomDataItem {
+    key: String,
+    value: String,
+    #[serde(default)]
+    last_modified_at: Option<i64>,
 }
 
 fn snapshot_to_entry(
@@ -644,6 +695,16 @@ fn snapshot_to_entry(
         };
         e.custom_fields
             .push(CustomField::new(k.clone(), plaintext, v.protected));
+    }
+    // Per-record `<CustomData>` (migration 0006 extended the JSON
+    // shape). Carries the parked-conflict marker
+    // (`keys.field_conflict.v1`) for the resolver UI to key off.
+    for cd in &snap.custom_data {
+        e.custom_data.push(CustomDataItem::new(
+            cd.key.clone(),
+            cd.value.clone(),
+            cd.last_modified_at.and_then(ms_to_dt),
+        ));
     }
     // History entries themselves carry no nested history, no
     // attachments — those aren't part of the snapshot JSON.

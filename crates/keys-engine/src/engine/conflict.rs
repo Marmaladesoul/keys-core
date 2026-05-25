@@ -318,6 +318,31 @@ impl Engine {
         Ok(())
     }
 
+    /// Crate-internal: re-ingest an in-memory [`Vault`] without
+    /// round-tripping through a fresh KDBX envelope. Used by paths
+    /// (e.g. parked-conflict marker cleanup) that mutate the
+    /// projected vault and want to land the changes in `SQLite`
+    /// without holding the composite key.
+    pub(crate) fn ingest_vault(
+        &mut self,
+        vault: &keepass_core::model::Vault,
+    ) -> Result<(), EngineError> {
+        let _outcome = crate::ingest::ingest_vault(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            vault,
+        )?;
+        Ok(())
+    }
+
+    /// Crate-internal: borrow the `SQLite` connection for read-only
+    /// queries the reconcile path needs to run outside the regular
+    /// engine APIs.
+    pub(crate) fn conn_ref(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
+
     /// One-shot: did `(observed_mtime, observed_size)` come from our own
     /// most recent [`Engine::save_to_kdbx`]?
     ///

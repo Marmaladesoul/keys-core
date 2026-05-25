@@ -25,7 +25,7 @@ use crate::ingest;
 use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
 use crate::projection;
-use crate::reconcile::{self, MergeResult};
+use crate::reconcile::{self, MergeResult, ParkConflictsResult};
 use crate::save::{self, SelfWriteSignature};
 use crate::strength::{self, Strength};
 
@@ -771,6 +771,86 @@ impl Engine {
         composite_key: &CompositeKey,
     ) -> Result<MergeResult, EngineError> {
         reconcile::reconcile_with_disk(self, kdbx_path, composite_key)
+    }
+
+    /// Park-conflicts variant of [`Self::reconcile_with_disk`].
+    ///
+    /// Where the legacy method bails out with
+    /// [`MergeResult::Conflict`] when the three-way merge surfaces
+    /// genuine "both sides edited the same field" conflicts, this
+    /// variant calls
+    /// [`keepass_merge::apply_merge_park_conflicts`] — the
+    /// non-conflicting parts are applied as usual, and each
+    /// conflicting entry's remote-side snapshot is pushed into
+    /// local's `<History>` with a `keys.field_conflict.v1` marker
+    /// attached. Sync never blocks. The user reviews via Keys-Mac's
+    /// `ConflictResolverView` at their leisure.
+    ///
+    /// `now` stamps the marker (`FieldConflictMarker::at`). Inject
+    /// it so the call stays a pure function — frontends typically
+    /// pass `chrono::Utc::now()`.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`Self::reconcile_with_disk`]: IO, KDBX
+    /// open/parse, merge, ingest. Per the upstream
+    /// `apply_merge_park_conflicts` contract the synthesised
+    /// resolution is valid by construction, so no resolution-class
+    /// `MergeError` reaches the engine path.
+    pub fn reconcile_with_disk_park_conflicts(
+        &mut self,
+        kdbx_path: &Path,
+        composite_key: &CompositeKey,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ParkConflictsResult, EngineError> {
+        reconcile::reconcile_with_disk_park_conflicts(self, kdbx_path, composite_key, now)
+    }
+
+    /// Return the UUIDs of every entry that currently has at least
+    /// one parked-conflict marker (`keys.field_conflict.v1`) on one
+    /// of its history records.
+    ///
+    /// Drives the vault-tile warning triangle in Keys-Mac: any
+    /// non-empty result means the vault has entries awaiting user
+    /// review via the conflict resolver. Returned UUIDs sort
+    /// ascending for stable rendering.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Sqlite`] on storage failure.
+    pub fn entries_with_parked_conflict(&self) -> Result<Vec<uuid::Uuid>, EngineError> {
+        reconcile::entries_with_parked_conflict(self)
+    }
+
+    /// Clear every parked-conflict marker
+    /// (`keys.field_conflict.v1`) on `entry_uuid` by tombstoning the
+    /// marker-bearing history records via
+    /// [`keepass_merge::add_history_tombstone`].
+    ///
+    /// Called by Keys-Mac's conflict resolver after the user picks
+    /// per-field winners and the Apply path writes their choices
+    /// back. The tombstone propagates via `custom_data` set-union, so
+    /// the marker is reliably gone across the sync swarm — no
+    /// resurrection on the next external-change merge.
+    ///
+    /// Idempotent: a no-op (returns 0) on entries with no markers.
+    /// `now` stamps the tombstone's `at` timestamp; inject so the
+    /// call stays a pure function.
+    ///
+    /// Returns the number of marker history records cleared.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry
+    ///   with `entry_uuid` exists.
+    /// - [`EngineError::Sqlite`] / [`EngineError::Ingest`] on storage
+    ///   failure during the re-ingest.
+    pub fn clear_parked_conflict_marker(
+        &mut self,
+        entry_uuid: uuid::Uuid,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u32, EngineError> {
+        reconcile::clear_parked_conflict_marker(self, entry_uuid, now)
     }
 
     /// Install a [`ReconcileTrigger`] so the file-watcher path can

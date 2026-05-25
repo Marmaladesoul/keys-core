@@ -119,6 +119,26 @@ pub struct CustomFieldRef {
     pub is_protected: bool,
 }
 
+/// One `<CustomData>` key/value pair on an entry or one of its
+/// history records.
+///
+/// Exposed for clients (e.g. Keys-Mac) that need to read
+/// Keys-namespaced extensions — `keys.field_conflict.v1` on a
+/// parked-conflict history record, `keys.history_tombstones.v1` on
+/// the live entry — without decoding them through reveal. Opaque
+/// to the engine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomDataItemRef {
+    /// `<Key>` value — usually a reverse-DNS / namespaced
+    /// identifier.
+    pub key: String,
+    /// `<Value>` value, verbatim.
+    pub value: String,
+    /// `<LastModificationTime>` ms since Unix epoch (UTC). `None`
+    /// when KDBX3 writers omitted it.
+    pub last_modified_at: Option<i64>,
+}
+
 /// Reference to an entry attachment — name and size only.
 ///
 /// Bytes are fetched on demand via
@@ -239,6 +259,11 @@ pub struct EntryFull {
     /// Number of history snapshots available via
     /// [`crate::Engine::history`].
     pub history_count: u32,
+    /// Per-entry `<CustomData>` items, sorted by `key`. Carries
+    /// Keys-namespaced extensions like
+    /// `keys.history_tombstones.v1` so clients can read them without
+    /// going through reveal.
+    pub custom_data: Vec<CustomDataItemRef>,
 }
 
 /// Flat group-tree node. Tree shape is reconstructed by callers from
@@ -315,6 +340,10 @@ pub struct HistoricEntry {
     /// attachments share the same content-addressed pool as the
     /// live entry, so the most recent versions are what come back.
     pub attachments: Vec<AttachmentRef>,
+    /// Per-snapshot `<CustomData>` items, sorted by `key`. Carries
+    /// the parked-conflict marker (`keys.field_conflict.v1`) for the
+    /// resolver UI to key off.
+    pub custom_data: Vec<CustomDataItemRef>,
 }
 
 /// A persisted smart-folder row from the `smart_folder` table.
