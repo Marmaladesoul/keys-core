@@ -13,7 +13,8 @@ use std::io::Write;
 
 use chrono::{DateTime, Utc};
 use keepass_core::CompositeKey;
-use keepass_core::model::{CustomFieldValue, HistoryPolicy, NewEntry, NewGroup};
+use keepass_core::model::{Binary, CustomFieldValue, HistoryPolicy, NewEntry, NewGroup};
+use keepass_merge::{TombstoneReason, add_history_tombstone, prune_history_with_tombstones};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
@@ -1569,17 +1570,42 @@ impl Vault {
         let mut guard = self.inner.lock().expect("Vault mutex poisoned");
         let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
         let target = parse_entry_id(&entry_uuid)?;
-        let removed = kdbx
+        let now = Utc::now();
+        let outcome: Result<(), HistoryDeleteError> = kdbx
             .edit_entry(target, HistoryPolicy::NoSnapshot, |editor| {
-                editor.remove_history_at(index as usize)
+                // Capture the record being tombstoned + the pool view
+                // before we cross the mutable-borrow line.
+                let record = editor
+                    .history()
+                    .get(index as usize)
+                    .cloned()
+                    .ok_or(HistoryDeleteError::IndexOutOfRange)?;
+                let binaries: Vec<Binary> = editor.binaries().to_vec();
+                add_history_tombstone(
+                    editor.entry_mut(),
+                    &record,
+                    &binaries,
+                    TombstoneReason::UserDelete,
+                    None,
+                    now,
+                )
+                .map_err(HistoryDeleteError::Tombstone)
             })
             .map_err(model_err_to_vault_err)?;
         drop(guard);
-        if removed {
-            self.fire(&VaultChange::EntryModified { uuid: entry_uuid });
-            Ok(())
-        } else {
-            Err(VaultError::IndexOutOfRange)
+        match outcome {
+            Ok(()) => {
+                self.fire(&VaultChange::EntryModified { uuid: entry_uuid });
+                Ok(())
+            }
+            Err(HistoryDeleteError::IndexOutOfRange) => Err(VaultError::IndexOutOfRange),
+            // Malformed pre-existing tombstone JSON is the only failure
+            // mode for add_history_tombstone — surface as a generic
+            // VaultError so frontends don't need a new variant for a
+            // case that should be impossible on healthy vaults.
+            Err(HistoryDeleteError::Tombstone(e)) => Err(VaultError::Unexpected(format!(
+                "history tombstone write failed: {e}"
+            ))),
         }
     }
 
@@ -1589,8 +1615,10 @@ impl Vault {
     ///
     /// Trimming is a bookkeeping operation: the live entry's
     /// `last_modification_time` is **not** stamped, and
-    /// `meta.settings_changed` is **not** touched. Mirrors
-    /// [`keepass_core::kdbx::Kdbx::trim_entry_history`].
+    /// `meta.settings_changed` is **not** touched. Each evicted
+    /// record is tombstoned with [`TombstoneReason::QuotaTrim`] so
+    /// the deletion survives subsequent merges with un-trimmed
+    /// peers.
     ///
     /// # Errors
     ///
@@ -1601,8 +1629,27 @@ impl Vault {
         let mut guard = self.inner.lock().expect("Vault mutex poisoned");
         let kdbx = guard.as_mut().ok_or(VaultError::Locked)?;
         let target = parse_entry_id(&entry_uuid)?;
-        let removed = kdbx
-            .trim_entry_history(target)
+        let max_items = kdbx.vault().meta.history_max_items;
+        let max_size = kdbx.vault().meta.history_max_size;
+        let now = Utc::now();
+        let removed: u32 = kdbx
+            .edit_entry(target, HistoryPolicy::NoSnapshot, |editor| {
+                let binaries: Vec<Binary> = editor.binaries().to_vec();
+                prune_history_with_tombstones(
+                    editor.entry_mut(),
+                    max_items,
+                    max_size,
+                    &binaries,
+                    TombstoneReason::QuotaTrim,
+                    None,
+                    now,
+                )
+                // Malformed pre-existing tombstone JSON is the only
+                // way this fails; for the API contract we surface as
+                // zero pruned (same shape as the prior implementation
+                // on a no-op call).
+                .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
+            })
             .map_err(model_err_to_vault_err)?;
         drop(guard);
         if removed > 0 {
@@ -1610,4 +1657,13 @@ impl Vault {
         }
         Ok(removed)
     }
+}
+
+/// Inner error type used to thread `add_history_tombstone` failures
+/// through the `edit_entry` closure (whose return type is squeezed
+/// between us and the closure caller). `delete_history_at` maps
+/// every variant back to a [`VaultError`] at its boundary.
+enum HistoryDeleteError {
+    IndexOutOfRange,
+    Tombstone(keepass_merge::TombstoneError),
 }

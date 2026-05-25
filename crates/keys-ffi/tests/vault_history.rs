@@ -458,3 +458,132 @@ fn vault_trim_entry_history_returns_zero_when_within_limits() {
     let after = vault.entry_history(uuid).expect("history").len();
     assert_eq!(after, 2, "history untouched when within limits");
 }
+
+// MARK: - History tombstone integration (slice 3b)
+
+/// `delete_history_at` must write a `keys.history_tombstones.v1`
+/// `<CustomData>` entry, and that entry must survive a save+reload
+/// cycle. Without this, the user-deleted history record would
+/// resurrect on next merge with an un-truncated peer.
+#[test]
+fn delete_history_at_writes_tombstone_persisting_through_save_reload() {
+    use std::fs;
+
+    use keepass_core::CompositeKey;
+    use keepass_core::kdbx::Kdbx;
+    use keepass_core::model::{Entry, EntryId, Group};
+    use keepass_merge::{TOMBSTONE_CUSTOM_DATA_KEY, TombstoneReason, parse_tombstones};
+    use secrecy::ExposeSecret;
+    use secrecy::SecretString;
+    use tempfile::TempDir;
+
+    fn find_entry(group: &Group, target: EntryId) -> Option<&Entry> {
+        if let Some(e) = group.entries.iter().find(|e| e.id == target) {
+            return Some(e);
+        }
+        group.groups.iter().find_map(|g| find_entry(g, target))
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("test.kdbx");
+    let pw = "tëst pässwörd 🔑/\\";
+    fs::copy(fixture("keepassxc/kdbx3-basic.kdbx"), &path).expect("copy fixture");
+
+    let vault = Vault::new(path.to_string_lossy().into_owned(), pw.to_owned(), None).expect("open");
+    let uuid = seed_history(&vault, 3);
+    vault.delete_history_at(uuid.clone(), 1).expect("delete");
+    vault.save().expect("save");
+
+    // Reload via keepass-core directly so we can inspect the entry's
+    // custom_data without needing FFI exposure of that field.
+    let secret = SecretString::from(pw.to_owned());
+    let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
+    let kdbx = Kdbx::open(&path)
+        .expect("open kdbx")
+        .read_header()
+        .expect("header")
+        .unlock(&composite)
+        .expect("unlock");
+
+    let target_uuid: uuid::Uuid = uuid.parse().expect("parse uuid");
+    let target = EntryId(target_uuid);
+    let entry = find_entry(&kdbx.vault().root, target).expect("entry survives reload");
+
+    assert!(
+        entry
+            .custom_data
+            .iter()
+            .any(|cd| cd.key == TOMBSTONE_CUSTOM_DATA_KEY),
+        "tombstone custom_data key must be on the entry after save+reload"
+    );
+
+    let tombstones = parse_tombstones(&entry.custom_data).expect("parse tombstones");
+    assert_eq!(
+        tombstones.len(),
+        1,
+        "exactly one tombstone for the deleted record"
+    );
+    assert_eq!(
+        tombstones[0].reason,
+        TombstoneReason::UserDelete,
+        "user-driven deletion gets UserDelete reason"
+    );
+}
+
+/// `trim_entry_history` (called when the quota cap is tightened)
+/// must write `QuotaTrim` tombstones for every evicted record.
+#[test]
+fn trim_entry_history_writes_quota_trim_tombstones_persisting_through_save_reload() {
+    use std::fs;
+
+    use keepass_core::CompositeKey;
+    use keepass_core::kdbx::Kdbx;
+    use keepass_core::model::{Entry, EntryId, Group};
+    use keepass_merge::{TombstoneReason, parse_tombstones};
+    use secrecy::ExposeSecret;
+    use secrecy::SecretString;
+    use tempfile::TempDir;
+
+    fn find_entry(group: &Group, target: EntryId) -> Option<&Entry> {
+        if let Some(e) = group.entries.iter().find(|e| e.id == target) {
+            return Some(e);
+        }
+        group.groups.iter().find_map(|g| find_entry(g, target))
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("trim.kdbx");
+    let pw = "tëst pässwörd 🔑/\\";
+    fs::copy(fixture("keepassxc/kdbx3-basic.kdbx"), &path).expect("copy fixture");
+
+    let vault = Vault::new(path.to_string_lossy().into_owned(), pw.to_owned(), None).expect("open");
+    let uuid = seed_history(&vault, 6);
+    vault.set_history_max_items(2).expect("set max items");
+    let removed = vault.trim_entry_history(uuid.clone()).expect("trim");
+    assert!(removed > 0, "expected to trim at least one record");
+    vault.save().expect("save");
+
+    let secret = SecretString::from(pw.to_owned());
+    let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
+    let kdbx = Kdbx::open(&path)
+        .expect("open kdbx")
+        .read_header()
+        .expect("header")
+        .unlock(&composite)
+        .expect("unlock");
+
+    let target = EntryId(uuid.parse::<uuid::Uuid>().expect("parse uuid"));
+    let entry = find_entry(&kdbx.vault().root, target).expect("entry survives reload");
+    let tombstones = parse_tombstones(&entry.custom_data).expect("parse");
+    assert_eq!(
+        tombstones.len() as u32,
+        removed,
+        "one QuotaTrim tombstone per evicted record"
+    );
+    assert!(
+        tombstones
+            .iter()
+            .all(|t| t.reason == TombstoneReason::QuotaTrim),
+        "all tombstones from trim_entry_history must be QuotaTrim"
+    );
+}
