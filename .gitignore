@@ -19,6 +19,14 @@ Cargo.lock.bak
 /swift-harness/.swiftpm/
 /swift-harness/Package.resolved
 
+# Swift harness build outputs from `bindgen/build-swift-iroh-sync.sh`.
+/swift-harness-iroh-sync/Sources/KeysIrohSyncFFI/
+/swift-harness-iroh-sync/KeysIrohSyncFFI.xcframework/
+/swift-harness-iroh-sync/.build/
+/swift-harness-iroh-sync/build/
+/swift-harness-iroh-sync/.swiftpm/
+/swift-harness-iroh-sync/Package.resolved
+
 # IDE
 .idea/
 .vscode/

@@ -3,7 +3,9 @@ resolver = "2"
 members = [
     "crates/keys-engine",
     "crates/keys-ffi",
+    "crates/keys-iroh-sync",
     "crates/uniffi-bindgen-swift",
+    "crates/uniffi-bindgen-swift-029",
 ]
 
 [workspace.package]

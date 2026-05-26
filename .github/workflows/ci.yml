@@ -74,3 +74,50 @@ jobs:
       - name: doc
         working-directory: KeysCore
         run: cargo doc --workspace --no-deps --all-features
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    # Checks Cargo.lock against the RustSec Advisory Database for known
+    # CVEs in any transitive dependency. Fast (~5 s) and a no-brainer
+    # for a workspace that handles credentials and now owns the iroh
+    # transport layer. Side-by-side checkout because the workspace's
+    # path deps refer to ../KeepassCore.
+    steps:
+      - name: Checkout keys-core
+        uses: actions/checkout@v6
+        with:
+          path: KeysCore
+      - name: Checkout keepass-core
+        uses: actions/checkout@v6
+        with:
+          repository: Marmaladesoul/keepass-core
+          path: KeepassCore
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: KeysCore
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    # Stricter than cargo audit: enforces a license allowlist (no GPL
+    # / unknown licenses), a source allowlist (deps must come from
+    # crates.io — blocks attacker-supplied path/git overrides), a
+    # banned-crates list (openssl/native-tls), and surfaces duplicate
+    # versions. Config lives in `deny.toml` at the workspace root.
+    steps:
+      - name: Checkout keys-core
+        uses: actions/checkout@v6
+        with:
+          path: KeysCore
+      - name: Checkout keepass-core
+        uses: actions/checkout@v6
+        with:
+          repository: Marmaladesoul/keepass-core
+          path: KeepassCore
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+          manifest-path: KeysCore/Cargo.toml

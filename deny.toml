@@ -1,0 +1,115 @@
+# cargo-deny configuration for the KeysCore workspace.
+#
+# Run locally: `cargo deny --all-features check`.
+# CI invokes this via `EmbarkStudios/cargo-deny-action` in
+# `.github/workflows/ci.yml`.
+#
+# Schema docs: https://embarkstudios.github.io/cargo-deny/
+#
+# Modelled on KeepassCore/deny.toml but adapted for KeysCore's
+# additional dependency cones (rusqlite-with-SQLCipher pulls
+# vendored openssl-sys; the iroh stack pulls a handful of
+# unmaintained-but-pinned proc-macro helpers).
+
+[graph]
+# Restrict checks to host targets we actually ship to. Avoids spurious
+# license warnings from platform-specific transitive crates we never link.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-ios" },
+    { triple = "x86_64-pc-windows-msvc" },
+]
+all-features = true
+
+# ---------------------------------------------------------------------------
+# Advisories — RustSec advisory database
+# ---------------------------------------------------------------------------
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Known unmaintained crates that we depend on transitively through
+# iroh / uniffi / bao-tree. Tracked here with rationale; revisit when
+# the upstream replaces them.
+ignore = [
+    # iroh's bao-tree (via genawaiter-proc-macro) and uniffi 0.28
+    # (via uniffi_bindgen) pull this in. Both are tracking newer
+    # replacements; nothing we can do at this layer.
+    "RUSTSEC-2024-0370", # proc-macro-error unmaintained
+    # paste — same story, pulled in by netdev (via iroh) and by
+    # uniffi 0.28. Drops out when iroh moves off netdev and when
+    # keys-ffi catches up to uniffi 0.29+.
+    "RUSTSEC-2024-0436",
+    # bincode unmaintained — iroh-docs uses it. Bincode 2.x exists
+    # but the iroh crates haven't migrated. No exploit, just lifecycle.
+    "RUSTSEC-2025-0141",
+]
+
+# ---------------------------------------------------------------------------
+# Licenses — MIT / Apache-2.0 / BSD family + a few specific permissives
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "Unlicense",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    # webpki-roots is CDLA-Permissive-2.0 — an OSI-pending, GitHub-
+    # blessed permissive licence used widely in the Rust TLS stack.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+# Workspace crates set `license = "UNLICENSED"` and `publish = false`
+# — this isn't a redistribution risk, it's a "we don't intend to
+# license this for public reuse" signal. The `private` table tells
+# cargo-deny to skip license-checking these.
+private = { ignore = true }
+
+# ---------------------------------------------------------------------------
+# Bans — explicit deny-list + duplicate detection
+# ---------------------------------------------------------------------------
+[bans]
+# iroh's pre-1.0 transitive graph has duplicate versions during the
+# rc.x churn (rand 0.8/0.9, getrandom 0.2/0.3, etc.). Warn so the
+# noise stays visible without blocking CI; revisit at iroh 1.0.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path deps (KeepassCore + keys-engine + keys-ffi cross-refs)
+# appear to cargo-deny as wildcard versions. They're not real wildcards
+# — they're path-relative deps. Allow them explicitly.
+allow-wildcard-paths = true
+highlight = "all"
+# Note on TLS: we DO NOT ban openssl / openssl-sys here, even though
+# KeepassCore does. KeysCore's keys-engine pulls
+# rusqlite/bundled-sqlcipher-vendored-openssl, which statically links
+# a vendored OpenSSL inside the SQLCipher library. That's an
+# intentional, audited choice (SQLCipher requires OpenSSL or a fork).
+# We still ban native-tls because nothing in this workspace should be
+# doing platform-TLS — iroh uses rustls, and SQLCipher's OpenSSL is
+# crypto-only, not TLS.
+deny = [
+    { crate = "native-tls", reason = "iroh uses rustls; no platform TLS in this workspace" },
+]
+skip = []
+
+# ---------------------------------------------------------------------------
+# Sources — only crates.io
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
