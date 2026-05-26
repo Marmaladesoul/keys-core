@@ -251,8 +251,8 @@ fn recycle_bin_enabled_returns_meta_flag() {
     // and verify both states round-trip through the FFI accessor.
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("rb.kdbx").to_string_lossy().into_owned();
-    let vault =
-        Vault::create_empty(path, "pw".to_owned(), "Vault".to_owned(), None).expect("create_empty");
+    let vault = Vault::create_empty(path, "pw".to_owned(), "Vault".to_owned(), None, None)
+        .expect("create_empty");
 
     // Force-enable, then read.
     vault.set_recycle_bin(true, None).expect("enable");
@@ -293,8 +293,8 @@ fn move_group_to_position_within_same_parent_reorders() {
         .join("reorder.kdbx")
         .to_string_lossy()
         .into_owned();
-    let vault =
-        Vault::create_empty(path, "pw".to_owned(), "Vault".to_owned(), None).expect("create_empty");
+    let vault = Vault::create_empty(path, "pw".to_owned(), "Vault".to_owned(), None, None)
+        .expect("create_empty");
 
     let root_uuid = vault
         .list_groups()
@@ -336,8 +336,8 @@ fn move_group_to_position_within_same_parent_reorders() {
 fn move_group_to_position_to_new_parent_with_index() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("move.kdbx").to_string_lossy().into_owned();
-    let vault =
-        Vault::create_empty(path, "pw".to_owned(), "Vault".to_owned(), None).expect("create_empty");
+    let vault = Vault::create_empty(path, "pw".to_owned(), "Vault".to_owned(), None, None)
+        .expect("create_empty");
 
     let root_uuid = vault
         .list_groups()

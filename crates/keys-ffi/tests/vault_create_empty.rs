@@ -27,6 +27,7 @@ fn create_empty_writes_file_and_reopens_with_same_password() {
         "hunter2".to_owned(),
         "My Test Vault".to_owned(),
         None,
+        None,
     )
     .expect("create_empty");
 
@@ -56,6 +57,7 @@ fn create_empty_wrong_password_after_reopen_rejects() {
         "correct-password".to_owned(),
         "Vault".to_owned(),
         None,
+        None,
     )
     .expect("create_empty");
 
@@ -68,8 +70,14 @@ fn create_empty_accepts_mutations_then_persists_on_save() {
     let dir = TempDir::new().expect("tempdir");
     let path = fresh_path(&dir, "test.kdbx");
 
-    let vault = Vault::create_empty(path.clone(), "pw".to_owned(), "Vault".to_owned(), None)
-        .expect("create_empty");
+    let vault = Vault::create_empty(
+        path.clone(),
+        "pw".to_owned(),
+        "Vault".to_owned(),
+        None,
+        None,
+    )
+    .expect("create_empty");
 
     // Add an entry, save, reopen.
     let groups = vault.list_groups().expect("list groups");
@@ -86,10 +94,36 @@ fn create_empty_accepts_mutations_then_persists_on_save() {
 }
 
 #[test]
+fn create_empty_with_temp_dir_routes_tempfile_through_override() {
+    // Mirrors the `Engine::save_to_kdbx` `temp_dir` override path: the
+    // tempfile lives under a caller-supplied directory, then renames
+    // over the destination. Same-volume rename keeps the write atomic.
+    // Sandboxed macOS callers rely on this — the `NSSavePanel`-issued
+    // sandbox extension covers the chosen kdbx URL but not arbitrary
+    // siblings in its parent directory.
+    let dest_dir = TempDir::new().expect("dest tempdir");
+    let temp_dir = TempDir::new().expect("override tempdir");
+    let path = fresh_path(&dest_dir, "test.kdbx");
+
+    let _vault = Vault::create_empty(
+        path.clone(),
+        "pw".to_owned(),
+        "Vault".to_owned(),
+        None,
+        Some(temp_dir.path().to_string_lossy().into_owned()),
+    )
+    .expect("create_empty");
+
+    assert!(std::path::Path::new(&path).exists());
+    let reopened = Vault::new(path, "pw".to_owned(), None).expect("reopen");
+    assert_eq!(reopened.list_groups().expect("list").len(), 1);
+}
+
+#[test]
 fn create_empty_io_error_on_missing_parent_directory() {
     // Path whose parent doesn't exist — should surface as a typed Io error
     // rather than panic.
     let path = "/nonexistent-parent-dir-for-keys-test/foo.kdbx".to_owned();
-    let result = Vault::create_empty(path, "pw".to_owned(), "Vault".to_owned(), None);
+    let result = Vault::create_empty(path, "pw".to_owned(), "Vault".to_owned(), None, None);
     assert!(matches!(result, Err(VaultError::Io(_))));
 }

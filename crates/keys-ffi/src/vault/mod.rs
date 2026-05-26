@@ -107,10 +107,20 @@ impl Vault {
     }
 
     /// Create a fresh KDBX4 vault at `path`, encrypted with `password`,
-    /// titled `database_name`. The path is written atomically (sibling
-    /// tempfile + `rename(2)`); if the file already exists, it's
+    /// titled `database_name`. The path is written atomically
+    /// (tempfile + `rename(2)`); if the file already exists, it's
     /// overwritten. Returns an unlocked `Vault` handle ready for
     /// mutations or immediate use.
+    ///
+    /// `temp_dir`, when supplied, is used as the directory for the
+    /// atomic-write tempfile instead of `path`'s parent. Sandboxed
+    /// macOS callers should pass `NSTemporaryDirectory()` here: the
+    /// `NSSavePanel`-issued sandbox extension grants write to the
+    /// chosen kdbx file but not arbitrary siblings in its parent
+    /// directory, so the default sibling-tempfile path fails with
+    /// EPERM. The override must live on the same filesystem volume
+    /// as `path` (rename is not cross-volume atomic). Pass `None` on
+    /// non-sandboxed platforms to keep the historical behaviour.
     ///
     /// Defaults are baked in upstream
     /// ([`keepass_core::kdbx::Kdbx::<Unlocked>::create_empty_v4`]):
@@ -140,6 +150,7 @@ impl Vault {
         password: String,
         database_name: String,
         field_protector: Option<Arc<dyn VaultFieldProtector>>,
+        temp_dir: Option<String>,
     ) -> Result<Arc<Self>, VaultError> {
         let path_buf = PathBuf::from(&path);
         let secret = SecretString::from(password);
@@ -159,8 +170,9 @@ impl Vault {
         let parent = path_buf.parent().ok_or_else(|| {
             VaultError::Io("create_empty path has no parent directory".to_owned())
         })?;
+        let tmp_in = temp_dir.as_deref().map_or(parent, std::path::Path::new);
         let mut tmp =
-            tempfile::NamedTempFile::new_in(parent).map_err(|e| VaultError::Io(e.to_string()))?;
+            tempfile::NamedTempFile::new_in(tmp_in).map_err(|e| VaultError::Io(e.to_string()))?;
         tmp.write_all(&bytes)
             .map_err(|e| VaultError::Io(e.to_string()))?;
         tmp.flush().map_err(|e| VaultError::Io(e.to_string()))?;

@@ -96,6 +96,7 @@ fn fresh_vault_with_protected_entry(
         password.to_owned(),
         "Protector Fixture".to_owned(),
         None,
+        None,
     )
     .expect("create_empty");
 
@@ -191,6 +192,7 @@ fn vault_create_empty_accepts_protector() {
         "pw".to_owned(),
         "Fresh".to_owned(),
         Some(Arc::clone(&protector)),
+        None,
     )
     .expect("create_empty with protector");
 
