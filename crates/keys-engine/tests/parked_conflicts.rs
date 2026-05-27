@@ -407,3 +407,79 @@ fn clear_parked_conflict_marker_no_op_on_clean_entry() {
         .expect("clear");
     assert_eq!(cleared, 0);
 }
+
+/// Bug #2 regression: a one-sided engine edit on Mac-A must reconcile
+/// cleanly on Mac-B without parking a conflict. Before the fix the
+/// engine's mutations didn't push a history snapshot of the pre-edit
+/// state, so the projected kdbx had empty `<History>` for the edited
+/// entry — the peer's merger then had no common ancestor and fell back
+/// to parking. After the fix, A's save carries the pre-edit snapshot
+/// and the merger adopts the change as a clean update.
+#[test]
+fn two_engine_one_sided_title_edit_updates_without_parking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx_path = dir.path().join("vault.kdbx");
+
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    kdbx.add_entry(root, NewEntry::new("seed"))
+        .expect("seed entry");
+
+    // Mac-A engine: owns the kdbx, will edit and save.
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    engine_a
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("a initial save");
+
+    // Mac-B engine: ingests from the same disk file.
+    let kdbx_b_view = reopen_kdbx(&kdbx_path);
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b.ingest_from_kdbx(&kdbx_b_view).expect("b ingest");
+
+    let summaries = engine_a
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list");
+    let seed_uuid = summaries[0].uuid;
+
+    // Mac-A: edit the title via the engine, save to disk.
+    engine_a
+        .update_entry(
+            seed_uuid,
+            keys_engine::EntryUpdate {
+                title: Some("edited-on-A".into()),
+                ..Default::default()
+            },
+        )
+        .expect("a edit");
+    engine_a
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("a save");
+
+    // Mac-B: reconcile against the updated disk. No conflict should be parked.
+    let result = engine_b
+        .reconcile_with_disk_park_conflicts(&kdbx_path, &composite(), chrono::Utc::now())
+        .expect("b reconcile");
+
+    match result {
+        ParkConflictsResult::Applied { applied, parked } => {
+            assert!(
+                parked.entries_with_parked_conflict.is_empty(),
+                "B should not park; got: {:?}",
+                parked.entries_with_parked_conflict
+            );
+            assert_eq!(
+                applied.entries_updated, 1,
+                "B should adopt A's edit as a clean update"
+            );
+        }
+        other => panic!("expected Applied with one update, got {other:?}"),
+    }
+
+    let after = engine_b.entry(seed_uuid).expect("entry").expect("present");
+    assert_eq!(after.title, "edited-on-A");
+}

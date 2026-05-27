@@ -523,10 +523,26 @@ fn apply_resolution_handles_icon_conflict() {
 
 #[test]
 fn apply_resolution_handles_delete_edit_choice() {
-    // Local edits the entry; disk deletes it. `KeepLocal` keeps the
-    // edited entry alive; `AcceptRemoteDelete` honours the deletion.
+    // Disk deletes the entry; local then edits it after the deletion
+    // tombstone. `KeepLocal` keeps the edited entry alive;
+    // `AcceptRemoteDelete` honours the deletion. The order matters
+    // for the merger's `local_edited_after(local, deleted_at)` check
+    // — local must mtime AFTER the tombstone for the delete-edit
+    // bucket to fire (otherwise the merger correctly classifies as a
+    // clean remote-delete adoption).
     let mut f = fixture();
 
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .delete_entry(EntryId(f.seed_uuid))
+        .expect("disk delete");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    // Ensure the local edit's wall-clock mtime is strictly after the
+    // tombstone — KDBX timestamps land at ms precision, so a 2ms
+    // pause makes the ordering deterministic across thread loads.
+    std::thread::sleep(std::time::Duration::from_millis(2));
     f.engine
         .update_entry(
             f.seed_uuid,
@@ -536,13 +552,6 @@ fn apply_resolution_handles_delete_edit_choice() {
             },
         )
         .expect("local edit");
-
-    let mut external = reopen_kdbx(&f.kdbx_path);
-    external
-        .delete_entry(EntryId(f.seed_uuid))
-        .expect("disk delete");
-    let bytes = external.save_to_bytes().expect("save");
-    std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
     let id = match f
         .engine
