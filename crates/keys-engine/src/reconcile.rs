@@ -179,12 +179,17 @@ pub(crate) fn reconcile_with_disk(
         .vault_with_unwrapped_protected()
         .map_err(|e| EngineError::Serialise(format!("unwrap disk protected: {e}")))?;
 
-    // 5. Quick equality check: if the two vaults are byte-identical
-    //    under merge's lens, short-circuit with NoChange and just
-    //    refresh the ancestor.
-    if vaults_equivalent(&local_vault, &remote_vault) {
-        engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-        return Ok(MergeResult::NoChange);
+    // 5. Quick equality check: if the disk bytes are byte-identical to
+    //    the engine's last-saved baseline, short-circuit with NoChange.
+    //    Every engine save produces fresh bytes from a new nonce only
+    //    when something actually changed, so byte equality against the
+    //    agreed baseline IS content equality. If we have no baseline
+    //    (first-ever reconcile), fall through and let the merge run.
+    if let Some(baseline) = engine.last_saved_kdbx_bytes()? {
+        if baseline == disk_bytes {
+            engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
+            return Ok(MergeResult::NoChange);
+        }
     }
 
     // 6. Run the merge.
@@ -297,9 +302,17 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
         .vault_with_unwrapped_protected()
         .map_err(|e| EngineError::Serialise(format!("unwrap disk protected: {e}")))?;
 
-    if vaults_equivalent(&local_vault, &remote_vault) {
-        engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-        return Ok(ParkConflictsResult::NoChange);
+    // Byte-equivalence short-circuit against the engine's last-saved
+    // baseline. See `reconcile_with_disk` for the rationale: byte
+    // equality of disk_bytes vs the agreed baseline IS content
+    // equality, because the engine only re-encrypts on a real state
+    // advance. No baseline (first-ever reconcile) → fall through and
+    // run the merge (which is a no-op on identical content anyway).
+    if let Some(baseline) = engine.last_saved_kdbx_bytes()? {
+        if baseline == disk_bytes {
+            engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
+            return Ok(ParkConflictsResult::NoChange);
+        }
     }
 
     let outcome = keepass_merge::merge(&local_vault, &remote_vault)
@@ -373,82 +386,6 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
         applied: stats,
         parked,
     })
-}
-
-/// Cheap structural-equivalence check between two vaults at merge
-/// time. Used to short-circuit a reconcile when the disk file and
-/// the engine's projection carry the same content (e.g. when the
-/// engine writes the file, the watcher catches it past the self-
-/// write filter window, and reconcile runs anyway — a no-op reload).
-///
-/// Compares entry-uuid sets, group-uuid sets, and tombstone-uuid
-/// sets. A finer comparison is unnecessary: if any content actually
-/// differs the merge itself does the right thing in O(entries),
-/// which is fine.
-fn vaults_equivalent(a: &Vault, b: &Vault) -> bool {
-    use std::collections::HashSet;
-    let mut a_entries: HashSet<uuid::Uuid> = HashSet::new();
-    let mut b_entries: HashSet<uuid::Uuid> = HashSet::new();
-    let mut a_groups: HashSet<uuid::Uuid> = HashSet::new();
-    let mut b_groups: HashSet<uuid::Uuid> = HashSet::new();
-    walk(&a.root, &mut a_entries, &mut a_groups);
-    walk(&b.root, &mut b_entries, &mut b_groups);
-    if a_entries != b_entries || a_groups != b_groups {
-        return false;
-    }
-    // Compare entry content by (title, username, url, notes).
-    // Per-field comparison is enough to catch the "external edit"
-    // case for these tests; a fuller comparison would walk every
-    // field including protected slots (which we'd have to unwrap).
-    let a_idx = index_entries(&a.root);
-    let b_idx = index_entries(&b.root);
-    for (id, ea) in &a_idx {
-        let Some(eb) = b_idx.get(id) else {
-            return false;
-        };
-        if ea.title != eb.title
-            || ea.username != eb.username
-            || ea.url != eb.url
-            || ea.notes != eb.notes
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn walk(
-    group: &keepass_core::model::Group,
-    entries: &mut std::collections::HashSet<uuid::Uuid>,
-    groups: &mut std::collections::HashSet<uuid::Uuid>,
-) {
-    groups.insert(group.id.0);
-    for e in &group.entries {
-        entries.insert(e.id.0);
-    }
-    for sub in &group.groups {
-        walk(sub, entries, groups);
-    }
-}
-
-fn index_entries_walk<'a>(
-    g: &'a keepass_core::model::Group,
-    out: &mut std::collections::HashMap<uuid::Uuid, &'a keepass_core::model::Entry>,
-) {
-    for e in &g.entries {
-        out.insert(e.id.0, e);
-    }
-    for sub in &g.groups {
-        index_entries_walk(sub, out);
-    }
-}
-
-fn index_entries(
-    group: &keepass_core::model::Group,
-) -> std::collections::HashMap<uuid::Uuid, &keepass_core::model::Entry> {
-    let mut out = std::collections::HashMap::new();
-    index_entries_walk(group, &mut out);
-    out
 }
 
 /// Count groups present only on the remote side (will be added by

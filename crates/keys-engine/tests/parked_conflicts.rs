@@ -306,6 +306,91 @@ fn clear_parked_conflict_marker_removes_marker_and_writes_tombstone() {
     );
 }
 
+/// Regression test for Bug #1 — `vaults_equivalent` short-circuited
+/// reconcile on content-only edits (password/tags/custom fields/
+/// attachments/custom icon), so a password edit on one Mac never
+/// propagated to a peer. The fix replaces the field-content comparator
+/// with a byte-equivalence check against the engine's last-saved
+/// baseline. If the disk bytes differ from the baseline, the merge
+/// runs unconditionally; identical content produces empty buckets that
+/// the apply path treats as a no-op.
+#[test]
+fn two_engine_one_sided_password_edit_propagates() {
+    use secrecy::{ExposeSecret, SecretString};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    kdbx.add_entry(root, NewEntry::new("seed")).expect("seed");
+
+    // Engine A: ingests, saves the kdbx to disk.
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    engine_a
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("a save");
+
+    // Engine B: reads the kdbx A wrote, ingests, then re-ingests after
+    // re-reading from disk so its baseline equals the disk bytes.
+    let kdbx_b_view = reopen_kdbx(&kdbx_path);
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b.ingest_from_kdbx(&kdbx_b_view).expect("b ingest");
+    // Run an initial reconcile so B picks up the current disk bytes as
+    // its baseline. (Without this, B's `last_saved_kdbx_bytes` is None
+    // and the short-circuit falls through anyway, but we want to
+    // exercise the post-baseline path.)
+    let _ = engine_b
+        .reconcile_with_disk_park_conflicts(&kdbx_path, &composite(), chrono::Utc::now())
+        .expect("b initial reconcile");
+
+    let seed_uuid = engine_a
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list")[0]
+        .uuid;
+
+    // A edits ONLY the password — the kind of edit `vaults_equivalent`
+    // used to ignore (it only compared title/username/url/notes).
+    engine_a
+        .update_entry(
+            seed_uuid,
+            keys_engine::EntryUpdate {
+                password: Some(SecretString::from("new-secret-pw".to_string())),
+                ..Default::default()
+            },
+        )
+        .expect("a edit pw");
+    engine_a
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("a save 2");
+
+    // B reconciles — must see the password edit, not NoChange.
+    let result = engine_b
+        .reconcile_with_disk_park_conflicts(&kdbx_path, &composite(), chrono::Utc::now())
+        .expect("b reconcile");
+    match result {
+        ParkConflictsResult::Applied { .. } => {
+            // The merge ran. Whether the change lands in
+            // `entries_updated` or via the park path is incidental for
+            // Bug #1 — what matters is that the short-circuit didn't
+            // swallow it. The password assertion below proves the
+            // edit actually reached B.
+        }
+        ParkConflictsResult::NoChange => {
+            panic!("password-only edit was lost (Bug #1 — vaults_equivalent ignored password)")
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Verify the password actually landed in B's projection.
+    let revealed = engine_b.reveal_password(seed_uuid).expect("reveal");
+    assert_eq!(revealed.expose_secret(), "new-secret-pw");
+}
+
 /// Clearing an entry with no markers is a clean no-op.
 #[test]
 fn clear_parked_conflict_marker_no_op_on_clean_entry() {
