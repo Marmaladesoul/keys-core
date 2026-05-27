@@ -196,6 +196,18 @@ pub(crate) fn reconcile_with_disk(
     let outcome = keepass_merge::merge(&local_vault, &remote_vault)
         .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
 
+    // 6a. Empty-merge short-circuit. The byte-equivalence check above
+    //     catches the "same kdbx file" case, but two byte-different
+    //     kdbx files can carry content-identical vaults (fresh
+    //     encryption nonce on each save). Without this guard, an
+    //     empty-bucket merge would still return `Merged`, which makes
+    //     SyncManager save + push fresh bytes that the peer then sees
+    //     as a new disk update — an infinite ping-pong loop.
+    if outcome_is_no_op(&outcome, &local_vault, &remote_vault) {
+        engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
+        return Ok(MergeResult::NoChange);
+    }
+
     // 7. Conflict path — surface and bail without mutating SQLite.
     if !outcome.entry_conflicts.is_empty() || !outcome.delete_edit_conflicts.is_empty() {
         let id = NEXT_CONFLICT_ID.fetch_add(1, Ordering::Relaxed);
@@ -318,6 +330,13 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     let outcome = keepass_merge::merge(&local_vault, &remote_vault)
         .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
 
+    // Same empty-merge short-circuit as `reconcile_with_disk` — see
+    // there for the ping-pong-loop rationale.
+    if outcome_is_no_op(&outcome, &local_vault, &remote_vault) {
+        engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
+        return Ok(ParkConflictsResult::NoChange);
+    }
+
     // Stats reflect the non-conflicting buckets. Conflict-bucket
     // entries are NOT counted as "updated" — they're parked, leaving
     // local's current state untouched (the additions live only in
@@ -386,6 +405,29 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
         applied: stats,
         parked,
     })
+}
+
+/// True when a merge outcome has no actual state change for the
+/// engine to apply: no entry buckets populated, no group structural
+/// changes, no conflicts. Used by both reconcile variants to break
+/// the iroh ping-pong loop where each `save_to_kdbx` produces fresh
+/// bytes (new nonce) even when the logical content is unchanged.
+///
+/// `entry_conflicts` and `delete_edit_conflicts` deliberately count
+/// as "something happened" — even though they don't mutate the
+/// engine's `SQLite` mirror in the classic reconcile path, the
+/// park-conflicts variant pushes a marked snapshot into history and
+/// the engine state genuinely advances.
+fn outcome_is_no_op(outcome: &keepass_merge::MergeOutcome, local: &Vault, remote: &Vault) -> bool {
+    outcome.added_on_disk.is_empty()
+        && outcome.disk_only_changes.is_empty()
+        && outcome.local_only_changes.is_empty()
+        && outcome.deleted_on_disk.is_empty()
+        && outcome.local_deletions_pending_sync.is_empty()
+        && outcome.entry_conflicts.is_empty()
+        && outcome.delete_edit_conflicts.is_empty()
+        && count_groups_remote_only(local, remote) == 0
+        && count_groups_tombstoned(local, remote) == 0
 }
 
 /// Count groups present only on the remote side (will be added by

@@ -391,6 +391,66 @@ fn two_engine_one_sided_password_edit_propagates() {
     assert_eq!(revealed.expose_secret(), "new-secret-pw");
 }
 
+/// Regression test for the iroh ping-pong loop: after both sides
+/// converge on the same logical content, the receiving engine must
+/// return `NoChange` even though the disk bytes don't byte-equal the
+/// engine's last-saved baseline (every save produces fresh
+/// encryption nonces). Without this guard, every reconcile would
+/// return `Applied` with zero stats, triggering a save+push cascade
+/// that the peer answers with another save+push, forever.
+#[test]
+fn empty_outcome_after_byte_different_input_returns_no_change() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    kdbx.add_entry(root, NewEntry::new("seed")).expect("seed");
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    engine_a
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("a initial save");
+
+    // Engine A re-saves the kdbx WITHOUT mutating any content. The
+    // re-save produces fresh bytes (new encryption nonce) but the
+    // logical content is identical. Simulates peer's "save +
+    // push-back" after an empty-merge reconcile.
+    engine_a
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("a re-save");
+    let disk_bytes_after_resave = std::fs::read(&kdbx_path).expect("read");
+    // Force a difference from A's last-saved baseline so the byte-
+    // equality short-circuit doesn't fire — we need to exercise the
+    // post-merge outcome_is_no_op path. Open the kdbx fresh and
+    // re-save it via a separate handle so the bytes on disk differ
+    // from what A wrote.
+    let external = reopen_kdbx(&kdbx_path);
+    let alt_bytes = external.save_to_bytes().expect("external save");
+    assert_ne!(
+        disk_bytes_after_resave, alt_bytes,
+        "fresh nonce should produce different bytes",
+    );
+    {
+        let mut f = std::fs::File::create(&kdbx_path).expect("open for write");
+        f.write_all(&alt_bytes).expect("overwrite");
+    }
+
+    // Now A's last-saved baseline (disk_bytes_after_resave) differs
+    // from disk_bytes (alt_bytes). Reconcile should run the merge,
+    // see empty buckets, and return NoChange.
+    let result = engine_a
+        .reconcile_with_disk_park_conflicts(&kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile");
+    assert!(
+        matches!(result, ParkConflictsResult::NoChange),
+        "byte-different but content-equivalent disk must yield NoChange, got: {result:?}",
+    );
+}
+
 /// Clearing an entry with no markers is a clean no-op.
 #[test]
 fn clear_parked_conflict_marker_no_op_on_clean_entry() {
