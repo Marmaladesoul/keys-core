@@ -189,6 +189,42 @@ fn apply_resolution_with_take_remote_all_fields() {
     assert_eq!(after.title, "disk-title", "remote side won");
 }
 
+/// Phase 2b: resolving writes a `keys.conflict_resolutions.v1` record into
+/// the vault Meta so the decision propagates to peers (design §5.3). The
+/// record is secret-safe — it carries the facet identity (entry, kind,
+/// key) and a timestamp, but **no value and no winning side**.
+#[test]
+fn apply_resolution_writes_conflict_resolution_record_to_meta() {
+    let mut f = fixture();
+    let id = drive_title_conflict(&mut f, "local-title", "disk-title");
+
+    f.engine
+        .apply_conflict_resolution(id, &title_resolution(f.seed_uuid, ConflictSide::Remote))
+        .expect("apply remote");
+
+    // Persist the resolved state so the record (now in the engine's SQLite
+    // Meta) projects into the KDBX that iroh would sync.
+    let mut handle = reopen_kdbx(&f.kdbx_path);
+    f.engine
+        .save_to_kdbx(&f.kdbx_path, &mut handle, None)
+        .expect("save resolved");
+
+    // Reopen from disk and assert the record landed in Meta.
+    let reopened = reopen_kdbx(&f.kdbx_path);
+    let records = keepass_merge::parse_conflict_resolutions(&reopened.vault().meta.custom_data)
+        .expect("parse resolutions");
+    let rec = records
+        .iter()
+        .find(|r| r.entry == f.seed_uuid && r.kind == keepass_merge::ConflictKind::Field)
+        .expect("a Field resolution for the seed entry");
+    assert_eq!(
+        rec.key.as_deref(),
+        Some("Title"),
+        "names the resolved field"
+    );
+    assert!(rec.by.is_none(), "pre-P2P resolutions carry no `by`");
+}
+
 #[test]
 fn apply_resolution_with_keep_local_all_fields() {
     let mut f = fixture();

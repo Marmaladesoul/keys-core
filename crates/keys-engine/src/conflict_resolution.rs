@@ -19,9 +19,15 @@
 //!    same id returns [`EngineError::NotFound`]).
 //! 2. Run `keepass_merge::apply_merge` against the stashed local /
 //!    remote vaults and outcome, with the caller's resolution.
-//! 3. Reconcile timestamps and re-ingest into `SQLite` via the same
+//! 3. Record a `keys.conflict_resolutions.v1` entry into the merged
+//!    vault's Meta for every resolved facet, so the decision propagates
+//!    and peers adopt the resolving side's value (design §5.3). The
+//!    record carries no value and no side — secret-safe; the chosen value
+//!    rides as ordinary protected entry data that step 2 already set.
+//! 4. Reconcile timestamps and re-ingest into `SQLite` via the same
 //!    single-transaction `ingest_merged` path 4.6 uses for `Merged`.
-//! 4. Refresh `last_saved_kdbx_bytes` to the disk-side bytes and emit
+//! 5. Refresh `last_saved_kdbx_bytes` to the disk-side bytes, drop the
+//!    resolved entries from the derived held-conflict badge set, and emit
 //!    [`crate::events::ChangeEvent::ExternalChangeMerged`] with empty
 //!    `conflicts`.
 //!
@@ -43,9 +49,11 @@
 //! `KeepBoth` on a single-sided attachment) is collapsed to
 //! [`EngineError::ResolutionMismatch`] via the `MergeError` Display.
 
+use std::collections::HashSet;
+
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{Group, Vault};
-use keepass_merge::{MergeOutcome, Resolution};
+use keepass_merge::{ConflictKind, ConflictResolution, MergeOutcome, Resolution};
 use secrecy::SecretString;
 use uuid::Uuid;
 
@@ -134,6 +142,7 @@ pub(crate) fn apply_conflict_resolution(
     //    `apply_merge` does its own read-only validation pass before
     //    any mutation; a validation failure bails here without
     //    touching SQLite or the engine state.
+    let now = chrono::Utc::now();
     let mut merged = local_vault;
     keepass_merge::apply_merge(&mut merged, &remote_vault, &outcome, resolution).map_err(|e| {
         EngineError::ResolutionMismatch {
@@ -142,19 +151,50 @@ pub(crate) fn apply_conflict_resolution(
     })?;
     keepass_merge::reconcile_timestamps(&mut merged, &remote_vault);
 
-    // 3. Splice the merged vault into the unlocked disk Kdbx and
+    // 3. Record the resolution into the merged vault's Meta so it
+    //    propagates: the next save writes a `keys.conflict_resolutions.v1`
+    //    record per resolved facet, and on the peer's next merge the
+    //    presence-asymmetry adoption rule converges that facet to this
+    //    side's (now chosen) value (design §5.3). Secret-safe: the record
+    //    carries no value and no side — the chosen value rides as ordinary
+    //    protected entry data, which `apply_merge` already set above.
+    record_resolutions_into_meta(&mut merged, resolution, now)?;
+
+    // 4. Splice the merged vault into the unlocked disk Kdbx and
     //    re-ingest. The disk Kdbx already has the protector and crypto
     //    envelope wired up; reusing it avoids re-unlocking (and thus
     //    avoids asking the caller for the composite key again).
     disk_kdbx.replace_vault(merged);
     engine.ingest_merged(&disk_kdbx)?;
 
-    // 4. Refresh the common ancestor to the disk bytes — same as 4.6's
+    // 5. Refresh the common ancestor to the disk bytes — same as 4.6's
     //    Merged path. A follow-up save_to_kdbx will overwrite the disk
     //    file (and the ancestor) with the resolved-and-combined state.
     engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
 
-    // 5. Emit the success event. Stats are best-effort — the resolved
+    // Drop the resolved entries from the derived held-conflict badge set:
+    // their conflicts have converged locally to the chosen values, so they
+    // are no longer held on this device. (Cross-peer clearing rides the
+    // resolution records written in step 3.) Keeps the badge consistent
+    // without waiting for the next reconcile.
+    let resolved_entries: HashSet<Uuid> = resolution
+        .entry_field_choices
+        .keys()
+        .chain(resolution.entry_attachment_choices.keys())
+        .chain(resolution.entry_icon_choices.keys())
+        .chain(resolution.delete_edit_choices.keys())
+        .map(|e| e.0)
+        .collect();
+    if !resolved_entries.is_empty() {
+        let mut held = engine.held_conflicts()?;
+        let before = held.len();
+        held.retain(|u| !resolved_entries.contains(u));
+        if held.len() != before {
+            engine.set_held_conflicts(&held)?;
+        }
+    }
+
+    // 6. Emit the success event. Stats are best-effort — the resolved
     //    state has already landed and the frontend's primary signal is
     //    that the conflict has cleared; cardinality of the merge here
     //    is reported as zero across the board because the field-level
@@ -176,6 +216,66 @@ pub(crate) fn apply_conflict_resolution(
     };
     engine.emit(ChangeEvent::ExternalChangeMerged { applied });
 
+    Ok(())
+}
+
+/// Write a [`ConflictResolution`] record into `merged`'s Meta for every
+/// facet covered by `resolution`, so the user's decision propagates and
+/// peers adopt the resolving side's value (design §5.3).
+///
+/// One record per resolved field / attachment / icon, keyed by
+/// `(entry, kind, key)` and set-unioned via
+/// [`keepass_merge::add_conflict_resolution`]. The records are
+/// **side-agnostic and value-free** by the secret-safety rule: which side
+/// won and the chosen value never travel in the record — the value rides as
+/// ordinary protected entry data that `apply_merge` already set, and the
+/// peer infers "adopt this side's current value" from presence-asymmetry.
+///
+/// `delete_edit_choices` get no record: a delete-vs-edit decision isn't a
+/// field/icon/attachment facet (there's no matching [`ConflictKind`]), and
+/// the merge's tombstone/restore logic already converges it.
+fn record_resolutions_into_meta(
+    merged: &mut Vault,
+    resolution: &Resolution,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), EngineError> {
+    let cd = &mut merged.meta.custom_data;
+    let mut add = |record: &ConflictResolution| -> Result<(), EngineError> {
+        keepass_merge::add_conflict_resolution(cd, record)
+            .map_err(|e| EngineError::Serialise(format!("add_conflict_resolution: {e}")))
+    };
+
+    for (entry, fields) in &resolution.entry_field_choices {
+        for field_name in fields.keys() {
+            add(&ConflictResolution::new(
+                entry.0,
+                ConflictKind::Field,
+                Some(field_name.clone()),
+                now,
+                None,
+            ))?;
+        }
+    }
+    for (entry, attachments) in &resolution.entry_attachment_choices {
+        for name in attachments.keys() {
+            add(&ConflictResolution::new(
+                entry.0,
+                ConflictKind::Attachment,
+                Some(name.clone()),
+                now,
+                None,
+            ))?;
+        }
+    }
+    for entry in resolution.entry_icon_choices.keys() {
+        add(&ConflictResolution::new(
+            entry.0,
+            ConflictKind::Icon,
+            None,
+            now,
+            None,
+        ))?;
+    }
     Ok(())
 }
 
