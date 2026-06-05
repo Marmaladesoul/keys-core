@@ -309,6 +309,78 @@ pub(crate) fn reconcile_with_disk(
     Ok(MergeResult::Merged { applied: stats })
 }
 
+/// Derive the current conflict payload for the **held** (parked) path and
+/// stash a context so it can be resolved through the same
+/// [`Engine::apply_conflict_resolution`] entry point the live path uses.
+///
+/// This is the resolver-open counterpart to the badge query
+/// [`entries_with_parked_conflict`]. Under hold-open a conflict's
+/// divergence stays live in current state, but once
+/// [`reconcile_with_disk_park_conflicts`] has set the baseline to the disk
+/// bytes the byte-equivalence short-circuit means a plain reconcile would
+/// return `NoChange` and never re-derive the conflict — so neither reconcile
+/// variant can rebuild a resolvable payload after the badge has been cached
+/// (e.g. across an app relaunch). This method merges local-vs-disk
+/// **unconditionally** (no short-circuit, no apply) purely to:
+///
+/// 1. rebuild the rich [`ConflictPayload`] (field / icon / attachment deltas,
+///    the same shape the live path produces), and
+/// 2. stash the [`PendingConflictContext`] so a subsequent
+///    `apply_conflict_resolution(id, …)` converges the chosen values and
+///    writes the propagating resolution records (phase 2b).
+///
+/// It mutates **no** `SQLite` state (the park reconcile owns the held-open
+/// apply + the badge cache); its only side effect is the stash. Returns
+/// `None` — and the stash is left untouched — when the merge surfaces no
+/// conflicts (e.g. the conflict was resolved on a peer and the resolution
+/// record has since synced in, so adoption converged it).
+pub(crate) fn held_conflict_payload(
+    engine: &mut Engine,
+    kdbx_path: &Path,
+    composite_key: &CompositeKey,
+) -> Result<Option<ConflictPayload>, EngineError> {
+    let disk_bytes = std::fs::read(kdbx_path)?;
+    let disk_kdbx = Kdbx::open_from_bytes(disk_bytes.clone())
+        .map_err(|e| EngineError::Serialise(format!("open disk kdbx: {e}")))?
+        .read_header()
+        .map_err(|e| EngineError::Serialise(format!("read disk header: {e}")))?
+        .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
+        .map_err(|e| EngineError::Serialise(format!("unlock disk kdbx: {e}")))?;
+
+    let local_vault = engine.project_to_vault()?;
+    let remote_vault = disk_kdbx
+        .vault_with_unwrapped_protected()
+        .map_err(|e| EngineError::Serialise(format!("unwrap disk protected: {e}")))?;
+
+    // Unconditional merge — deliberately no byte-equivalence / no-op
+    // short-circuit. A held conflict has disk == baseline (the park reconcile
+    // refreshed it) yet local still diverges from disk, so the short-circuits
+    // would wrongly report "nothing to resolve".
+    let outcome = keepass_merge::merge(&local_vault, &remote_vault)
+        .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
+
+    if outcome.entry_conflicts.is_empty() && outcome.delete_edit_conflicts.is_empty() {
+        return Ok(None);
+    }
+
+    let id = NEXT_CONFLICT_ID.fetch_add(1, Ordering::Relaxed);
+    let payload = ConflictPayload {
+        id,
+        entry_conflicts: outcome.entry_conflicts.clone(),
+        delete_edit_conflicts: outcome.delete_edit_conflicts.clone(),
+    };
+    engine.stash_conflict_payload(payload.clone());
+    engine.stash_conflict_context(crate::conflict_resolution::PendingConflictContext {
+        payload: payload.clone(),
+        outcome,
+        local_vault,
+        remote_vault,
+        disk_kdbx,
+        disk_bytes,
+    });
+    Ok(Some(payload))
+}
+
 /// Park-conflicts variant of [`reconcile_with_disk`].
 ///
 /// Identical disk read / parse / project / merge prefix, but continues

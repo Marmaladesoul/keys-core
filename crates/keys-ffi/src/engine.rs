@@ -907,9 +907,43 @@ impl Engine {
         })
     }
 
-    /// Return the UUIDs of every entry that currently has at least
-    /// one parked-conflict marker on one of its history records.
-    /// Drives Keys-Mac's vault-tile warning triangle.
+    /// Build the rich conflict payload for the currently **held** (parked)
+    /// conflicts and stash a context so they can be resolved through the same
+    /// [`Self::apply_conflict_resolution`] entry point the live
+    /// [`Self::reconcile_with_disk`] path uses.
+    ///
+    /// This is the resolver-open companion to
+    /// [`Self::entries_with_parked_conflict`] (which only drives the badge):
+    /// it returns the same icon-aware [`ConflictPayloadFfi`] the live path
+    /// produces — per-entry field / icon / attachment deltas plus the stash
+    /// `id` to echo back to [`Self::apply_conflict_resolution`]. The badge
+    /// survives relaunch but the rich payload does not, so Keys-Mac calls
+    /// this when the user opens the resolver. Returns `None` when no conflict
+    /// remains (e.g. a peer resolved it and the resolution record has synced
+    /// in). See [`keys_engine::Engine::held_conflict_payload`].
+    pub async fn held_conflict_payload(
+        &self,
+        kdbx_path: String,
+        password: String,
+    ) -> Result<Option<ConflictPayloadFfi>, EngineError> {
+        let path = PathBuf::from(kdbx_path);
+        let pw = SecretString::from(password);
+        let composite = tokio::task::spawn_blocking(move || {
+            CompositeKey::from_password(pw.expose_secret().as_bytes())
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))?;
+        self.with_engine_mut(|e| match e.held_conflict_payload(&path, &composite)? {
+            Some(payload) => Ok(build_conflict_payload_ffi(e, payload.id)),
+            None => Ok(None),
+        })
+    }
+
+    /// Return the UUIDs of every entry currently **held** in an unresolved
+    /// sync conflict. Drives Keys-Mac's vault-tile warning triangle and the
+    /// per-entry conflict badge. Reads the engine's derived held-conflict set
+    /// (refreshed on each park reconcile); see
+    /// [`keys_engine::Engine::entries_with_parked_conflict`].
     pub fn entries_with_parked_conflict(&self) -> Result<Vec<String>, EngineError> {
         self.with_engine(|e| {
             Ok(e.entries_with_parked_conflict()?
@@ -919,10 +953,11 @@ impl Engine {
         })
     }
 
-    /// Clear every parked-conflict marker on `entry_uuid` by
-    /// tombstoning the marker-bearing history records. Called from
-    /// the resolver's Apply path after the user's per-field choices
-    /// are written back. See
+    /// Dismiss the held-conflict badge on `entry_uuid` locally (drop it from
+    /// the derived held set) and clean up any legacy `keys.field_conflict.v1`
+    /// history markers from older builds. Cross-peer convergence is driven by
+    /// the resolution record [`Self::apply_conflict_resolution`] writes — not
+    /// by this call. See
     /// [`keys_engine::Engine::clear_parked_conflict_marker`].
     pub fn clear_parked_conflict_marker(&self, entry_uuid: String) -> Result<u32, EngineError> {
         let u = parse_uuid(&entry_uuid, "entry")?;

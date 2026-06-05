@@ -17,6 +17,7 @@ use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{
     AttachmentChoice, ChangeEvent, ConflictResolution, ConflictSide, DataChangeObserver, DbKey,
     DeleteEditChoice, Engine, EngineError, KeyProvider, KeyProviderError, MergeResult,
+    ParkConflictsResult,
 };
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
@@ -223,6 +224,88 @@ fn apply_resolution_writes_conflict_resolution_record_to_meta() {
         "names the resolved field"
     );
     assert!(rec.by.is_none(), "pre-P2P resolutions carry no `by`");
+}
+
+/// Phase 3: a **held** (parked) conflict is resolvable through the same
+/// `apply_conflict_resolution` entry point as the live path. The
+/// non-blocking park reconcile holds the conflict (keeping local, setting
+/// the badge); `held_conflict_payload` rebuilds the rich payload + a
+/// resolvable stash on demand — even though the byte-equiv short-circuit
+/// would make a plain reconcile a no-op; applying converges to the chosen
+/// value, clears the badge, and writes the propagating record.
+#[test]
+fn held_conflict_payload_enables_parked_resolution() {
+    let mut f = fixture();
+
+    // Hold a title conflict via the non-blocking park path.
+    f.engine
+        .update_entry(
+            f.seed_uuid,
+            keys_engine::EntryUpdate {
+                title: Some("local-title".into()),
+                ..Default::default()
+            },
+        )
+        .expect("local edit");
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .edit_entry(EntryId(f.seed_uuid), HistoryPolicy::Snapshot, |e| {
+            e.set_title("disk-title");
+        })
+        .expect("disk edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    match f
+        .engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park")
+    {
+        ParkConflictsResult::Applied { parked, .. } => assert_eq!(
+            parked.entries_with_parked_conflict,
+            vec![f.seed_uuid.to_string()],
+        ),
+        other => panic!("expected Applied, got {other:?}"),
+    }
+    // Hold-open kept local; badge shows.
+    assert_eq!(
+        f.engine.entry(f.seed_uuid).unwrap().unwrap().title,
+        "local-title",
+    );
+    assert_eq!(
+        f.engine.entries_with_parked_conflict().expect("badge"),
+        vec![f.seed_uuid],
+    );
+
+    // Resolver-open: rebuild the rich payload + stash on demand.
+    let payload = f
+        .engine
+        .held_conflict_payload(&f.kdbx_path, &composite())
+        .expect("derive")
+        .expect("a held conflict is present");
+    assert_eq!(payload.entry_conflicts.len(), 1, "one held entry surfaced");
+
+    // Resolve to the remote side through the unified entry point.
+    f.engine
+        .apply_conflict_resolution(
+            payload.id,
+            &title_resolution(f.seed_uuid, ConflictSide::Remote),
+        )
+        .expect("apply");
+
+    // Converged to the disk value and the badge cleared.
+    assert_eq!(
+        f.engine.entry(f.seed_uuid).unwrap().unwrap().title,
+        "disk-title",
+        "resolved to the chosen (remote) value",
+    );
+    assert!(
+        f.engine
+            .entries_with_parked_conflict()
+            .expect("badge")
+            .is_empty(),
+        "badge cleared after parked resolution",
+    );
 }
 
 #[test]

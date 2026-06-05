@@ -863,6 +863,36 @@ impl Engine {
         reconcile::reconcile_with_disk_park_conflicts(self, kdbx_path, composite_key, now)
     }
 
+    /// Build the rich conflict payload for the currently **held** (parked)
+    /// conflicts and stash a context so they can be resolved through the same
+    /// [`Self::apply_conflict_resolution`] entry point the live
+    /// [`Self::reconcile_with_disk`] path uses.
+    ///
+    /// This is the resolver-open companion to the badge query
+    /// [`Self::entries_with_parked_conflict`]. The badge set is cached
+    /// locally and survives relaunch, but the *rich* payload (field / icon /
+    /// attachment deltas + a resolvable stash) does not — and the byte-
+    /// equivalence short-circuit on both reconcile variants means a held
+    /// conflict can't be re-derived once its disk bytes are the baseline.
+    /// This merges local-vs-disk unconditionally to rebuild that payload and
+    /// stash it, mutating no `SQLite` state.
+    ///
+    /// Returns `None` when the merge surfaces no conflicts (e.g. a peer
+    /// resolved it and the resolution record has since synced in).
+    /// `composite_key` is needed to unlock the disk KDBX.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`Self::reconcile_with_disk`]: IO, KDBX open/parse,
+    /// merge.
+    pub fn held_conflict_payload(
+        &mut self,
+        kdbx_path: &Path,
+        composite_key: &CompositeKey,
+    ) -> Result<Option<ConflictPayload>, EngineError> {
+        reconcile::held_conflict_payload(self, kdbx_path, composite_key)
+    }
+
     /// Return the UUIDs of every entry that currently has at least
     /// one parked-conflict marker (`keys.field_conflict.v1`) on one
     /// of its history records.
