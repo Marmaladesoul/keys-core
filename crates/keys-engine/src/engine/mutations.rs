@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::error::EngineError;
 use crate::events::{ChangeEvent, EntryDeletionInfo, EntryMove, GroupDeletionInfo, GroupMove};
-use crate::model::{EntryUpdate, GroupUpdate, HistoricEntry, NewEntryFields, NewGroupFields};
+use crate::model::{
+    EntrySave, EntryUpdate, GroupUpdate, HistoricEntry, NewEntryFields, NewGroupFields,
+};
 use crate::mutations;
 use crate::portable::PortableEntry;
 
@@ -167,6 +169,43 @@ impl Engine {
             &*self.field_protector,
             uuid,
             update,
+        )?;
+        self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
+        Ok(())
+    }
+
+    /// Save the full desired state of an entry in ONE transaction with
+    /// EXACTLY ONE history snapshot.
+    ///
+    /// The single funnel for the entry editor's "Save": it replaces the
+    /// old sequence of per-field engine mutations (each of which pushed
+    /// its own `<History>` snapshot) so one logical save archives one
+    /// history record regardless of how many custom fields the entry
+    /// carries. Standard fields, icon, expiry, the canonical Password
+    /// slot, the full custom-field set (replace-all), and tags
+    /// (set-semantics) are all applied; `password_strength_bucket`,
+    /// `password_entropy`, `password_fingerprint`, `url_host`, and
+    /// `has_totp` are recomputed. `modified_at` is bumped.
+    ///
+    /// Every call archives exactly one snapshot and bumps `modified_at`
+    /// — it does not diff against the current state. See
+    /// [`crate::EntrySave`] for the field contract.
+    ///
+    /// Emits [`ChangeEvent::EntriesUpdated`] for `uuid`.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
+    /// - [`EngineError::Wrap`] / [`EngineError::SessionKey`] on wrap
+    ///   failure.
+    /// - [`EngineError::Sqlite`] on storage failure.
+    pub fn save_entry(&mut self, uuid: Uuid, save: EntrySave) -> Result<(), EngineError> {
+        mutations::save_entry(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            uuid,
+            save,
         )?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())

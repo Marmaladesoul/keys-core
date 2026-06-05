@@ -1,6 +1,9 @@
 //! Bug #2 regression suite — every content-mutating entry path must
 //! push exactly one history snapshot of the pre-edit state, and the
-//! prune pass must respect `keys.field_conflict.v1` markers.
+//! prune pass must honour the `history_max_items` / `history_max_size`
+//! quotas. (The prune pass also still pins any *legacy*
+//! `keys.field_conflict.v1` marker records so a cleanup pass can find
+//! them, but the hold-open redesign no longer writes that marker.)
 //!
 //! Tests run against the public `Engine` surface so they exercise the
 //! same enforcement funnel a real caller would hit.

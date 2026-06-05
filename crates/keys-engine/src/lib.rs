@@ -40,9 +40,9 @@ pub use key_provider::{DbKey, KeyProvider, KeyProviderError};
 pub use meta::DatabaseMetadata;
 pub use migrations::MigrationError;
 pub use model::{
-    AttachmentRef, CustomDataItemRef, CustomFieldRef, EntryFull, EntrySummary, EntryUpdate,
-    GroupNode, GroupUpdate, HistoricEntry, IconRef, NewCustomField, NewEntryFields, NewGroupFields,
-    Pagination, SearchScope, SmartFolder, StrengthBucket,
+    AttachmentRef, CustomDataItemRef, CustomFieldRef, EntryFull, EntrySave, EntrySummary,
+    EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, IconRef, NewCustomField, NewEntryFields,
+    NewGroupFields, Pagination, SearchScope, SmartFolder, StrengthBucket,
 };
 pub use portable::{PortableAttachment, PortableEntry};
 pub use predicate::Predicate;

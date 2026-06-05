@@ -438,6 +438,76 @@ impl IrohNode {
         Ok(id.to_string())
     }
 
+    /// Re-attach to a doc that this node already has on disk. Useful
+    /// after a process restart: the persistent doc store survives, but
+    /// the in-memory `joined` map starts empty, so any `list_entries`
+    /// / `set_entry` / `subscribe` call would fail with "doc not
+    /// joined" until the doc is re-imported.
+    ///
+    /// Returns `true` if the doc was found locally and added to the
+    /// `joined` map (idempotent — re-opening an already-joined doc is
+    /// a successful no-op). Returns `false` if no doc with that
+    /// namespace exists in the persistent store, so the caller can
+    /// decide whether to surface "I don't know this doc" to the user
+    /// or fall through to `create_doc` / `join_doc(ticket)`.
+    ///
+    /// This is the resume primitive Keys clients use on app launch to
+    /// re-activate sync sessions that were live in the previous run.
+    ///
+    /// Two iroh-docs API facts make this the complete resume path
+    /// (verified against iroh-docs 0.99 source):
+    ///
+    /// 1. `DocsApi::open(namespace)` returns a `Doc` handle but does
+    ///    NOT start live sync — it's purely "give me a handle to a
+    ///    doc I already hold". Forgetting to follow it with
+    ///    `start_sync` is why an earlier version of this method
+    ///    resumed the replica but never reconnected to peers.
+    /// 2. `Doc::start_sync(peers)` enables live sync AND merges in the
+    ///    per-document "known useful peers" that iroh-docs persists in
+    ///    its own redb store (the `sync-peers-1` table). Those peers
+    ///    are recorded after every successful sync round and survive
+    ///    restarts, so passing an empty `peers` vec is sufficient:
+    ///    iroh pulls the stored peer set itself and rediscovers each
+    ///    peer's current address via NodeId-based DNS/DERP lookup.
+    ///
+    /// So there's no need for the caller to persist or replay the
+    /// join ticket — iroh already remembers who to talk to. We pass
+    /// an empty peer list and let the library do the rest.
+    ///
+    /// Does not wait for a sync round (peers may be unreachable at
+    /// launch; we don't want to hang startup). The caller subscribes
+    /// to events afterward and observes the first `SyncFinished` as a
+    /// connection signal.
+    pub async fn open_existing_doc(&self, doc_id: String) -> Result<bool> {
+        let namespace: NamespaceId = doc_id
+            .parse()
+            .context("parse doc id (NamespaceId)")
+            .map_err(SyncError::from)?;
+        // Already in the joined map? Idempotent success.
+        if self.joined.lock().await.contains_key(&namespace) {
+            return Ok(true);
+        }
+        let Some(doc) = self
+            .docs
+            .api()
+            .open(namespace)
+            .await
+            .context("open existing doc")
+            .map_err(SyncError::from)?
+        else {
+            return Ok(false);
+        };
+        // Enable live sync. Empty peer list — iroh-docs supplies the
+        // persisted per-doc peers from its own store and handles
+        // address rediscovery.
+        doc.start_sync(Vec::new())
+            .await
+            .context("start sync on resumed doc")
+            .map_err(SyncError::from)?;
+        self.joined.lock().await.insert(namespace, doc);
+        Ok(true)
+    }
+
     /// Mint a ticket for a doc this node holds. `writable` selects
     /// `ShareMode::Write` vs `ShareMode::Read`. The ticket embeds the
     /// node's relay-and-direct address so a fresh peer can dial back

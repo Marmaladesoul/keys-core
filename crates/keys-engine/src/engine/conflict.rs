@@ -336,13 +336,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Crate-internal: borrow the `SQLite` connection for read-only
-    /// queries the reconcile path needs to run outside the regular
-    /// engine APIs.
-    pub(crate) fn conn_ref(&self) -> &rusqlite::Connection {
-        &self.conn
-    }
-
     /// One-shot: did `(observed_mtime, observed_size)` come from our own
     /// most recent [`Engine::save_to_kdbx`]?
     ///

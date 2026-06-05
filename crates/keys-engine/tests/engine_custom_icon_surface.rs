@@ -227,6 +227,44 @@ fn clear_entry_custom_icon_nulls_ref_but_leaves_blob_in_pool() {
 }
 
 #[test]
+fn link_entry_custom_icon_sets_icon_without_history_or_mtime_bump() {
+    // A fetched favicon is cosmetic enrichment, not a user edit: it
+    // must not archive a <History> snapshot or bump modified_at.
+    let (mut engine, root, _dir) = engine_with_empty_vault();
+
+    let entry_uuid = engine
+        .create_entry(
+            root,
+            new_entry_with_icon("favicon-target", IconRef::Builtin(0)),
+        )
+        .expect("create");
+    let before = engine.entry(entry_uuid).expect("entry").expect("some");
+    assert_eq!(before.history_count, 0, "fresh entry has no history");
+
+    let icon_uuid_str = engine.add_custom_icon(ICON_A).expect("add icon");
+    let icon_uuid = Uuid::parse_str(&icon_uuid_str).expect("parse");
+
+    engine
+        .link_entry_custom_icon(entry_uuid, icon_uuid)
+        .expect("link favicon");
+
+    let after = engine.entry(entry_uuid).expect("entry").expect("some");
+    assert!(
+        matches!(after.icon, IconRef::Custom(u) if u == icon_uuid),
+        "favicon should be linked as the custom icon, got {:?}",
+        after.icon
+    );
+    assert_eq!(
+        after.history_count, 0,
+        "a favicon link must NOT archive a history snapshot",
+    );
+    assert_eq!(
+        after.modified_at, before.modified_at,
+        "a favicon link must NOT bump modified_at",
+    );
+}
+
+#[test]
 fn clear_entry_custom_icon_emits_entries_updated() {
     let (mut engine, root, _dir) = engine_with_empty_vault();
     let icon_uuid_str = engine.add_custom_icon(ICON_A).expect("add icon");

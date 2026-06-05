@@ -638,6 +638,63 @@ impl Engine {
         Ok(())
     }
 
+    /// The UUIDs of every entry currently **held** in an unresolved sync
+    /// conflict — the badge cache that backs
+    /// [`Engine::entries_with_parked_conflict`].
+    ///
+    /// Under the hold-open model (see
+    /// `_project-management/sync-conflict-state-redesign.md`) the open-conflict
+    /// set is *derived* from live current-state divergence at each merge
+    /// (`reconcile_with_disk_park_conflicts`) rather than
+    /// stored in the KDBX. This caches the most-recently-derived set **locally**
+    /// in the `setting` table (key `held_conflicts`, a JSON array of hyphenated
+    /// UUID strings) so the badge survives engine close + reopen without having
+    /// to re-run a merge. Nothing here crosses the wire — only the resolution
+    /// records do. Mirrors [`Engine::last_saved_kdbx_bytes`].
+    ///
+    /// Returns an empty vec when the key is absent (no conflict ever held) or
+    /// the stored JSON is unparseable — a corrupt badge cache must never wedge
+    /// the UI, so it degrades to "no conflicts" rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn held_conflicts(&self) -> Result<Vec<uuid::Uuid>, EngineError> {
+        let json: String = match self.conn.query_row(
+            "SELECT value FROM setting WHERE key = 'held_conflicts'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(s) => s,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+            Err(err) => return Err(EngineError::Sqlite(err)),
+        };
+        let strings: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
+        Ok(strings
+            .iter()
+            .filter_map(|s| uuid::Uuid::parse_str(s).ok())
+            .collect())
+    }
+
+    /// Persist the held-conflict badge set, replacing the row in place.
+    ///
+    /// The derived set is recomputed in full on every merge, so this is always
+    /// a complete snapshot rather than a delta. See [`Engine::held_conflicts`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on write failure.
+    pub(crate) fn set_held_conflicts(&mut self, uuids: &[uuid::Uuid]) -> Result<(), EngineError> {
+        let strings: Vec<String> = uuids.iter().map(uuid::Uuid::to_string).collect();
+        let json =
+            serde_json::to_string(&strings).expect("Vec<String> serialisation is infallible");
+        self.conn.execute(
+            "INSERT OR REPLACE INTO setting(key, value) VALUES ('held_conflicts', ?1)",
+            rusqlite::params![json],
+        )?;
+        Ok(())
+    }
+
     /// The `(mtime, size)` of the KDBX file whose contents this engine's
     /// `SQLite` mirror currently corresponds to, or `None` if neither
     /// [`Engine::ingest_from_kdbx`] nor [`Engine::save_to_kdbx`] has

@@ -61,10 +61,10 @@ use crate::engine_file_watcher::{self, VaultFileWatcher};
 use crate::engine_observer::{BridgeObserver, VaultDataChangeObserver};
 use crate::engine_portable::EnginePortableEntry;
 use crate::engine_types::{
-    ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull, EntryUpdate,
-    GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi, MergeResult,
-    NewEntryFields, NewGroupFields, Page, ParkConflictsResultFfi, Predicate, SearchScope,
-    SmartFolder, TagUsageCount, VaultState, parse_uuid,
+    ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull, EntrySave,
+    EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi,
+    MergeResult, NewEntryFields, NewGroupFields, Page, ParkConflictsResultFfi, Predicate,
+    SearchScope, SmartFolder, TagUsageCount, VaultState, parse_uuid,
 };
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
@@ -327,6 +327,21 @@ impl Engine {
     pub fn clear_entry_custom_icon(&self, entry_uuid: String) -> Result<(), EngineError> {
         let u = parse_uuid(&entry_uuid, "entry")?;
         self.with_engine_mut(|e| Ok(e.clear_entry_custom_icon(u)?))
+    }
+
+    /// See [`keys_engine::Engine::link_entry_custom_icon`]. Sets the
+    /// entry's custom icon to a fetched favicon WITHOUT archiving a
+    /// history snapshot or bumping `modified_at` — a favicon is cosmetic
+    /// enrichment, not a user edit. The user-driven icon picker uses
+    /// `update_entry` (which archives + bumps) instead.
+    pub fn link_entry_custom_icon(
+        &self,
+        entry_uuid: String,
+        icon_uuid: String,
+    ) -> Result<(), EngineError> {
+        let entry = parse_uuid(&entry_uuid, "entry")?;
+        let icon = parse_uuid(&icon_uuid, "custom_icon")?;
+        self.with_engine_mut(|e| Ok(e.link_entry_custom_icon(entry, icon)?))
     }
 
     /// See [`keys_engine::Engine::touch_entry`]. Bumps the entry's
@@ -610,6 +625,18 @@ impl Engine {
         let u = parse_uuid(&uuid, "entry")?;
         let upd: eng::EntryUpdate = update.try_into()?;
         self.with_engine_mut(|e| Ok(e.update_entry(u, upd)?))
+    }
+
+    /// See [`keys_engine::Engine::save_entry`]. Applies the full desired
+    /// entry state in ONE transaction with EXACTLY ONE history snapshot
+    /// — the entry editor's single "Save" funnel, replacing the old
+    /// sequence of per-field mutations that each archived their own
+    /// snapshot. `custom_fields` is a replace-all set; `tags` is applied
+    /// with set-semantics.
+    pub fn save_entry(&self, uuid: String, save: EntrySave) -> Result<(), EngineError> {
+        let u = parse_uuid(&uuid, "entry")?;
+        let s: eng::EntrySave = save.try_into()?;
+        self.with_engine_mut(|e| Ok(e.save_entry(u, s)?))
     }
 
     pub fn recycle_entry(&self, uuid: String) -> Result<(), EngineError> {

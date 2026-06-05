@@ -330,6 +330,29 @@ impl Engine {
         Ok(())
     }
 
+    /// Link a fetched favicon to an entry as its custom icon WITHOUT
+    /// archiving a history snapshot or bumping `modified_at`. A favicon
+    /// is automatic cosmetic enrichment, not a user edit — see
+    /// `mutations::link_entry_custom_icon`. The user-driven icon
+    /// picker uses [`Engine::update_entry`] instead, which does archive
+    /// and bump. Emits [`ChangeEvent::EntriesUpdated`] so the icon
+    /// repaints.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry
+    ///   row matches the uuid.
+    /// - [`EngineError::Sqlite`] on update failure.
+    pub fn link_entry_custom_icon(
+        &mut self,
+        entry_uuid: Uuid,
+        icon_uuid: Uuid,
+    ) -> Result<(), EngineError> {
+        mutations::link_entry_custom_icon(&mut self.conn, entry_uuid, icon_uuid)?;
+        self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
+        Ok(())
+    }
+
     /// Bump an entry's `last_used_at` to now. Read-touch flow: nothing
     /// else on the entry changes (no `modified_at` bump, no history
     /// snapshot, no protected-field reseal). Intended for `AutoFill`

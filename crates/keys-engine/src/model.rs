@@ -460,6 +460,45 @@ pub struct EntryUpdate {
     pub expires_at: Option<Option<i64>>,
 }
 
+/// Full desired entry state for [`crate::Engine::save_entry`].
+///
+/// Unlike [`EntryUpdate`]'s patch shape (where `None` means "leave
+/// alone"), every field here is the *complete* post-save value.
+/// `save_entry` applies the whole entry in one transaction with exactly
+/// one history snapshot, replacing the standard fields, icon, expiry,
+/// tags, and the full custom-field set wholesale. This is the engine's
+/// single funnel for the entry editor's "Save" — it retires the old
+/// Swift-orchestrated sequence of per-field mutations (each of which
+/// pushed its own history snapshot) so one logical save archives one
+/// `<History>` record regardless of how many custom fields the entry
+/// carries.
+#[derive(Debug)]
+pub struct EntrySave {
+    /// Entry title.
+    pub title: String,
+    /// Username field.
+    pub username: String,
+    /// URL field (raw, as the user enters it). Drives `url_host`.
+    pub url: String,
+    /// Notes field (plaintext).
+    pub notes: String,
+    /// Canonical Password slot. Always re-wrapped + re-fingerprinted.
+    pub password: SecretString,
+    /// Icon reference (built-in index or custom-icon UUID).
+    pub icon: IconRef,
+    /// Expiry timestamp, ms since Unix epoch; `None` = no expiry.
+    pub expires_at: Option<i64>,
+    /// Full custom-field set (protected + non-protected). Applied as a
+    /// replace-all: any field NOT present here is removed. Excludes the
+    /// canonical Password slot — pass that via [`Self::password`]. A
+    /// protected field named `"Password"` is ignored to avoid shadowing
+    /// the canonical slot (same policy as ingest / `create_entry`).
+    pub custom_fields: Vec<NewCustomField>,
+    /// Tags. Trimmed + de-duplicated by the engine; applied with
+    /// set-semantics (the entry's tag set becomes exactly this set).
+    pub tags: Vec<String>,
+}
+
 /// Field values for [`crate::Engine::create_group`].
 #[derive(Debug)]
 pub struct NewGroupFields {

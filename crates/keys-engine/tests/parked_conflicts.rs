@@ -1,8 +1,14 @@
-//! Integration tests for slice 5b — non-blocking reconcile via
-//! [`keys_engine::Engine::reconcile_with_disk_park_conflicts`] plus
-//! the marker-clearing surfaces
+//! Integration tests for non-blocking reconcile via
+//! [`keys_engine::Engine::reconcile_with_disk_park_conflicts`] plus the
+//! held-conflict badge surfaces
 //! ([`Engine::entries_with_parked_conflict`] /
 //! [`Engine::clear_parked_conflict_marker`]).
+//!
+//! Under the hold-open redesign a genuine clash keeps each side's own
+//! current value — no winner, no history marker — and the divergent entry
+//! is *derived* into a held-conflict set the engine caches locally for the
+//! badge. These tests assert that derived-set behaviour, not the retired
+//! `keys.field_conflict.v1` history marker.
 //!
 //! Mirrors the fixture posture of `external_change_merge.rs`
 //! (`FixedKey` + `FixedProtector` + seeded one-entry vault) so the two
@@ -146,13 +152,14 @@ fn park_conflicts_applies_non_conflicting_external_add() {
     assert!(summaries.iter().any(|s| s.uuid == new_id.0));
 }
 
-/// The headline test: a same-entry conflict on disk + locally lands
-/// non-blocking. The merge applies via park-conflicts, the entry's
-/// uuid surfaces in `entries_with_parked_conflict`, and the entry's
-/// history has gained a record carrying the
-/// `keys.field_conflict.v1` marker.
+/// The headline test under hold-open: a same-entry field clash on disk +
+/// locally lands non-blocking. Each side keeps its **own** current value
+/// (no winner, no `keys.field_conflict.v1` marker written to history), the
+/// divergent entry surfaces in the derived held-conflict set, and a
+/// re-reconcile with no further disk change is a stable no-op that leaves
+/// the badge in place (loop-safe — no re-park, no churn).
 #[test]
-fn park_conflicts_parks_field_conflict_into_history_with_marker() {
+fn park_conflicts_holds_field_conflict_keeping_local() {
     let mut f = fixture();
     let summaries = f
         .engine
@@ -185,51 +192,66 @@ fn park_conflicts_parks_field_conflict_into_history_with_marker() {
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    // Park-conflicts: applies successfully, parks the conflict.
+    // Hold-open: applies successfully, reports the held conflict.
     let result = f
         .engine
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile");
     match result {
         ParkConflictsResult::Applied { parked, .. } => {
-            assert_eq!(parked.entries_with_parked_conflict.len(), 1, "one parked");
             assert_eq!(
-                parked.entries_with_parked_conflict[0],
-                seed_uuid.to_string()
+                parked.entries_with_parked_conflict,
+                vec![seed_uuid.to_string()],
+                "the divergent entry is held",
             );
         }
         other => panic!("expected Applied, got {other:?}"),
     }
 
-    // Local current-state preserved.
+    // Hold-open keeps local: our current value is untouched (no winner).
     let after = f.engine.entry(seed_uuid).expect("entry").expect("present");
     assert_eq!(after.title, "local-rename");
 
-    // The marker shows up in the marker query.
-    let with_marker = f.engine.entries_with_parked_conflict().expect("query");
-    assert_eq!(with_marker, vec![seed_uuid]);
+    // The derived held set surfaces the entry for the badge.
+    let held = f.engine.entries_with_parked_conflict().expect("query");
+    assert_eq!(held, vec![seed_uuid]);
 
-    // The history list contains a snapshot tagged with the marker.
+    // Clean cut: hold-open writes no `keys.field_conflict.v1` marker into
+    // history (the divergence lives in current state, not on a marker).
     let history = f.engine.history(seed_uuid).expect("history");
-    let marker_snapshots: Vec<_> = history
-        .iter()
-        .filter(|h| {
-            h.custom_data
-                .iter()
-                .any(|cd| cd.key == keepass_merge::FIELD_CONFLICT_CUSTOM_DATA_KEY)
-        })
-        .collect();
-    assert_eq!(marker_snapshots.len(), 1, "exactly one parked snapshot");
-    assert_eq!(marker_snapshots[0].title, "disk-rename");
+    assert!(
+        !history.iter().any(|h| h
+            .custom_data
+            .iter()
+            .any(|cd| cd.key == "keys.field_conflict.v1")),
+        "hold-open must not write a conflict marker into history",
+    );
+
+    // Loop-safety: disk is unchanged, so a second reconcile is a stable
+    // no-op and the badge persists — no re-park, no doc-version churn.
+    let again = f
+        .engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile 2");
+    assert!(
+        matches!(again, ParkConflictsResult::NoChange),
+        "re-reconcile of a held conflict must be a no-op, got {again:?}",
+    );
+    assert_eq!(
+        f.engine.entries_with_parked_conflict().expect("query"),
+        vec![seed_uuid],
+        "badge persists across a no-op reconcile",
+    );
 }
 
-/// `clear_parked_conflict_marker` tombstones the marker history
-/// record: it disappears from history, the marker query no longer
-/// surfaces the entry, and the entry's `custom_data` carries a
-/// `keys.history_tombstones.v1` row so the cleanup propagates across
-/// sync.
+/// `clear_parked_conflict_marker` is the local badge-dismissal half of
+/// hold-open: after a held conflict it drops the entry from the derived
+/// held set so the badge clears on this device. (Cross-peer convergence is
+/// driven by the `keys.conflict_resolutions.v1` record that
+/// `apply_conflict_resolution` writes — exercised in
+/// `tests/conflict_resolution.rs`, not here.)
 #[test]
-fn clear_parked_conflict_marker_removes_marker_and_writes_tombstone() {
+fn clear_parked_conflict_dismisses_held_badge() {
     let mut f = fixture();
     let summaries = f
         .engine
@@ -265,45 +287,28 @@ fn clear_parked_conflict_marker_removes_marker_and_writes_tombstone() {
         vec![seed_uuid],
     );
 
-    // Clear the marker.
+    // Dismiss the held badge locally.
     let cleared = f
         .engine
         .clear_parked_conflict_marker(seed_uuid, chrono::Utc::now())
         .expect("clear");
-    assert_eq!(cleared, 1, "one marker cleared");
+    assert_eq!(cleared, 1, "held badge dismissed");
 
-    // No more entries flagged.
+    // No more entries flagged on this device.
     assert!(
         f.engine
             .entries_with_parked_conflict()
             .expect("query")
             .is_empty(),
-        "no parked conflicts after clear",
+        "held set empty after dismiss",
     );
 
-    // The marker history record is gone.
-    let history = f.engine.history(seed_uuid).expect("history");
-    assert!(
-        !history.iter().any(|h| h
-            .custom_data
-            .iter()
-            .any(|cd| { cd.key == keepass_merge::FIELD_CONFLICT_CUSTOM_DATA_KEY })),
-        "marker-bearing history record removed",
-    );
-
-    // The tombstone landed on the live entry's custom_data —
-    // visible via the projection.
-    let full = f.engine.entry(seed_uuid).expect("entry").expect("present");
-    assert!(
-        full.custom_data
-            .iter()
-            .any(|cd| cd.key == keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY),
-        "tombstone written to entry custom_data — got {:?}",
-        full.custom_data
-            .iter()
-            .map(|cd| &cd.key)
-            .collect::<Vec<_>>(),
-    );
+    // Idempotent: dismissing again is a clean 0.
+    let again = f
+        .engine
+        .clear_parked_conflict_marker(seed_uuid, chrono::Utc::now())
+        .expect("clear again");
+    assert_eq!(again, 0, "second dismiss is a no-op");
 }
 
 /// Regression test for Bug #1 — `vaults_equivalent` short-circuited

@@ -27,7 +27,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{EngineError, RevealError};
 use crate::fingerprint;
-use crate::model::{EntryUpdate, GroupUpdate, IconRef, NewEntryFields, NewGroupFields};
+use crate::model::{EntrySave, EntryUpdate, GroupUpdate, IconRef, NewEntryFields, NewGroupFields};
 use crate::strength;
 use crate::totp;
 
@@ -223,10 +223,12 @@ fn push_history_snapshot(tx: &Transaction<'_>, uuid_str: &str) -> Result<(), Eng
 }
 
 /// Prune `entry_history` for `uuid_str` to honour
-/// `meta.history_max_items` and `meta.history_max_size`. Marker-bearing
-/// records (`keys.field_conflict.v1` in the snapshot's `custom_data`)
-/// are always retained — see [`push_history_snapshot`] for the
-/// rationale.
+/// `meta.history_max_items` and `meta.history_max_size`. Records carrying
+/// the *legacy* parked-conflict marker
+/// ([`crate::reconcile::FIELD_CONFLICT_CUSTOM_DATA_KEY`]) are always
+/// retained so a cleanup pass can still find and tombstone them — the
+/// hold-open redesign no longer writes the marker, but old vaults may
+/// still hold one. See [`crate::reconcile::clear_parked_conflict_marker`].
 ///
 /// Re-packs `history_index` into a dense `0..N` afterwards.
 #[allow(clippy::too_many_lines)]
@@ -267,7 +269,7 @@ fn prune_history(tx: &Transaction<'_>, uuid_str: &str) -> Result<(), EngineError
             let is_marker = serde_json::from_str::<HistorySnapshotIo>(&json).is_ok_and(|s| {
                 s.custom_data
                     .iter()
-                    .any(|cd| cd.key == keepass_merge::FIELD_CONFLICT_CUSTOM_DATA_KEY)
+                    .any(|cd| cd.key == crate::reconcile::FIELD_CONFLICT_CUSTOM_DATA_KEY)
             });
             out.push(Row {
                 history_index: idx,
@@ -591,6 +593,143 @@ pub(crate) fn update_entry(
     Ok(())
 }
 
+/// Apply the full desired state of an entry in ONE transaction with
+/// EXACTLY ONE history snapshot.
+///
+/// This is the engine's single funnel for the entry editor's "Save".
+/// It replaces the old Swift-orchestrated sequence of per-field
+/// mutations (`update_entry` + `set_tags` + per-field
+/// `set_*_custom_field` + `remove_custom_field` …) — each of which
+/// pushed its OWN `push_history_snapshot` — so one logical save now
+/// archives exactly one `<History>` record regardless of custom-field
+/// count.
+///
+/// Behaviour:
+/// - Takes a single [`push_history_snapshot`] of the pre-save state up
+///   front, then writes the new columns directly. It does NOT call any
+///   of the per-field archiving mutations (they'd each re-archive).
+/// - Standard fields (title/username/url/notes/password), icon, expiry,
+///   strength/fingerprint columns and `url_host` are overwritten.
+/// - The canonical Password slot is always re-wrapped under a fresh
+///   session key.
+/// - The custom-field set is applied as a **replace-all**: every
+///   `entry_protected` (except the canonical Password slot, re-written
+///   here) and `entry_custom_field` row is dropped and re-inserted from
+///   `save.custom_fields`. Fields absent from the set are therefore
+///   removed — this retires the editor's explicit removal bookkeeping.
+/// - Tags are applied with set-semantics (delete-all + re-insert + GC).
+/// - `has_totp` is recomputed from the final URL + field set.
+///
+/// **Idempotency.** Every call is treated as a user-initiated save: it
+/// unconditionally archives ONE snapshot and bumps `modified_at`. It
+/// does NOT diff against the current state, so re-saving identical
+/// state still archives exactly one snapshot. This is the deliberate
+/// "one snapshot per save" contract (chosen over a dedup heuristic) so
+/// the invariant stays simple and predictable across clients.
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+pub(crate) fn save_entry(
+    conn: &mut Connection,
+    fingerprint_key: &[u8; 32],
+    protector: &dyn FieldProtector,
+    uuid: Uuid,
+    save: EntrySave,
+) -> Result<(), EngineError> {
+    let uuid_str = uuid.to_string();
+    let session = session_key(protector)?;
+    let tx = conn.transaction()?;
+    if !entry_exists(&tx, &uuid_str)? {
+        return Err(EngineError::NotFound { entity: "entry" });
+    }
+
+    // One snapshot of the pre-save state, captured before any field
+    // mutates — see [`push_history_snapshot`] for the invariant.
+    push_history_snapshot(&tx, &uuid_str)?;
+
+    // ── Standard columns + derived password columns ──
+    let url_host = parse_host(&save.url);
+    let (icon_index, icon_custom_uuid) = icon_parts(&save.icon);
+    let pw_plain = save.password.expose_secret();
+    let (bucket, entropy, fp) = password_columns(pw_plain, fingerprint_key);
+    let fp_param: Option<&[u8]> = fp.as_ref().map(|b| &b[..]);
+    tx.execute(
+        "UPDATE entry SET \
+            title = ?1, username = ?2, url = ?3, url_host = ?4, notes = ?5, \
+            icon_index = ?6, icon_custom_uuid = ?7, expires_at = ?8, \
+            password_strength_bucket = ?9, password_entropy = ?10, \
+            password_fingerprint = ?11 \
+         WHERE uuid = ?12",
+        params![
+            save.title,
+            save.username,
+            save.url,
+            url_host,
+            save.notes,
+            icon_index,
+            icon_custom_uuid,
+            save.expires_at,
+            i64::from(bucket),
+            entropy,
+            fp_param,
+            uuid_str,
+        ],
+    )?;
+
+    // ── Custom fields: replace-all ──
+    // Drop every protected + non-protected row, then re-write the
+    // canonical Password slot followed by the desired custom-field set.
+    tx.execute(
+        "DELETE FROM entry_protected WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    tx.execute(
+        "DELETE FROM entry_custom_field WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    let wrapped_pw = wrap(&session, pw_plain.as_bytes())?;
+    tx.execute(
+        "INSERT INTO entry_protected (entry_uuid, field_name, wrapped_blob) \
+         VALUES (?1, ?2, ?3)",
+        params![uuid_str, PASSWORD_FIELD, wrapped_pw],
+    )?;
+    for cf in &save.custom_fields {
+        if cf.protected {
+            if cf.name == PASSWORD_FIELD {
+                // Never shadow the canonical Password slot — matches the
+                // ingest / `create_entry` policy.
+                continue;
+            }
+            let wrapped = wrap(&session, cf.value.expose_secret().as_bytes())?;
+            tx.execute(
+                "INSERT INTO entry_protected (entry_uuid, field_name, wrapped_blob) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(entry_uuid, field_name) DO UPDATE SET wrapped_blob = excluded.wrapped_blob",
+                params![uuid_str, cf.name, wrapped],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO entry_custom_field (entry_uuid, field_name, value) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(entry_uuid, field_name) DO UPDATE SET value = excluded.value",
+                params![uuid_str, cf.name, cf.value.expose_secret()],
+            )?;
+        }
+    }
+
+    // ── Tags: set-semantics ──
+    tx.execute(
+        "DELETE FROM entry_tag WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    insert_tags(&tx, &uuid_str, &save.tags)?;
+    gc_orphan_tags(&tx)?;
+
+    // ── Derived bit + modified stamp ──
+    recompute_has_totp(&tx, &uuid_str)?;
+    bump_modified(&tx, &uuid_str)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn bump_modified(tx: &Transaction<'_>, uuid: &str) -> Result<(), EngineError> {
     tx.execute(
         "UPDATE entry SET modified_at = ?1 WHERE uuid = ?2",
@@ -665,6 +804,32 @@ pub(crate) fn clear_entry_custom_icon(
         params![uuid_str],
     )?;
     bump_modified(&tx, &uuid_str)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Link a fetched favicon to an entry as its custom icon WITHOUT
+/// archiving a history snapshot or bumping `modified_at`. A favicon is
+/// automatic cosmetic enrichment, not a user edit — it must not clutter
+/// the entry's `<History>` or move its "last modified" time. (The
+/// user-driven icon picker goes through [`update_entry`], which *does*
+/// archive + bump, because hand-choosing an icon IS a real edit.)
+/// `icon_index` is left untouched — the orthogonal built-in fallback
+/// slot per KDBX semantics.
+pub(crate) fn link_entry_custom_icon(
+    conn: &mut Connection,
+    uuid: Uuid,
+    icon_uuid: Uuid,
+) -> Result<(), EngineError> {
+    let uuid_str = uuid.to_string();
+    let tx = conn.transaction()?;
+    if !entry_exists(&tx, &uuid_str)? {
+        return Err(EngineError::NotFound { entity: "entry" });
+    }
+    tx.execute(
+        "UPDATE entry SET icon_custom_uuid = ?1 WHERE uuid = ?2",
+        params![icon_uuid.to_string(), uuid_str],
+    )?;
     tx.commit()?;
     Ok(())
 }

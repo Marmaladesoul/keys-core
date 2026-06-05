@@ -612,6 +612,46 @@ impl TryFrom<EntryUpdate> for eng::EntryUpdate {
     }
 }
 
+/// Full desired entry state for `save_entry`. Unlike [`EntryUpdate`]'s
+/// patch shape, every field is the complete post-save value. The engine
+/// applies the whole entry in one transaction with exactly one history
+/// snapshot — the editor's single "Save" funnel. `custom_fields` is a
+/// replace-all set (protected + non-protected, excluding the canonical
+/// Password slot); `tags` is applied with set-semantics.
+#[derive(uniffi::Record, Debug, Clone)]
+pub struct EntrySave {
+    pub title: String,
+    pub username: String,
+    pub url: String,
+    pub notes: String,
+    /// Canonical Password slot plaintext; AES-GCM-sealed by the engine.
+    pub password: String,
+    pub icon: IconRef,
+    /// Expiry, ms since Unix epoch; `None` = no expiry.
+    pub expires_at: Option<i64>,
+    /// Full custom-field set (replace-all). Excludes Password.
+    pub custom_fields: Vec<NewCustomField>,
+    pub tags: Vec<String>,
+}
+
+impl TryFrom<EntrySave> for eng::EntrySave {
+    type Error = EngineError;
+
+    fn try_from(s: EntrySave) -> Result<Self, EngineError> {
+        Ok(Self {
+            title: s.title,
+            username: s.username,
+            url: s.url,
+            notes: s.notes,
+            password: secrecy::SecretString::from(s.password),
+            icon: s.icon.try_into()?,
+            expires_at: s.expires_at,
+            custom_fields: s.custom_fields.into_iter().map(Into::into).collect(),
+            tags: s.tags,
+        })
+    }
+}
+
 /// Field values for create_group.
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct NewGroupFields {
