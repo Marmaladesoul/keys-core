@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::Kdbx;
-use keepass_core::model::{EntryId, Vault};
+use keepass_core::model::{Entry, EntryId, Group, Timestamps, Vault};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -471,6 +471,11 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
         groups_moved: 0,
     };
 
+    // Snapshot of local before apply — the loop-safety guard compares each
+    // held entry's merged form back against this to tell a genuine
+    // non-conflicting facet change (a unioned tag / attachment tombstone the
+    // apply folds onto a held entry) from a true no-op.
+    let local_before = local_vault.clone();
     let mut merged = local_vault;
     let report = keepass_merge::apply_merge_park_conflicts(
         &mut merged,
@@ -480,6 +485,31 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     )
     .map_err(|e| EngineError::Serialise(format!("apply_merge_park_conflicts: {e}")))?;
     keepass_merge::reconcile_timestamps(&mut merged, &remote_vault);
+
+    let held: Vec<uuid::Uuid> = report
+        .entries_with_parked_conflict
+        .iter()
+        .map(|id| id.0)
+        .collect();
+
+    // ── Held-conflict loop-safety guard (design §4.4) ──
+    //
+    // Hold-open keeps each side's own value, so a merge whose *only* effect
+    // is held conflicts changes nothing locally — re-merging it must write
+    // nothing, or sync loops forever (each save re-encrypts with a fresh
+    // nonce → the peer sees "new" bytes → merges → saves → …). But "held"
+    // is NOT "untouched": apply still folds the peer's non-conflicting facets
+    // (unioned tags, attachment tombstones) onto a held entry and LWW group
+    // metadata (rename/notes/icon) onto its group, and those are real changes
+    // we must persist or lose. `park_merge_is_no_op` therefore checks both the
+    // buckets AND the normalised merged-vs-local entry/group tree — see its
+    // docs. Adoption of a resolution record drops the entry from `held`, so the
+    // guard correctly falls through to `Applied`.
+    if park_merge_is_no_op(&outcome, &held, &stats, &local_before, &merged) {
+        engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
+        engine.set_held_conflicts(&held)?;
+        return Ok(ParkConflictsResult::NoChange);
+    }
 
     // Re-ingest the merged vault into SQLite via the same `ingest_merged`
     // path the standard reconcile uses. The migration-0006
@@ -498,18 +528,13 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
 
     engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
 
-    // Cache the derived held-conflict set for the badge. This is the full
-    // current set (the apply walks every conflict), so it replaces the kv
-    // outright — entries that converged this round drop off, new ones
-    // appear. Set after `ingest_merged` for the same reason
+    // Cache the derived held-conflict set for the badge (`held` computed
+    // above). This is the full current set (the apply walks every conflict),
+    // so it replaces the kv outright — entries that converged this round drop
+    // off, new ones appear. Set after `ingest_merged` for the same reason
     // `last_saved_kdbx_bytes` is: the `held_conflicts` setting row is not a
     // `meta.*` key so the re-ingest leaves it alone, but mirroring the
     // ordering keeps the invariant obvious.
-    let held: Vec<uuid::Uuid> = report
-        .entries_with_parked_conflict
-        .iter()
-        .map(|id| id.0)
-        .collect();
     engine.set_held_conflicts(&held)?;
 
     let parked = ParkedConflictsSummary {
@@ -716,6 +741,103 @@ fn outcome_is_no_op(outcome: &keepass_merge::MergeOutcome, local: &Vault, remote
         && outcome.delete_edit_conflicts.is_empty()
         && count_groups_remote_only(local, remote) == 0
         && count_groups_tombstoned(local, remote) == 0
+}
+
+/// True when an `apply_merge_park_conflicts` run changes nothing we must
+/// persist — the loop-safety signal for hold-open. Unlike [`outcome_is_no_op`]
+/// it tolerates a non-empty `entry_conflicts`, because a held conflict keeps
+/// local's *conflicting* value. But "held" is not "untouched": apply still
+/// folds the peer's **non-conflicting** facets onto a held entry (tags and
+/// tag-state unioned, attachment tombstones that can even drop a local
+/// attachment) and applies last-writer-wins **group** metadata (rename, notes,
+/// icon) onto groups holding held entries. Those are real changes; skipping
+/// the ingest/save would silently and permanently lose them (the next
+/// reconcile byte-equiv short-circuits). So this is a two-part test:
+///
+/// 1. **Buckets** — every conflicting entry is *held* (not adopted via a
+///    resolution record) and no non-conflict / propagation bucket moved. The
+///    bucket check is load-bearing on its own for cases the tree compare can't
+///    see: e.g. `local_only_changes` / `local_deletions_pending_sync` leave
+///    `merged == local_before` yet still need a save to propagate to the peer.
+/// 2. **Tree unchanged** — the merged entry/group tree equals the pre-apply
+///    local tree under [`normalise_root_for_noop`], which clears `history` +
+///    `times` and sorts every order-insensitive collection. History + times
+///    are excluded deliberately: apply re-times history non-deterministically
+///    (KDBX second-resolution mtimes → flaky dedup) and hold-open does not
+///    persist cross-side history for a held conflict, so including them would
+///    reintroduce the re-save loop. The sort is load-bearing too: apply rewrites
+///    `custom_data` via retain+push (key moves to the end) while the `SQLite`
+///    projection loads it `ORDER BY key`, so a raw `Vec` compare would see a
+///    phantom reorder and loop. Every *real* difference (a unioned tag, an
+///    attachment tombstone, a group rename) is still caught.
+///
+/// Vault `meta` is never compared (mirroring [`outcome_is_no_op`], which also
+/// ignores it), so the phantom custom-icon-pool union and projection settings
+/// flags can't be misread as a real change.
+fn park_merge_is_no_op(
+    outcome: &keepass_merge::MergeOutcome,
+    held: &[uuid::Uuid],
+    stats: &MergeStats,
+    local_before: &Vault,
+    merged: &Vault,
+) -> bool {
+    let held_set: std::collections::HashSet<uuid::Uuid> = held.iter().copied().collect();
+    let buckets_clean = outcome
+        .entry_conflicts
+        .iter()
+        .all(|c| held_set.contains(&c.entry_id.0))
+        && outcome.delete_edit_conflicts.is_empty()
+        && outcome.added_on_disk.is_empty()
+        && outcome.disk_only_changes.is_empty()
+        && outcome.local_only_changes.is_empty()
+        && outcome.deleted_on_disk.is_empty()
+        && outcome.local_deletions_pending_sync.is_empty()
+        && outcome.group_conflicts.is_empty()
+        && stats.groups_added == 0
+        && stats.groups_deleted == 0;
+    if !buckets_clean {
+        return false;
+    }
+
+    // Buckets clean ⇒ the only entries/groups that can differ between
+    // `local_before` and `merged` are the held entries (apply folded a facet)
+    // and groups whose LWW metadata apply took. Compare the whole normalised
+    // tree: non-held, non-changed nodes are identical so they never trip it.
+    let mut local_root = local_before.root.clone();
+    let mut merged_root = merged.root.clone();
+    normalise_root_for_noop(&mut local_root);
+    normalise_root_for_noop(&mut merged_root);
+    local_root == merged_root
+}
+
+/// Canonicalise a group subtree for the [`park_merge_is_no_op`] tree compare:
+/// drop the facets apply mutates non-meaningfully (`history`, all `times`) and
+/// sort every order-insensitive collection so an apply-vs-projection ordering
+/// difference can't masquerade as a real change. `unknown_xml` is left as-is
+/// (position may be meaningful and apply doesn't reorder it on a held node).
+/// Sorting can only ever hide a pure reorder — an add/remove still changes the
+/// set — so it is safe in the data-loss direction.
+fn normalise_root_for_noop(group: &mut Group) {
+    group.times = Timestamps::default();
+    group.custom_data.sort_by(|a, b| a.key.cmp(&b.key));
+    for entry in &mut group.entries {
+        normalise_entry_for_noop(entry);
+    }
+    group.entries.sort_by_key(|e| e.id.0);
+    for child in &mut group.groups {
+        normalise_root_for_noop(child);
+    }
+    group.groups.sort_by_key(|g| g.id.0);
+}
+
+/// Per-entry half of [`normalise_root_for_noop`].
+fn normalise_entry_for_noop(entry: &mut Entry) {
+    entry.history = Vec::new();
+    entry.times = Timestamps::default();
+    entry.tags.sort();
+    entry.custom_data.sort_by(|a, b| a.key.cmp(&b.key));
+    entry.custom_fields.sort_by(|a, b| a.key.cmp(&b.key));
+    entry.attachments.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 // ---------------------------------------------------------------------------
@@ -999,4 +1121,107 @@ fn find_entry_mut(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod noop_compare_tests {
+    //! Unit coverage for the [`park_merge_is_no_op`] tree normalisation —
+    //! the loop-safety / data-loss invariants the adversarial review surfaced.
+    use super::{normalise_entry_for_noop, normalise_root_for_noop};
+    use keepass_core::model::{CustomDataItem, Entry, EntryId, Group, GroupId};
+
+    fn cd(key: &str) -> CustomDataItem {
+        CustomDataItem::new(key.to_string(), "v".to_string(), None)
+    }
+
+    /// Blocker 2: apply rewrites `custom_data` via retain+push (the touched key
+    /// moves to the end) while the `SQLite` projection loads it `ORDER BY key`. A
+    /// raw `Vec` compare would read that reorder as a change → false `Applied`
+    /// → never converges (projection re-sorts, apply re-reorders) → sync loop.
+    /// Normalisation must make the compare order-insensitive.
+    #[test]
+    fn custom_data_reorder_is_not_a_change() {
+        let id = EntryId(uuid::Uuid::new_v4());
+        let mut sorted = Entry::empty(id);
+        sorted.custom_data = vec![cd("keys.attachment_tombstones.v1"), cd("keys.tag_state.v1")];
+        let mut reordered = Entry::empty(id);
+        reordered.custom_data = vec![cd("keys.tag_state.v1"), cd("keys.attachment_tombstones.v1")];
+        normalise_entry_for_noop(&mut sorted);
+        normalise_entry_for_noop(&mut reordered);
+        assert_eq!(
+            sorted, reordered,
+            "custom_data order must not count as a change"
+        );
+    }
+
+    /// ...but a genuine `custom_data` set difference is still caught.
+    #[test]
+    fn custom_data_real_change_is_caught() {
+        let id = EntryId(uuid::Uuid::new_v4());
+        let mut a = Entry::empty(id);
+        a.custom_data = vec![cd("keys.tag_state.v1")];
+        let mut b = Entry::empty(id);
+        b.custom_data = vec![cd("keys.tag_state.v1"), cd("keys.attachment_tombstones.v1")];
+        normalise_entry_for_noop(&mut a);
+        normalise_entry_for_noop(&mut b);
+        assert_ne!(a, b, "a real custom_data difference must be caught");
+    }
+
+    /// Tag order is irrelevant (set semantics); a new tag is a real change.
+    #[test]
+    fn tag_reorder_is_not_a_change_but_a_new_tag_is() {
+        let id = EntryId(uuid::Uuid::new_v4());
+        let mut a = Entry::empty(id);
+        a.tags = vec!["b".into(), "a".into()];
+        let mut b = Entry::empty(id);
+        b.tags = vec!["a".into(), "b".into()];
+        normalise_entry_for_noop(&mut a);
+        normalise_entry_for_noop(&mut b);
+        assert_eq!(a, b, "tag order must not count as a change");
+
+        let mut c = Entry::empty(id);
+        c.tags = vec!["a".into(), "b".into(), "c".into()];
+        normalise_entry_for_noop(&mut c);
+        assert_ne!(a, c, "a new tag must be caught");
+    }
+
+    /// History + times differences are excluded (apply re-times them
+    /// non-deterministically; including them would loop).
+    #[test]
+    fn history_and_times_diffs_are_excluded() {
+        let id = EntryId(uuid::Uuid::new_v4());
+        let mut a = Entry::empty(id);
+        let mut b = Entry::empty(id);
+        b.times.last_modification_time = Some(chrono::Utc::now());
+        b.history.push(Entry::empty(EntryId(uuid::Uuid::new_v4())));
+        normalise_entry_for_noop(&mut a);
+        normalise_entry_for_noop(&mut b);
+        assert_eq!(a, b, "history/times diffs must not count as a change");
+    }
+
+    /// Blocker 1: a group rename (LWW metadata apply folds in) must count even
+    /// when nothing else moved...
+    #[test]
+    fn group_rename_is_a_change() {
+        let id = GroupId(uuid::Uuid::new_v4());
+        let mut a = Group::empty(id);
+        a.name = "before".into();
+        let mut b = Group::empty(id);
+        b.name = "after".into();
+        normalise_root_for_noop(&mut a);
+        normalise_root_for_noop(&mut b);
+        assert_ne!(a, b, "a group rename must be caught");
+    }
+
+    /// ...but a pure group-`times` bump must not (avoids a phantom save).
+    #[test]
+    fn group_time_only_diff_is_not_a_change() {
+        let id = GroupId(uuid::Uuid::new_v4());
+        let mut a = Group::empty(id);
+        let mut b = Group::empty(id);
+        b.times.last_modification_time = Some(chrono::Utc::now());
+        normalise_root_for_noop(&mut a);
+        normalise_root_for_noop(&mut b);
+        assert_eq!(a, b, "a pure group-times bump must not count as a change");
+    }
 }

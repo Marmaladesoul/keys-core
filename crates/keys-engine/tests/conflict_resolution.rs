@@ -17,7 +17,6 @@ use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{
     AttachmentChoice, ChangeEvent, ConflictResolution, ConflictSide, DataChangeObserver, DbKey,
     DeleteEditChoice, Engine, EngineError, KeyProvider, KeyProviderError, MergeResult,
-    ParkConflictsResult,
 };
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
@@ -256,25 +255,23 @@ fn held_conflict_payload_enables_parked_resolution() {
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    match f
-        .engine
+    // Park the conflict. (The result may be NoChange or a one-time Applied
+    // depending on whether the merge also converges a differing history
+    // snapshot — loop-safety of the *held* state is covered by the dedicated
+    // park_conflicts_holds_* tests. Here we only need the conflict held +
+    // badged so it can be resolved.)
+    f.engine
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
-        .expect("park")
-    {
-        ParkConflictsResult::Applied { parked, .. } => assert_eq!(
-            parked.entries_with_parked_conflict,
-            vec![f.seed_uuid.to_string()],
-        ),
-        other => panic!("expected Applied, got {other:?}"),
-    }
-    // Hold-open kept local; badge shows.
-    assert_eq!(
-        f.engine.entry(f.seed_uuid).unwrap().unwrap().title,
-        "local-title",
-    );
+        .expect("park");
     assert_eq!(
         f.engine.entries_with_parked_conflict().expect("badge"),
         vec![f.seed_uuid],
+        "the conflict is held + badged",
+    );
+    // Hold-open kept local.
+    assert_eq!(
+        f.engine.entry(f.seed_uuid).unwrap().unwrap().title,
+        "local-title",
     );
 
     // Resolver-open: rebuild the rich payload + stash on demand.
