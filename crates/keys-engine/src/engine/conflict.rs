@@ -370,6 +370,46 @@ impl Engine {
         Ok(())
     }
 
+    /// Ingest one peer's vault as owner-tagged conflict rows — the
+    /// multi-peer owner-rows store (Phase 2,
+    /// `_project-management/sync-multipeer-store.md` §9).
+    ///
+    /// For each entry the peer holds that we also hold, runs the
+    /// keepass-merge `classify` brain (item granularity) and either advances
+    /// our local entry (one-sided / non-overlapping peer edit), stores the
+    /// peer's value as an `owner`-keyed conflict row (genuine conflict, held
+    /// open — local is left untouched), or does nothing (agreement). Purely
+    /// additive: writes only the `conflict_*` tables plus any single advanced
+    /// local entry, and never clears the vault tables.
+    ///
+    /// `owner` is an opaque peer/device identifier the sync layer supplies;
+    /// the same string must be reused across that peer's pulls so its rows
+    /// refresh in place. The returned [`crate::ingest::IngestPeerOutcome`]'s
+    /// `auto_merged` bucket tells the caller whether the local side changed
+    /// (and so must be saved). Not yet wired to the live reconcile path —
+    /// Phase 4 repoints the sync reconcile here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] if projecting the local vault fails, or if any
+    /// `SQLite` write / field-seal during the per-entry classification fails
+    /// (the whole pass runs in one transaction, so a failure rolls back).
+    pub fn ingest_peer(
+        &mut self,
+        owner: &str,
+        peer: &keepass_core::model::Vault,
+    ) -> Result<crate::ingest::IngestPeerOutcome, EngineError> {
+        let local = self.project_to_vault()?;
+        crate::ingest::ingest_peer(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            owner,
+            &local,
+            peer,
+        )
+    }
+
     /// One-shot: did `(observed_mtime, observed_size)` come from our own
     /// most recent [`Engine::save_to_kdbx`]?
     ///

@@ -62,6 +62,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "entry_custom_data",
         sql: include_str!("migrations/0006_entry_custom_data.sql"),
     },
+    Migration {
+        version: 7,
+        name: "owner_conflict_rows",
+        sql: include_str!("migrations/0007_owner_conflict_rows.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.

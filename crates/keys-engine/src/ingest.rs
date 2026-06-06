@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{Entry, Group, GroupId, Vault};
 use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
+use keepass_merge::{Classification, Granularity, classify};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -773,6 +774,279 @@ fn b64_encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Owner-tagged peer ingest — the multi-peer owner-rows store (Phase 2).
+//
+// `ingest_peer` is the lazy-conflict counterpart to the eager-merge reconcile
+// path. For each entry a peer holds that we also hold, it runs the
+// keepass-merge `classify` brain (item granularity) and:
+//   - InSync     → nothing diverged; clear any stale row for this (owner, entry).
+//   - AutoMerged → advance our local entry to the merged value; clear the row.
+//   - Conflict   → keep our local value (hold-open) and store the peer's value
+//                  as an `owner`-keyed `conflict_*` row for the resolver.
+// It is purely additive: it writes only the `conflict_*` tables plus (for an
+// auto-merge) the single advanced local entry, and never calls
+// `clear_vault_tables`. Not yet wired into the live reconcile path — Phase 4
+// repoints the sync reconcile at it.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Outcome of an `ingest_peer` pass.
+///
+/// The three buckets let the caller decide save-vs-no-save (the loop-safety
+/// contract): a non-empty [`Self::auto_merged`] means the local side changed
+/// and must be persisted; pure conflicts / in-sync advance nothing locally,
+/// so no save (and thus no fresh-nonce re-push) is needed.
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct IngestPeerOutcome {
+    /// Entries where the peer genuinely conflicts — a `conflict_*` row was
+    /// written/refreshed for this `owner`. The badge candidates.
+    pub conflicted: Vec<Uuid>,
+    /// Entries advanced to a merged value (one-sided / non-overlapping peer
+    /// edits). The local side changed → the caller must persist.
+    pub auto_merged: Vec<Uuid>,
+    /// Count of entries the peer agreed on outright — nothing written.
+    pub in_sync: usize,
+}
+
+/// Ingest one peer's vault as owner-tagged conflict rows. See the module
+/// section header for the per-entry classification. `local` is the engine's
+/// projected vault (the source of truth for our side); `peer` is the peer
+/// KDBX with protected fields unwrapped to plaintext for the call's duration.
+/// `owner` is an opaque peer/device identifier the sync layer supplies; it is
+/// the conflict-row key, so the same string must be used across that peer's
+/// pulls for the refresh-in-place semantics to hold.
+pub(crate) fn ingest_peer(
+    conn: &mut Connection,
+    fingerprint_key: &[u8; 32],
+    protector: &dyn FieldProtector,
+    owner: &str,
+    local: &Vault,
+    peer: &Vault,
+) -> Result<IngestPeerOutcome, EngineError> {
+    // One session-key fetch per call — same discipline as `ingest`.
+    let session_key = protector
+        .acquire_session_key()
+        .map_err(|e| EngineError::Ingest(IngestError::SessionKey(e.to_string())))?;
+
+    let local_by_uuid = index_entries(&local.root);
+    let local_bin_refs: Vec<&[u8]> = local.binaries.iter().map(|b| b.data.as_slice()).collect();
+
+    let mut outcome = IngestPeerOutcome::default();
+    let tx = conn.transaction()?;
+
+    for peer_entry in collect_entries(&peer.root) {
+        let uuid = peer_entry.id.0;
+        let Some(local_entry) = local_by_uuid.get(&uuid) else {
+            // Peer-present / local-absent: a new-entry / tombstone question
+            // deferred to Phase 5. Discard — don't invent add/delete here.
+            continue;
+        };
+        let uuid_str = uuid.to_string();
+        match classify(
+            local_entry,
+            peer_entry,
+            &local.binaries,
+            &peer.binaries,
+            Granularity::Item,
+        ) {
+            Classification::InSync => {
+                clear_conflict_rows(&tx, owner, &uuid_str)?;
+                outcome.in_sync += 1;
+            }
+            Classification::AutoMerged { merged } => {
+                advance_local_entry(
+                    &tx,
+                    local,
+                    &merged,
+                    fingerprint_key,
+                    &session_key,
+                    &local_bin_refs,
+                )?;
+                clear_conflict_rows(&tx, owner, &uuid_str)?;
+                outcome.auto_merged.push(uuid);
+            }
+            Classification::Conflict { conflict } => {
+                // Hold-open: leave the local entry untouched; store the peer's
+                // value (the resolver's "theirs"). Refresh in place so a
+                // re-pull replaces rather than accumulates.
+                clear_conflict_rows(&tx, owner, &uuid_str)?;
+                insert_conflict_entry(&tx, owner, &conflict.remote, &session_key)?;
+                outcome.conflicted.push(uuid);
+            }
+            // `Classification` is `#[non_exhaustive]`; a future verdict variant
+            // must be handled explicitly above. Until one exists, conservatively
+            // do nothing for this entry — never silently advance (and thus
+            // overwrite) the local side on a verdict we don't understand.
+            _ => {}
+        }
+    }
+
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// Depth-first collection of every entry under `root` (read-only — the
+/// write-side counterpart is [`walk_entries`]).
+fn collect_entries(root: &Group) -> Vec<&Entry> {
+    fn walk<'a>(group: &'a Group, out: &mut Vec<&'a Entry>) {
+        out.extend(group.entries.iter());
+        for child in &group.groups {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
+}
+
+/// `entry-uuid → &Entry` index for the local side, so the per-peer walk can
+/// pair each peer entry with our own in O(1).
+fn index_entries(root: &Group) -> HashMap<Uuid, &Entry> {
+    collect_entries(root)
+        .into_iter()
+        .map(|e| (e.id.0, e))
+        .collect()
+}
+
+/// Advance the local mirror's entry to `merged` (an auto-merge result).
+///
+/// `merged` keeps the entry's existing group and recycle state (classify
+/// never moves entries), so we read those from the current row, drop the
+/// entry (its child rows cascade), and re-insert via the canonical
+/// [`insert_entry`] so every derived column / sealed field / history row is
+/// rebuilt exactly as a normal ingest would. `merged`'s attachments and
+/// history are inherited from local, so they index into the local binary
+/// pool (`binaries`).
+fn advance_local_entry(
+    tx: &Connection,
+    local_vault: &Vault,
+    merged: &Entry,
+    fingerprint_key: &[u8; 32],
+    session_key: &SessionKey,
+    binaries: &[&[u8]],
+) -> Result<(), EngineError> {
+    let uuid_str = merged.id.0.to_string();
+    let (group_uuid_str, is_recycled): (String, bool) = tx.query_row(
+        "SELECT group_uuid, is_recycled FROM entry WHERE uuid = ?1",
+        params![uuid_str],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
+    )?;
+    let group_id =
+        GroupId(Uuid::parse_str(&group_uuid_str).map_err(|e| {
+            EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?);
+    // Child tables (entry_protected/attachment/history/tag/custom_field/
+    // custom_data) cascade off entry(uuid) ON DELETE — same posture as
+    // `mutations::delete_entry`.
+    tx.execute("DELETE FROM entry WHERE uuid = ?1", params![uuid_str])?;
+    insert_entry(
+        tx,
+        local_vault,
+        merged,
+        group_id,
+        is_recycled,
+        fingerprint_key,
+        session_key,
+        binaries,
+    )?;
+    Ok(())
+}
+
+/// Write the peer's value as an `owner`-keyed `conflict_*` row set (the
+/// resolver's "theirs"). Mirrors [`insert_entry`]'s field walk but targets
+/// the parallel conflict tables and omits the engine-internal derived
+/// columns / history / tags / attachments (out of Phase-2 scope). Protected
+/// fields are sealed under the same session key the live rows use — never
+/// stored as plaintext.
+fn insert_conflict_entry(
+    tx: &Connection,
+    owner: &str,
+    entry: &Entry,
+    session_key: &SessionKey,
+) -> Result<(), EngineError> {
+    let uuid = entry.id.0.to_string();
+    tx.execute(
+        "INSERT INTO conflict_entry (\
+            owner, entry_uuid, group_uuid, title, username, url, notes, \
+            icon_index, icon_custom_uuid, created_at, modified_at, accessed_at, expires_at\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            owner,
+            uuid,
+            // group placement is Phase-5 group reconciliation.
+            Option::<String>::None,
+            entry.title,
+            entry.username,
+            entry.url,
+            entry.notes,
+            i64::from(entry.icon_id),
+            entry.custom_icon_uuid.map(|u| u.to_string()),
+            dt_to_ms_required(entry.times.creation_time),
+            dt_to_ms_required(entry.times.last_modification_time),
+            dt_to_ms_required(entry.times.last_access_time),
+            expiry_ms(&entry.times),
+        ],
+    )?;
+
+    // Canonical Password slot, always sealed (even empty) for symmetry with
+    // the live `entry_protected` row.
+    let wrapped_password = seal_with_key(session_key, entry.password.as_bytes())
+        .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
+    tx.execute(
+        "INSERT INTO conflict_entry_protected (owner, entry_uuid, field_name, wrapped_blob) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![owner, uuid, PASSWORD_FIELD, wrapped_password],
+    )?;
+
+    for cf in &entry.custom_fields {
+        if cf.protected {
+            // Mirror `insert_entry`: a custom field named "Password" would
+            // collide with the canonical slot, so skip it.
+            if cf.key == PASSWORD_FIELD {
+                continue;
+            }
+            let wrapped = seal_with_key(session_key, cf.value.as_bytes())
+                .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
+            tx.execute(
+                "INSERT INTO conflict_entry_protected (owner, entry_uuid, field_name, wrapped_blob) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![owner, uuid, cf.key, wrapped],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO conflict_entry_custom_field (owner, entry_uuid, field_name, value) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![owner, uuid, cf.key, cf.value],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Drop the `conflict_*` rows for one `(owner, entry)`. Explicit child
+/// deletes (don't rely on the FK-cascade pragma being on), parent last.
+fn clear_conflict_rows(
+    tx: &Connection,
+    owner: &str,
+    entry_uuid: &str,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "DELETE FROM conflict_entry_protected WHERE owner = ?1 AND entry_uuid = ?2",
+        params![owner, entry_uuid],
+    )?;
+    tx.execute(
+        "DELETE FROM conflict_entry_custom_field WHERE owner = ?1 AND entry_uuid = ?2",
+        params![owner, entry_uuid],
+    )?;
+    tx.execute(
+        "DELETE FROM conflict_entry WHERE owner = ?1 AND entry_uuid = ?2",
+        params![owner, entry_uuid],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +1065,372 @@ mod tests {
         assert_eq!(parse_host("not a url"), "");
         // Schemeless input is not a URL per RFC 3986; url crate refuses.
         assert_eq!(parse_host("example.com"), "");
+    }
+}
+
+#[cfg(test)]
+mod ingest_peer_tests {
+    //! Owner-tagged peer ingest (Phase 2). In-memory migrated connection +
+    //! hand-built vaults (explicit `<History>` so classify finds the LCA, the
+    //! same posture as the keepass-merge `classify` unit tests) + raw-SQL
+    //! inspection of the `conflict_*` rows. Logic-level — the real-KDBX
+    //! history-identity soak is the Phase-4 gate.
+
+    use super::{IngestPeerOutcome, ingest_peer, ingest_vault};
+    use crate::migrations;
+    use keepass_core::model::{CustomField, Entry, EntryId, GroupId, Timestamps, Vault};
+    use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey, open_with_key};
+    use rusqlite::{Connection, params};
+    use uuid::Uuid;
+
+    const FP_KEY: [u8; 32] = [0x11; 32];
+    const SK: [u8; 32] = [0x9c; 32];
+
+    #[derive(Debug)]
+    struct TestProtector;
+    impl FieldProtector for TestProtector {
+        fn acquire_session_key(&self) -> Result<SessionKey, ProtectorError> {
+            Ok(SessionKey::from_bytes(SK))
+        }
+    }
+
+    fn mem_conn() -> Connection {
+        let mut c = Connection::open_in_memory().expect("open in-memory db");
+        migrations::apply_pending(&mut c).expect("apply migrations");
+        c
+    }
+
+    fn ts(secs: i64) -> Timestamps {
+        let mut t = Timestamps::default();
+        t.last_modification_time = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0);
+        t
+    }
+
+    /// An entry sharing uuid `id` whose CURRENT `(title, password)` is
+    /// `current` and whose `<History>` holds one ancestor snapshot `base`
+    /// stamped `base_secs` — the LCA the local + peer forks share. `current
+    /// == base` models an untouched side (current is the LCA).
+    fn forked(id: Uuid, base: (&str, &str), base_secs: i64, current: (&str, &str)) -> Entry {
+        let mut snap = Entry::empty(EntryId(id));
+        snap.title = base.0.into();
+        snap.password = base.1.into();
+        snap.times = ts(base_secs);
+
+        let mut e = Entry::empty(EntryId(id));
+        e.title = current.0.into();
+        e.password = current.1.into();
+        e.history = vec![snap];
+        e
+    }
+
+    /// Like [`forked`] but the diverging facet is a non-protected custom
+    /// field `note` (base value vs current value).
+    fn forked_note(id: Uuid, base_note: &str, base_secs: i64, current_note: &str) -> Entry {
+        let mut snap = Entry::empty(EntryId(id));
+        snap.custom_fields = vec![CustomField::new("note", base_note, false)];
+        snap.times = ts(base_secs);
+
+        let mut e = Entry::empty(EntryId(id));
+        e.custom_fields = vec![CustomField::new("note", current_note, false)];
+        e.history = vec![snap];
+        e
+    }
+
+    fn vault_of(entries: Vec<Entry>) -> Vault {
+        let mut v = Vault::empty(GroupId(Uuid::new_v4()));
+        v.root.entries = entries;
+        v
+    }
+
+    /// Seed the local mirror from `local`.
+    fn seeded(local: &Vault) -> Connection {
+        let mut conn = mem_conn();
+        ingest_vault(&mut conn, &FP_KEY, &TestProtector, local).expect("seed local");
+        conn
+    }
+
+    fn peer_into(
+        conn: &mut Connection,
+        owner: &str,
+        local: &Vault,
+        peer: &Vault,
+    ) -> IngestPeerOutcome {
+        ingest_peer(conn, &FP_KEY, &TestProtector, owner, local, peer).expect("ingest_peer")
+    }
+
+    /// Seed `local`, ingest one `peer` as `owner`, return (conn, outcome).
+    fn run(local: &Vault, owner: &str, peer: &Vault) -> (Connection, IngestPeerOutcome) {
+        let mut conn = seeded(local);
+        let outcome = peer_into(&mut conn, owner, local, peer);
+        (conn, outcome)
+    }
+
+    fn conflict_rows_for(conn: &Connection, uuid: Uuid) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM conflict_entry WHERE entry_uuid = ?1",
+            params![uuid.to_string()],
+            |r| r.get(0),
+        )
+        .expect("count conflict rows")
+    }
+
+    fn local_entry_exists(conn: &Connection, uuid: Uuid) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM entry WHERE uuid = ?1",
+            params![uuid.to_string()],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("count entry")
+            > 0
+    }
+
+    fn local_title(conn: &Connection, uuid: Uuid) -> String {
+        conn.query_row(
+            "SELECT title FROM entry WHERE uuid = ?1",
+            params![uuid.to_string()],
+            |r| r.get(0),
+        )
+        .expect("local title")
+    }
+
+    /// Decrypt a sealed `conflict_entry_protected` field for assertions.
+    fn peer_protected(conn: &Connection, owner: &str, uuid: Uuid, field: &str) -> Vec<u8> {
+        let wrapped: Vec<u8> = conn
+            .query_row(
+                "SELECT wrapped_blob FROM conflict_entry_protected \
+                 WHERE owner = ?1 AND entry_uuid = ?2 AND field_name = ?3",
+                params![owner, uuid.to_string(), field],
+                |r| r.get(0),
+            )
+            .expect("protected row");
+        open_with_key(&SessionKey::from_bytes(SK), &wrapped).expect("unseal")
+    }
+
+    #[test]
+    fn in_sync_peer_writes_nothing() {
+        let id = Uuid::new_v4();
+        let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "p0"))]);
+        let peer = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "p0"))]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.in_sync, 1);
+        assert!(outcome.conflicted.is_empty());
+        assert!(outcome.auto_merged.is_empty());
+        assert_eq!(conflict_rows_for(&conn, id), 0);
+    }
+
+    #[test]
+    fn one_sided_peer_edit_advances_local() {
+        let id = Uuid::new_v4();
+        // Local untouched (current == LCA); peer changed the title.
+        let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "p0"))]);
+        let peer = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T-PEER", "p0"))]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.auto_merged, vec![id]);
+        assert!(outcome.conflicted.is_empty());
+        assert_eq!(
+            local_title(&conn, id),
+            "T-PEER",
+            "peer's edit adopted locally"
+        );
+        assert_eq!(
+            conflict_rows_for(&conn, id),
+            0,
+            "auto-merge stores no peer row"
+        );
+    }
+
+    #[test]
+    fn both_sided_same_field_holds_local_and_stores_peer_row() {
+        let id = Uuid::new_v4();
+        // Both moved Password off the LCA, differently → genuine conflict.
+        let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "p-MINE"))]);
+        let peer = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "p-THEIRS"))]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.conflicted, vec![id]);
+        assert!(
+            outcome.auto_merged.is_empty(),
+            "hold-open: local not advanced"
+        );
+        assert_eq!(conflict_rows_for(&conn, id), 1);
+        // Local untouched; peer's password stored (sealed) as theirs.
+        assert_eq!(local_title(&conn, id), "T");
+        assert_eq!(peer_protected(&conn, "peerB", id, "Password"), b"p-THEIRS");
+    }
+
+    #[test]
+    fn item_granularity_different_fields_conflicts() {
+        let id = Uuid::new_v4();
+        // Local changed Title, peer changed Password — disjoint fields. Under
+        // item granularity (what ingest uses) this is a conflict, where
+        // field-level would have silently merged.
+        let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T-MINE", "p0"))]);
+        let peer = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "p-PEER"))]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.conflicted, vec![id]);
+        assert!(outcome.auto_merged.is_empty());
+        assert_eq!(conflict_rows_for(&conn, id), 1);
+    }
+
+    #[test]
+    fn peer_password_is_sealed_not_plaintext() {
+        let id = Uuid::new_v4();
+        let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "mine"))]);
+        let peer = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "theirs"))]);
+        let (conn, _) = run(&local, "peerB", &peer);
+        let wrapped: Vec<u8> = conn
+            .query_row(
+                "SELECT wrapped_blob FROM conflict_entry_protected \
+                 WHERE owner = 'peerB' AND entry_uuid = ?1 AND field_name = 'Password'",
+                params![id.to_string()],
+                |r| r.get(0),
+            )
+            .expect("protected row");
+        assert_ne!(
+            wrapped.as_slice(),
+            b"theirs",
+            "stored sealed, not plaintext"
+        );
+        // AES-GCM: 12-byte nonce + ciphertext(=plaintext len) + 16-byte tag.
+        assert_eq!(wrapped.len(), 12 + "theirs".len() + 16);
+        // ...and it round-trips back to the peer value under the session key.
+        assert_eq!(peer_protected(&conn, "peerB", id, "Password"), b"theirs");
+    }
+
+    #[test]
+    fn repull_refreshes_peer_row_in_place() {
+        let id = Uuid::new_v4();
+        let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "mine"))]);
+        let mut conn = seeded(&local);
+
+        let peer_v1 = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "theirs-1"))]);
+        peer_into(&mut conn, "peerB", &local, &peer_v1);
+        assert_eq!(peer_protected(&conn, "peerB", id, "Password"), b"theirs-1");
+
+        // Same peer pulls again with a newer value → one row, refreshed.
+        let peer_v2 = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "theirs-2"))]);
+        peer_into(&mut conn, "peerB", &local, &peer_v2);
+        let owner_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conflict_entry WHERE owner = 'peerB' AND entry_uuid = ?1",
+                params![id.to_string()],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(owner_rows, 1, "refresh in place, no accumulation");
+        assert_eq!(peer_protected(&conn, "peerB", id, "Password"), b"theirs-2");
+    }
+
+    #[test]
+    fn multiple_peers_store_distinct_rows() {
+        let id = Uuid::new_v4();
+        let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "mine"))]);
+        let mut conn = seeded(&local);
+
+        peer_into(
+            &mut conn,
+            "peerB",
+            &local,
+            &vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "from-B"))]),
+        );
+        peer_into(
+            &mut conn,
+            "peerC",
+            &local,
+            &vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "from-C"))]),
+        );
+
+        assert_eq!(
+            conflict_rows_for(&conn, id),
+            2,
+            "one row per peer — native multi-peer"
+        );
+        assert_eq!(peer_protected(&conn, "peerB", id, "Password"), b"from-B");
+        assert_eq!(peer_protected(&conn, "peerC", id, "Password"), b"from-C");
+    }
+
+    #[test]
+    fn peer_only_entry_is_discarded() {
+        let local_id = Uuid::new_v4();
+        let peer_only_id = Uuid::new_v4();
+        let local = vault_of(vec![forked(local_id, ("T", "p0"), 1000, ("T", "p0"))]);
+        // Peer carries an extra entry we've never seen.
+        let peer = vault_of(vec![
+            forked(local_id, ("T", "p0"), 1000, ("T", "p0")),
+            forked(peer_only_id, ("X", "x0"), 1000, ("X", "x0")),
+        ]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert!(outcome.conflicted.is_empty());
+        assert!(outcome.auto_merged.is_empty());
+        assert_eq!(
+            conflict_rows_for(&conn, peer_only_id),
+            0,
+            "no conflict row for a peer-only add"
+        );
+        assert!(
+            !local_entry_exists(&conn, peer_only_id),
+            "not added locally (deferred to Phase 5)"
+        );
+    }
+
+    #[test]
+    fn conflict_then_reagreement_clears_row() {
+        let id = Uuid::new_v4();
+        let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "mine"))]);
+        let mut conn = seeded(&local);
+
+        // Round 1: genuine conflict → row stored.
+        peer_into(
+            &mut conn,
+            "peerB",
+            &local,
+            &vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "theirs"))]),
+        );
+        assert_eq!(conflict_rows_for(&conn, id), 1);
+
+        // Round 2: the peer now matches our current value → InSync → cleared.
+        peer_into(
+            &mut conn,
+            "peerB",
+            &local,
+            &vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "mine"))]),
+        );
+        assert_eq!(
+            conflict_rows_for(&conn, id),
+            0,
+            "re-agreement clears the badge for free"
+        );
+    }
+
+    #[test]
+    fn non_protected_custom_field_conflict_stores_peer_value() {
+        let id = Uuid::new_v4();
+        let local = vault_of(vec![forked_note(id, "n0", 1000, "A")]);
+        let peer = vault_of(vec![forked_note(id, "n0", 1000, "B")]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.conflicted, vec![id]);
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM conflict_entry_custom_field \
+                 WHERE owner = 'peerB' AND entry_uuid = ?1 AND field_name = 'note'",
+                params![id.to_string()],
+                |r| r.get(0),
+            )
+            .expect("custom field row");
+        assert_eq!(
+            stored, "B",
+            "peer's non-protected custom field stored as theirs"
+        );
+    }
+
+    #[test]
+    fn no_shared_ancestor_falls_back_to_conflict() {
+        let id = Uuid::new_v4();
+        // Disjoint history mtimes ⇒ no shared snapshot; a both-present field
+        // that differs parks conservatively (the same fallback classify uses).
+        let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "mine"))]);
+        let peer = vault_of(vec![forked(id, ("X", "x0"), 9999, ("T", "theirs"))]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.conflicted, vec![id]);
+        assert_eq!(conflict_rows_for(&conn, id), 1);
     }
 }
