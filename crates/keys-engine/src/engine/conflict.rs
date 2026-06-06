@@ -410,6 +410,20 @@ impl Engine {
         )
     }
 
+    /// Owner-rows badge query (Phase 3): every entry UUID that carries at
+    /// least one stored peer conflict row.
+    ///
+    /// The owner-rows replacement for the legacy `held_conflicts` JSON-array
+    /// kv. Not yet wired to the FFI badge — Phase 4 repoints
+    /// `entries_with_parked_conflict` here as part of the atomic switch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] if the underlying `SQLite` query fails.
+    pub fn parked_conflict_uuids_from_rows(&self) -> Result<Vec<Uuid>, EngineError> {
+        crate::conflict_rows::parked_conflict_uuids(&self.conn)
+    }
+
     /// One-shot: did `(observed_mtime, observed_size)` come from our own
     /// most recent [`Engine::save_to_kdbx`]?
     ///
