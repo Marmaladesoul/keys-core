@@ -336,26 +336,34 @@ pub(crate) fn reconcile_with_disk(
 /// record has since synced in, so adoption converged it).
 pub(crate) fn held_conflict_payload(
     engine: &mut Engine,
-    kdbx_path: &Path,
+    _kdbx_path: &Path,
     composite_key: &CompositeKey,
 ) -> Result<Option<ConflictPayload>, EngineError> {
-    let disk_bytes = std::fs::read(kdbx_path)?;
-    let disk_kdbx = Kdbx::open_from_bytes(disk_bytes.clone())
-        .map_err(|e| EngineError::Serialise(format!("open disk kdbx: {e}")))?
+    // "Theirs" comes from the local peer snapshot stashed at park time, NOT
+    // from the vault file: hold-open never writes the peer value to disk (that
+    // would defeat loop-safety), and over iroh the peer bytes arrive in a
+    // throwaway temp file. `_kdbx_path` is retained only for FFI-signature
+    // stability. No snapshot → nothing held to resolve (e.g. the conflict
+    // already converged, or this build pre-dates the stash).
+    let Some(remote_bytes) = engine.held_conflict_remote_bytes()? else {
+        return Ok(None);
+    };
+    let disk_kdbx = Kdbx::open_from_bytes(remote_bytes.clone())
+        .map_err(|e| EngineError::Serialise(format!("open theirs kdbx: {e}")))?
         .read_header()
-        .map_err(|e| EngineError::Serialise(format!("read disk header: {e}")))?
+        .map_err(|e| EngineError::Serialise(format!("read theirs header: {e}")))?
         .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
-        .map_err(|e| EngineError::Serialise(format!("unlock disk kdbx: {e}")))?;
+        .map_err(|e| EngineError::Serialise(format!("unlock theirs kdbx: {e}")))?;
 
     let local_vault = engine.project_to_vault()?;
     let remote_vault = disk_kdbx
         .vault_with_unwrapped_protected()
-        .map_err(|e| EngineError::Serialise(format!("unwrap disk protected: {e}")))?;
+        .map_err(|e| EngineError::Serialise(format!("unwrap theirs protected: {e}")))?;
 
     // Unconditional merge — deliberately no byte-equivalence / no-op
-    // short-circuit. A held conflict has disk == baseline (the park reconcile
-    // refreshed it) yet local still diverges from disk, so the short-circuits
-    // would wrongly report "nothing to resolve".
+    // short-circuit. A held conflict's local value still diverges from the
+    // stashed peer snapshot, so the short-circuits would wrongly report
+    // "nothing to resolve".
     let outcome = keepass_merge::merge(&local_vault, &remote_vault)
         .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
 
@@ -370,13 +378,18 @@ pub(crate) fn held_conflict_payload(
         delete_edit_conflicts: outcome.delete_edit_conflicts.clone(),
     };
     engine.stash_conflict_payload(payload.clone());
+    // The stashed context carries the peer snapshot as both `remote_vault` and
+    // `disk_kdbx`/`disk_bytes`; `apply_conflict_resolution` uses the latter
+    // only as a crypto-wired container to splice + ingest the resolved vault
+    // and as the interim baseline (the follow-up save overwrites it), so the
+    // peer kdbx — same vault, same key — works exactly as the disk one did.
     engine.stash_conflict_context(crate::conflict_resolution::PendingConflictContext {
         payload: payload.clone(),
         outcome,
         local_vault,
         remote_vault,
         disk_kdbx,
-        disk_bytes,
+        disk_bytes: remote_bytes,
     });
     Ok(Some(payload))
 }
@@ -452,7 +465,7 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     // convergence: both sides independently landed on the same value).
     if outcome_is_no_op(&outcome, &local_vault, &remote_vault) {
         engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-        engine.set_held_conflicts(&[])?;
+        persist_held_set(engine, &[], &disk_bytes)?;
         return Ok(ParkConflictsResult::NoChange);
     }
 
@@ -507,7 +520,10 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     // guard correctly falls through to `Applied`.
     if park_merge_is_no_op(&outcome, &held, &stats, &local_before, &merged) {
         engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-        engine.set_held_conflicts(&held)?;
+        // Pair the badge set with the peer snapshot so the resolver can
+        // rebuild "theirs" on demand — this is exactly the held-but-not-saved
+        // case where the vault file never carries the peer value.
+        persist_held_set(engine, &held, &disk_bytes)?;
         return Ok(ParkConflictsResult::NoChange);
     }
 
@@ -534,8 +550,9 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     // off, new ones appear. Set after `ingest_merged` for the same reason
     // `last_saved_kdbx_bytes` is: the `held_conflicts` setting row is not a
     // `meta.*` key so the re-ingest leaves it alone, but mirroring the
-    // ordering keeps the invariant obvious.
-    engine.set_held_conflicts(&held)?;
+    // ordering keeps the invariant obvious. Pairs the peer snapshot too (or
+    // drops it when nothing remains held) so the resolver can rebuild "theirs".
+    persist_held_set(engine, &held, &disk_bytes)?;
 
     let parked = ParkedConflictsSummary {
         entries_with_parked_conflict: report
@@ -715,6 +732,9 @@ pub(crate) fn clear_parked_conflict_marker(
     let removed = held.len() != before;
     if removed {
         engine.set_held_conflicts(&held)?;
+        if held.is_empty() {
+            engine.clear_held_conflict_remote_bytes()?;
+        }
     }
 
     Ok(legacy_cleared + u32::from(removed))
@@ -741,6 +761,26 @@ fn outcome_is_no_op(outcome: &keepass_merge::MergeOutcome, local: &Vault, remote
         && outcome.delete_edit_conflicts.is_empty()
         && count_groups_remote_only(local, remote) == 0
         && count_groups_tombstoned(local, remote) == 0
+}
+
+/// Persist the held-conflict badge set AND its paired peer ("theirs")
+/// snapshot together, so the resolver can always rebuild a held conflict's
+/// remote side ([`Engine::held_conflict_remote_bytes`]) — hold-open never
+/// writes the peer value to the vault file, so without this the resolver has
+/// nothing to re-derive "theirs" from. When the set is empty the snapshot is
+/// dropped. `remote_bytes` is the bytes just merged in: the peer's on the iroh
+/// sync path, the changed file's on the file-drop path.
+fn persist_held_set(
+    engine: &mut Engine,
+    held: &[uuid::Uuid],
+    remote_bytes: &[u8],
+) -> Result<(), EngineError> {
+    engine.set_held_conflicts(held)?;
+    if held.is_empty() {
+        engine.clear_held_conflict_remote_bytes()
+    } else {
+        engine.set_held_conflict_remote_bytes(remote_bytes)
+    }
 }
 
 /// True when an `apply_merge_park_conflicts` run changes nothing we must

@@ -191,6 +191,12 @@ pub(crate) fn apply_conflict_resolution(
         held.retain(|u| !resolved_entries.contains(u));
         if held.len() != before {
             engine.set_held_conflicts(&held)?;
+            // Drop the peer ("theirs") snapshot once nothing is held — the
+            // resolved entries converged, so there's no remote side left to
+            // rebuild (see `Engine::held_conflict_remote_bytes`).
+            if held.is_empty() {
+                engine.clear_held_conflict_remote_bytes()?;
+            }
         }
     }
 

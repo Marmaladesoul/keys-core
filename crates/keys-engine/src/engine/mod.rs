@@ -638,6 +638,66 @@ impl Engine {
         Ok(())
     }
 
+    /// The peer ("theirs") KDBX snapshot behind the currently-held conflicts,
+    /// or `None` if nothing is held.
+    ///
+    /// Hold-open keeps each device's own value and deliberately never writes
+    /// the peer's value to the vault file (that would defeat loop-safety), and
+    /// over iroh the peer bytes arrive in a throwaway temp file. So the
+    /// resolver can't re-read "theirs" from disk on demand. This stashes the
+    /// peer's full KDBX bytes **locally** (the `setting` table, key
+    /// `held_conflict_remote_bytes`, encrypted at rest by `SQLCipher`) whenever
+    /// a conflict is held, so [`crate::reconcile::held_conflict_payload`] can
+    /// rebuild the conflict's "theirs" side — including across an app relaunch.
+    /// Never synced; mirrors [`Engine::last_saved_kdbx_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub(crate) fn held_conflict_remote_bytes(&self) -> Result<Option<Vec<u8>>, EngineError> {
+        match self.conn.query_row(
+            "SELECT value FROM setting WHERE key = 'held_conflict_remote_bytes'",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        ) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(EngineError::Sqlite(err)),
+        }
+    }
+
+    /// Persist the peer snapshot paired with the current held set. Written by
+    /// `reconcile_with_disk_park_conflicts` every time it holds a conflict.
+    /// See [`Engine::held_conflict_remote_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on write failure.
+    pub(crate) fn set_held_conflict_remote_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), EngineError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO setting(key, value) VALUES ('held_conflict_remote_bytes', ?1)",
+            rusqlite::params![bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Drop the peer snapshot when the held set goes empty (everything
+    /// converged or was resolved). See [`Engine::held_conflict_remote_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on write failure.
+    pub(crate) fn clear_held_conflict_remote_bytes(&mut self) -> Result<(), EngineError> {
+        self.conn.execute(
+            "DELETE FROM setting WHERE key = 'held_conflict_remote_bytes'",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// The UUIDs of every entry currently **held** in an unresolved sync
     /// conflict — the badge cache that backs
     /// [`Engine::entries_with_parked_conflict`].

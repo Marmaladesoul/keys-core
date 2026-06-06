@@ -305,6 +305,84 @@ fn held_conflict_payload_enables_parked_resolution() {
     );
 }
 
+/// The iroh-path regression (soak): hold-open never writes the peer value to
+/// the vault file, and over iroh the peer bytes arrive in a throwaway temp
+/// file that's gone by the time the user clicks "Resolve". So the resolver
+/// MUST rebuild "theirs" from the local stash, not by re-reading the vault
+/// file. Park a conflict against a peer blob (which stashes "theirs"), then
+/// call `held_conflict_payload` with a **nonexistent** path: the old
+/// disk-re-derive read that path and would error / find nothing; the
+/// stash-based one surfaces the held conflict and resolves it cleanly.
+#[test]
+fn held_conflict_payload_rebuilds_from_stash_when_disk_lacks_peer() {
+    let mut f = fixture();
+    f.engine
+        .update_entry(
+            f.seed_uuid,
+            keys_engine::EntryUpdate {
+                title: Some("local-title".into()),
+                ..Default::default()
+            },
+        )
+        .expect("local edit");
+
+    // Peer ("theirs") version, written to a SEPARATE path — like the temp
+    // blob SyncManager feeds the engine over iroh.
+    let peer_path = f.kdbx_path.with_extension("peer.kdbx");
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .edit_entry(EntryId(f.seed_uuid), HistoryPolicy::Snapshot, |e| {
+            e.set_title("peer-title");
+        })
+        .expect("peer edit");
+    let peer_bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&peer_path, &peer_bytes).expect("write peer blob");
+
+    // Park against the peer blob → holds + stashes "theirs" locally.
+    f.engine
+        .reconcile_with_disk_park_conflicts(&peer_path, &composite(), chrono::Utc::now())
+        .expect("park");
+    assert_eq!(
+        f.engine.entries_with_parked_conflict().expect("badge"),
+        vec![f.seed_uuid],
+        "the conflict is held + badged",
+    );
+
+    // Simulate the iroh reality: the peer blob is deleted (SyncManager's
+    // defer cleanup) and the vault file never carried the peer value. Hand the
+    // resolver a path that doesn't exist — it must NOT read disk at all.
+    std::fs::remove_file(&peer_path).expect("rm peer blob");
+    let bogus = f.kdbx_path.with_extension("does-not-exist.kdbx");
+    assert!(!bogus.exists());
+
+    let payload = f
+        .engine
+        .held_conflict_payload(&bogus, &composite())
+        .expect("derive from stash, not disk")
+        .expect("held conflict present despite no peer value on disk");
+    assert_eq!(payload.entry_conflicts.len(), 1, "one held entry surfaced");
+
+    // A full resolve converges to the chosen (peer) value and clears the badge.
+    f.engine
+        .apply_conflict_resolution(
+            payload.id,
+            &title_resolution(f.seed_uuid, ConflictSide::Remote),
+        )
+        .expect("apply");
+    assert_eq!(
+        f.engine.entry(f.seed_uuid).unwrap().unwrap().title,
+        "peer-title",
+        "resolved to the chosen (peer) value rebuilt from the stash",
+    );
+    assert!(
+        f.engine
+            .entries_with_parked_conflict()
+            .expect("badge")
+            .is_empty(),
+        "badge cleared after resolution",
+    );
+}
+
 #[test]
 fn apply_resolution_with_keep_local_all_fields() {
     let mut f = fixture();
