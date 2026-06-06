@@ -738,6 +738,69 @@ fn apply_resolution_missing_id_returns_not_found() {
     );
 }
 
+/// Dismissing a resolver ("Resolve Later") drops both stash halves —
+/// the peek-side payload mirror and the resolvable context — without
+/// touching the held value or the badge. Guards against the orphaned-
+/// stash leak that repeated open/dismiss would otherwise cause.
+#[test]
+fn discard_conflict_drops_stash_without_resolving() {
+    let mut f = fixture();
+    let id = drive_title_conflict(&mut f, "local-title", "disk-title");
+
+    // Stash present: payload mirror peekable, context resolvable.
+    assert!(f.engine.pending_conflict(id).is_some(), "payload stashed");
+    assert_eq!(f.engine.pending_conflict_count_for_test(), 1);
+    let held_before = f.engine.entry(f.seed_uuid).unwrap().unwrap().title;
+
+    // Dismiss without resolving.
+    f.engine.discard_conflict(id);
+
+    // Payload mirror gone.
+    assert!(
+        f.engine.pending_conflict(id).is_none(),
+        "payload mirror dropped",
+    );
+    assert_eq!(f.engine.pending_conflict_count_for_test(), 0);
+
+    // Context gone too: apply now reports NotFound rather than a stale
+    // resolve.
+    let result = f
+        .engine
+        .apply_conflict_resolution(id, &title_resolution(f.seed_uuid, ConflictSide::Local));
+    assert!(
+        matches!(
+            result,
+            Err(EngineError::NotFound {
+                entity: "conflict_payload"
+            })
+        ),
+        "context dropped → apply NotFound, got {result:?}",
+    );
+
+    // Dismiss is not a resolve: the held value is unchanged.
+    assert_eq!(
+        f.engine.entry(f.seed_uuid).unwrap().unwrap().title,
+        held_before,
+        "dismiss leaves the held value untouched",
+    );
+}
+
+/// `discard_conflict` is idempotent: an unknown id is a no-op that
+/// leaves an unrelated live stash intact.
+#[test]
+fn discard_conflict_unknown_id_is_noop() {
+    let mut f = fixture();
+    let id = drive_title_conflict(&mut f, "local", "disk");
+
+    f.engine.discard_conflict(99_999);
+
+    assert!(
+        f.engine.pending_conflict(id).is_some(),
+        "unrelated stash untouched",
+    );
+    assert_eq!(f.engine.pending_conflict_count_for_test(), 1);
+}
+
 #[test]
 fn apply_resolution_mismatched_entries_returns_error() {
     let mut f = fixture();

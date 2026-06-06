@@ -1006,6 +1006,34 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.apply_conflict_resolution(id, &km_resolution)?))
     }
 
+    /// Discard a stashed conflict by `id` without resolving it.
+    ///
+    /// The resolver-open path ([`Self::held_conflict_payload`]) and the
+    /// live [`Self::reconcile_with_disk`] path both stash a rich payload
+    /// plus a context (two in-memory vaults — sizeable on a big vault)
+    /// keyed by `id`. [`Self::apply_conflict_resolution`] consumes that
+    /// stash, but a resolver the user dismisses with "Resolve Later"
+    /// never resolves — so Keys-Mac calls this on dismiss to drop the
+    /// otherwise-orphaned stash (repeated open/dismiss would leak one
+    /// per round until vault lock).
+    ///
+    /// Idempotent: an unknown / already-consumed `id` is a no-op. The
+    /// held-conflict badge ([`Self::entries_with_parked_conflict`])
+    /// stays put — the conflict is still real, just not open in a
+    /// resolver, and a fresh `held_conflict_payload` rebuilds the stash.
+    /// See [`keys_engine::Engine::discard_conflict`].
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::NotFound`] (`entity = "engine"`) if the vault is
+    /// already locked — in which case the stash is gone anyway.
+    pub fn discard_conflict(&self, id: i64) -> Result<(), EngineError> {
+        self.with_engine(|e| {
+            e.discard_conflict(id);
+            Ok(())
+        })
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Internals
     // ────────────────────────────────────────────────────────────────────

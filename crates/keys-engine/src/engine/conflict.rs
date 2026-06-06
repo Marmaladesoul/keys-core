@@ -222,6 +222,40 @@ impl Engine {
         crate::conflict_resolution::apply_conflict_resolution(self, id, resolution)
     }
 
+    /// Discard a stashed conflict — both the peek-side
+    /// [`ConflictPayload`] mirror and the internal resolution context
+    /// — for `id` without resolving it.
+    ///
+    /// Both the live ([`Self::reconcile_with_disk`]) and held
+    /// ([`Self::held_conflict_payload`]) paths stash a payload plus a
+    /// context (two in-memory [`Vault`](keepass_core::model::Vault)s —
+    /// sizeable on a big vault) keyed by `id`.
+    /// [`Self::apply_conflict_resolution`] consumes both; but if the
+    /// user opens the resolver and dismisses it without resolving
+    /// ("Resolve Later"), nothing consumes the stash and it lingers
+    /// until the engine is dropped (vault lock). Repeated open/dismiss
+    /// orphans one stash per round. This drops both halves for `id` so
+    /// a dismissed resolver doesn't leak them.
+    ///
+    /// Idempotent and infallible: an unknown / already-consumed `id`
+    /// is a no-op. The derived held-conflict badge set
+    /// ([`Self::entries_with_parked_conflict`]) is **untouched** — the
+    /// conflict is still real, just not currently open in a resolver;
+    /// a fresh [`Self::held_conflict_payload`] rebuilds the stash on
+    /// demand.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine's internal stash `Mutex` is poisoned —
+    /// see [`Self::last_self_write`] for the same caveat.
+    pub fn discard_conflict(&self, id: i64) {
+        // Same order `apply_conflict_resolution` consumes them: drop
+        // the context, then the peek-side payload mirror. Both are
+        // plain map removals; a missing id is a no-op on each.
+        self.take_pending_conflict_context(id);
+        self.discard_pending_conflict_payload(id);
+    }
+
     /// Reveal a single field on the **local** side of a stashed
     /// conflict as plaintext.
     ///
