@@ -387,16 +387,18 @@ impl Engine {
     /// keepass-merge `classify` brain (item granularity) and either advances
     /// our local entry (one-sided / non-overlapping peer edit), stores the
     /// peer's value as an `owner`-keyed conflict row (genuine conflict, held
-    /// open — local is left untouched), or does nothing (agreement). Purely
-    /// additive: writes only the `conflict_*` tables plus any single advanced
-    /// local entry, and never clears the vault tables.
+    /// open — local is left untouched), or does nothing (agreement). Phase 5b
+    /// also reconciles cross-peer deletes against both sides' `<DeletedObjects>`
+    /// tombstones (propagate / edit-wins / union). Purely additive: writes only
+    /// the `conflict_*` tables, the advanced / resurrected / removed local
+    /// entries, and `meta_deleted_object`; never clears the vault tables.
     ///
     /// `owner` is an opaque peer/device identifier the sync layer supplies;
     /// the same string must be reused across that peer's pulls so its rows
     /// refresh in place. The returned [`crate::ingest::IngestPeerOutcome`]'s
-    /// `auto_merged` bucket tells the caller whether the local side changed
-    /// (and so must be saved). As of Phase 4 this is the live sync reconcile's
-    /// ingest path ([`Self::reconcile_with_disk_park_conflicts`]).
+    /// `auto_merged` / `added` / `deleted` buckets tell the caller whether the
+    /// local side changed (and so must be saved). As of Phase 4 this is the live
+    /// sync reconcile's ingest path ([`Self::reconcile_with_disk_park_conflicts`]).
     ///
     /// # Errors
     ///

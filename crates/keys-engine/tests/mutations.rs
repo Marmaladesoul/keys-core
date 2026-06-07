@@ -305,6 +305,39 @@ fn delete_cascades_protected_and_attachments() {
 }
 
 #[test]
+fn delete_entry_records_tombstone() {
+    // Phase 5b producer side: a hard delete must leave a `<DeletedObjects>`
+    // tombstone so the deletion can propagate cross-peer (otherwise a peer that
+    // still holds the entry would resurrect it on the next owner-rows ingest).
+    let (mut engine, root, dir) = engine_with_empty_vault();
+    let uuid = engine
+        .create_entry(root, new_entry("x", "p"))
+        .expect("create");
+    let path = dir.path().join("keys.db");
+
+    engine.delete_entry(uuid).expect("delete");
+    engine.close().expect("close");
+
+    let raw = raw_open(&path);
+    let tomb_ct: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM meta_deleted_object WHERE uuid = ?1",
+            params![uuid.to_string()],
+            |r| r.get(0),
+        )
+        .expect("count tombstones");
+    assert_eq!(tomb_ct, 1, "delete recorded a tombstone");
+    let deleted_at: Option<i64> = raw
+        .query_row(
+            "SELECT deleted_at FROM meta_deleted_object WHERE uuid = ?1",
+            params![uuid.to_string()],
+            |r| r.get(0),
+        )
+        .expect("deleted_at");
+    assert!(deleted_at.is_some(), "tombstone carries a deletion time");
+}
+
+#[test]
 fn delete_entry_unknown_returns_not_found() {
     let (mut engine, _root, _dir) = engine_with_empty_vault();
     let err = engine.delete_entry(Uuid::new_v4()).unwrap_err();
@@ -613,6 +646,63 @@ fn delete_group_removes_descendants_recursively() {
         )
         .expect("count entries");
     assert_eq!(entry_ct, 0);
+}
+
+#[test]
+fn delete_group_records_tombstones() {
+    // Phase 5b: a group-cascade delete must tombstone every removed entry AND
+    // group, or a peer that still holds them resurrects them on the next sync
+    // (the entries re-parented to root). Mirrors `delete_entry_records_tombstone`
+    // for the cascade path.
+    let (mut engine, root, dir) = engine_with_empty_vault();
+    let parent = engine
+        .create_group(
+            root,
+            NewGroupFields {
+                name: "P".into(),
+                notes: String::new(),
+                icon: IconRef::Builtin(0),
+            },
+        )
+        .expect("create p");
+    let child = engine
+        .create_group(
+            parent,
+            NewGroupFields {
+                name: "C".into(),
+                notes: String::new(),
+                icon: IconRef::Builtin(0),
+            },
+        )
+        .expect("create c");
+    let e1 = engine
+        .create_entry(parent, new_entry("e1", "p"))
+        .expect("e1");
+    let e2 = engine
+        .create_entry(child, new_entry("e2", "p"))
+        .expect("e2");
+
+    engine.delete_group(parent).expect("delete");
+    let path = dir.path().join("keys.db");
+    engine.close().expect("close");
+    let raw = raw_open(&path);
+    // All four uuids — both groups and both entries — must be tombstoned.
+    let tomb_ct: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM meta_deleted_object WHERE uuid IN (?1, ?2, ?3, ?4)",
+            params![
+                parent.to_string(),
+                child.to_string(),
+                e1.to_string(),
+                e2.to_string()
+            ],
+            |r| r.get(0),
+        )
+        .expect("count tombstones");
+    assert_eq!(
+        tomb_ct, 4,
+        "every cascade-deleted entry and group is tombstoned"
+    );
 }
 
 #[test]

@@ -170,6 +170,21 @@ fn gc_orphan_tags(tx: &Transaction<'_>) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Record a `<DeletedObjects>` tombstone for `uuid` so the deletion propagates
+/// cross-peer (Phase 5b). Without it a peer that still holds the object can't
+/// tell "deleted here" from "never seen there" and would resurrect it on the
+/// next owner-rows ingest. `INSERT OR REPLACE` stays idempotent (a live object
+/// shouldn't already carry a tombstone, but re-deletion mustn't error). Shared
+/// by `delete_entry` and the `delete_group` cascade so *every* removed entry
+/// and group leaves a tombstone.
+fn record_tombstone(tx: &Connection, uuid: &str) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "INSERT OR REPLACE INTO meta_deleted_object (uuid, deleted_at) VALUES (?1, ?2)",
+        params![uuid, now_ms()],
+    )?;
+    Ok(())
+}
+
 /// Insert (or no-op) a tag name and return its row id.
 fn upsert_tag(tx: &Transaction<'_>, name: &str) -> Result<i64, EngineError> {
     tx.execute(
@@ -966,6 +981,7 @@ pub(crate) fn delete_entry(
         .map_err(|e| EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
     tx.execute("DELETE FROM entry WHERE uuid = ?1", params![uuid_str])?;
     gc_orphan_tags(&tx)?;
+    record_tombstone(&tx, &uuid_str)?;
     tx.commit()?;
     Ok(DeleteEntryOutcome { previous_group })
 }
@@ -2080,11 +2096,21 @@ fn delete_group_recursive(
             EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
         })?;
         outcome.deleted_entries.push((entry_uuid, self_uuid));
+        // Each cascade-deleted entry needs its own `<DeletedObjects>` tombstone
+        // (Phase 5b) — the owner-rows ingest reconciles deletes per entry uuid,
+        // so without this a peer would resurrect these entries (re-parented to
+        // root) on the next sync.
+        record_tombstone(tx, &entry_uuid_str)?;
     }
 
     tx.execute("DELETE FROM entry WHERE group_uuid = ?1", params![uuid])?;
     tx.execute("DELETE FROM \"group\" WHERE uuid = ?1", params![uuid])?;
     outcome.deleted_groups.push((self_uuid, parent_uuid));
+    // Tombstone the group itself too (kdbx-native `<DeletedObjects>` covers
+    // entries *and* groups — sync-merge-strategies §4). Consuming group
+    // tombstones to remove a peer's live group is Phase 5d; recording them now
+    // is forward-compatible and stops the group resurrecting later.
+    record_tombstone(tx, uuid)?;
     Ok(())
 }
 

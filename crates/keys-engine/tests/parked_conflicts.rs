@@ -115,10 +115,10 @@ fn park_conflicts_no_change_when_in_sync() {
 }
 
 /// Owner-rows scope (Phase 4): a peer-only **add** propagates. An add is
-/// unambiguous (present beats absent), unlike a delete (the deleted-vs-just-
-/// added ambiguity that waits for the Phase-5 tombstone story). So a disk-side
-/// add advances local ⇒ `Applied`, and the entry appears locally — not a
-/// conflict.
+/// unambiguous (present beats absent) and needs no tombstone; a delete is
+/// recognised via the peer's `<DeletedObjects>` tombstone (Phase 5b — see
+/// `park_conflicts_propagates_peer_delete`). So a disk-side add advances local
+/// ⇒ `Applied`, and the entry appears locally — not a conflict.
 #[test]
 fn park_conflicts_applies_peer_only_add() {
     let mut f = fixture();
@@ -155,6 +155,60 @@ fn park_conflicts_applies_peer_only_add() {
             .expect("query")
             .is_empty(),
         "a peer-only add is not a conflict",
+    );
+}
+
+/// Phase 5b on the live path: a disk-side **delete** (a `<DeletedObjects>`
+/// tombstone) propagates — the entry is removed locally, the reconcile is
+/// `Applied` (a real local change, like a peer-only add), and a re-reconcile is
+/// a stable no-op (loop-safe). End-to-end: keepass-core records the disk
+/// tombstone, `ingest_peer` consumes it.
+#[test]
+fn park_conflicts_propagates_peer_delete() {
+    let mut f = fixture();
+    let summaries = f
+        .engine
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list");
+    let seed_uuid = summaries[0].uuid;
+
+    // Disk side deletes the seed entry (keepass-core records the tombstone).
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .delete_entry(keepass_core::model::EntryId(seed_uuid))
+        .expect("disk delete");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    let result = f
+        .engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile");
+    match result {
+        ParkConflictsResult::Applied { applied, .. } => {
+            assert_eq!(applied.entries_deleted, 1, "one entry deleted");
+        }
+        other => panic!("expected Applied, got {other:?}"),
+    }
+
+    let after = f
+        .engine
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list after");
+    assert!(
+        !after.iter().any(|s| s.uuid == seed_uuid),
+        "peer-deleted entry removed locally",
+    );
+
+    // Loop-safety: the disk file no longer changes, so a re-reconcile is a
+    // stable no-op (the unioned tombstone matches; nothing to advance).
+    let again = f
+        .engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile 2");
+    assert!(
+        matches!(again, ParkConflictsResult::NoChange),
+        "re-reconcile after a propagated delete is a stable no-op, got {again:?}",
     );
 }
 

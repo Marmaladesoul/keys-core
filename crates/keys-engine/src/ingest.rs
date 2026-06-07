@@ -10,7 +10,7 @@
 //! round-trip. Mutation semantics — single-row edits without rewriting
 //! every table — land in Phase 4.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use keepass_core::kdbx::{Kdbx, Unlocked};
@@ -784,19 +784,31 @@ fn b64_encode(bytes: &[u8]) -> String {
 //   - AutoMerged → advance our local entry to the merged value; clear the row.
 //   - Conflict   → keep our local value (hold-open) and store the peer's value
 //                  as an `owner`-keyed `conflict_*` row for the resolver.
-// It is purely additive: it writes only the `conflict_*` tables plus (for an
-// auto-merge) the single advanced local entry, and never calls
-// `clear_vault_tables`. As of Phase 4 this is the live sync reconcile's ingest
-// path (`reconcile::reconcile_with_disk_park_conflicts`).
+//
+// Phase 5b adds cross-peer DELETE reconciliation, applied symmetrically against
+// each side's `<DeletedObjects>` tombstones (per sync-merge-strategies §4):
+//   - A peer entry we don't hold but *did* delete is only resurrected if the
+//     peer's copy post-dates our tombstone (edit-wins); otherwise it stays
+//     deleted (no zombie).
+//   - A local entry the peer no longer holds is removed when the peer
+//     tombstoned it and we hadn't edited since; kept (edit-wins) otherwise.
+//   - Both sides' tombstones are unioned (grow-only, earliest deletion time
+//     wins) so deletions propagate onward — never against a uuid that is still
+//     a live local object (a live record must not carry its own tombstone).
+//
+// It is purely additive: it writes only the `conflict_*` tables, the advanced /
+// resurrected / removed local entries, and `meta_deleted_object`; it never
+// calls `clear_vault_tables`. As of Phase 4 this is the live sync reconcile's
+// ingest path (`reconcile::reconcile_with_disk_park_conflicts`).
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Outcome of an `ingest_peer` pass.
 ///
 /// The buckets let the caller decide save-vs-no-save (the loop-safety
-/// contract): a non-empty [`Self::auto_merged`] **or** [`Self::added`] means
-/// the local side changed and must be persisted; pure conflicts / in-sync
-/// advance nothing locally, so no save (and thus no fresh-nonce re-push) is
-/// needed.
+/// contract): a non-empty [`Self::auto_merged`], [`Self::added`], **or**
+/// [`Self::deleted`] means the local side changed and must be persisted; pure
+/// conflicts / in-sync advance nothing locally, so no save (and thus no
+/// fresh-nonce re-push) is needed.
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
 pub struct IngestPeerOutcome {
@@ -804,12 +816,19 @@ pub struct IngestPeerOutcome {
     /// written/refreshed for this `owner`. The badge candidates.
     pub conflicted: Vec<Uuid>,
     /// Entries advanced to a merged value (one-sided / non-overlapping peer
-    /// edits). The local side changed → the caller must persist.
+    /// edits), or restored from our own tombstone because the peer's copy
+    /// post-dates our deletion (edit-wins resurrection, Phase 5b). The local
+    /// side changed → the caller must persist.
     pub auto_merged: Vec<Uuid>,
     /// Peer-only entries the peer added that we didn't hold — inserted locally
-    /// (present beats absent; an add is unambiguous, unlike a delete). The
-    /// local side changed → the caller must persist.
+    /// (present beats absent; an add is unambiguous). Includes edit-wins
+    /// resurrections of entries we had deleted (the peer's copy is newer than
+    /// our tombstone). The local side changed → the caller must persist.
     pub added: Vec<Uuid>,
+    /// Local entries removed because the peer tombstoned them and we hadn't
+    /// edited since (cross-peer delete propagation, Phase 5b). The local side
+    /// changed → the caller must persist.
+    pub deleted: Vec<Uuid>,
     /// Count of entries the peer agreed on outright — nothing written.
     pub in_sync: usize,
 }
@@ -846,18 +865,42 @@ pub(crate) fn ingest_peer(
     let peer_resolved = resolution_times(&peer.meta.custom_data);
     let local_resolved = resolution_times(&local.meta.custom_data);
 
+    // Tombstone maps (Phase 5b). Deduplicated per uuid with the earliest
+    // deletion time winning — the grow-only `<DeletedObjects>` merge rule.
+    let peer_tomb = tombstone_map(&peer.deleted_objects);
+    let local_tomb = tombstone_map(&local.deleted_objects);
+    // Uuids the peer still holds live, so the local-side delete pass can tell a
+    // shared entry from one the peer dropped.
+    let peer_uuids: HashSet<Uuid> = collect_entries(&peer.root).iter().map(|e| e.id.0).collect();
+
     let mut outcome = IngestPeerOutcome::default();
     let tx = conn.transaction()?;
 
     for (peer_entry, peer_parent) in collect_entries_with_parent(&peer.root) {
         let uuid = peer_entry.id.0;
+        let uuid_str = uuid.to_string();
         let Some(local_entry) = local_by_uuid.get(&uuid) else {
-            // Peer-side ADD (present beats absent — unambiguous). Only a DELETE
-            // (local-present / peer-absent) carries the "deleted vs. just-added"
-            // ambiguity that waits for the Phase-5 tombstone story. Insert under
-            // the peer's parent group if we hold it, else the local root
-            // (group-structure reconciliation — renames / moves / recycle bin —
-            // is Phase 5).
+            // The peer holds an entry we don't. Either a peer-side ADD (we've
+            // never seen it) or a RESURRECTION candidate (we deleted it). The
+            // Phase 5b tombstone guard stops a stale peer from zombie-ing an
+            // entry we intentionally deleted: re-add only when the peer's copy
+            // post-dates our tombstone (edit-wins).
+            if let Some(&our_deleted_at) = local_tomb.get(&uuid) {
+                if !live_edit_wins(peer_entry.times.last_modification_time, our_deleted_at) {
+                    // Our deletion is at least as recent as the peer's copy →
+                    // keep it deleted, don't re-add. The peer learns our
+                    // tombstone (it rides in our projection) and converges.
+                    continue;
+                }
+                // Peer edited strictly after our delete → edit wins: resurrect.
+                // Scrub our tombstone first so the restored entry never coexists
+                // with it (a live entry + matching tombstone is re-deleted by
+                // other KDBX clients — sync-merge-strategies §4).
+                remove_tombstone(&tx, &uuid_str)?;
+            }
+            // Insert under the peer's parent group if we hold it, else the local
+            // root (group-structure reconciliation — renames / moves / recycle
+            // bin — is Phase 5d).
             let group_id = if group_exists(&tx, peer_parent)? {
                 peer_parent
             } else {
@@ -876,7 +919,6 @@ pub(crate) fn ingest_peer(
             outcome.added.push(uuid);
             continue;
         };
-        let uuid_str = uuid.to_string();
         match classify(
             local_entry,
             peer_entry,
@@ -960,8 +1002,61 @@ pub(crate) fn ingest_peer(
         }
     }
 
+    // Cross-peer DELETE propagation + tombstone union (Phase 5b, direction 1).
+    reconcile_peer_deletes(&tx, &local_by_uuid, &peer_uuids, &peer_tomb, &mut outcome)?;
+
     tx.commit()?;
     Ok(outcome)
+}
+
+/// Phase 5b direction-1: reconcile local entries the peer no longer holds
+/// against the peer's tombstones, then union both sides' `<DeletedObjects>`.
+/// Mutates the local mirror inside `tx` and records propagated deletes in
+/// `outcome.deleted`. See the module section header for the full rule set.
+fn reconcile_peer_deletes(
+    tx: &Connection,
+    local_by_uuid: &HashMap<Uuid, &Entry>,
+    peer_uuids: &HashSet<Uuid>,
+    peer_tomb: &HashMap<Uuid, Option<DateTime<Utc>>>,
+    outcome: &mut IngestPeerOutcome,
+) -> Result<(), EngineError> {
+    // A local entry the peer no longer holds may have been deleted there:
+    //   - peer tombstoned it + we didn't edit after → propagate the delete
+    //     (remove locally; the tombstone is unioned in below). A local change →
+    //     drives the save.
+    //   - peer tombstoned it + we edited after       → edit-vs-delete: keep
+    //     local. The conservative default for a password manager — never
+    //     silently drop a live edit. No surfaced conflict: the case is rare and
+    //     the peer resurrects on its own pull of our still-present entry, so the
+    //     two sides still converge (the edit wins everywhere).
+    //   - no peer tombstone                          → the peer simply hasn't
+    //     seen our add yet; keep it.
+    for (uuid, local_entry) in local_by_uuid {
+        if peer_uuids.contains(uuid) {
+            continue; // present on both → handled by the classify walk above.
+        }
+        let Some(&peer_deleted_at) = peer_tomb.get(uuid) else {
+            continue; // the peer never had it (our local-only add) → keep.
+        };
+        if live_edit_wins(local_entry.times.last_modification_time, peer_deleted_at) {
+            continue; // edit wins → keep local (the union below skips its tombstone).
+        }
+        delete_local_entry(tx, &uuid.to_string())?;
+        outcome.deleted.push(*uuid);
+    }
+
+    // Fold the peer's `<DeletedObjects>` into ours so deletions propagate
+    // onward (grow-only set, earliest deletion time wins). Skip any uuid still
+    // backing a live local object (entry or group): a live record must never
+    // carry its own tombstone, or other KDBX clients re-delete it.
+    for (uuid, deleted_at) in peer_tomb {
+        let uuid_str = uuid.to_string();
+        if entry_exists(tx, &uuid_str)? || group_exists(tx, GroupId(*uuid))? {
+            continue;
+        }
+        union_tombstone(tx, &uuid_str, *deleted_at)?;
+    }
+    Ok(())
 }
 
 /// Depth-first collection of every entry under `root` (read-only — the
@@ -1174,6 +1269,135 @@ fn clear_conflict_rows(
     Ok(())
 }
 
+// ── Phase 5b: cross-peer delete / tombstone helpers ─────────────────────────
+
+/// Does a live edit beat a tombstone? The single rule behind both directions of
+/// the Phase 5b edit-vs-delete reconciliation, applied symmetrically:
+///
+/// - **Direction 1** (our live entry vs the peer's tombstone): keep our entry
+///   iff the edit wins; otherwise propagate the peer's delete.
+/// - **Direction 2** (the peer's live entry vs our tombstone): resurrect the
+///   peer's entry iff its edit wins; otherwise keep the entry deleted.
+///
+/// Conservative for a password manager — never drop a live edit without proof
+/// the deletion is at least as recent:
+/// - both times known → the edit wins iff *strictly* newer than the deletion
+///   (ties go to the delete — "we didn't edit *after* it");
+/// - deletion time unknown → the edit wins (can't justify dropping live data
+///   against an undated tombstone);
+/// - edit time unknown but the deletion is dated → the delete wins.
+fn live_edit_wins(edit: Option<DateTime<Utc>>, delete: Option<DateTime<Utc>>) -> bool {
+    match (edit, delete) {
+        (Some(e), Some(d)) => e > d,
+        (_, None) => true,
+        (None, Some(_)) => false,
+    }
+}
+
+/// Index a vault's `<DeletedObjects>` by uuid. On a duplicate uuid the
+/// **earliest** deletion time wins (grow-only-set provenance), preferring a
+/// known time over `None`.
+fn tombstone_map(
+    deleted: &[keepass_core::model::DeletedObject],
+) -> HashMap<Uuid, Option<DateTime<Utc>>> {
+    let mut out: HashMap<Uuid, Option<DateTime<Utc>>> = HashMap::new();
+    for t in deleted {
+        out.entry(t.uuid)
+            .and_modify(|cur| *cur = earliest(*cur, t.deleted_at))
+            .or_insert(t.deleted_at);
+    }
+    out
+}
+
+/// The earlier of two optional deletion times, preferring a known time over an
+/// undated (`None`) one.
+fn earliest(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// Does the local mirror still hold a live entry `uuid`?
+fn entry_exists(tx: &Connection, uuid: &str) -> Result<bool, rusqlite::Error> {
+    tx.query_row("SELECT 1 FROM entry WHERE uuid = ?1", params![uuid], |_| {
+        Ok(())
+    })
+    .optional()
+    .map(|row| row.is_some())
+}
+
+/// Remove an entry from the local mirror (Phase 5b delete propagation). Child
+/// rows cascade off `entry(uuid) ON DELETE`; the orphan-tag sweep mirrors
+/// `mutations::delete_entry` so a tag whose last referencing entry just went
+/// away doesn't linger.
+fn delete_local_entry(tx: &Connection, uuid: &str) -> Result<(), rusqlite::Error> {
+    tx.execute("DELETE FROM entry WHERE uuid = ?1", params![uuid])?;
+    tx.execute(
+        "DELETE FROM tag WHERE id NOT IN (SELECT DISTINCT tag_id FROM entry_tag)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Drop a `<DeletedObjects>` tombstone for `uuid` from the local mirror. Used on
+/// edit-wins resurrection — a restored live entry must never coexist with its
+/// own tombstone (cross-client re-delete hazard).
+fn remove_tombstone(tx: &Connection, uuid: &str) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "DELETE FROM meta_deleted_object WHERE uuid = ?1",
+        params![uuid],
+    )?;
+    Ok(())
+}
+
+/// Union one peer tombstone into the local mirror's `<DeletedObjects>`, keeping
+/// the **earliest** deletion time on a uuid collision (grow-only set). The
+/// caller guarantees `uuid` is not a live local object.
+fn union_tombstone(
+    tx: &Connection,
+    uuid: &str,
+    deleted_at: Option<DateTime<Utc>>,
+) -> Result<(), rusqlite::Error> {
+    let new_ms = deleted_at.map(|d| d.timestamp_millis());
+    let existing: Option<Option<i64>> = tx
+        .query_row(
+            "SELECT deleted_at FROM meta_deleted_object WHERE uuid = ?1",
+            params![uuid],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?;
+    match existing {
+        None => {
+            tx.execute(
+                "INSERT INTO meta_deleted_object (uuid, deleted_at) VALUES (?1, ?2)",
+                params![uuid, new_ms],
+            )?;
+        }
+        Some(existing_ms) => {
+            let merged = earliest_ms(existing_ms, new_ms);
+            if merged != existing_ms {
+                tx.execute(
+                    "UPDATE meta_deleted_object SET deleted_at = ?2 WHERE uuid = ?1",
+                    params![uuid, merged],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The earlier of two optional epoch-millis deletion times, preferring a known
+/// time over an undated (`None`) one.
+fn earliest_ms(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1205,7 +1429,9 @@ mod ingest_peer_tests {
 
     use super::{IngestPeerOutcome, ingest_peer, ingest_vault};
     use crate::migrations;
-    use keepass_core::model::{CustomField, Entry, EntryId, GroupId, Timestamps, Vault};
+    use keepass_core::model::{
+        CustomField, DeletedObject, Entry, EntryId, GroupId, Timestamps, Vault,
+    };
     use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey, open_with_key};
     use keepass_merge::{ConflictKind, ConflictResolution, add_conflict_resolution};
     use rusqlite::{Connection, params};
@@ -1225,6 +1451,10 @@ mod ingest_peer_tests {
     fn mem_conn() -> Connection {
         let mut c = Connection::open_in_memory().expect("open in-memory db");
         migrations::apply_pending(&mut c).expect("apply migrations");
+        // Mirror production (`Engine::open`): cascade child rows on entry delete
+        // so `delete_local_entry` behaves the same here as on a live engine.
+        c.execute_batch("PRAGMA foreign_keys = ON")
+            .expect("enable foreign keys");
         c
     }
 
@@ -1283,6 +1513,42 @@ mod ingest_peer_tests {
         );
         add_conflict_resolution(&mut v.meta.custom_data, &record).expect("add resolution record");
         v
+    }
+
+    /// A plain entry with uuid `id`, `title`, and a `last_modification_time` of
+    /// `mtime_secs` — the knob the Phase 5b delete reconciliation compares
+    /// against a tombstone. No `<History>`: the delete path never calls
+    /// `classify`.
+    fn entry_at(id: Uuid, title: &str, mtime_secs: i64) -> Entry {
+        let mut e = Entry::empty(EntryId(id));
+        e.title = title.into();
+        e.times = ts(mtime_secs);
+        e
+    }
+
+    /// A `<DeletedObjects>` tombstone for `id` stamped at `secs`.
+    fn tombstone(id: Uuid, secs: i64) -> DeletedObject {
+        DeletedObject::new(
+            id,
+            Some(chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).expect("ts")),
+        )
+    }
+
+    /// [`vault_of`] plus `<DeletedObjects>` tombstones.
+    fn vault_with_tombstones(entries: Vec<Entry>, tombs: Vec<DeletedObject>) -> Vault {
+        let mut v = vault_of(entries);
+        v.deleted_objects = tombs;
+        v
+    }
+
+    /// Count `meta_deleted_object` rows for `uuid` (0 or 1).
+    fn tombstone_rows(conn: &Connection, uuid: Uuid) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM meta_deleted_object WHERE uuid = ?1",
+            params![uuid.to_string()],
+            |r| r.get(0),
+        )
+        .expect("count tombstones")
     }
 
     /// Seed the local mirror from `local`.
@@ -1631,6 +1897,105 @@ mod ingest_peer_tests {
             local_title(&conn, id),
             "T-MINE",
             "local keeps its chosen value"
+        );
+    }
+
+    // ── Phase 5b: cross-peer deletes / tombstones ──────────────────────────
+
+    #[test]
+    fn peer_tombstone_propagates_delete() {
+        let id = Uuid::new_v4();
+        // Local last edited X at t=1000; the peer deleted it later at t=2000.
+        let local = vault_of(vec![entry_at(id, "X", 1000)]);
+        let peer = vault_with_tombstones(vec![], vec![tombstone(id, 2000)]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.deleted, vec![id], "peer delete propagated");
+        assert!(outcome.auto_merged.is_empty());
+        assert!(outcome.conflicted.is_empty());
+        assert!(!local_entry_exists(&conn, id), "entry removed locally");
+        assert_eq!(
+            tombstone_rows(&conn, id),
+            1,
+            "tombstone unioned for onward propagation"
+        );
+    }
+
+    #[test]
+    fn edit_vs_delete_keeps_local_edit() {
+        let id = Uuid::new_v4();
+        // We edited X at t=3000; the peer deleted it earlier at t=2000 → the
+        // edit wins (conservative: never silently drop a live edit).
+        let local = vault_of(vec![entry_at(id, "X-edited", 3000)]);
+        let peer = vault_with_tombstones(vec![], vec![tombstone(id, 2000)]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert!(outcome.deleted.is_empty(), "edit wins → not deleted");
+        assert!(local_entry_exists(&conn, id), "local edit kept");
+        assert_eq!(local_title(&conn, id), "X-edited");
+        assert_eq!(
+            tombstone_rows(&conn, id),
+            0,
+            "no tombstone against a live entry (cross-client re-delete hazard)"
+        );
+    }
+
+    #[test]
+    fn local_only_add_absent_on_peer_is_kept() {
+        let id = Uuid::new_v4();
+        // We added X; the peer simply hasn't seen it (no tombstone) → keep it.
+        let local = vault_of(vec![entry_at(id, "X", 1000)]);
+        let peer = vault_of(vec![]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert!(outcome.deleted.is_empty(), "no tombstone → not a delete");
+        assert!(local_entry_exists(&conn, id), "local-only add kept");
+        assert_eq!(tombstone_rows(&conn, id), 0);
+    }
+
+    #[test]
+    fn orphan_tombstone_is_unioned() {
+        let absent = Uuid::new_v4();
+        // Neither side holds `absent` live; the peer carries its tombstone. We
+        // adopt it so the deletion keeps propagating, without touching an entry.
+        let local = vault_of(vec![]);
+        let peer = vault_with_tombstones(vec![], vec![tombstone(absent, 4000)]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert!(outcome.deleted.is_empty());
+        assert!(outcome.added.is_empty());
+        assert!(outcome.auto_merged.is_empty());
+        assert_eq!(tombstone_rows(&conn, absent), 1, "orphan tombstone unioned");
+    }
+
+    #[test]
+    fn stale_peer_does_not_resurrect_deleted_entry() {
+        let id = Uuid::new_v4();
+        // We deleted X at t=3000. The peer still has a stale copy edited at
+        // t=2000 (before our delete) → it must NOT come back (no zombie).
+        let local = vault_with_tombstones(vec![], vec![tombstone(id, 3000)]);
+        let peer = vault_of(vec![entry_at(id, "X-stale", 2000)]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert!(outcome.added.is_empty(), "stale peer copy not resurrected");
+        assert!(!local_entry_exists(&conn, id), "entry stays deleted");
+        assert_eq!(tombstone_rows(&conn, id), 1, "our tombstone is retained");
+    }
+
+    #[test]
+    fn peer_edit_after_delete_resurrects_entry() {
+        let id = Uuid::new_v4();
+        // We deleted X at t=2000. The peer edited it later at t=3000 → edit
+        // wins: X comes back and our tombstone is scrubbed.
+        let local = vault_with_tombstones(vec![], vec![tombstone(id, 2000)]);
+        let peer = vault_of(vec![entry_at(id, "X-revived", 3000)]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(
+            outcome.added,
+            vec![id],
+            "peer's newer edit resurrects the entry"
+        );
+        assert!(local_entry_exists(&conn, id));
+        assert_eq!(local_title(&conn, id), "X-revived");
+        assert_eq!(
+            tombstone_rows(&conn, id),
+            0,
+            "tombstone scrubbed on resurrection (never live entry + tombstone)"
         );
     }
 }

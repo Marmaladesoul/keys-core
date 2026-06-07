@@ -449,10 +449,11 @@ fn child_contains_entry(group: &keepass_core::model::Group, id: EntryId) -> bool
 ///
 /// **Loop-safety (the #1 invariant).** A held conflict advances *nothing*
 /// locally, so there is nothing to save → no fresh-nonce re-push → the iroh
-/// loop can't start. The discriminator is exact: `auto_merged` *and* `added`
-/// both empty ⇒ `NoChange`; either non-empty (a real local advance — a merged
-/// edit or a peer-only add) ⇒ `Applied`. This structural guarantee replaces
-/// the old `park_merge_is_no_op` tree-compare guard.
+/// loop can't start. The discriminator is exact: `auto_merged`, `added`, *and*
+/// `deleted` all empty ⇒ `NoChange`; any non-empty (a real local advance — a
+/// merged edit, a peer-only add, or a propagated cross-peer delete) ⇒
+/// `Applied`. This structural guarantee replaces the old `park_merge_is_no_op`
+/// tree-compare guard.
 ///
 /// The badge ([`entries_with_parked_conflict`]) and the resolver's "theirs"
 /// ([`held_conflict_payload`]) both read the owner rows directly — no derived
@@ -484,17 +485,19 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     let outcome = engine.ingest_peer(FILE_OWNER, &remote_vault)?;
 
     // Loop-safety discriminator: only an advanced local side (a non-empty
-    // `auto_merged` or `added`) is something to save. A held conflict advanced
-    // nothing → NoChange → no save → no re-push → the loop never starts. The
-    // badge reads the owner rows directly, so `conflicted` does NOT make this
-    // `Applied`.
-    if outcome.auto_merged.is_empty() && outcome.added.is_empty() {
+    // `auto_merged`, `added`, or `deleted`) is something to save. A held
+    // conflict advanced nothing → NoChange → no save → no re-push → the loop
+    // never starts. The badge reads the owner rows directly, so `conflicted`
+    // does NOT make this `Applied`. A propagated cross-peer delete (Phase 5b) is
+    // a real local change, so it does (mirrors the `added` bucket).
+    if outcome.auto_merged.is_empty() && outcome.added.is_empty() && outcome.deleted.is_empty() {
         return Ok(ParkConflictsResult::NoChange);
     }
 
     let stats = MergeStats {
         entries_added: outcome.added.len(),
         entries_updated: outcome.auto_merged.len(),
+        entries_deleted: outcome.deleted.len(),
         ..Default::default()
     };
     let parked = ParkedConflictsSummary {
