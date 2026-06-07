@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{Entry, Group, GroupId, Vault};
 use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
-use keepass_merge::{Classification, Granularity, classify};
+use keepass_merge::{Classification, Granularity, classify, parse_conflict_resolutions};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -838,6 +838,14 @@ pub(crate) fn ingest_peer(
     let local_bin_refs: Vec<&[u8]> = local.binaries.iter().map(|b| b.data.as_slice()).collect();
     let peer_bin_refs: Vec<&[u8]> = peer.binaries.iter().map(|b| b.data.as_slice()).collect();
 
+    // Cross-peer resolution adoption (design §5.3): a side carrying a
+    // `keys.conflict_resolutions.v1` record for an entry has decided that
+    // conflict. Presence-asymmetry tells us which side resolved — the record
+    // travels with the resolver's vault, so the first sync after a resolution
+    // has it on exactly one side.
+    let peer_resolved = resolution_times(&peer.meta.custom_data);
+    let local_resolved = resolution_times(&local.meta.custom_data);
+
     let mut outcome = IngestPeerOutcome::default();
     let tx = conn.transaction()?;
 
@@ -893,25 +901,56 @@ pub(crate) fn ingest_peer(
                 outcome.auto_merged.push(uuid);
             }
             Classification::Conflict { conflict } => {
-                // Hold-open: leave the local entry untouched; store the peer's
-                // value (the resolver's "theirs"). Refresh in place so a
-                // re-pull replaces rather than accumulates.
-                //
-                // KNOWN LIMITATION (deferred to Phase 5, by design — classify's
-                // scope is standard + custom fields + icon): the peer's
-                // NON-conflicting facets that ride alongside this held conflict
-                // — tags, attachments, group placement — are neither folded onto
-                // local (hold-open keeps local) nor captured in the peer row
-                // (`insert_conflict_entry` stores fields only). They are not
-                // lost (the peer keeps them) but they don't reach this side
-                // until the field conflict converges and a later sync auto-merges
-                // them, or Phase 5 (content pools / tombstones / group LWW + the
-                // synced resolution-record adoption) lands. The eager-merge path
-                // this replaced folded them immediately; that's the accepted
-                // behavioural narrowing of the switch.
+                // Cross-peer resolution adoption (Phase 5a) before hold-open.
+                let peer_resolved_at = peer_resolved.get(&uuid).copied();
+                let local_resolved_this = local_resolved.contains_key(&uuid);
+                // Supersession: a local edit *after* the peer's resolution is a
+                // fresh local intent that re-opens the conflict (design §5.3).
+                let local_supersedes_peer =
+                    match (peer_resolved_at, local_entry.times.last_modification_time) {
+                        (Some(resolved_at), Some(local_mtime)) => local_mtime > resolved_at,
+                        _ => false,
+                    };
+
                 clear_conflict_rows(&tx, owner, &uuid_str)?;
-                insert_conflict_entry(&tx, owner, &conflict.remote, &session_key)?;
-                outcome.conflicted.push(uuid);
+                if local_resolved_this {
+                    // We already resolved this entry locally → keep our value and
+                    // leave the badge clear; the peer adopts our synced
+                    // resolution record on its pull. Re-holding here would
+                    // re-badge a conflict we already settled (the bug that made
+                    // resolve-on-one fail to clear-on-all). Local unchanged → no
+                    // save.
+                } else if peer_resolved_at.is_some() && !local_supersedes_peer {
+                    // The peer resolved this entry and we haven't (and our copy
+                    // isn't a newer edit) → adopt the peer's chosen value:
+                    // resolve-on-one ⇒ clears-on-all.
+                    advance_local_entry(
+                        &tx,
+                        peer,
+                        &conflict.remote,
+                        fingerprint_key,
+                        &session_key,
+                        &peer_bin_refs,
+                    )?;
+                    outcome.auto_merged.push(uuid);
+                } else {
+                    // Genuine unresolved conflict (or our edit superseded the
+                    // peer's resolution) → hold open: leave the local entry
+                    // untouched and store the peer's value (the resolver's
+                    // "theirs"), refreshed in place.
+                    //
+                    // KNOWN LIMITATION (deferred to Phase 5, by design —
+                    // classify's scope is standard + custom fields + icon): the
+                    // peer's NON-conflicting facets riding alongside this held
+                    // conflict (tags, attachments, group placement) are neither
+                    // folded onto local nor captured in the peer row. They are
+                    // not lost (the peer keeps them); they reach this side once
+                    // the conflict converges or Phase 5 (content pools / groups)
+                    // lands. The eager-merge path folded them immediately —
+                    // the accepted behavioural narrowing of the switch.
+                    insert_conflict_entry(&tx, owner, &conflict.remote, &session_key)?;
+                    outcome.conflicted.push(uuid);
+                }
             }
             // `Classification` is `#[non_exhaustive]`; a future verdict variant
             // must be handled explicitly above. Until one exists, conservatively
@@ -953,6 +992,27 @@ fn collect_entries_with_parent(root: &Group) -> Vec<(&Entry, GroupId)> {
     }
     let mut out = Vec::new();
     walk(root, &mut out);
+    out
+}
+
+/// Latest `keys.conflict_resolutions.v1` `resolved_at` per entry, parsed from a
+/// vault Meta's `custom_data`. Used by `ingest_peer` for cross-peer adoption:
+/// a side that carries a resolution record for an entry has *decided* that
+/// conflict. A parse failure degrades to "no resolutions" (a corrupt record
+/// must not block ingest).
+fn resolution_times(
+    custom_data: &[keepass_core::model::CustomDataItem],
+) -> HashMap<Uuid, DateTime<Utc>> {
+    let mut out: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
+    for record in parse_conflict_resolutions(custom_data).unwrap_or_default() {
+        out.entry(record.entry)
+            .and_modify(|t| {
+                if record.resolved_at > *t {
+                    *t = record.resolved_at;
+                }
+            })
+            .or_insert(record.resolved_at);
+    }
     out
 }
 
@@ -1147,6 +1207,7 @@ mod ingest_peer_tests {
     use crate::migrations;
     use keepass_core::model::{CustomField, Entry, EntryId, GroupId, Timestamps, Vault};
     use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey, open_with_key};
+    use keepass_merge::{ConflictKind, ConflictResolution, add_conflict_resolution};
     use rusqlite::{Connection, params};
     use uuid::Uuid;
 
@@ -1206,6 +1267,21 @@ mod ingest_peer_tests {
     fn vault_of(entries: Vec<Entry>) -> Vault {
         let mut v = Vault::empty(GroupId(Uuid::new_v4()));
         v.root.entries = entries;
+        v
+    }
+
+    /// Stamp a `keys.conflict_resolutions.v1` record for `entry`'s `field` onto
+    /// the vault's Meta — i.e. "this side resolved that conflict".
+    fn with_resolution(mut v: Vault, entry: Uuid, field: &str, resolved_secs: i64) -> Vault {
+        let at = chrono::DateTime::<chrono::Utc>::from_timestamp(resolved_secs, 0).expect("ts");
+        let record = ConflictResolution::new(
+            entry,
+            ConflictKind::Field,
+            Some(field.to_string()),
+            at,
+            None,
+        );
+        add_conflict_resolution(&mut v.meta.custom_data, &record).expect("add resolution record");
         v
     }
 
@@ -1502,5 +1578,59 @@ mod ingest_peer_tests {
         let (conn, outcome) = run(&local, "peerB", &peer);
         assert_eq!(outcome.conflicted, vec![id]);
         assert_eq!(conflict_rows_for(&conn, id), 1);
+    }
+
+    #[test]
+    fn peer_resolution_record_is_adopted() {
+        let id = Uuid::new_v4();
+        // Both edited Title (a conflict); the peer carries a resolution record
+        // ⇒ the peer resolved it ⇒ we adopt the peer's value (resolve-on-one
+        // clears-on-all), not hold.
+        let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T-MINE", "p0"))]);
+        let peer = with_resolution(
+            vault_of(vec![forked(id, ("T", "p0"), 1000, ("T-THEIRS", "p0"))]),
+            id,
+            "Title",
+            2000,
+        );
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.auto_merged, vec![id], "peer's resolution adopted");
+        assert!(outcome.conflicted.is_empty());
+        assert_eq!(conflict_rows_for(&conn, id), 0, "badge clears on adopt");
+        assert_eq!(
+            local_title(&conn, id),
+            "T-THEIRS",
+            "local advanced to the peer's resolved value"
+        );
+    }
+
+    #[test]
+    fn local_resolution_is_not_re_held() {
+        let id = Uuid::new_v4();
+        // We resolved Title locally; the peer hasn't adopted yet (values still
+        // differ). We must keep our value with the badge clear — re-holding
+        // would re-badge a conflict we already settled.
+        let local = with_resolution(
+            vault_of(vec![forked(id, ("T", "p0"), 1000, ("T-MINE", "p0"))]),
+            id,
+            "Title",
+            2000,
+        );
+        let peer = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T-THEIRS", "p0"))]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert!(
+            outcome.conflicted.is_empty(),
+            "we already resolved → don't re-hold"
+        );
+        assert!(
+            outcome.auto_merged.is_empty(),
+            "local keeps its value, no advance"
+        );
+        assert_eq!(conflict_rows_for(&conn, id), 0, "badge stays clear");
+        assert_eq!(
+            local_title(&conn, id),
+            "T-MINE",
+            "local keeps its chosen value"
+        );
     }
 }
