@@ -7,9 +7,9 @@
 //! row) and reconstruction of a peer's ("theirs") [`Entry`] from its sealed
 //! rows. These are the building blocks Phase 4 wires into the badge FFI and
 //! the resolver-payload rebuild, replacing the legacy `held_conflicts` kv +
-//! the single-blob theirs-stash. Purely additive: nothing here is on the live
-//! path yet (`conflict_owners_for` / `reconstruct_peer_entry` are consumed by
-//! the Phase-4 switch and the tests below).
+//! the single-blob theirs-stash. As of Phase 4 they are on the live path:
+//! `conflict_owners_for` / `reconstruct_peer_entry` rebuild the resolver's
+//! "theirs", and `drop_conflict_rows` clears the badge on resolve / dismiss.
 
 use keepass_core::model::{CustomField, Entry, EntryId, Timestamps};
 use keepass_core::protector::{SessionKey, open_with_key};
@@ -41,7 +41,6 @@ pub(crate) fn parked_conflict_uuids(conn: &Connection) -> Result<Vec<Uuid>, Engi
 
 /// The distinct owner ids holding a conflict row for `uuid` — one per peer
 /// (native multi-peer: an entry can carry several owners' divergent values).
-#[allow(dead_code)] // wired into the resolver rebuild in Phase 4
 pub(crate) fn conflict_owners_for(
     conn: &Connection,
     uuid: Uuid,
@@ -81,7 +80,6 @@ struct ConflictEntryRow {
 /// divergent field surfaces — exactly the item-granularity picker the
 /// resolver wants. Returns `None` when no `conflict_entry` row exists for
 /// `(owner, uuid)`.
-#[allow(dead_code)] // wired into the resolver rebuild in Phase 4
 pub(crate) fn reconstruct_peer_entry(
     conn: &Connection,
     owner: &str,
@@ -174,6 +172,32 @@ pub(crate) fn reconstruct_peer_entry(
     }
 
     Ok(Some(entry))
+}
+
+/// Drop every owner's conflict rows for one `entry_uuid` (across all peers),
+/// returning the number of `conflict_entry` parent rows removed. Used by the
+/// resolve / dismiss paths to clear an entry from the badge once its conflict
+/// has converged locally — the owner-rows replacement for the legacy
+/// `held_conflicts` kv read-modify-write.
+///
+/// Child tables are deleted explicitly (parent last) rather than relying on
+/// the FK `ON DELETE CASCADE` pragma being enabled, matching
+/// `ingest::clear_conflict_rows`'s posture.
+pub(crate) fn drop_conflict_rows(conn: &Connection, entry_uuid: Uuid) -> Result<u32, EngineError> {
+    let uuid_str = entry_uuid.to_string();
+    conn.execute(
+        "DELETE FROM conflict_entry_protected WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    conn.execute(
+        "DELETE FROM conflict_entry_custom_field WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    let removed = conn.execute(
+        "DELETE FROM conflict_entry WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    Ok(u32::try_from(removed).unwrap_or(u32::MAX))
 }
 
 fn reconstruct_times(row: &ConflictEntryRow) -> Timestamps {

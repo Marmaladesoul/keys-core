@@ -638,123 +638,6 @@ impl Engine {
         Ok(())
     }
 
-    /// The peer ("theirs") KDBX snapshot behind the currently-held conflicts,
-    /// or `None` if nothing is held.
-    ///
-    /// Hold-open keeps each device's own value and deliberately never writes
-    /// the peer's value to the vault file (that would defeat loop-safety), and
-    /// over iroh the peer bytes arrive in a throwaway temp file. So the
-    /// resolver can't re-read "theirs" from disk on demand. This stashes the
-    /// peer's full KDBX bytes **locally** (the `setting` table, key
-    /// `held_conflict_remote_bytes`, encrypted at rest by `SQLCipher`) whenever
-    /// a conflict is held, so [`crate::reconcile::held_conflict_payload`] can
-    /// rebuild the conflict's "theirs" side — including across an app relaunch.
-    /// Never synced; mirrors [`Engine::last_saved_kdbx_bytes`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Sqlite`] on query failure.
-    pub(crate) fn held_conflict_remote_bytes(&self) -> Result<Option<Vec<u8>>, EngineError> {
-        match self.conn.query_row(
-            "SELECT value FROM setting WHERE key = 'held_conflict_remote_bytes'",
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
-        ) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(err) => Err(EngineError::Sqlite(err)),
-        }
-    }
-
-    /// Persist the peer snapshot paired with the current held set. Written by
-    /// `reconcile_with_disk_park_conflicts` every time it holds a conflict.
-    /// See [`Engine::held_conflict_remote_bytes`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Sqlite`] on write failure.
-    pub(crate) fn set_held_conflict_remote_bytes(
-        &mut self,
-        bytes: &[u8],
-    ) -> Result<(), EngineError> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO setting(key, value) VALUES ('held_conflict_remote_bytes', ?1)",
-            rusqlite::params![bytes],
-        )?;
-        Ok(())
-    }
-
-    /// Drop the peer snapshot when the held set goes empty (everything
-    /// converged or was resolved). See [`Engine::held_conflict_remote_bytes`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Sqlite`] on write failure.
-    pub(crate) fn clear_held_conflict_remote_bytes(&mut self) -> Result<(), EngineError> {
-        self.conn.execute(
-            "DELETE FROM setting WHERE key = 'held_conflict_remote_bytes'",
-            [],
-        )?;
-        Ok(())
-    }
-
-    /// The UUIDs of every entry currently **held** in an unresolved sync
-    /// conflict — the badge cache that backs
-    /// [`Engine::entries_with_parked_conflict`].
-    ///
-    /// Under the hold-open model (see
-    /// `_project-management/sync-conflict-state-redesign.md`) the open-conflict
-    /// set is *derived* from live current-state divergence at each merge
-    /// (`reconcile_with_disk_park_conflicts`) rather than
-    /// stored in the KDBX. This caches the most-recently-derived set **locally**
-    /// in the `setting` table (key `held_conflicts`, a JSON array of hyphenated
-    /// UUID strings) so the badge survives engine close + reopen without having
-    /// to re-run a merge. Nothing here crosses the wire — only the resolution
-    /// records do. Mirrors [`Engine::last_saved_kdbx_bytes`].
-    ///
-    /// Returns an empty vec when the key is absent (no conflict ever held) or
-    /// the stored JSON is unparseable — a corrupt badge cache must never wedge
-    /// the UI, so it degrades to "no conflicts" rather than an error.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Sqlite`] on query failure.
-    pub fn held_conflicts(&self) -> Result<Vec<uuid::Uuid>, EngineError> {
-        let json: String = match self.conn.query_row(
-            "SELECT value FROM setting WHERE key = 'held_conflicts'",
-            [],
-            |row| row.get::<_, String>(0),
-        ) {
-            Ok(s) => s,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
-            Err(err) => return Err(EngineError::Sqlite(err)),
-        };
-        let strings: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
-        Ok(strings
-            .iter()
-            .filter_map(|s| uuid::Uuid::parse_str(s).ok())
-            .collect())
-    }
-
-    /// Persist the held-conflict badge set, replacing the row in place.
-    ///
-    /// The derived set is recomputed in full on every merge, so this is always
-    /// a complete snapshot rather than a delta. See [`Engine::held_conflicts`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::Sqlite`] on write failure.
-    pub(crate) fn set_held_conflicts(&mut self, uuids: &[uuid::Uuid]) -> Result<(), EngineError> {
-        let strings: Vec<String> = uuids.iter().map(uuid::Uuid::to_string).collect();
-        let json =
-            serde_json::to_string(&strings).expect("Vec<String> serialisation is infallible");
-        self.conn.execute(
-            "INSERT OR REPLACE INTO setting(key, value) VALUES ('held_conflicts', ?1)",
-            rusqlite::params![json],
-        )?;
-        Ok(())
-    }
-
     /// The `(mtime, size)` of the KDBX file whose contents this engine's
     /// `SQLite` mirror currently corresponds to, or `None` if neither
     /// [`Engine::ingest_from_kdbx`] nor [`Engine::save_to_kdbx`] has
@@ -929,22 +812,22 @@ impl Engine {
     /// [`Self::reconcile_with_disk`] path uses.
     ///
     /// This is the resolver-open companion to the badge query
-    /// [`Self::entries_with_parked_conflict`]. The badge set is cached
-    /// locally and survives relaunch, but the *rich* payload (field / icon /
-    /// attachment deltas + a resolvable stash) does not — and the byte-
-    /// equivalence short-circuit on both reconcile variants means a held
-    /// conflict can't be re-derived once its disk bytes are the baseline.
-    /// This merges local-vs-disk unconditionally to rebuild that payload and
-    /// stash it, mutating no `SQLite` state.
+    /// [`Self::entries_with_parked_conflict`]. "Theirs" is reconstructed from
+    /// the owner (`conflict_*`) rows the park reconcile wrote — not from the
+    /// disk file — so it works even when the peer blob has been discarded (the
+    /// iroh case) or the disk bytes have become the baseline. It merges
+    /// local-vs-(reconstructed-theirs) to rebuild the rich payload and stash
+    /// it, mutating no `SQLite` state.
     ///
-    /// Returns `None` when the merge surfaces no conflicts (e.g. a peer
-    /// resolved it and the resolution record has since synced in).
-    /// `composite_key` is needed to unlock the disk KDBX.
+    /// Returns `None` when no entry carries a parked owner row, or the merge
+    /// surfaces no conflict (e.g. a peer resolved it and the values have since
+    /// converged). `kdbx_path` / `composite_key` are unused — retained for
+    /// FFI-signature stability.
     ///
     /// # Errors
     ///
-    /// Same shape as [`Self::reconcile_with_disk`]: IO, KDBX open/parse,
-    /// merge.
+    /// - [`EngineError::Projection`] / [`EngineError::Sqlite`] on read failure;
+    ///   [`EngineError::Serialise`] on a merge failure.
     pub fn held_conflict_payload(
         &mut self,
         kdbx_path: &Path,
@@ -953,9 +836,8 @@ impl Engine {
         reconcile::held_conflict_payload(self, kdbx_path, composite_key)
     }
 
-    /// Return the UUIDs of every entry that currently has at least
-    /// one parked-conflict marker (`keys.field_conflict.v1`) on one
-    /// of its history records.
+    /// Return the UUIDs of every entry that currently carries at least one
+    /// stored peer conflict (`conflict_*`) row — the owner-rows badge query.
     ///
     /// Drives the vault-tile warning triangle in Keys-Mac: any
     /// non-empty result means the vault has entries awaiting user
@@ -969,29 +851,23 @@ impl Engine {
         reconcile::entries_with_parked_conflict(self)
     }
 
-    /// Clear every parked-conflict marker
-    /// (`keys.field_conflict.v1`) on `entry_uuid` by tombstoning the
-    /// marker-bearing history records via
-    /// [`keepass_merge::add_history_tombstone`].
+    /// Dismiss the held-conflict badge on `entry_uuid` by dropping its owner
+    /// (`conflict_*`) rows across every peer.
     ///
-    /// Called by Keys-Mac's conflict resolver after the user picks
-    /// per-field winners and the Apply path writes their choices
-    /// back. The tombstone propagates via `custom_data` set-union, so
-    /// the marker is reliably gone across the sync swarm — no
-    /// resurrection on the next external-change merge.
+    /// Called by Keys-Mac's conflict resolver after the user resolves an
+    /// entry (and as the local "dismiss badge" half). Clearing the rows drops
+    /// the entry from the owner-rows badge query immediately. Cross-peer
+    /// convergence is driven separately by the `keys.conflict_resolutions.v1`
+    /// record that [`Self::apply_conflict_resolution`] writes.
     ///
-    /// Idempotent: a no-op (returns 0) on entries with no markers.
-    /// `now` stamps the tombstone's `at` timestamp; inject so the
-    /// call stays a pure function.
+    /// Idempotent: a no-op (returns 0) on entries with no stored conflict
+    /// rows. `now` is unused — retained for FFI-signature stability.
     ///
-    /// Returns the number of marker history records cleared.
+    /// Returns the number of `conflict_entry` rows removed.
     ///
     /// # Errors
     ///
-    /// - [`EngineError::NotFound`] (`entity = "entry"`) if no entry
-    ///   with `entry_uuid` exists.
-    /// - [`EngineError::Sqlite`] / [`EngineError::Ingest`] on storage
-    ///   failure during the re-ingest.
+    /// - [`EngineError::Sqlite`] on storage failure.
     pub fn clear_parked_conflict_marker(
         &mut self,
         entry_uuid: uuid::Uuid,

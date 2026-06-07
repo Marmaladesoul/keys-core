@@ -24,10 +24,10 @@
 //!    and peers adopt the resolving side's value (design §5.3). The
 //!    record carries no value and no side — secret-safe; the chosen value
 //!    rides as ordinary protected entry data that step 2 already set.
-//! 4. Reconcile timestamps and re-ingest into `SQLite` via the same
-//!    single-transaction `ingest_merged` path 4.6 uses for `Merged`.
-//! 5. Refresh `last_saved_kdbx_bytes` to the disk-side bytes, drop the
-//!    resolved entries from the derived held-conflict badge set, and emit
+//! 4. Reconcile timestamps and re-ingest the merged [`Vault`] into
+//!    `SQLite` via the single-transaction `Engine::ingest_vault` path.
+//! 5. Drop the resolved entries' owner (`conflict_*`) rows so the badge
+//!    clears, and emit
 //!    [`crate::events::ChangeEvent::ExternalChangeMerged`] with empty
 //!    `conflicts`.
 //!
@@ -51,12 +51,12 @@
 
 use std::collections::HashSet;
 
-use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{Group, Vault};
 use keepass_merge::{ConflictKind, ConflictResolution, MergeOutcome, Resolution};
 use secrecy::SecretString;
 use uuid::Uuid;
 
+use crate::conflict_rows;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::events::{ChangeEvent, ConflictPayload};
@@ -77,27 +77,27 @@ const PASSWORD_FIELD: &str = "Password";
 ///
 /// - the full [`MergeOutcome`] (the public payload only carries the
 ///   conflict buckets);
-/// - both pre-merge vaults (so apply has both sides verbatim);
-/// - the already-unlocked disk [`Kdbx`] (so the merged [`Vault`] can be
-///   spliced in and ingested without re-deriving keys);
-/// - the disk bytes (so the common ancestor can be refreshed on the
-///   same value 4.6 would have used had the merge auto-applied).
+/// - both pre-merge vaults (so apply has both sides verbatim, and the
+///   per-side reveal path can read either).
+///
+/// The apply path re-ingests the merged [`Vault`] directly via
+/// `Engine::ingest_vault`, so the context no longer carries a disk Kdbx
+/// envelope or the disk bytes — the owner-rows switch dropped the baseline
+/// refresh from these paths (the database envelope and its `meta.*` header
+/// rows are unchanged by an in-memory re-ingest).
 pub(crate) struct PendingConflictContext {
     pub(crate) payload: ConflictPayload,
     pub(crate) outcome: MergeOutcome,
     pub(crate) local_vault: Vault,
     pub(crate) remote_vault: Vault,
-    pub(crate) disk_kdbx: Kdbx<Unlocked>,
-    pub(crate) disk_bytes: Vec<u8>,
 }
 
 impl std::fmt::Debug for PendingConflictContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `MergeOutcome`, `Vault`, and `Kdbx<Unlocked>` are all heavy
-        // types that would dominate any debug-print and add zero
-        // signal here — the payload id and bucket sizes are the
-        // only thing a caller actually needs. `finish_non_exhaustive`
-        // makes the intent explicit to clippy.
+        // `MergeOutcome` and `Vault` are heavy types that would dominate
+        // any debug-print and add zero signal here — the payload id and
+        // bucket sizes are the only thing a caller actually needs.
+        // `finish_non_exhaustive` makes the intent explicit to clippy.
         f.debug_struct("PendingConflictContext")
             .field("payload_id", &self.payload.id)
             .field("entry_conflicts", &self.payload.entry_conflicts.len())
@@ -105,7 +105,6 @@ impl std::fmt::Debug for PendingConflictContext {
                 "delete_edit_conflicts",
                 &self.payload.delete_edit_conflicts.len(),
             )
-            .field("disk_bytes_len", &self.disk_bytes.len())
             .finish_non_exhaustive()
     }
 }
@@ -134,8 +133,6 @@ pub(crate) fn apply_conflict_resolution(
         outcome,
         local_vault,
         remote_vault,
-        mut disk_kdbx,
-        disk_bytes,
     } = ctx;
 
     // 2. Apply the merge against an owned copy of the local side.
@@ -160,23 +157,19 @@ pub(crate) fn apply_conflict_resolution(
     //    protected entry data, which `apply_merge` already set above.
     record_resolutions_into_meta(&mut merged, resolution, now)?;
 
-    // 4. Splice the merged vault into the unlocked disk Kdbx and
-    //    re-ingest. The disk Kdbx already has the protector and crypto
-    //    envelope wired up; reusing it avoids re-unlocking (and thus
-    //    avoids asking the caller for the composite key again).
-    disk_kdbx.replace_vault(merged);
-    engine.ingest_merged(&disk_kdbx)?;
+    // 4. Re-ingest the merged vault directly. No KDBX envelope needed: the
+    //    database header (cipher / KDF / `meta.*` rows) is unchanged by an
+    //    in-memory re-ingest, so `ingest_vault` reuses the existing rows.
+    //    This also drops the baseline refresh the eager-merge path did — the
+    //    owner-rows switch took `set_last_saved_kdbx_bytes` off this path
+    //    (Keys-Mac saves the resolved projection out of band).
+    engine.ingest_vault(&merged)?;
 
-    // 5. Refresh the common ancestor to the disk bytes — same as 4.6's
-    //    Merged path. A follow-up save_to_kdbx will overwrite the disk
-    //    file (and the ancestor) with the resolved-and-combined state.
-    engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-
-    // Drop the resolved entries from the derived held-conflict badge set:
-    // their conflicts have converged locally to the chosen values, so they
-    // are no longer held on this device. (Cross-peer clearing rides the
-    // resolution records written in step 3.) Keeps the badge consistent
-    // without waiting for the next reconcile.
+    // Drop the resolved entries' owner rows so the badge clears: their
+    // conflicts have converged locally to the chosen values, so there is no
+    // peer side left to hold. (Cross-peer clearing rides the resolution
+    // records written in step 3.) Keeps the badge consistent without waiting
+    // for the next reconcile.
     let resolved_entries: HashSet<Uuid> = resolution
         .entry_field_choices
         .keys()
@@ -185,19 +178,8 @@ pub(crate) fn apply_conflict_resolution(
         .chain(resolution.delete_edit_choices.keys())
         .map(|e| e.0)
         .collect();
-    if !resolved_entries.is_empty() {
-        let mut held = engine.held_conflicts()?;
-        let before = held.len();
-        held.retain(|u| !resolved_entries.contains(u));
-        if held.len() != before {
-            engine.set_held_conflicts(&held)?;
-            // Drop the peer ("theirs") snapshot once nothing is held — the
-            // resolved entries converged, so there's no remote side left to
-            // rebuild (see `Engine::held_conflict_remote_bytes`).
-            if held.is_empty() {
-                engine.clear_held_conflict_remote_bytes()?;
-            }
-        }
+    for entry_uuid in resolved_entries {
+        conflict_rows::drop_conflict_rows(engine.conn(), entry_uuid)?;
     }
 
     // 6. Emit the success event. Stats are best-effort — the resolved
@@ -326,13 +308,16 @@ pub(crate) fn reveal_conflict_remote_field(
 /// ## Plaintext invariant
 ///
 /// Both vaults stashed in [`PendingConflictContext`] hold protected
-/// fields as **plaintext** by construction: `local_vault` is produced
+/// fields as **plaintext** by construction. `local_vault` is produced
 /// by [`Engine::project_to_vault`] (which unwraps `entry_protected`
-/// rows under the session key on projection) and `remote_vault` by
-/// [`keepass_core::kdbx::Kdbx::vault_with_unwrapped_protected`] (same
-/// post-unwrap shape). No protector / session-key acquisition is
-/// needed here — the values already sit in `Entry::password` /
-/// `CustomField::value` ready to read.
+/// rows under the session key on projection). `remote_vault` is produced
+/// either by [`keepass_core::kdbx::Kdbx::vault_with_unwrapped_protected`]
+/// (the live disk path) or, for an owner-rows held conflict, by
+/// `conflict_rows::reconstruct_peer_entry` unsealing the `conflict_*`
+/// rows under the session key (`held_conflict_payload`) — both yield the
+/// same post-unwrap plaintext shape. No protector / session-key
+/// acquisition is needed here — the values already sit in
+/// `Entry::password` / `CustomField::value` ready to read.
 ///
 /// `field_name == "Password"` reads [`keepass_core::model::Entry::password`];
 /// any other name reads from [`keepass_core::model::Entry::custom_fields`].

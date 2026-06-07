@@ -951,8 +951,13 @@ fn apply_resolution_emits_external_change_merged() {
     );
 }
 
+/// The owner-rows switch took `set_last_saved_kdbx_bytes` off the apply path
+/// (Keys-Mac saves the resolved projection out of band). Apply now just
+/// converges `SQLite` to the chosen value via a direct `ingest_vault`; this
+/// pins that convergence (the baseline-refresh assertion the eager path had is
+/// retired).
 #[test]
-fn apply_resolution_updates_common_ancestor() {
+fn apply_resolution_converges_sqlite_to_chosen_value() {
     let mut f = fixture();
     let id = drive_title_conflict(&mut f, "local-anc", "disk-anc");
 
@@ -960,13 +965,15 @@ fn apply_resolution_updates_common_ancestor() {
         .apply_conflict_resolution(id, &title_resolution(f.seed_uuid, ConflictSide::Remote))
         .expect("apply");
 
-    let stored = f
+    let after = f
         .engine
-        .last_saved_kdbx_bytes()
-        .expect("query")
-        .expect("ancestor stored");
-    let on_disk = std::fs::read(&f.kdbx_path).expect("read kdbx");
-    assert_eq!(stored, on_disk, "ancestor refreshed to disk bytes");
+        .entry(f.seed_uuid)
+        .expect("entry")
+        .expect("present");
+    assert_eq!(
+        after.title, "disk-anc",
+        "SQLite converged to the chosen (remote) value",
+    );
 }
 
 #[test]

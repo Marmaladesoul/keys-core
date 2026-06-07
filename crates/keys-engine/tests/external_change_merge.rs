@@ -14,8 +14,9 @@ use keepass_core::model::{NewEntry, NewGroup};
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{
     ChangeEvent, DataChangeObserver, DbKey, Engine, KeyProvider, KeyProviderError, MergeResult,
-    NotifyFileWatcher,
+    NotifyFileWatcher, ParkConflictsResult,
 };
+use secrecy::{ExposeSecret, SecretString};
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -472,6 +473,116 @@ fn reconcile_updates_common_ancestor_after_success() {
         stored, on_disk,
         "common ancestor must match disk bytes after Merged",
     );
+}
+
+// ── Owner-rows park path (Phase 4) ──────────────────────────────────────
+//
+// The live sync path is `reconcile_with_disk_park_conflicts`, now backed by
+// the owner-rows ingest. Re-prove the two ends of its loop-safety contract on
+// the same fixture the classic-path tests use.
+
+/// A one-sided external **password** edit propagates through the owner-rows
+/// park path: only the peer moved off the shared ancestor, so `classify`
+/// auto-merges and the local side advances ⇒ `Applied`. (Bug #1 class: the
+/// old cheap-equivalence comparator ignored password-only edits.)
+#[test]
+fn park_one_sided_password_edit_auto_merges_and_advances() {
+    let mut f = fixture();
+    let seed_uuid = f
+        .engine
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list")[0]
+        .uuid;
+
+    // Disk: edit ONLY the password (local stays on the shared ancestor).
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .edit_entry(
+            keepass_core::model::EntryId(seed_uuid),
+            keepass_core::model::HistoryPolicy::Snapshot,
+            |e| e.set_password(SecretString::from("disk-only-pw".to_string())),
+        )
+        .expect("disk pw edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    let result = f
+        .engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile");
+    match result {
+        ParkConflictsResult::Applied { applied, parked } => {
+            assert_eq!(applied.entries_updated, 1, "the peer edit advanced local");
+            assert!(
+                parked.entries_with_parked_conflict.is_empty(),
+                "a one-sided edit is not a conflict",
+            );
+        }
+        other => panic!("expected Applied, got {other:?}"),
+    }
+
+    // The password landed locally, and nothing is badged.
+    let revealed = f.engine.reveal_password(seed_uuid).expect("reveal");
+    assert_eq!(revealed.expose_secret(), "disk-only-pw");
+    assert!(
+        f.engine
+            .entries_with_parked_conflict()
+            .expect("query")
+            .is_empty(),
+    );
+}
+
+/// A genuine concurrent edit (both sides moved the same entry off the shared
+/// ancestor) holds open: nothing advances locally ⇒ `NoChange`, a peer
+/// conflict row is stored, and the entry is badged. This is the structural
+/// loop-safety guarantee — no local advance ⇒ no save ⇒ no re-push.
+#[test]
+fn park_genuine_concurrent_edit_holds_and_stores_row() {
+    let mut f = fixture();
+    let seed_uuid = f
+        .engine
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list")[0]
+        .uuid;
+
+    // Local edit + concurrent disk edit of the SAME entry's title.
+    f.engine
+        .update_entry(
+            seed_uuid,
+            keys_engine::EntryUpdate {
+                title: Some("local-rename".into()),
+                ..Default::default()
+            },
+        )
+        .expect("local edit");
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .edit_entry(
+            keepass_core::model::EntryId(seed_uuid),
+            keepass_core::model::HistoryPolicy::Snapshot,
+            |e| e.set_title("disk-rename"),
+        )
+        .expect("disk edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    let result = f
+        .engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile");
+    assert!(
+        matches!(result, ParkConflictsResult::NoChange),
+        "a held conflict advances nothing ⇒ NoChange (loop-safe), got {result:?}",
+    );
+
+    // The owner row drives the badge; local kept its own value.
+    assert_eq!(
+        f.engine.entries_with_parked_conflict().expect("query"),
+        vec![seed_uuid],
+        "the conflict row is stored and badged",
+    );
+    let after = f.engine.entry(seed_uuid).expect("entry").expect("present");
+    assert_eq!(after.title, "local-rename", "hold-open keeps local's title");
 }
 
 #[test]

@@ -127,6 +127,15 @@ impl Engine {
         Arc::clone(&self.field_protector)
     }
 
+    /// Crate-internal: borrow the engine's `SQLite` connection. Used by
+    /// the owner-rows conflict path ([`crate::reconcile`] /
+    /// [`crate::conflict_resolution`]) to read/drop `conflict_*` rows via
+    /// [`crate::conflict_rows`] without routing each query through a
+    /// dedicated `Engine` wrapper.
+    pub(crate) fn conn(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
+
     /// Crate-internal: drop the peek-only [`ConflictPayload`] mirror
     /// for `id`. Called by `apply_conflict_resolution` so the public
     /// [`Self::pending_conflict`] surface stops returning the payload
@@ -386,8 +395,8 @@ impl Engine {
     /// the same string must be reused across that peer's pulls so its rows
     /// refresh in place. The returned [`crate::ingest::IngestPeerOutcome`]'s
     /// `auto_merged` bucket tells the caller whether the local side changed
-    /// (and so must be saved). Not yet wired to the live reconcile path —
-    /// Phase 4 repoints the sync reconcile here.
+    /// (and so must be saved). As of Phase 4 this is the live sync reconcile's
+    /// ingest path ([`Self::reconcile_with_disk_park_conflicts`]).
     ///
     /// # Errors
     ///
@@ -410,12 +419,13 @@ impl Engine {
         )
     }
 
-    /// Owner-rows badge query (Phase 3): every entry UUID that carries at
-    /// least one stored peer conflict row.
+    /// Owner-rows badge query: every entry UUID that carries at least one
+    /// stored peer conflict row.
     ///
     /// The owner-rows replacement for the legacy `held_conflicts` JSON-array
-    /// kv. Not yet wired to the FFI badge — Phase 4 repoints
-    /// `entries_with_parked_conflict` here as part of the atomic switch.
+    /// kv. As of Phase 4 the live badge ([`Self::entries_with_parked_conflict`])
+    /// reads the same `conflict_*` rows; this remains as a direct accessor for
+    /// callers wanting the rows query without the badge wrapper.
     ///
     /// # Errors
     ///

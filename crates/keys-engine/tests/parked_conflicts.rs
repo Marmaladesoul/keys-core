@@ -114,11 +114,13 @@ fn park_conflicts_no_change_when_in_sync() {
     assert!(matches!(result, ParkConflictsResult::NoChange));
 }
 
-/// Adds-only on disk apply through the park-conflicts variant the
-/// same as the legacy variant: non-conflicting changes land, parked
-/// summary is empty.
+/// Owner-rows scope (Phase 4): a peer-only **add** propagates. An add is
+/// unambiguous (present beats absent), unlike a delete (the deleted-vs-just-
+/// added ambiguity that waits for the Phase-5 tombstone story). So a disk-side
+/// add advances local ⇒ `Applied`, and the entry appears locally — not a
+/// conflict.
 #[test]
-fn park_conflicts_applies_non_conflicting_external_add() {
+fn park_conflicts_applies_peer_only_add() {
     let mut f = fixture();
 
     let mut external = reopen_kdbx(&f.kdbx_path);
@@ -134,22 +136,26 @@ fn park_conflicts_applies_non_conflicting_external_add() {
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile");
 
-    match result {
-        ParkConflictsResult::Applied { applied, parked } => {
-            assert_eq!(applied.entries_added, 1, "one entry added");
-            assert!(
-                parked.entries_with_parked_conflict.is_empty(),
-                "no conflicts to park",
-            );
-        }
-        other => panic!("expected Applied, got {other:?}"),
-    }
+    assert!(
+        matches!(result, ParkConflictsResult::Applied { .. }),
+        "a peer-only add advances local and applies, got {result:?}",
+    );
 
     let summaries = f
         .engine
         .list_entries(None, keys_engine::Pagination::all())
         .expect("list");
-    assert!(summaries.iter().any(|s| s.uuid == new_id.0));
+    assert!(
+        summaries.iter().any(|s| s.uuid == new_id.0),
+        "peer-only add is ingested locally",
+    );
+    assert!(
+        f.engine
+            .entries_with_parked_conflict()
+            .expect("query")
+            .is_empty(),
+        "a peer-only add is not a conflict",
+    );
 }
 
 /// The headline test under hold-open: a same-entry field clash on disk +
@@ -241,19 +247,18 @@ fn park_conflicts_holds_field_conflict_keeping_local() {
     );
 }
 
-/// Regression for the held-conflict facet-loss gap (found by adversarial
-/// review before the loop fix shipped). A held conflict is NOT "untouched":
-/// `apply_merge_park_conflicts` still folds the peer's NON-conflicting facets
-/// onto the held entry. Here the disk side renames the title (→ held title
-/// conflict) AND adds a tag local lacks — the tag rides in the merge's
-/// per-entry sidecar, not in any change bucket. The loop-safety guard must
-/// NOT mistake this for a no-op: skipping the ingest/save would silently and
-/// permanently lose the peer's tag (the next reconcile byte-equiv
-/// short-circuits). So the reconcile must be `Applied`, the merged entry must
-/// carry the peer's tag, AND keep local's conflicting title (held); a
-/// re-reconcile then converges to a stable no-op.
+/// Owner-rows contract (Phase 4): a held conflict advances **nothing** locally
+/// — there is no silent facet-folding onto the held entry. Here the disk side
+/// renames the title (→ held conflict) AND adds a tag local lacks. Under the
+/// owner-rows model the entry classifies as a Conflict (item granularity: both
+/// touched the same entry), so it holds open: local is untouched, the peer's
+/// value (including its tag) is captured in the owner row for the resolver, and
+/// the reconcile is `NoChange` (loop-safe — nothing advanced ⇒ nothing to
+/// save). The peer's tag does NOT silently appear on the local entry; it
+/// surfaces through the resolver's "theirs" instead. A re-reconcile stays a
+/// stable no-op.
 #[test]
-fn park_conflicts_held_entry_absorbs_concurrent_tag_add() {
+fn park_conflicts_held_entry_does_not_fold_peer_tag() {
     let mut f = fixture();
     let seed_uuid = f
         .engine
@@ -272,9 +277,8 @@ fn park_conflicts_held_entry_absorbs_concurrent_tag_add() {
         )
         .expect("local edit");
 
-    // Disk: rename the SAME field differently (→ held title conflict) AND add
-    // a tag local doesn't have (a non-conflicting facet the merge folds onto
-    // the held entry via its per-entry tag sidecar, not via a change bucket).
+    // Disk: rename the SAME entry's title differently (→ Conflict) AND add a
+    // tag local doesn't have.
     let mut external = reopen_kdbx(&f.kdbx_path);
     external
         .edit_entry(
@@ -289,56 +293,58 @@ fn park_conflicts_held_entry_absorbs_concurrent_tag_add() {
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    // A held conflict that ALSO carries a real non-conflicting change (the
-    // tag) is NOT a no-op — apply folded the tag onto the held entry, so we
-    // must ingest + save it or lose it forever.
+    // Held conflict ⇒ nothing advances locally ⇒ NoChange (loop-safe).
     let result = f
         .engine
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile");
     assert!(
-        matches!(result, ParkConflictsResult::Applied { .. }),
-        "a held conflict that absorbs a peer tag must persist (Applied), got {result:?}",
+        matches!(result, ParkConflictsResult::NoChange),
+        "a held conflict advances nothing locally ⇒ NoChange, got {result:?}",
     );
 
-    // Held: local's conflicting title is kept (no winner)...
+    // Held: local's conflicting title is kept, and the peer's tag is NOT
+    // silently folded onto the local entry (it rides in the owner row).
     let after = f.engine.entry(seed_uuid).expect("entry").expect("present");
     assert_eq!(after.title, "local-rename", "hold-open keeps local's title");
-    // ...but the peer's non-conflicting tag was absorbed, not lost.
     assert!(
-        after.tags.iter().any(|t| t == "disk-only-tag"),
-        "the peer's concurrent tag must survive the held conflict, got {:?}",
+        !after.tags.iter().any(|t| t == "disk-only-tag"),
+        "the peer's tag must NOT be silently folded onto the held entry, got {:?}",
         after.tags,
     );
 
-    // Badge set for the still-divergent title.
+    // Badge set for the held entry.
     assert_eq!(
         f.engine.entries_with_parked_conflict().expect("query"),
         vec![seed_uuid],
     );
 
-    // Convergence: with the tag now absorbed and disk unchanged, a second
-    // reconcile is a stable no-op — the loop is dead.
+    // Loop-safety: disk unchanged → second reconcile is a stable no-op and the
+    // badge persists.
     let again = f
         .engine
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile 2");
     assert!(
         matches!(again, ParkConflictsResult::NoChange),
-        "after absorbing the tag, a re-reconcile must be a no-op, got {again:?}",
+        "re-reconcile of a held conflict must stay a no-op, got {again:?}",
+    );
+    assert_eq!(
+        f.engine.entries_with_parked_conflict().expect("query"),
+        vec![seed_uuid],
+        "badge persists across a no-op reconcile",
     );
 }
 
-/// Regression for the held-conflict GROUP-metadata-loss gap (found by a second
-/// adversarial pass). apply applies last-writer-wins group metadata (rename,
-/// notes, icon) onto a group that holds a held entry — but the merge stats
-/// hardcode `groups_updated`/`groups_moved` to 0, so a bucket-only guard sees
-/// "nothing moved" and the held entry untouched → wrongly `NoChange` → the
-/// peer's group rename is silently, permanently lost. The guard must compare
-/// the whole tree, not just held entries: result `Applied`, the rename lands,
-/// the held entry's title stays local.
+/// Owner-rows contract (Phase 4): a concurrent **group** rename alongside a
+/// held entry conflict does not change the loop-safety verdict. Group
+/// reconciliation is Phase-5 scope, so the owner-rows ingest neither advances
+/// the held entry nor applies the group rename — the reconcile is `NoChange`
+/// (loop-safe). The peer's group rename is simply not adopted yet; it is not
+/// lost (a future Phase-5 group pass handles it). The held entry keeps local's
+/// title and stays badged.
 #[test]
-fn park_conflicts_held_entry_absorbs_concurrent_group_rename() {
+fn park_conflicts_held_entry_group_rename_stays_loop_safe() {
     let mut f = fixture();
     let seed_uuid = f
         .engine
@@ -357,9 +363,8 @@ fn park_conflicts_held_entry_absorbs_concurrent_group_rename() {
         )
         .expect("local edit");
 
-    // Disk: rename the SAME field differently (→ held title conflict) AND
-    // rename the group that holds the entry (a LWW metadata change that lands
-    // in NO entry bucket and no counted group bucket).
+    // Disk: rename the SAME entry's title differently (→ Conflict) AND rename
+    // the group that holds the entry (Phase-5 group scope).
     let mut external = reopen_kdbx(&f.kdbx_path);
     let root_id = external.vault().root.id;
     external
@@ -377,36 +382,32 @@ fn park_conflicts_held_entry_absorbs_concurrent_group_rename() {
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    // The group rename is a real change apply folds in — NOT a no-op.
+    // Held conflict + Phase-5 group rename ⇒ nothing advances ⇒ NoChange.
     let result = f
         .engine
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile");
     assert!(
-        matches!(result, ParkConflictsResult::Applied { .. }),
-        "a held conflict that absorbs a peer group rename must persist (Applied), got {result:?}",
+        matches!(result, ParkConflictsResult::NoChange),
+        "owner-rows holds the entry and defers the group rename ⇒ NoChange, got {result:?}",
     );
 
-    // The peer's group rename survived...
-    let tree = f.engine.group_tree().expect("group tree");
-    assert!(
-        tree.iter()
-            .any(|g| g.uuid == root_id.0 && g.name == "disk-renamed-group"),
-        "the peer's group rename must survive the held conflict, got {:?}",
-        tree.iter().map(|g| (&g.name, g.uuid)).collect::<Vec<_>>(),
-    );
-    // ...and the held entry kept local's conflicting title.
+    // The held entry kept local's conflicting title and stays badged.
     let after = f.engine.entry(seed_uuid).expect("entry").expect("present");
     assert_eq!(after.title, "local-rename", "hold-open keeps local's title");
+    assert_eq!(
+        f.engine.entries_with_parked_conflict().expect("query"),
+        vec![seed_uuid],
+    );
 
-    // Convergence: disk unchanged → second reconcile is a stable no-op.
+    // Loop-safety: disk unchanged → second reconcile is a stable no-op.
     let again = f
         .engine
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile 2");
     assert!(
         matches!(again, ParkConflictsResult::NoChange),
-        "after absorbing the group rename, a re-reconcile must be a no-op, got {again:?}",
+        "re-reconcile must stay a no-op, got {again:?}",
     );
 }
 

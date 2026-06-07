@@ -17,7 +17,7 @@ use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{Entry, Group, GroupId, Vault};
 use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
 use keepass_merge::{Classification, Granularity, classify};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -786,16 +786,17 @@ fn b64_encode(bytes: &[u8]) -> String {
 //                  as an `owner`-keyed `conflict_*` row for the resolver.
 // It is purely additive: it writes only the `conflict_*` tables plus (for an
 // auto-merge) the single advanced local entry, and never calls
-// `clear_vault_tables`. Not yet wired into the live reconcile path — Phase 4
-// repoints the sync reconcile at it.
+// `clear_vault_tables`. As of Phase 4 this is the live sync reconcile's ingest
+// path (`reconcile::reconcile_with_disk_park_conflicts`).
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Outcome of an `ingest_peer` pass.
 ///
-/// The three buckets let the caller decide save-vs-no-save (the loop-safety
-/// contract): a non-empty [`Self::auto_merged`] means the local side changed
-/// and must be persisted; pure conflicts / in-sync advance nothing locally,
-/// so no save (and thus no fresh-nonce re-push) is needed.
+/// The buckets let the caller decide save-vs-no-save (the loop-safety
+/// contract): a non-empty [`Self::auto_merged`] **or** [`Self::added`] means
+/// the local side changed and must be persisted; pure conflicts / in-sync
+/// advance nothing locally, so no save (and thus no fresh-nonce re-push) is
+/// needed.
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
 pub struct IngestPeerOutcome {
@@ -805,6 +806,10 @@ pub struct IngestPeerOutcome {
     /// Entries advanced to a merged value (one-sided / non-overlapping peer
     /// edits). The local side changed → the caller must persist.
     pub auto_merged: Vec<Uuid>,
+    /// Peer-only entries the peer added that we didn't hold — inserted locally
+    /// (present beats absent; an add is unambiguous, unlike a delete). The
+    /// local side changed → the caller must persist.
+    pub added: Vec<Uuid>,
     /// Count of entries the peer agreed on outright — nothing written.
     pub in_sync: usize,
 }
@@ -831,15 +836,36 @@ pub(crate) fn ingest_peer(
 
     let local_by_uuid = index_entries(&local.root);
     let local_bin_refs: Vec<&[u8]> = local.binaries.iter().map(|b| b.data.as_slice()).collect();
+    let peer_bin_refs: Vec<&[u8]> = peer.binaries.iter().map(|b| b.data.as_slice()).collect();
 
     let mut outcome = IngestPeerOutcome::default();
     let tx = conn.transaction()?;
 
-    for peer_entry in collect_entries(&peer.root) {
+    for (peer_entry, peer_parent) in collect_entries_with_parent(&peer.root) {
         let uuid = peer_entry.id.0;
         let Some(local_entry) = local_by_uuid.get(&uuid) else {
-            // Peer-present / local-absent: a new-entry / tombstone question
-            // deferred to Phase 5. Discard — don't invent add/delete here.
+            // Peer-side ADD (present beats absent — unambiguous). Only a DELETE
+            // (local-present / peer-absent) carries the "deleted vs. just-added"
+            // ambiguity that waits for the Phase-5 tombstone story. Insert under
+            // the peer's parent group if we hold it, else the local root
+            // (group-structure reconciliation — renames / moves / recycle bin —
+            // is Phase 5).
+            let group_id = if group_exists(&tx, peer_parent)? {
+                peer_parent
+            } else {
+                local.root.id
+            };
+            insert_entry(
+                &tx,
+                peer,
+                peer_entry,
+                group_id,
+                false,
+                fingerprint_key,
+                &session_key,
+                &peer_bin_refs,
+            )?;
+            outcome.added.push(uuid);
             continue;
         };
         let uuid_str = uuid.to_string();
@@ -870,6 +896,19 @@ pub(crate) fn ingest_peer(
                 // Hold-open: leave the local entry untouched; store the peer's
                 // value (the resolver's "theirs"). Refresh in place so a
                 // re-pull replaces rather than accumulates.
+                //
+                // KNOWN LIMITATION (deferred to Phase 5, by design — classify's
+                // scope is standard + custom fields + icon): the peer's
+                // NON-conflicting facets that ride alongside this held conflict
+                // — tags, attachments, group placement — are neither folded onto
+                // local (hold-open keeps local) nor captured in the peer row
+                // (`insert_conflict_entry` stores fields only). They are not
+                // lost (the peer keeps them) but they don't reach this side
+                // until the field conflict converges and a later sync auto-merges
+                // them, or Phase 5 (content pools / tombstones / group LWW + the
+                // synced resolution-record adoption) lands. The eager-merge path
+                // this replaced folded them immediately; that's the accepted
+                // behavioural narrowing of the switch.
                 clear_conflict_rows(&tx, owner, &uuid_str)?;
                 insert_conflict_entry(&tx, owner, &conflict.remote, &session_key)?;
                 outcome.conflicted.push(uuid);
@@ -898,6 +937,34 @@ fn collect_entries(root: &Group) -> Vec<&Entry> {
     let mut out = Vec::new();
     walk(root, &mut out);
     out
+}
+
+/// Depth-first collection of every entry under `root` paired with its parent
+/// group id — the peer-side walk for `ingest_peer`, which needs the parent so
+/// a peer-only add lands under the right group.
+fn collect_entries_with_parent(root: &Group) -> Vec<(&Entry, GroupId)> {
+    fn walk<'a>(group: &'a Group, out: &mut Vec<(&'a Entry, GroupId)>) {
+        for entry in &group.entries {
+            out.push((entry, group.id));
+        }
+        for child in &group.groups {
+            walk(child, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
+}
+
+/// Does the local mirror already hold the group `group_id`?
+fn group_exists(tx: &Connection, group_id: GroupId) -> Result<bool, rusqlite::Error> {
+    tx.query_row(
+        "SELECT 1 FROM \"group\" WHERE uuid = ?1",
+        params![group_id.0.to_string()],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
 }
 
 /// `entry-uuid → &Entry` index for the local side, so the per-peer walk can
@@ -1349,27 +1416,30 @@ mod ingest_peer_tests {
     }
 
     #[test]
-    fn peer_only_entry_is_discarded() {
+    fn peer_only_entry_is_added_locally() {
         let local_id = Uuid::new_v4();
         let peer_only_id = Uuid::new_v4();
         let local = vault_of(vec![forked(local_id, ("T", "p0"), 1000, ("T", "p0"))]);
-        // Peer carries an extra entry we've never seen.
+        // Peer carries an extra entry we've never seen — a peer-side add.
         let peer = vault_of(vec![
             forked(local_id, ("T", "p0"), 1000, ("T", "p0")),
-            forked(peer_only_id, ("X", "x0"), 1000, ("X", "x0")),
+            forked(peer_only_id, ("X", "x0"), 1000, ("New", "x0")),
         ]);
         let (conn, outcome) = run(&local, "peerB", &peer);
+        // An add is unambiguous (present beats absent): taken locally, not a
+        // conflict. Only deletes wait for the Phase-5 tombstone story.
+        assert_eq!(outcome.added, vec![peer_only_id]);
         assert!(outcome.conflicted.is_empty());
-        assert!(outcome.auto_merged.is_empty());
         assert_eq!(
             conflict_rows_for(&conn, peer_only_id),
             0,
-            "no conflict row for a peer-only add"
+            "an add is not a conflict"
         );
         assert!(
-            !local_entry_exists(&conn, peer_only_id),
-            "not added locally (deferred to Phase 5)"
+            local_entry_exists(&conn, peer_only_id),
+            "peer-only entry inserted into the local mirror"
         );
+        assert_eq!(local_title(&conn, peer_only_id), "New");
     }
 
     #[test]

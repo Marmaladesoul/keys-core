@@ -34,18 +34,33 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::Kdbx;
-use keepass_core::model::{Entry, EntryId, Group, Timestamps, Vault};
+use keepass_core::model::{EntryId, Vault};
 
+use crate::conflict_rows;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::events::{ChangeEvent, ConflictPayload};
 
+/// Owner sentinel for the disk/iroh sync peer.
+///
+/// The owner-rows store keys conflict rows by an opaque peer identifier. The
+/// reconcile path collapses "whatever synced into the watched kdbx file" into
+/// a single peer — correct for the 2-device path the live sync ships today.
+///
+/// TODO(multi-peer): true N-peer differentiation threads a real peer id from
+/// the sync layer through to [`Engine::ingest_peer`] instead of this single
+/// sentinel, so divergent values from peers B and C don't share one owner row.
+/// Out of scope for the Phase-4 switch; see
+/// `_project-management/sync-multipeer-store.md` §9.
+const FILE_OWNER: &str = "file";
+
 /// Legacy `<CustomData>` key of the pre-redesign parked-conflict history
 /// marker. The hold-open redesign (keepass-merge #215, clean cut) deleted
-/// the marker entirely — conflicts are now *derived* and badged via the
-/// `held_conflicts` setting kv ([`Engine::held_conflicts`]), not stored on
-/// history records. This const survives **only** to recognise and clean up
-/// markers left in vaults written by an older build:
+/// the marker entirely, and the Phase-4 owner-rows switch now badges
+/// conflicts from the `conflict_entry` rows
+/// ([`entries_with_parked_conflict`]) — never stored on history records.
+/// This const survives **only** to recognise and clean up markers left in
+/// vaults written by an older build:
 /// [`clear_parked_conflict_marker`] tombstones them, and the history
 /// quota-trim ([`crate::mutations`]) still pins them so a cleanup pass can
 /// find them. No code path writes it any more.
@@ -250,8 +265,6 @@ pub(crate) fn reconcile_with_disk(
             outcome,
             local_vault,
             remote_vault,
-            disk_kdbx,
-            disk_bytes,
         });
         engine.emit(ChangeEvent::ConflictDetected(payload.clone()));
         return Ok(MergeResult::Conflict(payload));
@@ -309,62 +322,69 @@ pub(crate) fn reconcile_with_disk(
     Ok(MergeResult::Merged { applied: stats })
 }
 
-/// Derive the current conflict payload for the **held** (parked) path and
-/// stash a context so it can be resolved through the same
-/// [`Engine::apply_conflict_resolution`] entry point the live path uses.
+/// Rebuild the rich conflict payload for the **held** (parked) entries from
+/// the owner-rows store and stash a context so they can be resolved through
+/// the same [`Engine::apply_conflict_resolution`] entry point the live path
+/// uses.
 ///
 /// This is the resolver-open counterpart to the badge query
-/// [`entries_with_parked_conflict`]. Under hold-open a conflict's
-/// divergence stays live in current state, but once
-/// [`reconcile_with_disk_park_conflicts`] has set the baseline to the disk
-/// bytes the byte-equivalence short-circuit means a plain reconcile would
-/// return `NoChange` and never re-derive the conflict — so neither reconcile
-/// variant can rebuild a resolvable payload after the badge has been cached
-/// (e.g. across an app relaunch). This method merges local-vs-disk
-/// **unconditionally** (no short-circuit, no apply) purely to:
+/// [`entries_with_parked_conflict`]. "Theirs" is reconstructed from the
+/// `conflict_*` owner rows the park reconcile wrote — NOT from the vault file:
+/// hold-open never writes the peer value to disk (loop-safety), and over iroh
+/// the peer blob arrives in a throwaway temp file. `_kdbx_path` / `_composite`
+/// are retained only for FFI-signature stability — this method touches neither
+/// the disk file nor the composite key.
 ///
-/// 1. rebuild the rich [`ConflictPayload`] (field / icon / attachment deltas,
-///    the same shape the live path produces), and
-/// 2. stash the [`PendingConflictContext`] so a subsequent
-///    `apply_conflict_resolution(id, …)` converges the chosen values and
-///    writes the propagating resolution records (phase 2b).
+/// It builds a synthetic `theirs` vault (a clone of local with each parked
+/// entry swapped for its reconstructed peer value), merges local-vs-theirs to
+/// produce the rich [`ConflictPayload`] (the same field / icon / attachment
+/// delta shape the live path emits), and stashes a [`PendingConflictContext`]
+/// so a later `apply_conflict_resolution(id, …)` converges the chosen values
+/// and writes the propagating resolution records.
 ///
-/// It mutates **no** `SQLite` state (the park reconcile owns the held-open
-/// apply + the badge cache); its only side effect is the stash. Returns
-/// `None` — and the stash is left untouched — when the merge surfaces no
-/// conflicts (e.g. the conflict was resolved on a peer and the resolution
-/// record has since synced in, so adoption converged it).
+/// It mutates **no** `SQLite` state; its only side effect is the stash.
+/// Returns `None` — stash untouched — when no entry has a parked owner row, or
+/// when the local-vs-theirs merge surfaces no conflict (e.g. a peer resolved
+/// it and the values have since converged).
+///
+/// Multi-peer note: when an entry carries rows from several peers this picks
+/// the first owner ([`conflict_rows::conflict_owners_for`] returns them sorted)
+/// — surfacing the full N-value picker is deferred (see
+/// `_project-management/sync-multipeer-store.md` §3).
 pub(crate) fn held_conflict_payload(
     engine: &mut Engine,
     _kdbx_path: &Path,
-    composite_key: &CompositeKey,
+    _composite_key: &CompositeKey,
 ) -> Result<Option<ConflictPayload>, EngineError> {
-    // "Theirs" comes from the local peer snapshot stashed at park time, NOT
-    // from the vault file: hold-open never writes the peer value to disk (that
-    // would defeat loop-safety), and over iroh the peer bytes arrive in a
-    // throwaway temp file. `_kdbx_path` is retained only for FFI-signature
-    // stability. No snapshot → nothing held to resolve (e.g. the conflict
-    // already converged, or this build pre-dates the stash).
-    let Some(remote_bytes) = engine.held_conflict_remote_bytes()? else {
+    let parked = conflict_rows::parked_conflict_uuids(engine.conn())?;
+    if parked.is_empty() {
         return Ok(None);
-    };
-    let disk_kdbx = Kdbx::open_from_bytes(remote_bytes.clone())
-        .map_err(|e| EngineError::Serialise(format!("open theirs kdbx: {e}")))?
-        .read_header()
-        .map_err(|e| EngineError::Serialise(format!("read theirs header: {e}")))?
-        .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
-        .map_err(|e| EngineError::Serialise(format!("unlock theirs kdbx: {e}")))?;
+    }
 
     let local_vault = engine.project_to_vault()?;
-    let remote_vault = disk_kdbx
-        .vault_with_unwrapped_protected()
-        .map_err(|e| EngineError::Serialise(format!("unwrap theirs protected: {e}")))?;
+    let session_key = engine
+        .field_protector_arc()
+        .acquire_session_key()
+        .map_err(|e| EngineError::Serialise(format!("acquire session key: {e}")))?;
 
-    // Unconditional merge — deliberately no byte-equivalence / no-op
-    // short-circuit. A held conflict's local value still diverges from the
-    // stashed peer snapshot, so the short-circuits would wrongly report
-    // "nothing to resolve".
-    let outcome = keepass_merge::merge(&local_vault, &remote_vault)
+    // Build "theirs": a clone of local with each parked entry swapped for its
+    // reconstructed peer value. If local doesn't hold the entry, skip it (a
+    // peer-only entry has no local side to conflict against here).
+    let mut theirs_vault = local_vault.clone();
+    for uuid in &parked {
+        let owners = conflict_rows::conflict_owners_for(engine.conn(), *uuid)?;
+        let Some(owner) = owners.first() else {
+            continue;
+        };
+        let Some(peer_entry) =
+            conflict_rows::reconstruct_peer_entry(engine.conn(), owner, *uuid, &session_key)?
+        else {
+            continue;
+        };
+        swap_entry_in_tree(&mut theirs_vault.root, peer_entry);
+    }
+
+    let outcome = keepass_merge::merge(&local_vault, &theirs_vault)
         .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
 
     if outcome.entry_conflicts.is_empty() && outcome.delete_edit_conflicts.is_empty() {
@@ -378,44 +398,74 @@ pub(crate) fn held_conflict_payload(
         delete_edit_conflicts: outcome.delete_edit_conflicts.clone(),
     };
     engine.stash_conflict_payload(payload.clone());
-    // The stashed context carries the peer snapshot as both `remote_vault` and
-    // `disk_kdbx`/`disk_bytes`; `apply_conflict_resolution` uses the latter
-    // only as a crypto-wired container to splice + ingest the resolved vault
-    // and as the interim baseline (the follow-up save overwrites it), so the
-    // peer kdbx — same vault, same key — works exactly as the disk one did.
     engine.stash_conflict_context(crate::conflict_resolution::PendingConflictContext {
         payload: payload.clone(),
         outcome,
         local_vault,
-        remote_vault,
-        disk_kdbx,
-        disk_bytes: remote_bytes,
+        remote_vault: theirs_vault,
     });
     Ok(Some(payload))
 }
 
-/// Park-conflicts variant of [`reconcile_with_disk`].
+/// Replace the entry with `replacement.id` in the group tree with
+/// `replacement` (in place, preserving its group). A no-op if no entry with
+/// that id exists in the tree. Used to splice a reconstructed peer entry into
+/// the synthetic "theirs" vault.
+fn swap_entry_in_tree(
+    group: &mut keepass_core::model::Group,
+    replacement: keepass_core::model::Entry,
+) {
+    if let Some(slot) = group.entries.iter_mut().find(|e| e.id == replacement.id) {
+        *slot = replacement;
+        return;
+    }
+    for child in &mut group.groups {
+        // Cheap to recurse; the entry lives in exactly one group.
+        if child_contains_entry(child, replacement.id) {
+            swap_entry_in_tree(child, replacement);
+            return;
+        }
+    }
+}
+
+/// Whether `group` (or a descendant) holds an entry with `id`.
+fn child_contains_entry(group: &keepass_core::model::Group, id: EntryId) -> bool {
+    group.entries.iter().any(|e| e.id == id)
+        || group.groups.iter().any(|g| child_contains_entry(g, id))
+}
+
+/// Park-conflicts variant of [`reconcile_with_disk`] — the live sync path,
+/// now backed by the multi-peer **owner-rows** store.
 ///
-/// Identical disk read / parse / project / merge prefix, but continues
-/// past genuine conflicts by calling
-/// [`keepass_merge::apply_merge_park_conflicts`] (the hold-open apply).
-/// On a genuine clash each side keeps its **own** current value — no
-/// winner, no marker, no history write — and the merge adopts any
-/// `keys.conflict_resolutions.v1` record that covers the facet. Sync
-/// never blocks.
+/// Reads / parses / unlocks the disk kdbx and projects the remote vault, then
+/// hands it to [`Engine::ingest_peer`] (the owner-rows ingest) under the
+/// [`FILE_OWNER`] sentinel. `ingest_peer` runs the per-entry `classify` brain
+/// and, in one transaction:
 ///
-/// The set of still-divergent ("held") entries the apply reports is
-/// cached locally via [`Engine::set_held_conflicts`] so the badge
-/// ([`entries_with_parked_conflict`]) survives engine close + reopen
-/// without re-merging. That set is *derived* each merge, not stored in
-/// the KDBX — the only convergent KDBX state is the resolution record.
+/// - advances the local mirror for one-sided / non-overlapping peer edits
+///   (`auto_merged`), and
+/// - holds open genuine clashes — local untouched, the peer's value stored as
+///   an `owner`-keyed `conflict_*` row (`conflicted`) the resolver reads.
+///
+/// **Loop-safety (the #1 invariant).** A held conflict advances *nothing*
+/// locally, so there is nothing to save → no fresh-nonce re-push → the iroh
+/// loop can't start. The discriminator is exact: `auto_merged` *and* `added`
+/// both empty ⇒ `NoChange`; either non-empty (a real local advance — a merged
+/// edit or a peer-only add) ⇒ `Applied`. This structural guarantee replaces
+/// the old `park_merge_is_no_op` tree-compare guard.
+///
+/// The badge ([`entries_with_parked_conflict`]) and the resolver's "theirs"
+/// ([`held_conflict_payload`]) both read the owner rows directly — no derived
+/// `held_conflicts` kv, no theirs-stash, no baseline refresh on this path.
+/// Keys-Mac saves the KDBX from the advanced projection on `Applied`.
 pub(crate) fn reconcile_with_disk_park_conflicts(
     engine: &mut Engine,
     kdbx_path: &Path,
     composite_key: &CompositeKey,
-    now: chrono::DateTime<chrono::Utc>,
+    _now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ParkConflictsResult, EngineError> {
-    // Steps 1–4: same prefix as `reconcile_with_disk`.
+    // Read / parse / unlock the disk kdbx and project the remote vault — the
+    // same prefix the eager-merge path used.
     let disk_bytes = std::fs::read(kdbx_path)?;
     let disk_kdbx = Kdbx::open_from_bytes(disk_bytes.clone())
         .map_err(|e| EngineError::Serialise(format!("open disk kdbx: {e}")))?
@@ -424,152 +474,36 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
         .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
         .map_err(|e| EngineError::Serialise(format!("unlock disk kdbx: {e}")))?;
 
-    let local_vault = engine.project_to_vault()?;
     let remote_vault = disk_kdbx
         .vault_with_unwrapped_protected()
         .map_err(|e| EngineError::Serialise(format!("unwrap disk protected: {e}")))?;
 
-    // Byte-equivalence short-circuit against the engine's last-saved
-    // baseline. See `reconcile_with_disk` for the rationale: byte
-    // equality of disk_bytes vs the agreed baseline IS content
-    // equality, because the engine only re-encrypts on a real state
-    // advance. No baseline (first-ever reconcile) → fall through and
-    // run the merge (which is a no-op on identical content anyway).
-    let baseline = engine.last_saved_kdbx_bytes()?;
-    if let Some(ref b) = baseline {
-        if b == &disk_bytes {
-            debug_dump_reconcile("park", &local_vault, &remote_vault, None, true, &disk_bytes);
-            engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-            return Ok(ParkConflictsResult::NoChange);
-        }
-    }
+    // Owner-rows ingest. The disk file is one peer (FILE_OWNER) on the 2-device
+    // path; `ingest_peer` advances local on auto-merge and writes owner rows on
+    // a held conflict, committing its own transaction.
+    let outcome = engine.ingest_peer(FILE_OWNER, &remote_vault)?;
 
-    let outcome = keepass_merge::merge(&local_vault, &remote_vault)
-        .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
-
-    debug_dump_reconcile(
-        "park",
-        &local_vault,
-        &remote_vault,
-        Some(&outcome),
-        false,
-        &disk_bytes,
-    );
-
-    // Same empty-merge short-circuit as `reconcile_with_disk` — see
-    // there for the ping-pong-loop rationale. `outcome_is_no_op` is true
-    // only when there are zero conflicts (it checks `entry_conflicts` /
-    // `delete_edit_conflicts`), so a held conflict could never reach
-    // here while still divergent — meaning the derived held set is now
-    // empty. Clear the badge cache to match (covers coincidental
-    // convergence: both sides independently landed on the same value).
-    if outcome_is_no_op(&outcome, &local_vault, &remote_vault) {
-        engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-        persist_held_set(engine, &[], &disk_bytes)?;
+    // Loop-safety discriminator: only an advanced local side (a non-empty
+    // `auto_merged` or `added`) is something to save. A held conflict advanced
+    // nothing → NoChange → no save → no re-push → the loop never starts. The
+    // badge reads the owner rows directly, so `conflicted` does NOT make this
+    // `Applied`.
+    if outcome.auto_merged.is_empty() && outcome.added.is_empty() {
         return Ok(ParkConflictsResult::NoChange);
     }
 
-    // Stats reflect the non-conflicting buckets. Conflict-bucket
-    // entries are NOT counted as "updated" — they're parked, leaving
-    // local's current state untouched (the additions live only in
-    // history).
     let stats = MergeStats {
-        entries_added: outcome.added_on_disk.len(),
-        entries_updated: outcome.disk_only_changes.len() + outcome.local_only_changes.len(),
-        entries_deleted: outcome.deleted_on_disk.len(),
-        entries_moved: 0,
-        groups_added: count_groups_remote_only(&local_vault, &remote_vault),
-        groups_updated: 0,
-        groups_deleted: count_groups_tombstoned(&local_vault, &remote_vault),
-        groups_moved: 0,
+        entries_added: outcome.added.len(),
+        entries_updated: outcome.auto_merged.len(),
+        ..Default::default()
     };
-
-    // Snapshot of local before apply — the loop-safety guard compares each
-    // held entry's merged form back against this to tell a genuine
-    // non-conflicting facet change (a unioned tag / attachment tombstone the
-    // apply folds onto a held entry) from a true no-op.
-    let local_before = local_vault.clone();
-    let mut merged = local_vault;
-    let report = keepass_merge::apply_merge_park_conflicts(
-        &mut merged,
-        &remote_vault,
-        &outcome,
-        &keepass_merge::ParkConflictsConfig::with_now(now),
-    )
-    .map_err(|e| EngineError::Serialise(format!("apply_merge_park_conflicts: {e}")))?;
-    keepass_merge::reconcile_timestamps(&mut merged, &remote_vault);
-
-    let held: Vec<uuid::Uuid> = report
-        .entries_with_parked_conflict
-        .iter()
-        .map(|id| id.0)
-        .collect();
-
-    // ── Held-conflict loop-safety guard (design §4.4) ──
-    //
-    // Hold-open keeps each side's own value, so a merge whose *only* effect
-    // is held conflicts changes nothing locally — re-merging it must write
-    // nothing, or sync loops forever (each save re-encrypts with a fresh
-    // nonce → the peer sees "new" bytes → merges → saves → …). But "held"
-    // is NOT "untouched": apply still folds the peer's non-conflicting facets
-    // (unioned tags, attachment tombstones) onto a held entry and LWW group
-    // metadata (rename/notes/icon) onto its group, and those are real changes
-    // we must persist or lose. `park_merge_is_no_op` therefore checks both the
-    // buckets AND the normalised merged-vs-local entry/group tree — see its
-    // docs. Adoption of a resolution record drops the entry from `held`, so the
-    // guard correctly falls through to `Applied`.
-    if park_merge_is_no_op(&outcome, &held, &stats, &local_before, &merged) {
-        engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-        // Pair the badge set with the peer snapshot so the resolver can
-        // rebuild "theirs" on demand — this is exactly the held-but-not-saved
-        // case where the vault file never carries the peer value.
-        persist_held_set(engine, &held, &disk_bytes)?;
-        return Ok(ParkConflictsResult::NoChange);
-    }
-
-    // Re-ingest the merged vault into SQLite via the same `ingest_merged`
-    // path the standard reconcile uses. The migration-0006
-    // entry_custom_data table plus the history JSON shape extension
-    // round-trip both `keys.history_tombstones.v1` (on the live entry)
-    // and `keys.field_conflict.v1` (on parked history records) so
-    // markers + tombstones survive the SQLite mirror.
-    let mut disk_kdbx = Kdbx::open_from_bytes(disk_bytes.clone())
-        .map_err(|e| EngineError::Serialise(format!("re-open disk kdbx: {e}")))?
-        .read_header()
-        .map_err(|e| EngineError::Serialise(format!("re-read disk header: {e}")))?
-        .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
-        .map_err(|e| EngineError::Serialise(format!("re-unlock disk kdbx: {e}")))?;
-    disk_kdbx.replace_vault(merged);
-    engine.ingest_merged(&disk_kdbx)?;
-
-    engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-
-    // Cache the derived held-conflict set for the badge (`held` computed
-    // above). This is the full current set (the apply walks every conflict),
-    // so it replaces the kv outright — entries that converged this round drop
-    // off, new ones appear. Set after `ingest_merged` for the same reason
-    // `last_saved_kdbx_bytes` is: the `held_conflicts` setting row is not a
-    // `meta.*` key so the re-ingest leaves it alone, but mirroring the
-    // ordering keeps the invariant obvious. Pairs the peer snapshot too (or
-    // drops it when nothing remains held) so the resolver can rebuild "theirs".
-    persist_held_set(engine, &held, &disk_bytes)?;
-
     let parked = ParkedConflictsSummary {
-        entries_with_parked_conflict: report
-            .entries_with_parked_conflict
+        entries_with_parked_conflict: outcome
+            .conflicted
             .iter()
-            .map(|id| id.0.to_string())
+            .map(uuid::Uuid::to_string)
             .collect(),
-        entries_restored_from_deletion: report
-            .entries_restored_from_deletion
-            .iter()
-            .map(|id| id.0.to_string())
-            .collect(),
-        attachments_kept_both: report
-            .attachments_kept_both
-            .iter()
-            .map(|id| id.0.to_string())
-            .collect(),
+        ..Default::default()
     };
 
     engine.emit(ChangeEvent::ExternalChangeMerged {
@@ -628,116 +562,36 @@ fn collect_group_ids(
 /// Return the UUIDs of every entry currently **held** in an unresolved
 /// sync conflict — the resolver badge set.
 ///
-/// Reads the locally-cached derived set from the `held_conflicts` setting
-/// kv ([`Engine::held_conflicts`]), which
-/// [`reconcile_with_disk_park_conflicts`] refreshes on every merge. This
-/// replaced the old scan of `entry_history.snapshot_json` for the
-/// `keys.field_conflict.v1` marker: under hold-open the divergence lives in
-/// current state, not on a history marker, so there is nothing in history to
-/// scan — the engine derives the set at merge time and caches it here.
+/// Reads the owner-rows store directly: any entry with at least one stored
+/// peer `conflict_*` row (`SELECT DISTINCT entry_uuid FROM conflict_entry`).
+/// This replaced the derived `held_conflicts` kv — the badge is now a plain
+/// query over the rows [`reconcile_with_disk_park_conflicts`] populates, so it
+/// can't flap or go stale, and it survives engine close + reopen for free.
 pub(crate) fn entries_with_parked_conflict(
     engine: &Engine,
 ) -> Result<Vec<uuid::Uuid>, EngineError> {
-    engine.held_conflicts()
+    conflict_rows::parked_conflict_uuids(engine.conn())
 }
 
-/// Dismiss the held-conflict badge on the named entry locally.
+/// Dismiss the held-conflict badge on the named entry locally by dropping its
+/// owner (`conflict_*`) rows across every peer.
 ///
-/// Under hold-open this is the **local** dismissal half: it drops
-/// `entry_uuid` from the derived held-conflict set
-/// ([`Engine::held_conflicts`]) so the badge clears immediately on this
-/// device. Cross-peer convergence is driven separately by the
+/// This is the **local** dismissal half of hold-open: clearing the rows drops
+/// the entry from the owner-rows badge query immediately on this device.
+/// Cross-peer convergence is driven separately by the
 /// `keys.conflict_resolutions.v1` record that
 /// [`crate::conflict_resolution::apply_conflict_resolution`] writes — merely
-/// clearing the badge here does not resolve the conflict on other peers.
+/// clearing the rows here does not resolve the conflict on other peers.
 ///
-/// It also performs **legacy cleanup**: if the entry still carries any
-/// pre-redesign [`FIELD_CONFLICT_CUSTOM_DATA_KEY`] history markers (from a
-/// vault last written by an older build), each is tombstoned via
-/// [`keepass_merge::add_history_tombstone`] (which drops the record from
-/// `<History>` and writes a `keys.history_tombstones.v1` tombstone) and the
-/// vault re-ingested. The redesign never writes these, so this is a no-op on
-/// fresh data.
+/// Idempotent: an entry with no stored conflict rows returns 0.
 ///
-/// Idempotent: clearing an entry that is neither held nor marked returns 0.
-/// Surfaces [`EngineError::NotFound`] if the entry doesn't exist.
-///
-/// Returns the number of facets cleared (legacy markers tombstoned, plus 1 if
-/// the entry was in the held set).
+/// Returns the number of `conflict_entry` rows removed.
 pub(crate) fn clear_parked_conflict_marker(
     engine: &mut Engine,
     entry_uuid: uuid::Uuid,
-    now: chrono::DateTime<chrono::Utc>,
+    _now: chrono::DateTime<chrono::Utc>,
 ) -> Result<u32, EngineError> {
-    let mut vault = engine.project_to_vault()?;
-    let id = EntryId(entry_uuid);
-
-    // Find the entry; if it doesn't exist, surface NotFound rather
-    // than silently succeeding — the caller asked about an entry we
-    // can't find.
-    let Some(entry) = find_entry_mut(&mut vault.root, id) else {
-        return Err(EngineError::NotFound { entity: "entry" });
-    };
-
-    // Legacy cleanup: collect every pre-redesign marker-bearing history
-    // record as owned clones — we need them out of the borrow before we can
-    // mutate the entry via `add_history_tombstone`. The clone is cheap
-    // (single Entry) and there are at most a handful per entry in practice.
-    // The redesign no longer writes markers, so this is empty on fresh data.
-    let marker_records: Vec<keepass_core::model::Entry> = entry
-        .history
-        .iter()
-        .filter(|h| {
-            h.custom_data
-                .iter()
-                .any(|cd| cd.key == FIELD_CONFLICT_CUSTOM_DATA_KEY)
-        })
-        .cloned()
-        .collect();
-    let legacy_cleared = u32::try_from(marker_records.len()).unwrap_or(u32::MAX);
-
-    if !marker_records.is_empty() {
-        // `add_history_tombstone` does the dual write: drops the matching
-        // record from `entry.history` AND adds the (mtime, hash) entry to
-        // the entry's `keys.history_tombstones.v1` list. Binaries are
-        // unused for the marker case (parked-remote snapshots clone
-        // attachment refs but the hash inputs include attachment bytes
-        // for cross-binary-pool stability — see entry_content_hash).
-        for record in &marker_records {
-            keepass_merge::add_history_tombstone(
-                entry,
-                record,
-                &vault.binaries,
-                keepass_merge::TombstoneReason::ConflictCleanup,
-                None,
-                now,
-            )
-            .map_err(|e| EngineError::Serialise(format!("add_history_tombstone: {e}")))?;
-        }
-
-        // Re-ingest the mutated vault directly. The KDBX envelope on
-        // disk hasn't changed (we haven't touched the file), so the
-        // `meta.*` outer-header rows already in SQLite remain accurate
-        // and `ingest_vault` skips re-persisting them.
-        engine.ingest_vault(&vault)?;
-        engine.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
-    }
-
-    // Primary action: drop the entry from the derived held-conflict badge
-    // set. `held_conflicts` is a plain `setting` row (not a `meta.*` key) so
-    // the re-ingest above leaves it intact; do the read-modify-write after.
-    let mut held = engine.held_conflicts()?;
-    let before = held.len();
-    held.retain(|u| *u != entry_uuid);
-    let removed = held.len() != before;
-    if removed {
-        engine.set_held_conflicts(&held)?;
-        if held.is_empty() {
-            engine.clear_held_conflict_remote_bytes()?;
-        }
-    }
-
-    Ok(legacy_cleared + u32::from(removed))
+    conflict_rows::drop_conflict_rows(engine.conn(), entry_uuid)
 }
 
 /// True when a merge outcome has no actual state change for the
@@ -761,123 +615,6 @@ fn outcome_is_no_op(outcome: &keepass_merge::MergeOutcome, local: &Vault, remote
         && outcome.delete_edit_conflicts.is_empty()
         && count_groups_remote_only(local, remote) == 0
         && count_groups_tombstoned(local, remote) == 0
-}
-
-/// Persist the held-conflict badge set AND its paired peer ("theirs")
-/// snapshot together, so the resolver can always rebuild a held conflict's
-/// remote side ([`Engine::held_conflict_remote_bytes`]) — hold-open never
-/// writes the peer value to the vault file, so without this the resolver has
-/// nothing to re-derive "theirs" from. When the set is empty the snapshot is
-/// dropped. `remote_bytes` is the bytes just merged in: the peer's on the iroh
-/// sync path, the changed file's on the file-drop path.
-fn persist_held_set(
-    engine: &mut Engine,
-    held: &[uuid::Uuid],
-    remote_bytes: &[u8],
-) -> Result<(), EngineError> {
-    engine.set_held_conflicts(held)?;
-    if held.is_empty() {
-        engine.clear_held_conflict_remote_bytes()
-    } else {
-        engine.set_held_conflict_remote_bytes(remote_bytes)
-    }
-}
-
-/// True when an `apply_merge_park_conflicts` run changes nothing we must
-/// persist — the loop-safety signal for hold-open. Unlike [`outcome_is_no_op`]
-/// it tolerates a non-empty `entry_conflicts`, because a held conflict keeps
-/// local's *conflicting* value. But "held" is not "untouched": apply still
-/// folds the peer's **non-conflicting** facets onto a held entry (tags and
-/// tag-state unioned, attachment tombstones that can even drop a local
-/// attachment) and applies last-writer-wins **group** metadata (rename, notes,
-/// icon) onto groups holding held entries. Those are real changes; skipping
-/// the ingest/save would silently and permanently lose them (the next
-/// reconcile byte-equiv short-circuits). So this is a two-part test:
-///
-/// 1. **Buckets** — every conflicting entry is *held* (not adopted via a
-///    resolution record) and no non-conflict / propagation bucket moved. The
-///    bucket check is load-bearing on its own for cases the tree compare can't
-///    see: e.g. `local_only_changes` / `local_deletions_pending_sync` leave
-///    `merged == local_before` yet still need a save to propagate to the peer.
-/// 2. **Tree unchanged** — the merged entry/group tree equals the pre-apply
-///    local tree under [`normalise_root_for_noop`], which clears `history` +
-///    `times` and sorts every order-insensitive collection. History + times
-///    are excluded deliberately: apply re-times history non-deterministically
-///    (KDBX second-resolution mtimes → flaky dedup) and hold-open does not
-///    persist cross-side history for a held conflict, so including them would
-///    reintroduce the re-save loop. The sort is load-bearing too: apply rewrites
-///    `custom_data` via retain+push (key moves to the end) while the `SQLite`
-///    projection loads it `ORDER BY key`, so a raw `Vec` compare would see a
-///    phantom reorder and loop. Every *real* difference (a unioned tag, an
-///    attachment tombstone, a group rename) is still caught.
-///
-/// Vault `meta` is never compared (mirroring [`outcome_is_no_op`], which also
-/// ignores it), so the phantom custom-icon-pool union and projection settings
-/// flags can't be misread as a real change.
-fn park_merge_is_no_op(
-    outcome: &keepass_merge::MergeOutcome,
-    held: &[uuid::Uuid],
-    stats: &MergeStats,
-    local_before: &Vault,
-    merged: &Vault,
-) -> bool {
-    let held_set: std::collections::HashSet<uuid::Uuid> = held.iter().copied().collect();
-    let buckets_clean = outcome
-        .entry_conflicts
-        .iter()
-        .all(|c| held_set.contains(&c.entry_id.0))
-        && outcome.delete_edit_conflicts.is_empty()
-        && outcome.added_on_disk.is_empty()
-        && outcome.disk_only_changes.is_empty()
-        && outcome.local_only_changes.is_empty()
-        && outcome.deleted_on_disk.is_empty()
-        && outcome.local_deletions_pending_sync.is_empty()
-        && outcome.group_conflicts.is_empty()
-        && stats.groups_added == 0
-        && stats.groups_deleted == 0;
-    if !buckets_clean {
-        return false;
-    }
-
-    // Buckets clean ⇒ the only entries/groups that can differ between
-    // `local_before` and `merged` are the held entries (apply folded a facet)
-    // and groups whose LWW metadata apply took. Compare the whole normalised
-    // tree: non-held, non-changed nodes are identical so they never trip it.
-    let mut local_root = local_before.root.clone();
-    let mut merged_root = merged.root.clone();
-    normalise_root_for_noop(&mut local_root);
-    normalise_root_for_noop(&mut merged_root);
-    local_root == merged_root
-}
-
-/// Canonicalise a group subtree for the [`park_merge_is_no_op`] tree compare:
-/// drop the facets apply mutates non-meaningfully (`history`, all `times`) and
-/// sort every order-insensitive collection so an apply-vs-projection ordering
-/// difference can't masquerade as a real change. `unknown_xml` is left as-is
-/// (position may be meaningful and apply doesn't reorder it on a held node).
-/// Sorting can only ever hide a pure reorder — an add/remove still changes the
-/// set — so it is safe in the data-loss direction.
-fn normalise_root_for_noop(group: &mut Group) {
-    group.times = Timestamps::default();
-    group.custom_data.sort_by(|a, b| a.key.cmp(&b.key));
-    for entry in &mut group.entries {
-        normalise_entry_for_noop(entry);
-    }
-    group.entries.sort_by_key(|e| e.id.0);
-    for child in &mut group.groups {
-        normalise_root_for_noop(child);
-    }
-    group.groups.sort_by_key(|g| g.id.0);
-}
-
-/// Per-entry half of [`normalise_root_for_noop`].
-fn normalise_entry_for_noop(entry: &mut Entry) {
-    entry.history = Vec::new();
-    entry.times = Timestamps::default();
-    entry.tags.sort();
-    entry.custom_data.sort_by(|a, b| a.key.cmp(&b.key));
-    entry.custom_fields.sort_by(|a, b| a.key.cmp(&b.key));
-    entry.attachments.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,126 +879,4 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
-}
-
-/// Walk the group tree looking for the live entry with `id`. Returns
-/// the mutable borrow on first match. Mirrors the same helper in
-/// `keepass-merge::auto`; kept private here to avoid a public re-
-/// export from a sibling crate.
-fn find_entry_mut(
-    group: &mut keepass_core::model::Group,
-    id: EntryId,
-) -> Option<&mut keepass_core::model::Entry> {
-    if let Some(idx) = group.entries.iter().position(|e| e.id == id) {
-        return Some(&mut group.entries[idx]);
-    }
-    for sub in &mut group.groups {
-        if let Some(e) = find_entry_mut(sub, id) {
-            return Some(e);
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod noop_compare_tests {
-    //! Unit coverage for the [`park_merge_is_no_op`] tree normalisation —
-    //! the loop-safety / data-loss invariants the adversarial review surfaced.
-    use super::{normalise_entry_for_noop, normalise_root_for_noop};
-    use keepass_core::model::{CustomDataItem, Entry, EntryId, Group, GroupId};
-
-    fn cd(key: &str) -> CustomDataItem {
-        CustomDataItem::new(key.to_string(), "v".to_string(), None)
-    }
-
-    /// Blocker 2: apply rewrites `custom_data` via retain+push (the touched key
-    /// moves to the end) while the `SQLite` projection loads it `ORDER BY key`. A
-    /// raw `Vec` compare would read that reorder as a change → false `Applied`
-    /// → never converges (projection re-sorts, apply re-reorders) → sync loop.
-    /// Normalisation must make the compare order-insensitive.
-    #[test]
-    fn custom_data_reorder_is_not_a_change() {
-        let id = EntryId(uuid::Uuid::new_v4());
-        let mut sorted = Entry::empty(id);
-        sorted.custom_data = vec![cd("keys.attachment_tombstones.v1"), cd("keys.tag_state.v1")];
-        let mut reordered = Entry::empty(id);
-        reordered.custom_data = vec![cd("keys.tag_state.v1"), cd("keys.attachment_tombstones.v1")];
-        normalise_entry_for_noop(&mut sorted);
-        normalise_entry_for_noop(&mut reordered);
-        assert_eq!(
-            sorted, reordered,
-            "custom_data order must not count as a change"
-        );
-    }
-
-    /// ...but a genuine `custom_data` set difference is still caught.
-    #[test]
-    fn custom_data_real_change_is_caught() {
-        let id = EntryId(uuid::Uuid::new_v4());
-        let mut a = Entry::empty(id);
-        a.custom_data = vec![cd("keys.tag_state.v1")];
-        let mut b = Entry::empty(id);
-        b.custom_data = vec![cd("keys.tag_state.v1"), cd("keys.attachment_tombstones.v1")];
-        normalise_entry_for_noop(&mut a);
-        normalise_entry_for_noop(&mut b);
-        assert_ne!(a, b, "a real custom_data difference must be caught");
-    }
-
-    /// Tag order is irrelevant (set semantics); a new tag is a real change.
-    #[test]
-    fn tag_reorder_is_not_a_change_but_a_new_tag_is() {
-        let id = EntryId(uuid::Uuid::new_v4());
-        let mut a = Entry::empty(id);
-        a.tags = vec!["b".into(), "a".into()];
-        let mut b = Entry::empty(id);
-        b.tags = vec!["a".into(), "b".into()];
-        normalise_entry_for_noop(&mut a);
-        normalise_entry_for_noop(&mut b);
-        assert_eq!(a, b, "tag order must not count as a change");
-
-        let mut c = Entry::empty(id);
-        c.tags = vec!["a".into(), "b".into(), "c".into()];
-        normalise_entry_for_noop(&mut c);
-        assert_ne!(a, c, "a new tag must be caught");
-    }
-
-    /// History + times differences are excluded (apply re-times them
-    /// non-deterministically; including them would loop).
-    #[test]
-    fn history_and_times_diffs_are_excluded() {
-        let id = EntryId(uuid::Uuid::new_v4());
-        let mut a = Entry::empty(id);
-        let mut b = Entry::empty(id);
-        b.times.last_modification_time = Some(chrono::Utc::now());
-        b.history.push(Entry::empty(EntryId(uuid::Uuid::new_v4())));
-        normalise_entry_for_noop(&mut a);
-        normalise_entry_for_noop(&mut b);
-        assert_eq!(a, b, "history/times diffs must not count as a change");
-    }
-
-    /// Blocker 1: a group rename (LWW metadata apply folds in) must count even
-    /// when nothing else moved...
-    #[test]
-    fn group_rename_is_a_change() {
-        let id = GroupId(uuid::Uuid::new_v4());
-        let mut a = Group::empty(id);
-        a.name = "before".into();
-        let mut b = Group::empty(id);
-        b.name = "after".into();
-        normalise_root_for_noop(&mut a);
-        normalise_root_for_noop(&mut b);
-        assert_ne!(a, b, "a group rename must be caught");
-    }
-
-    /// ...but a pure group-`times` bump must not (avoids a phantom save).
-    #[test]
-    fn group_time_only_diff_is_not_a_change() {
-        let id = GroupId(uuid::Uuid::new_v4());
-        let mut a = Group::empty(id);
-        let mut b = Group::empty(id);
-        b.times.last_modification_time = Some(chrono::Utc::now());
-        normalise_root_for_noop(&mut a);
-        normalise_root_for_noop(&mut b);
-        assert_eq!(a, b, "a pure group-times bump must not count as a change");
-    }
 }
