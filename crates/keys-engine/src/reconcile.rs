@@ -465,6 +465,30 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     composite_key: &CompositeKey,
     _now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ParkConflictsResult, EngineError> {
+    // The disk file is one peer under the FILE_OWNER sentinel — the
+    // file-watcher / Syncthing / external-client path.
+    ingest_kdbx_as_owner(engine, kdbx_path, composite_key, FILE_OWNER)
+}
+
+/// Per-device-key sync transport: ingest a fetched peer KDBX blob under the
+/// peer's own device-id `owner`, so 3+ peers' divergences land in distinct
+/// owner rows (vs the single `FILE_OWNER` used for the disk-watcher path). Same
+/// owner-rows engine; the owner string is the only difference.
+pub(crate) fn ingest_peer_from_kdbx(
+    engine: &mut Engine,
+    kdbx_path: &Path,
+    composite_key: &CompositeKey,
+    owner: &str,
+) -> Result<ParkConflictsResult, EngineError> {
+    ingest_kdbx_as_owner(engine, kdbx_path, composite_key, owner)
+}
+
+fn ingest_kdbx_as_owner(
+    engine: &mut Engine,
+    kdbx_path: &Path,
+    composite_key: &CompositeKey,
+    owner: &str,
+) -> Result<ParkConflictsResult, EngineError> {
     // Read / parse / unlock the disk kdbx and project the remote vault — the
     // same prefix the eager-merge path used.
     let disk_bytes = std::fs::read(kdbx_path)?;
@@ -479,10 +503,11 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
         .vault_with_unwrapped_protected()
         .map_err(|e| EngineError::Serialise(format!("unwrap disk protected: {e}")))?;
 
-    // Owner-rows ingest. The disk file is one peer (FILE_OWNER) on the 2-device
-    // path; `ingest_peer` advances local on auto-merge and writes owner rows on
-    // a held conflict, committing its own transaction.
-    let outcome = engine.ingest_peer(FILE_OWNER, &remote_vault)?;
+    // Owner-rows ingest under `owner` (FILE_OWNER for the disk path, the peer's
+    // device id for the per-device-key transport). `ingest_peer` advances local
+    // on auto-merge and writes owner rows on a held conflict, committing its
+    // own transaction.
+    let outcome = engine.ingest_peer(owner, &remote_vault)?;
 
     // Loop-safety discriminator: only an advanced local side (a non-empty
     // `auto_merged`, `added`, or `deleted`) is something to save. A held

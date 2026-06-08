@@ -907,6 +907,30 @@ impl Engine {
         })
     }
 
+    /// Per-device-key sync transport: ingest a fetched peer KDBX blob (written
+    /// to a temp path) under the peer's `owner_id` (its device id), so multi-
+    /// peer divergences land in distinct owner rows. Sibling of
+    /// [`Self::reconcile_with_disk_park_conflicts`], which uses the FILE_OWNER
+    /// sentinel for the disk-watcher path.
+    pub async fn ingest_peer_kdbx(
+        &self,
+        owner_id: String,
+        kdbx_path: String,
+        password: String,
+    ) -> Result<ParkConflictsResultFfi, EngineError> {
+        let path = PathBuf::from(kdbx_path);
+        let pw = SecretString::from(password);
+        let composite = tokio::task::spawn_blocking(move || {
+            CompositeKey::from_password(pw.expose_secret().as_bytes())
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))?;
+        self.with_engine_mut(|e| {
+            Ok(e.ingest_peer_from_kdbx(&path, &composite, &owner_id)?
+                .into())
+        })
+    }
+
     /// Build the rich conflict payload for the currently **held** (parked)
     /// conflicts and stash a context so they can be resolved through the same
     /// [`Self::apply_conflict_resolution`] entry point the live

@@ -806,6 +806,25 @@ impl Engine {
         reconcile::reconcile_with_disk_park_conflicts(self, kdbx_path, composite_key, now)
     }
 
+    /// Per-device-key sync transport: ingest a fetched peer KDBX blob under the
+    /// peer's `owner` device id (vs the `FILE_OWNER` sentinel that
+    /// [`Self::reconcile_with_disk_park_conflicts`] uses for the disk-watcher
+    /// path). Distinct owners → distinct conflict rows → multi-peer `N`-way
+    /// resolution. Same park-conflicts owner-rows engine underneath.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`Self::reconcile_with_disk_park_conflicts`]: IO, KDBX
+    /// open/parse/unlock, and ingest errors.
+    pub fn ingest_peer_from_kdbx(
+        &mut self,
+        kdbx_path: &Path,
+        composite_key: &CompositeKey,
+        owner: &str,
+    ) -> Result<ParkConflictsResult, EngineError> {
+        reconcile::ingest_peer_from_kdbx(self, kdbx_path, composite_key, owner)
+    }
+
     /// Build the rich conflict payload for the currently **held** (parked)
     /// conflicts and stash a context so they can be resolved through the same
     /// [`Self::apply_conflict_resolution`] entry point the live
