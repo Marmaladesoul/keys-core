@@ -924,7 +924,13 @@ pub(crate) fn ingest_peer(
             peer_entry,
             &local.binaries,
             &peer.binaries,
-            Granularity::Item,
+            // Field granularity: non-overlapping edits (different fields on each
+            // side) auto-merge instead of parking the whole entry; only a
+            // same-field clash is a held conflict. (Was Item — park any
+            // divergence — the conservative choice while the sync transport was
+            // unproven. Flip back to Granularity::Item if field auto-merge
+            // misbehaves.)
+            Granularity::Field,
         ) {
             Classification::InSync => {
                 clear_conflict_rows(&tx, owner, &uuid_str)?;
@@ -1667,17 +1673,24 @@ mod ingest_peer_tests {
     }
 
     #[test]
-    fn item_granularity_different_fields_conflicts() {
+    fn field_granularity_different_fields_auto_merge() {
         let id = Uuid::new_v4();
         // Local changed Title, peer changed Password — disjoint fields. Under
-        // item granularity (what ingest uses) this is a conflict, where
-        // field-level would have silently merged.
+        // field granularity (what ingest now uses) these non-overlapping edits
+        // auto-merge into one combined entry; no conflict is parked. (Item
+        // granularity, the prior choice, would have parked the whole entry.)
         let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T-MINE", "p0"))]);
         let peer = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "p-PEER"))]);
         let (conn, outcome) = run(&local, "peerB", &peer);
-        assert_eq!(outcome.conflicted, vec![id]);
-        assert!(outcome.auto_merged.is_empty());
-        assert_eq!(conflict_rows_for(&conn, id), 1);
+        assert_eq!(outcome.auto_merged, vec![id]);
+        assert!(
+            outcome.conflicted.is_empty(),
+            "disjoint-field edits auto-merge, no conflict parked"
+        );
+        assert_eq!(conflict_rows_for(&conn, id), 0);
+        // Local advanced to the combined entry — local's title edit survives
+        // (peer's password edit rides in too, from the LCA-unchanged side).
+        assert_eq!(local_title(&conn, id), "T-MINE");
     }
 
     #[test]
