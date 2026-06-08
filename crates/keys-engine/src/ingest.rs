@@ -950,24 +950,34 @@ pub(crate) fn ingest_peer(
             }
             Classification::Conflict { conflict } => {
                 // Cross-peer resolution adoption (Phase 5a) before hold-open.
+                // A resolution record is keyed by entry uuid, not by the resolved
+                // values, so it must only settle the *one* divergence it was made
+                // for. An edit on either side *after* the relevant `resolved_at`
+                // is fresh intent that re-opens the conflict (design §5.3):
+                //   - local edit after the PEER resolved  → don't adopt theirs;
+                //   - peer  edit after WE   resolved      → don't suppress ours.
+                // Missing the second guard let a stale local record permanently
+                // mute every future conflict on that entry — and asymmetrically,
+                // since only the resolver's vault carries the record (it no-ops
+                // while the peer parks). Soak bug: a re-edited, previously-resolved
+                // entry surfaced a conflict on one side only.
                 let peer_resolved_at = peer_resolved.get(&uuid).copied();
-                let local_resolved_this = local_resolved.contains_key(&uuid);
-                // Supersession: a local edit *after* the peer's resolution is a
-                // fresh local intent that re-opens the conflict (design §5.3).
-                let local_supersedes_peer =
-                    match (peer_resolved_at, local_entry.times.last_modification_time) {
-                        (Some(resolved_at), Some(local_mtime)) => local_mtime > resolved_at,
-                        _ => false,
-                    };
+                let local_resolved_at = local_resolved.get(&uuid).copied();
+                let local_mtime = local_entry.times.last_modification_time;
+                let peer_mtime = peer_entry.times.last_modification_time;
+                let local_supersedes_peer = edited_after(local_mtime, peer_resolved_at);
+                let peer_edited_since_local_res = edited_after(peer_mtime, local_resolved_at);
+                let local_resolution_holds =
+                    local_resolved_at.is_some() && !peer_edited_since_local_res;
 
                 clear_conflict_rows(&tx, owner, &uuid_str)?;
-                if local_resolved_this {
-                    // We already resolved this entry locally → keep our value and
-                    // leave the badge clear; the peer adopts our synced
-                    // resolution record on its pull. Re-holding here would
-                    // re-badge a conflict we already settled (the bug that made
-                    // resolve-on-one fail to clear-on-all). Local unchanged → no
-                    // save.
+                if local_resolution_holds {
+                    // We resolved this exact conflict and the peer hasn't edited
+                    // since → keep our value and leave the badge clear; the peer
+                    // adopts our synced resolution record on its pull. Re-holding
+                    // here would re-badge a conflict we already settled (the bug
+                    // that made resolve-on-one fail to clear-on-all). Local
+                    // unchanged → no save.
                 } else if peer_resolved_at.is_some() && !local_supersedes_peer {
                     // The peer resolved this entry and we haven't (and our copy
                     // isn't a newer edit) → adopt the peer's chosen value:
@@ -1115,6 +1125,13 @@ fn resolution_times(
             .or_insert(record.resolved_at);
     }
     out
+}
+
+/// Was `mtime` recorded strictly after `resolved_at`? `false` when either is
+/// absent — supersession (an edit re-opening a resolved conflict) requires a
+/// known, strictly-later edit; a missing timestamp is never treated as fresher.
+fn edited_after(mtime: Option<DateTime<Utc>>, resolved_at: Option<DateTime<Utc>>) -> bool {
+    matches!((mtime, resolved_at), (Some(m), Some(r)) if m > r)
 }
 
 /// Does the local mirror already hold the group `group_id`?
@@ -1911,6 +1928,61 @@ mod ingest_peer_tests {
             "T-MINE",
             "local keeps its chosen value"
         );
+    }
+
+    #[test]
+    fn stale_local_resolution_reopens_on_fresh_peer_edit() {
+        let id = Uuid::new_v4();
+        // We resolved Title at t=2000. THEN the peer made a *fresh* edit
+        // (mtime 3000) producing a new divergence the old record never covered.
+        // The stale resolution must NOT suppress it — a genuine new conflict is
+        // parked. Regression: a once-resolved entry permanently muted every
+        // future conflict, and only on the resolver's side (the other peer,
+        // lacking the record, parked) — the soak asymmetry on re-edited entries.
+        let local = with_resolution(
+            vault_of(vec![forked(id, ("T", "p0"), 1000, ("T-MINE", "p0"))]),
+            id,
+            "Title",
+            2000,
+        );
+        let mut peer_entry = forked(id, ("T", "p0"), 1000, ("T-THEIRS-NEW", "p0"));
+        peer_entry.times = ts(3000); // peer edited AFTER our resolution
+        let peer = vault_of(vec![peer_entry]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(
+            outcome.conflicted,
+            vec![id],
+            "fresh peer edit after our resolution re-opens the conflict"
+        );
+        assert!(
+            outcome.auto_merged.is_empty(),
+            "re-opened conflict holds open, no silent adopt"
+        );
+        assert_eq!(conflict_rows_for(&conn, id), 1);
+    }
+
+    #[test]
+    fn local_resolution_still_holds_when_peer_edit_predates_it() {
+        let id = Uuid::new_v4();
+        // Boundary: the peer's diverging value predates our resolution (mtime
+        // 1500 < resolved 2000) — it's the conflict we already settled, not a
+        // fresh one. Must still suppress (resolve-on-one stays cleared-on-all).
+        let local = with_resolution(
+            vault_of(vec![forked(id, ("T", "p0"), 1000, ("T-MINE", "p0"))]),
+            id,
+            "Title",
+            2000,
+        );
+        let mut peer_entry = forked(id, ("T", "p0"), 1000, ("T-THEIRS", "p0"));
+        peer_entry.times = ts(1500); // peer's value predates our resolution
+        let peer = vault_of(vec![peer_entry]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert!(
+            outcome.conflicted.is_empty(),
+            "pre-resolution peer value is the settled conflict → no re-hold"
+        );
+        assert_eq!(conflict_rows_for(&conn, id), 0, "badge stays clear");
+        assert_eq!(local_title(&conn, id), "T-MINE", "local keeps its value");
     }
 
     // ── Phase 5b: cross-peer deletes / tombstones ──────────────────────────
