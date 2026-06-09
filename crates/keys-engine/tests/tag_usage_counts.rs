@@ -11,7 +11,9 @@ use std::sync::Arc;
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
-use keys_engine::{DbKey, Engine, IconRef, KeyProvider, KeyProviderError, NewEntryFields};
+use keys_engine::{
+    DbKey, Engine, IconRef, KeyProvider, KeyProviderError, NewEntryFields, NewGroupFields,
+};
 use secrecy::SecretString;
 use uuid::Uuid;
 
@@ -124,9 +126,23 @@ fn recycled_entries_count_toward_totals() {
     // referenced only by a recycled entry should still surface with
     // count 1.
     let (mut engine, root, _dir) = engine_with_empty_vault();
-    // Enable recycle bin so `recycle_entry` soft-deletes rather than
-    // permanently deletes.
-    engine.set_recycle_bin(true, None).expect("set_recycle_bin");
+    // Designate a real bin group so `recycle_entry` soft-deletes (moves into
+    // the bin) rather than permanently deleting. Enabling without a bin group
+    // (`set_recycle_bin(true, None)`) leaves no bin to move into, so a recycle
+    // would hard-delete + tombstone (KeePass "no bin = permanent delete").
+    let bin = engine
+        .create_group(
+            root,
+            NewGroupFields {
+                name: "Recycle Bin".into(),
+                notes: String::new(),
+                icon: IconRef::Builtin(43),
+            },
+        )
+        .expect("create bin");
+    engine
+        .set_recycle_bin(true, Some(bin))
+        .expect("set_recycle_bin");
 
     let live = engine
         .create_entry(root, new_entry("live", vec!["shared".into()]))

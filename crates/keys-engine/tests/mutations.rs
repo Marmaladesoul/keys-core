@@ -242,6 +242,20 @@ fn update_entry_unknown_returns_not_found() {
 #[test]
 fn recycle_then_restore_round_trip() {
     let (mut engine, root, _dir) = engine_with_empty_vault();
+    // The soft-delete path needs a bin group to move into. Without a bin a
+    // "recycle" is a permanent delete (see
+    // `recycle_entry_without_bin_hard_deletes_and_tombstones`).
+    let bin = engine
+        .create_group(
+            root,
+            NewGroupFields {
+                name: "Recycle Bin".into(),
+                notes: String::new(),
+                icon: IconRef::Builtin(43),
+            },
+        )
+        .expect("create bin");
+    engine.set_recycle_bin(true, Some(bin)).expect("set bin");
     let uuid = engine
         .create_entry(root, new_entry("x", "p"))
         .expect("create");
@@ -249,6 +263,38 @@ fn recycle_then_restore_round_trip() {
     assert!(engine.entry(uuid).unwrap().unwrap().is_recycled);
     engine.restore_entry(uuid).expect("restore");
     assert!(!engine.entry(uuid).unwrap().unwrap().is_recycled);
+}
+
+#[test]
+fn recycle_entry_without_bin_hard_deletes_and_tombstones() {
+    // With no recycle bin configured, a "recycle" is a permanent delete: the
+    // entry is removed and a tombstone recorded so the removal persists to the
+    // file and propagates cross-peer (Phase 5b) — rather than stranding behind
+    // an unsyncable `is_recycled` flag with no KDBX home.
+    let (mut engine, root, dir) = engine_with_empty_vault();
+    let uuid = engine
+        .create_entry(root, new_entry("x", "p"))
+        .expect("create");
+    let path = dir.path().join("keys.db");
+
+    engine
+        .recycle_entry(uuid)
+        .expect("recycle (no bin → hard delete)");
+    assert!(
+        engine.entry(uuid).unwrap().is_none(),
+        "entry hard-deleted when there is no bin"
+    );
+    engine.close().expect("close");
+
+    let raw = raw_open(&path);
+    let tomb_ct: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM meta_deleted_object WHERE uuid = ?1",
+            params![uuid.to_string()],
+            |r| r.get(0),
+        )
+        .expect("count tombstones");
+    assert_eq!(tomb_ct, 1, "no-bin recycle recorded a tombstone");
 }
 
 #[test]

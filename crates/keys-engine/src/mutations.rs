@@ -929,18 +929,23 @@ pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
     if !entry_exists(&tx, &uuid_str)? {
         return Err(EngineError::NotFound { entity: "entry" });
     }
-    let now = now_ms();
     if let Some(bin) = recycle_bin_uuid(&tx)? {
         tx.execute(
             "UPDATE entry SET is_recycled = 1, group_uuid = ?1, modified_at = ?2 \
              WHERE uuid = ?3",
-            params![bin, now, uuid_str],
+            params![bin, now_ms(), uuid_str],
         )?;
     } else {
-        tx.execute(
-            "UPDATE entry SET is_recycled = 1, modified_at = ?1 WHERE uuid = ?2",
-            params![now, uuid_str],
-        )?;
+        // No recycle bin configured (RecycleBinEnabled = false, or no bin
+        // group). KeePass semantics make a delete here *permanent*. A soft
+        // `is_recycled` flag has no KDBX representation without a bin group, so
+        // it would neither persist to the file nor sync nor be emptyable — the
+        // entry would strand (deleted in the UI, untouched on disk + on peers).
+        // Hard-delete + tombstone instead, so the removal persists and
+        // propagates to peers (Phase 5b). Child rows cascade on entry delete.
+        tx.execute("DELETE FROM entry WHERE uuid = ?1", params![uuid_str])?;
+        gc_orphan_tags(&tx)?;
+        record_tombstone(&tx, &uuid_str)?;
     }
     tx.commit()?;
     Ok(())
