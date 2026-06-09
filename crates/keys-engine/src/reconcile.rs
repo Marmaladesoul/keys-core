@@ -355,8 +355,22 @@ pub(crate) fn held_conflict_payload(
     engine: &mut Engine,
     _kdbx_path: &Path,
     _composite_key: &CompositeKey,
+    entry_filter: Option<uuid::Uuid>,
 ) -> Result<Option<ConflictPayload>, EngineError> {
-    let parked = conflict_rows::parked_conflict_uuids(engine.conn())?;
+    let mut parked = conflict_rows::parked_conflict_uuids(engine.conn())?;
+    if parked.is_empty() {
+        return Ok(None);
+    }
+    // One conflict per resolution session — the resolver is one-entry-at-a-time.
+    // The apply validates a session atomically, so a multi-entry session rejects
+    // a single-entry resolution (the badge-never-clears soak bug). Scope to the
+    // requested entry, else the first held (uuid-sorted for a deterministic
+    // pick); resolving it drops only its rows, leaving the rest held.
+    parked.sort();
+    match entry_filter {
+        Some(filter) => parked.retain(|u| *u == filter),
+        None => parked.truncate(1),
+    }
     if parked.is_empty() {
         return Ok(None);
     }

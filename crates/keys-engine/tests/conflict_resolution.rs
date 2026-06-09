@@ -277,7 +277,7 @@ fn held_conflict_payload_enables_parked_resolution() {
     // Resolver-open: rebuild the rich payload + stash on demand.
     let payload = f
         .engine
-        .held_conflict_payload(&f.kdbx_path, &composite())
+        .held_conflict_payload(&f.kdbx_path, &composite(), None)
         .expect("derive")
         .expect("a held conflict is present");
     assert_eq!(payload.entry_conflicts.len(), 1, "one held entry surfaced");
@@ -302,6 +302,96 @@ fn held_conflict_payload_enables_parked_resolution() {
             .expect("badge")
             .is_empty(),
         "badge cleared after parked resolution",
+    );
+}
+
+/// Multiple entries held at once: the resolution session must scope to **one**
+/// entry, so resolving it clears just that entry and leaves the rest held.
+/// Regression for the soak bug where the per-entry resolver submitted a
+/// one-entry resolution against an all-entries session → `apply` rejected the
+/// whole thing ("no resolution provided for conflict on entry …") and the badge
+/// never cleared.
+#[test]
+fn held_payload_scopes_to_one_entry_and_resolving_leaves_the_rest() {
+    use keepass_core::model::NewEntry;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let id1 = kdbx
+        .add_entry(root, NewEntry::new("one"))
+        .expect("seed e1")
+        .0;
+    let id2 = kdbx
+        .add_entry(root, NewEntry::new("two"))
+        .expect("seed e2")
+        .0;
+    let mut engine =
+        Engine::open(&db_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open engine");
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("initial save");
+    engine
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_path))
+        .expect("re-ingest");
+
+    // Diverge BOTH entries: local Title edit + a different disk Title edit.
+    for (id, local) in [(id1, "one-mine"), (id2, "two-mine")] {
+        engine
+            .update_entry(
+                id,
+                keys_engine::EntryUpdate {
+                    title: Some(local.into()),
+                    ..Default::default()
+                },
+            )
+            .expect("local edit");
+    }
+    let mut external = reopen_kdbx(&kdbx_path);
+    external
+        .edit_entry(EntryId(id1), HistoryPolicy::Snapshot, |e| {
+            e.set_title("one-disk");
+        })
+        .expect("disk edit 1");
+    external
+        .edit_entry(EntryId(id2), HistoryPolicy::Snapshot, |e| {
+            e.set_title("two-disk");
+        })
+        .expect("disk edit 2");
+    std::fs::write(&kdbx_path, external.save_to_bytes().expect("save")).expect("write");
+
+    engine
+        .reconcile_with_disk_park_conflicts(&kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park");
+    let mut held = engine.entries_with_parked_conflict().expect("badge");
+    held.sort();
+    let mut both = vec![id1, id2];
+    both.sort();
+    assert_eq!(held, both, "both entries are held");
+
+    // The session scopes to the requested entry only.
+    let payload = engine
+        .held_conflict_payload(&kdbx_path, &composite(), Some(id1))
+        .expect("derive")
+        .expect("a held conflict is present");
+    assert_eq!(
+        payload.entry_conflicts.len(),
+        1,
+        "session scoped to a single entry"
+    );
+    assert_eq!(payload.entry_conflicts[0].entry_id.0, id1);
+
+    // Resolving it clears id1 and leaves id2 held — the per-entry fix.
+    engine
+        .apply_conflict_resolution(payload.id, &title_resolution(id1, ConflictSide::Local))
+        .expect("apply");
+    assert_eq!(
+        engine.entries_with_parked_conflict().expect("badge"),
+        vec![id2],
+        "only the unresolved entry remains held",
     );
 }
 
@@ -357,7 +447,7 @@ fn held_conflict_payload_rebuilds_from_stash_when_disk_lacks_peer() {
 
     let payload = f
         .engine
-        .held_conflict_payload(&bogus, &composite())
+        .held_conflict_payload(&bogus, &composite(), None)
         .expect("derive from stash, not disk")
         .expect("held conflict present despite no peer value on disk");
     assert_eq!(payload.entry_conflicts.len(), 1, "one held entry surfaced");

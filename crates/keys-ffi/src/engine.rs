@@ -949,17 +949,27 @@ impl Engine {
         &self,
         kdbx_path: String,
         password: String,
+        entry_uuid: Option<String>,
     ) -> Result<Option<ConflictPayloadFfi>, EngineError> {
         let path = PathBuf::from(kdbx_path);
         let pw = SecretString::from(password);
+        // Scope the resolution session to one entry (one-at-a-time resolver):
+        // `None` lets the engine pick the first held entry. See
+        // `keys_engine::Engine::held_conflict_payload`.
+        let entry_filter = entry_uuid
+            .as_deref()
+            .map(|u| parse_uuid(u, "entry"))
+            .transpose()?;
         let composite = tokio::task::spawn_blocking(move || {
             CompositeKey::from_password(pw.expose_secret().as_bytes())
         })
         .await
         .map_err(|e| EngineError::Internal(format!("join: {e}")))?;
-        self.with_engine_mut(|e| match e.held_conflict_payload(&path, &composite)? {
-            Some(payload) => Ok(build_conflict_payload_ffi(e, payload.id)),
-            None => Ok(None),
+        self.with_engine_mut(|e| {
+            match e.held_conflict_payload(&path, &composite, entry_filter)? {
+                Some(payload) => Ok(build_conflict_payload_ffi(e, payload.id)),
+                None => Ok(None),
+            }
         })
     }
 

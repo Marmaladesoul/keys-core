@@ -851,8 +851,9 @@ impl Engine {
         &mut self,
         kdbx_path: &Path,
         composite_key: &CompositeKey,
+        entry_filter: Option<uuid::Uuid>,
     ) -> Result<Option<ConflictPayload>, EngineError> {
-        reconcile::held_conflict_payload(self, kdbx_path, composite_key)
+        reconcile::held_conflict_payload(self, kdbx_path, composite_key, entry_filter)
     }
 
     /// Return the UUIDs of every entry that currently carries at least one
