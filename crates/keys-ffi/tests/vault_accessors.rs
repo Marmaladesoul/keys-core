@@ -304,29 +304,35 @@ fn move_group_to_position_within_same_parent_reorders() {
         .expect("root")
         .uuid;
 
-    // Three siblings under root, in order [a, b, c].
+    // Reorder under a dedicated parent — root now also holds the
+    // eagerly-created Recycle Bin group, so it isn't a clean [a, b, c].
+    let parent = vault
+        .create_group("P".to_owned(), Some(root_uuid.clone()))
+        .expect("parent");
+
+    // Three siblings under `parent`, in order [a, b, c].
     let a = vault
-        .create_group("a".to_owned(), Some(root_uuid.clone()))
+        .create_group("a".to_owned(), Some(parent.clone()))
         .expect("a");
     let b = vault
-        .create_group("b".to_owned(), Some(root_uuid.clone()))
+        .create_group("b".to_owned(), Some(parent.clone()))
         .expect("b");
     let c = vault
-        .create_group("c".to_owned(), Some(root_uuid.clone()))
+        .create_group("c".to_owned(), Some(parent.clone()))
         .expect("c");
 
     assert_eq!(
-        child_uuids_in_order(&vault, &root_uuid),
+        child_uuids_in_order(&vault, &parent),
         vec![a.clone(), b.clone(), c.clone()],
     );
 
     // Move `a` to index 2. After removal the remaining siblings are
     // [b, c]; inserting at index 2 (== len) appends → [b, c, a].
     vault
-        .move_group_to_position(a.clone(), root_uuid.clone(), 2)
+        .move_group_to_position(a.clone(), parent.clone(), 2)
         .expect("reorder");
     assert_eq!(
-        child_uuids_in_order(&vault, &root_uuid),
+        child_uuids_in_order(&vault, &parent),
         vec![b, c, a],
         "same-parent move should act as a sibling reorder",
     );

@@ -42,9 +42,16 @@ fn create_empty_writes_file_and_reopens_with_same_password() {
     let summaries = reopened.list_entries(None).expect("list");
     assert!(summaries.is_empty(), "fresh vault has no entries");
     let groups = reopened.list_groups().expect("list groups");
-    // Root group only.
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].name, "My Test Vault");
+    // Root + the eagerly-created Recycle Bin group.
+    assert_eq!(groups.len(), 2);
+    assert!(
+        groups.iter().any(|g| g.name == "My Test Vault"),
+        "root group carries the database name"
+    );
+    assert!(
+        groups.iter().any(|g| g.name == "Recycle Bin"),
+        "new vaults ship with a recycle bin group"
+    );
 }
 
 #[test]
@@ -116,7 +123,8 @@ fn create_empty_with_temp_dir_routes_tempfile_through_override() {
 
     assert!(std::path::Path::new(&path).exists());
     let reopened = Vault::new(path, "pw".to_owned(), None).expect("reopen");
-    assert_eq!(reopened.list_groups().expect("list").len(), 1);
+    // Root + the eagerly-created Recycle Bin group.
+    assert_eq!(reopened.list_groups().expect("list").len(), 2);
 }
 
 #[test]

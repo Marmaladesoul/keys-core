@@ -266,11 +266,71 @@ fn recycle_then_restore_round_trip() {
 }
 
 #[test]
-fn recycle_entry_without_bin_hard_deletes_and_tombstones() {
-    // With no recycle bin configured, a "recycle" is a permanent delete: the
-    // entry is removed and a tombstone recorded so the removal persists to the
-    // file and propagates cross-peer (Phase 5b) — rather than stranding behind
-    // an unsyncable `is_recycled` flag with no KDBX home.
+fn recycle_entry_enabled_without_bin_lazy_creates_and_recycles() {
+    // Recycle bin *enabled* but no bin group yet (a fresh vault, or one made
+    // by keepassxc-cli). The first recycle must lazily create the bin and
+    // soft-recycle the entry — NOT permanently delete it. Mirrors
+    // keepass-core's `find_or_create_recycle_bin`.
+    let (mut engine, root, _dir) = engine_with_empty_vault();
+    engine
+        .set_recycle_bin(true, None)
+        .expect("enable bin without choosing a group");
+    let uuid = engine
+        .create_entry(root, new_entry("x", "p"))
+        .expect("create");
+
+    engine.recycle_entry(uuid).expect("recycle");
+
+    let entry = engine
+        .entry(uuid)
+        .unwrap()
+        .expect("entry still exists — soft-recycled, not permanently deleted");
+    assert!(entry.is_recycled, "entry moved into the lazily-created bin");
+    assert!(
+        engine.recycle_bin_uuid().unwrap().is_some(),
+        "a recycle bin group was created on first recycle"
+    );
+}
+
+#[test]
+fn ensure_recycle_bin_creates_when_enabled_and_is_idempotent() {
+    // Enabled but no bin group (the freshly-added-vault state). `ensure`
+    // creates the bin up front; a second call is a no-op returning the same
+    // uuid (so two adds / re-opens never mint a second bin).
+    let (mut engine, _root, _dir) = engine_with_empty_vault();
+    engine
+        .set_recycle_bin(true, None)
+        .expect("enable bin without a group");
+    assert!(engine.recycle_bin_uuid().unwrap().is_none());
+
+    let bin = engine
+        .ensure_recycle_bin()
+        .expect("ensure")
+        .expect("bin created");
+    assert_eq!(
+        engine.recycle_bin_uuid().unwrap().as_deref(),
+        Some(bin.as_str())
+    );
+
+    let again = engine.ensure_recycle_bin().expect("ensure again");
+    assert_eq!(again.as_deref(), Some(bin.as_str()), "idempotent");
+}
+
+#[test]
+fn ensure_recycle_bin_noop_when_disabled() {
+    // Disabled vault → ensure creates nothing (a permanent-delete vault by
+    // the user's choice).
+    let (mut engine, _root, _dir) = engine_with_empty_vault();
+    assert!(engine.ensure_recycle_bin().expect("ensure").is_none());
+    assert!(engine.recycle_bin_uuid().unwrap().is_none());
+}
+
+#[test]
+fn recycle_entry_disabled_without_bin_hard_deletes_and_tombstones() {
+    // Recycle bin *disabled* and none exists → a "recycle" is a permanent
+    // delete: the entry is removed and a tombstone recorded so the removal
+    // persists to the file and propagates cross-peer (Phase 5b) — rather than
+    // stranding behind an unsyncable `is_recycled` flag with no KDBX home.
     let (mut engine, root, dir) = engine_with_empty_vault();
     let uuid = engine
         .create_entry(root, new_entry("x", "p"))

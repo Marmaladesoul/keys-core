@@ -159,11 +159,30 @@ impl Vault {
 
         // Build the unlocked vault, derive the transformed key against
         // the freshly-generated KDF params.
-        let kdbx = Kdbx::<keepass_core::kdbx::Unlocked>::create_empty_v4_with_protector(
+        let mut kdbx = Kdbx::<keepass_core::kdbx::Unlocked>::create_empty_v4_with_protector(
             &composite,
             database_name,
             bridged,
         )?;
+
+        // Keys policy: new vaults ship with the recycle bin enabled AND the
+        // bin group already created, so the first "Move to Trash" is
+        // recoverable — and so the bin's UUID is fixed before the vault is
+        // ever synced (no "two peers each mint their own bin" race). The group
+        // matches keepass-core's `find_or_create_recycle_bin` (name + icon 43,
+        // auto-type / search off); we just create it eagerly here instead of
+        // lazily on first recycle.
+        let root = kdbx.vault().root.id;
+        let bin = kdbx
+            .add_group(
+                root,
+                keepass_core::model::NewGroup::new("Recycle Bin")
+                    .icon_id(43)
+                    .enable_auto_type(Some(false))
+                    .enable_searching(Some(false)),
+            )
+            .map_err(crate::error::model_err_to_vault_err)?;
+        kdbx.set_recycle_bin(true, Some(bin));
 
         // Initial save via the same atomic-write pattern as `Self::save`.
         let bytes = kdbx.save_to_bytes()?;

@@ -224,6 +224,27 @@ impl Engine {
         Ok(())
     }
 
+    /// Ensure a recycle bin group exists when the bin is enabled but none
+    /// is present — call this once when a vault is first added so Keys
+    /// never carries an enabled-but-binless vault into use or sync.
+    /// Idempotent: a no-op when a bin already exists or the bin is
+    /// disabled. Returns the bin uuid if one exists/was created.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Sqlite`] on insert/update failure.
+    pub fn ensure_recycle_bin(&mut self) -> Result<Option<String>, EngineError> {
+        let before = self.recycle_bin_uuid()?;
+        let bin = mutations::ensure_recycle_bin(&mut self.conn)?;
+        // Emit only when we actually created the group (it was absent before).
+        if before.is_none() {
+            if let Some(uuid) = bin.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
+                self.emit(ChangeEvent::GroupsAdded(vec![uuid]));
+            }
+        }
+        Ok(bin)
+    }
+
     /// Restore a recycled entry: clear `is_recycled`. The group does
     /// not move — callers decide whether to move it elsewhere.
     ///

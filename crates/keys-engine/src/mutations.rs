@@ -929,26 +929,93 @@ pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
     if !entry_exists(&tx, &uuid_str)? {
         return Err(EngineError::NotFound { entity: "entry" });
     }
-    if let Some(bin) = recycle_bin_uuid(&tx)? {
+
+    // Resolve the bin group, lazily creating it when the vault has the
+    // recycle bin *enabled* but no bin group exists yet. This mirrors
+    // keepass-core's `Kdbx::recycle_entry` / `find_or_create_recycle_bin`
+    // (the canonical KDBX model) and the contract the rest of this module
+    // already assumes — see `meta::clear_recycle_bin_group`, whose docs
+    // state "recycle_entry will lazily create one". Without this, the
+    // first recycle on any enabled-but-binless vault (a fresh vault, or
+    // one created by keepassxc-cli) silently *permanently* deleted the
+    // entry under a "Move to Trash" label.
+    let bin = match recycle_bin_uuid(&tx)? {
+        Some(bin) => Some(bin),
+        None if crate::meta::read_recycle_bin_enabled(&tx)? => Some(create_recycle_bin_group(&tx)?),
+        None => None,
+    };
+
+    if let Some(bin) = bin {
         tx.execute(
             "UPDATE entry SET is_recycled = 1, group_uuid = ?1, modified_at = ?2 \
              WHERE uuid = ?3",
             params![bin, now_ms(), uuid_str],
         )?;
     } else {
-        // No recycle bin configured (RecycleBinEnabled = false, or no bin
-        // group). KeePass semantics make a delete here *permanent*. A soft
-        // `is_recycled` flag has no KDBX representation without a bin group, so
-        // it would neither persist to the file nor sync nor be emptyable — the
-        // entry would strand (deleted in the UI, untouched on disk + on peers).
-        // Hard-delete + tombstone instead, so the removal persists and
-        // propagates to peers (Phase 5b). Child rows cascade on entry delete.
+        // Recycle bin genuinely disabled and none exists. KeePass semantics
+        // make a delete here *permanent*: a soft `is_recycled` flag has no
+        // KDBX representation without a bin group, so it would neither
+        // persist nor sync nor be emptyable — the entry would strand
+        // (deleted in the UI, untouched on disk + on peers). Hard-delete +
+        // tombstone instead, so the removal persists and propagates to
+        // peers (Phase 5b). Child rows cascade on entry delete.
         tx.execute("DELETE FROM entry WHERE uuid = ?1", params![uuid_str])?;
         gc_orphan_tags(&tx)?;
         record_tombstone(&tx, &uuid_str)?;
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Create the canonical "Recycle Bin" group at the vault root, flag it as
+/// the bin, and record it in meta (enabled + designation). Returns the new
+/// group UUID. Mirrors keepass-core's `find_or_create_recycle_bin` — same
+/// name and icon (43) — so a bin created here is indistinguishable from one
+/// the model layer would mint, and projects/syncs identically.
+fn create_recycle_bin_group(tx: &Transaction<'_>) -> Result<String, EngineError> {
+    let root_uuid: String = tx.query_row(
+        "SELECT uuid FROM \"group\" WHERE parent_uuid IS NULL LIMIT 1",
+        [],
+        |r| r.get(0),
+    )?;
+    let new_uuid = Uuid::new_v4().to_string();
+    let now = now_ms();
+    let next_sort_order: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM \"group\" WHERE parent_uuid = ?1",
+        params![root_uuid],
+        |r| r.get(0),
+    )?;
+    // is_recycle_bin starts 0 here; `write_recycle_bin_group` sets it to 1
+    // (and clears the flag on any prior bin — the one-bin invariant).
+    tx.execute(
+        "INSERT INTO \"group\" (\
+            uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
+            created_at, modified_at, expires_at, is_recycle_bin, sort_order\
+         ) VALUES (?1, ?2, 'Recycle Bin', 43, NULL, '', ?3, ?3, NULL, 0, ?4)",
+        params![new_uuid, root_uuid, now, next_sort_order],
+    )?;
+    crate::meta::write_recycle_bin_group(tx, &new_uuid)?;
+    crate::meta::write_recycle_bin_enabled(tx, true)?;
+    Ok(new_uuid)
+}
+
+/// Ensure a recycle bin group exists when the bin is enabled but none is
+/// present. Idempotent: a no-op when a bin already exists or the bin is
+/// disabled. Returns the bin's uuid if one exists/was created, else `None`.
+///
+/// Called when a vault is first added so Keys never carries an
+/// enabled-but-binless vault into normal use — fixing the bin's uuid up
+/// front (before sync) avoids two peers each lazily minting their own bin.
+/// `recycle_entry`'s lazy-create remains the last-ditch safety net.
+pub(crate) fn ensure_recycle_bin(conn: &mut Connection) -> Result<Option<String>, EngineError> {
+    let tx = conn.transaction()?;
+    let bin = match recycle_bin_uuid(&tx)? {
+        Some(bin) => Some(bin),
+        None if crate::meta::read_recycle_bin_enabled(&tx)? => Some(create_recycle_bin_group(&tx)?),
+        None => None,
+    };
+    tx.commit()?;
+    Ok(bin)
 }
 
 pub(crate) fn restore_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {

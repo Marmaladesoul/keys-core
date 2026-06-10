@@ -304,6 +304,14 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.set_recycle_bin(enabled, parsed)?))
     }
 
+    /// See [`keys_engine::Engine::ensure_recycle_bin`]. Call once when a
+    /// vault is first added so an enabled-but-binless vault gets its bin
+    /// group created up front (before sync). Idempotent; returns the bin
+    /// uuid if one exists/was created.
+    pub fn ensure_recycle_bin(&self) -> Result<Option<String>, EngineError> {
+        self.with_engine_mut(|e| Ok(e.ensure_recycle_bin()?))
+    }
+
     /// See [`keys_engine::Engine::set_history_max_items`].
     pub fn set_history_max_items(&self, max: i32) -> Result<(), EngineError> {
         self.with_engine_mut(|e| Ok(e.set_history_max_items(max)?))
