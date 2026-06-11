@@ -42,8 +42,9 @@ pub use engine_types::{
     AttachmentRef as EngineAttachmentRef, ConflictPayloadFfi,
     CustomFieldRef as EngineCustomFieldRef, EngineEntrySummary, EntryFull,
     EntryUpdate as EngineEntryUpdate, GroupNode, GroupUpdate as EngineGroupUpdate, HistoricEntry,
-    IconRef, MergeResult, MergeStats, NewCustomField, NewEntryFields, NewGroupFields, Page,
-    Predicate, SearchScope, SmartFolder, Strength, StrengthBucket, TagUsageCount, VaultState,
+    IconRef, KdbxStateSignatureFfi, MergeResult, MergeStats, NewCustomField, NewEntryFields,
+    NewGroupFields, Page, ParkConflictsResultFfi, ParkedConflictsSummaryFfi, Predicate,
+    SearchScope, SmartFolder, Strength, StrengthBucket, TagUsageCount, VaultState,
 };
 pub use error::VaultError;
 pub use merge::{
