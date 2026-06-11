@@ -2634,6 +2634,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyhole"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "keys-ffi",
+ "tokio",
+]
+
+[[package]]
 name = "keys-engine"
 version = "0.0.0"
 dependencies = [

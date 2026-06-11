@@ -1,0 +1,30 @@
+[package]
+name = "keyhole"
+description = "Headless test-driver for Keys. Drives the same keys-ffi surface the GUI apps drive, minus the UI — so automated tests can prove app-level behaviour one step below the real client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "keyhole"
+path = "src/main.rs"
+
+[dependencies]
+# THE SEAM. keyhole depends on the exact crate the Mac/iOS/Windows
+# frontends bind to via uniffi. Anything keyhole can reach, a real
+# client reaches the same way. keys-ffi exposes an `rlib` crate-type
+# alongside its staticlib/cdylib, so it links as a normal Rust dep.
+keys-ffi = { path = "../crates/keys-ffi" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# keys-ffi's slow ops (ingest_from_kdbx / save_to_kdbx) are async and
+# dispatch onto tokio (uniffi `async_runtime = "tokio"`). Multi-thread
+# so the internal spawn_blocking has somewhere to run.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

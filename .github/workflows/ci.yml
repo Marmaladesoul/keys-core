@@ -75,6 +75,17 @@ jobs:
         working-directory: KeysCore
         run: cargo doc --workspace --no-deps --all-features
 
+      # keyhole scenarios: end-to-end behaviour proofs one rung below
+      # the GUI (see keyhole/DESIGN.md). keepassxc-cli seeds the
+      # cross-implementation honesty scenarios — kept on purpose so we
+      # test real-world KDBX files, not just our own.
+      - name: Install keepassxc-cli
+        run: sudo apt-get update && sudo apt-get install -y keepassxc
+
+      - name: keyhole scenarios
+        working-directory: KeysCore
+        run: ./keyhole/scenarios/run-all.sh
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
