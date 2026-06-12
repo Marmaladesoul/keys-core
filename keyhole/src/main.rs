@@ -106,6 +106,22 @@ enum Command {
         /// Path to the .kdbx vault.
         vault: PathBuf,
     },
+    /// Enable or disable the vault's recycle bin, then persist — the
+    /// behaviour behind the Vault Info toggle. Enabling auto-creates a
+    /// bin group when none exists (no group picker). Disabling keeps
+    /// the old bin group as an ordinary group by default; afterwards,
+    /// recycling is a PERMANENT tombstoned delete (engine policy).
+    SetBin {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// `on` or `off`.
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+        /// With `off`: permanently delete the old bin group and all
+        /// its contents (tombstoned, propagates to peers).
+        #[arg(long)]
+        delete_bin_contents: bool,
+    },
     /// Open a vault and print its high-level state (counts, recycle
     /// bin, group tree size). The cheapest end-to-end smoke test.
     Inspect {
@@ -328,6 +344,18 @@ async fn main() -> Result<()> {
         Command::EnsureBin { vault } => {
             let session = Session::open(&vault, &password).await?;
             session.ensure_bin().await?;
+        }
+        Command::SetBin {
+            vault,
+            state,
+            delete_bin_contents,
+        } => {
+            anyhow::ensure!(
+                !(state == "on" && delete_bin_contents),
+                "--delete-bin-contents only applies with `off`"
+            );
+            let session = Session::open(&vault, &password).await?;
+            session.set_bin(state == "on", delete_bin_contents).await?;
         }
         Command::Inspect { vault } => {
             let session = Session::open(&vault, &password).await?;
@@ -643,6 +671,54 @@ impl Session {
                 println!("recycle bin ensured: {uuid} (saved)");
             }
             None => println!("recycle bin disabled — nothing to ensure"),
+        }
+        Ok(())
+    }
+
+    /// Toggle the recycle bin and persist. Enable = designate + lazily
+    /// create the group (the same `ensure_recycle_bin` the unlock hook
+    /// uses); disable = clear the designation, optionally hard-deleting
+    /// the old bin group + contents first (tombstoned). The old group
+    /// otherwise survives as an ordinary group.
+    async fn set_bin(&self, enable: bool, delete_contents: bool) -> Result<()> {
+        if enable {
+            self.engine
+                .set_recycle_bin(true, None)
+                .map_err(|e| anyhow::anyhow!("set_recycle_bin: {e:?}"))?;
+            let bin = self
+                .engine
+                .ensure_recycle_bin()
+                .map_err(|e| anyhow::anyhow!("ensure_recycle_bin: {e:?}"))?;
+            self.save().await?;
+            match bin {
+                Some(uuid) => println!("recycle bin enabled (group {uuid}) and saved"),
+                None => anyhow::bail!("enable left no bin group — engine contract violated"),
+            }
+        } else {
+            let old = self
+                .engine
+                .recycle_bin_uuid()
+                .map_err(|e| anyhow::anyhow!("recycle_bin_uuid: {e:?}"))?;
+            if delete_contents {
+                if let Some(bin) = &old {
+                    self.engine
+                        .delete_group(bin.clone())
+                        .map_err(|e| anyhow::anyhow!("delete_group(bin): {e:?}"))?;
+                }
+            }
+            self.engine
+                .set_recycle_bin(false, None)
+                .map_err(|e| anyhow::anyhow!("set_recycle_bin: {e:?}"))?;
+            self.save().await?;
+            match (&old, delete_contents) {
+                (Some(b), true) => {
+                    println!("recycle bin disabled; old bin {b} deleted with contents; saved");
+                }
+                (Some(b), false) => {
+                    println!("recycle bin disabled; old bin {b} kept as ordinary group; saved");
+                }
+                (None, _) => println!("recycle bin disabled (no bin group existed); saved"),
+            }
         }
         Ok(())
     }

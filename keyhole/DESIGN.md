@@ -265,6 +265,15 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   Finding #4's flooring makes mtimes sync-safe).
   `fuzz-attachments.sh` reproduces it ~1-in-7 runs and stays
   manual/diagnostic until fixed.
+- **Done (2026-06-13):** `set-bin <vault> on|off [--delete-bin-contents]`
+  — the behaviour behind Keys-Mac's Vault Info recycle-bin toggle
+  (agreed design from the KeysCore #136 review: respect the per-vault
+  setting; bin off = permanent delete).
+  [set-bin-toggle.sh](scenarios/set-bin-toggle.sh) pins: disable keeps
+  the old group as an ordinary group and makes recycling a permanent
+  tombstoned delete; enable auto-creates/designates a bin (no group
+  picker); disable + delete removes the bin and contents. The GUI
+  toggle is now "call the proven path".
 - **Next:** the remaining 5c slice — fix Finding #8 (LCA generation
   disambiguation), fix Finding #7 (conflict rows store attachments;
   resolve preserves/merges attachment state), then both-sided
