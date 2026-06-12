@@ -218,6 +218,30 @@ enum Command {
         /// UUID of the entry to delete (see `list`).
         uuid: String,
     },
+    /// Add or replace an attachment on an entry (content-addressed
+    /// blob pool + per-entry link), then persist.
+    SetAttachment {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry (see `list`).
+        uuid: String,
+        /// Attachment name (replaces an existing attachment of the
+        /// same name).
+        name: String,
+        /// Attachment content as a literal string (test data).
+        #[arg(long)]
+        text: String,
+    },
+    /// Print an attachment's bytes to stdout (raw — pipe or compare;
+    /// test data only, like everything keyhole touches).
+    CatAttachment {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry (see `list`).
+        uuid: String,
+        /// Attachment name.
+        name: String,
+    },
     /// Resolve a held conflict by choosing one side for every delta
     /// (fields, attachments, icon, delete-vs-edit), then persist.
     Resolve {
@@ -354,6 +378,21 @@ async fn main() -> Result<()> {
         Command::DeleteEntry { vault, uuid } => {
             let session = Session::open(&vault, &password).await?;
             session.delete_entry(uuid).await?;
+        }
+        Command::SetAttachment {
+            vault,
+            uuid,
+            name,
+            text,
+        } => {
+            let session = Session::open(&vault, &password).await?;
+            session
+                .set_attachment(uuid, name, text.into_bytes())
+                .await?;
+        }
+        Command::CatAttachment { vault, uuid, name } => {
+            let session = Session::open(&vault, &password).await?;
+            session.cat_attachment(uuid, name)?;
         }
         Command::Resolve {
             vault,
@@ -765,6 +804,31 @@ impl Session {
         self.save().await?;
         println!("deleted {uuid} permanently (tombstoned) and saved to disk");
         Ok(())
+    }
+
+    /// Add or replace an attachment and persist.
+    async fn set_attachment(&self, uuid: String, name: String, bytes: Vec<u8>) -> Result<()> {
+        self.engine
+            .set_attachment(uuid.clone(), name.clone(), bytes)
+            .map_err(|e| anyhow::anyhow!("set_attachment: {e:?}"))?;
+        self.save().await?;
+        println!("set attachment {name:?} on {uuid} and saved to disk");
+        Ok(())
+    }
+
+    /// Write an attachment's raw bytes to stdout. A closed pipe (e.g.
+    /// `keyhole cat-attachment … | head`) is a normal way for a reader
+    /// to stop early, not an error.
+    fn cat_attachment(&self, uuid: String, name: String) -> Result<()> {
+        use std::io::Write as _;
+        let bytes = self
+            .engine
+            .attachment_bytes(uuid, name)
+            .map_err(|e| anyhow::anyhow!("attachment_bytes: {e:?}"))?;
+        match std::io::stdout().write_all(&bytes) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            other => Ok(other?),
+        }
     }
 
     /// Print the content digest — the convergence oracle. One hex line

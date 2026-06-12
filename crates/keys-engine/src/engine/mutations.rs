@@ -401,6 +401,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Add or replace an attachment by name. The blob lands in the
+    /// content-addressed pool (dedup'd by SHA-256); re-using a name
+    /// re-points the link at the new bytes. History snapshots first,
+    /// like every entry mutation.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "entry"`).
+    /// - [`EngineError::Sqlite`].
+    pub fn set_attachment(
+        &mut self,
+        uuid: Uuid,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), EngineError> {
+        mutations::set_attachment(&mut self.conn, uuid, name, bytes)?;
+        self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
+        Ok(())
+    }
+
     /// Remove an attachment by name. The underlying `attachment_blob`
     /// row is left in place (content-addressed and potentially shared).
     ///

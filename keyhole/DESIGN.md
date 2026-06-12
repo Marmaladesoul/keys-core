@@ -196,10 +196,28 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   [delete-vs-edit.sh](scenarios/delete-vs-edit.sh) pinning the 5b rules
   at disk precision: post-delete edit wins and resurrects (tombstone
   scrubbed); same-second tie → delete wins on both sides identically.
-- **Next:** attachment conflict scenarios + attachment verbs (with 5c
-  content pools); `empty-bin` verb; widen the fuzz op mix as 5c/5d
-  land; value-hash-based adoption matching (timestamp-free) as
-  hardening when resolution records grow fields.
+- **Done (2026-06-12, attachment foundation):** `set-attachment` pushed
+  down through keys-engine (`set_attachment` mutation: content-
+  addressed pool insert + link upsert + history snapshot) and keys-ffi
+  — no attachment-*add* surface existed below the GUI at all.
+  keyhole verbs `set-attachment` / `cat-attachment`;
+  [attachment-roundtrip.sh](scenarios/attachment-roundtrip.sh) pins the
+  single-replica storage contract (round-trip, replace-by-name,
+  digest visibility).
+- **5c starting point (probed 2026-06-12):** cross-peer attachment
+  propagation does NOT work — an attachment-only peer change verdicts
+  `InSync` because `keepass_merge::classify` deliberately excludes
+  attachments from its verdict (entry_merge.rs ~812: "Attachments are
+  out of classify's scope"). The 5c fix starts there (the
+  AttachmentDelta machinery already exists for the conflict payload),
+  plus `advance_local_entry` copying attachment links + pool blobs
+  when adopting a merged peer entry. The cross-peer attachment
+  scenario lands with that fix.
+- **Next:** 5c content pools (attachment-aware classify → engine
+  adoption of attachment changes → cross-peer scenario → widen fuzz op
+  mix with set-attachment); `empty-bin` verb; value-hash-based
+  adoption matching (timestamp-free) as hardening when resolution
+  records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old

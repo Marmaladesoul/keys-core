@@ -2032,6 +2032,47 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+/// Add or replace an attachment on an entry: the blob lands in the
+/// content-addressed pool (`attachment_blob`, dedup'd by SHA-256, same
+/// shape ingest writes) and the per-entry link row is upserted by
+/// name. History snapshots before the change, like every entry
+/// mutation. Blob GC stays a separate concern, mirroring
+/// [`remove_attachment`].
+pub(crate) fn set_attachment(
+    conn: &mut Connection,
+    uuid: Uuid,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), EngineError> {
+    let uuid_str = uuid.to_string();
+    let tx = conn.transaction()?;
+    if !entry_exists(&tx, &uuid_str)? {
+        return Err(EngineError::NotFound { entity: "entry" });
+    }
+    push_history_snapshot(&tx, &uuid_str)?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let sha = hasher.finalize();
+    let sha_bytes: &[u8] = sha.as_slice();
+    let size_i64 = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+    tx.execute(
+        "INSERT OR IGNORE INTO attachment_blob (sha256, bytes, size) VALUES (?1, ?2, ?3)",
+        params![sha_bytes, bytes, size_i64],
+    )?;
+    // Upsert the link: replacing an attachment's bytes under the same
+    // name re-points the link row at the new blob.
+    tx.execute(
+        "INSERT INTO entry_attachment (entry_uuid, attachment_name, blob_sha256) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(entry_uuid, attachment_name) DO UPDATE SET blob_sha256 = excluded.blob_sha256",
+        params![uuid_str, name, sha_bytes],
+    )?;
+    bump_modified(&tx, &uuid_str)?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub(crate) fn remove_attachment(
     conn: &mut Connection,
     uuid: Uuid,

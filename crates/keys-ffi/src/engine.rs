@@ -731,6 +731,19 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.attach_file(u, &name, bytes)?))
     }
 
+    /// Add or replace an attachment by name. See
+    /// [`keys_engine::Engine::set_attachment`] — content-addressed pool
+    /// insert + per-entry link upsert, with a history snapshot first.
+    pub fn set_attachment(
+        &self,
+        uuid: String,
+        name: String,
+        bytes: Vec<u8>,
+    ) -> Result<(), EngineError> {
+        let u = parse_uuid(&uuid, "entry")?;
+        self.with_engine_mut(|e| Ok(e.set_attachment(u, &name, &bytes)?))
+    }
+
     pub fn remove_attachment(&self, uuid: String, name: String) -> Result<(), EngineError> {
         let u = parse_uuid(&uuid, "entry")?;
         self.with_engine_mut(|e| Ok(e.remove_attachment(u, &name)?))
