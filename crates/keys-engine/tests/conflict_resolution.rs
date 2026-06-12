@@ -305,6 +305,73 @@ fn held_conflict_payload_enables_parked_resolution() {
     );
 }
 
+/// A held conflict whose values have since converged (e.g. the user edited
+/// local to match the peer, or a peer's resolution synced in) must clear its
+/// badge at resolver-open instead of ghosting forever. Regression for the
+/// fuzz-soak finding (keyhole DESIGN.md Finding #5): `held_conflict_payload`
+/// returned `None` for the dissolved conflict but left the `conflict_*` rows,
+/// so `entries_with_parked_conflict` re-reported the entry on every read and
+/// the resolver opened to nothing, forever.
+#[test]
+fn dissolved_held_conflict_clears_badge_at_resolver_open() {
+    let mut f = fixture();
+
+    // Hold a title conflict via the non-blocking park path.
+    f.engine
+        .update_entry(
+            f.seed_uuid,
+            keys_engine::EntryUpdate {
+                title: Some("local-title".into()),
+                ..Default::default()
+            },
+        )
+        .expect("local edit");
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .edit_entry(EntryId(f.seed_uuid), HistoryPolicy::Snapshot, |e| {
+            e.set_title("disk-title");
+        })
+        .expect("disk edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+    f.engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park");
+    assert_eq!(
+        f.engine.entries_with_parked_conflict().expect("badge"),
+        vec![f.seed_uuid],
+        "the conflict is held + badged",
+    );
+
+    // Dissolve it: local converges on the peer's value by ordinary edit.
+    f.engine
+        .update_entry(
+            f.seed_uuid,
+            keys_engine::EntryUpdate {
+                title: Some("disk-title".into()),
+                ..Default::default()
+            },
+        )
+        .expect("converging edit");
+
+    // Resolver-open finds nothing to resolve — and must clear the rows.
+    let payload = f
+        .engine
+        .held_conflict_payload(&f.kdbx_path, &composite(), None)
+        .expect("derive");
+    assert!(
+        payload.is_none(),
+        "no conflict remains once values converge"
+    );
+    assert!(
+        f.engine
+            .entries_with_parked_conflict()
+            .expect("badge")
+            .is_empty(),
+        "dissolved conflict cleared its badge instead of ghosting",
+    );
+}
+
 /// Multiple entries held at once: the resolution session must scope to **one**
 /// entry, so resolving it clears just that entry and leaves the rest held.
 /// Regression for the soak bug where the per-entry resolver submitted a
@@ -824,9 +891,13 @@ fn apply_resolution_handles_delete_edit_choice() {
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
     // Ensure the local edit's wall-clock mtime is strictly after the
-    // tombstone — KDBX timestamps land at ms precision, so a 2ms
-    // pause makes the ordering deterministic across thread loads.
-    std::thread::sleep(std::time::Duration::from_millis(2));
+    // tombstone AT DISK PRECISION. Every KDBX serialisation of a
+    // timestamp is second-resolution, and the projection now floors to
+    // match (Finding #4: sync decisions must be pure functions of
+    // synced bytes) — so a same-second edit-vs-delete is a tie, and
+    // ties go to the delete (the documented 5b rule). Crossing a whole
+    // second boundary is what makes this a genuine edit-after-delete.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     f.engine
         .update_entry(
             f.seed_uuid,

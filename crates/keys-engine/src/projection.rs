@@ -763,8 +763,22 @@ fn parse_uuid_col(row: &rusqlite::Row<'_>, idx: usize) -> Result<Uuid, rusqlite:
     })
 }
 
+/// Millisecond column → `DateTime`, **floored to whole seconds**.
+///
+/// Deliberate precision loss: every KDBX serialisation of a timestamp
+/// is second-precision (our encoder writes ISO-8601 `SecondsFormat::
+/// Secs`; KDBX4's native base64 form is i64 *seconds* since year 1),
+/// so a projected vault must carry exactly what a save → load
+/// round-trip would produce. Keeping mirror milliseconds here made the
+/// same edit read as two different instants on the two sides of a sync
+/// — local (projected, ms) vs peer (KDBX, floored) — which skewed every
+/// timestamp comparison in `ingest_peer`'s merge/adoption guards and
+/// let replicas silently diverge (keyhole DESIGN.md Finding #4). Sync
+/// decisions must be pure functions of disk-serialised bytes, never of
+/// mirror-local precision a peer cannot see. The mirror's own ms
+/// columns are untouched — UI reads keep full resolution.
 fn ms_to_dt(ms: i64) -> Option<DateTime<Utc>> {
-    Utc.timestamp_millis_opt(ms).single()
+    Utc.timestamp_millis_opt(ms - ms.rem_euclid(1000)).single()
 }
 
 /// Build a [`Timestamps`] from the columns we persist. Schema-wise

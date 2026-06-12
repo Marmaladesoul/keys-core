@@ -342,10 +342,15 @@ pub(crate) fn reconcile_with_disk(
 /// so a later `apply_conflict_resolution(id, …)` converges the chosen values
 /// and writes the propagating resolution records.
 ///
-/// It mutates **no** `SQLite` state; its only side effect is the stash.
-/// Returns `None` — stash untouched — when no entry has a parked owner row, or
-/// when the local-vs-theirs merge surfaces no conflict (e.g. a peer resolved
-/// it and the values have since converged).
+/// Side effects: the stash, plus **clearing the `conflict_*` rows of any
+/// candidate whose conflict has dissolved** — when the local-vs-theirs merge
+/// for a held entry surfaces no conflict (e.g. a peer's resolution record
+/// synced in, or local has since converged on the peer's values), the rows
+/// are stale state. Leaving them made the badge immortal: the resolver
+/// opened to nothing while [`entries_with_parked_conflict`] kept reporting
+/// the entry forever (found by keyhole's fuzz soak — DESIGN.md Finding #5).
+/// After clearing a dissolved candidate, the unfiltered path moves on to the
+/// next held entry, so `None` genuinely means "nothing left to resolve".
 ///
 /// Multi-peer note: when an entry carries rows from several peers this picks
 /// the first owner ([`conflict_rows::conflict_owners_for`] returns them sorted)
@@ -358,21 +363,14 @@ pub(crate) fn held_conflict_payload(
     entry_filter: Option<uuid::Uuid>,
 ) -> Result<Option<ConflictPayload>, EngineError> {
     let mut parked = conflict_rows::parked_conflict_uuids(engine.conn())?;
-    if parked.is_empty() {
-        return Ok(None);
-    }
     // One conflict per resolution session — the resolver is one-entry-at-a-time.
     // The apply validates a session atomically, so a multi-entry session rejects
     // a single-entry resolution (the badge-never-clears soak bug). Scope to the
-    // requested entry, else the first held (uuid-sorted for a deterministic
-    // pick); resolving it drops only its rows, leaving the rest held.
+    // requested entry, else walk the held set uuid-sorted (deterministic pick);
+    // resolving one drops only its rows, leaving the rest held.
     parked.sort();
-    match entry_filter {
-        Some(filter) => parked.retain(|u| *u == filter),
-        None => parked.truncate(1),
-    }
-    if parked.is_empty() {
-        return Ok(None);
+    if let Some(filter) = entry_filter {
+        parked.retain(|u| *u == filter);
     }
 
     let local_vault = engine.project_to_vault()?;
@@ -381,44 +379,49 @@ pub(crate) fn held_conflict_payload(
         .acquire_session_key()
         .map_err(|e| EngineError::Serialise(format!("acquire session key: {e}")))?;
 
-    // Build "theirs": a clone of local with each parked entry swapped for its
-    // reconstructed peer value. If local doesn't hold the entry, skip it (a
-    // peer-only entry has no local side to conflict against here).
-    let mut theirs_vault = local_vault.clone();
-    for uuid in &parked {
-        let owners = conflict_rows::conflict_owners_for(engine.conn(), *uuid)?;
+    for uuid in parked {
+        // Build "theirs": a clone of local with this parked entry swapped for
+        // its reconstructed peer value. If local doesn't hold the entry, skip
+        // it (a peer-only entry has no local side to conflict against here).
+        let owners = conflict_rows::conflict_owners_for(engine.conn(), uuid)?;
         let Some(owner) = owners.first() else {
             continue;
         };
         let Some(peer_entry) =
-            conflict_rows::reconstruct_peer_entry(engine.conn(), owner, *uuid, &session_key)?
+            conflict_rows::reconstruct_peer_entry(engine.conn(), owner, uuid, &session_key)?
         else {
             continue;
         };
+        let mut theirs_vault = local_vault.clone();
         swap_entry_in_tree(&mut theirs_vault.root, peer_entry);
+
+        let outcome = keepass_merge::merge(&local_vault, &theirs_vault)
+            .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
+
+        if outcome.entry_conflicts.is_empty() && outcome.delete_edit_conflicts.is_empty() {
+            // Dissolved: the stored peer value no longer conflicts with
+            // local. Drop the stale rows so the badge clears, and keep
+            // walking — a later candidate may still hold a real conflict.
+            conflict_rows::drop_conflict_rows(engine.conn(), uuid)?;
+            continue;
+        }
+
+        let id = NEXT_CONFLICT_ID.fetch_add(1, Ordering::Relaxed);
+        let payload = ConflictPayload {
+            id,
+            entry_conflicts: outcome.entry_conflicts.clone(),
+            delete_edit_conflicts: outcome.delete_edit_conflicts.clone(),
+        };
+        engine.stash_conflict_payload(payload.clone());
+        engine.stash_conflict_context(crate::conflict_resolution::PendingConflictContext {
+            payload: payload.clone(),
+            outcome,
+            local_vault,
+            remote_vault: theirs_vault,
+        });
+        return Ok(Some(payload));
     }
-
-    let outcome = keepass_merge::merge(&local_vault, &theirs_vault)
-        .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
-
-    if outcome.entry_conflicts.is_empty() && outcome.delete_edit_conflicts.is_empty() {
-        return Ok(None);
-    }
-
-    let id = NEXT_CONFLICT_ID.fetch_add(1, Ordering::Relaxed);
-    let payload = ConflictPayload {
-        id,
-        entry_conflicts: outcome.entry_conflicts.clone(),
-        delete_edit_conflicts: outcome.delete_edit_conflicts.clone(),
-    };
-    engine.stash_conflict_payload(payload.clone());
-    engine.stash_conflict_context(crate::conflict_resolution::PendingConflictContext {
-        payload: payload.clone(),
-        outcome,
-        local_vault,
-        remote_vault: theirs_vault,
-    });
-    Ok(Some(payload))
+    Ok(None)
 }
 
 /// Replace the entry with `replacement.id` in the group tree with

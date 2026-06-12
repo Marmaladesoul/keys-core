@@ -183,11 +183,17 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   (location ops join when 5d lands). On its first day it correctly
   rediscovered the deferred 5d gap twice and then found Finding #4
   (open) — the manual-soak-replacement loop working end to end.
-- **Next:** fix Finding #4 (timestamp-precision asymmetry in adoption
-  guards) and re-gate the fuzzer in `run-all.sh`; per-field `resolve`
-  choices (`--field UserName=local …`); delete-vs-edit and attachment
-  conflict scenarios; `empty-bin` verb; widen the fuzz op mix as
-  5c/5d land.
+- **Done (2026-06-12, the convergence-fix push):** Finding #4 fixed
+  (timestamp flooring — sync decisions are pure functions of synced
+  bytes) and Finding #5 found-and-fixed by its validation soak
+  (dissolved held conflicts now clear their badge at resolver-open);
+  30/30 fuzz soak green; **`fuzz-convergence.sh` is now a CI gate** in
+  `run-all.sh`.
+- **Next:** per-field `resolve` choices (`--field UserName=local …`);
+  delete-vs-edit and attachment conflict scenarios; `empty-bin` verb;
+  widen the fuzz op mix as 5c/5d land; value-hash-based adoption
+  matching (timestamp-free) as hardening when resolution records grow
+  fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old
@@ -255,13 +261,25 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   recorded previous parent (root when absent/deleted, matching
   KeePassXC). Proven across reopen incl. the subfolder round-trip.
 
-- **[OPEN] convergence divergence under rapid re-edit around a
-  resolution — found by `scenarios/fuzz-convergence.sh` (excluded from
-  `run-all.sh` until fixed).** Two replicas under seeded concurrent
-  entry create/edit/delete + park/resolve/sync rounds intermittently
-  end a round with different content digests, or with one side
-  re-parking a conflict whose resolution record it should have adopted.
-  Evidence (env `KEYS_DEBUG_ADOPTION=1` instruments
+- **[FIXED] convergence divergence under rapid re-edit around a
+  resolution — found by `scenarios/fuzz-convergence.sh`.** Two replicas
+  under seeded concurrent entry create/edit/delete + park/resolve/sync
+  rounds intermittently ended a round with different content digests,
+  or with one side re-parking a conflict whose resolution record it
+  should have adopted. **Fix (30/30 soak runs green; fuzzer now a CI
+  gate in `run-all.sh`):** every KDBX serialisation of a timestamp is
+  second-precision (our encoder writes ISO-8601 `SecondsFormat::Secs`
+  for 3.1 *and* 4.x; KDBX4's native base64 form is i64 seconds — so
+  the quantisation is version-independent), and the millisecond
+  precision existed only in the SQLite mirror. The projection now
+  floors times to seconds (`projection::ms_to_dt`) so a projected
+  vault equals what a save → load round-trip produces, and
+  `resolution_times` floors `resolved_at` to match — making every
+  merge/adoption decision a **pure function of disk-serialised
+  (synced) bytes** that both peers compute identically. Same-second
+  ties resolve deterministically (resolution wins; edit-vs-delete
+  ties keep the documented delete-wins rule). Original evidence
+  (env `KEYS_DEBUG_ADOPTION=1` instruments
   `keys-engine/src/ingest.rs`):
   - The same edit reads as `…T14:16:23.677Z` from the local mirror
     (millisecond precision) but `…T14:16:23Z` from the peer's KDBX
@@ -286,6 +304,21 @@ GUI) instead of one — short-term effort bought for compounding payoff.
     `previous_parent_uuid` wholesale while location reconciliation is
     otherwise deferred — fold proper previous-parent merge rules into
     the 5d work.
+
+- **[FIXED] ghost conflict badge: a dissolved held conflict never
+  cleared — found by the fuzz soak that validated the Finding #4 fix.**
+  When a held conflict's values converged out-of-band (local edited to
+  match the peer, or a peer's resolution record synced in),
+  `held_conflict_payload` correctly returned `None` ("no conflict
+  remains") but left the `conflict_*` owner rows — so
+  `entries_with_parked_conflict` re-reported the entry on every read,
+  forever: a resolver that opens to nothing and a badge that never
+  clears (in the GUI, plausibly kin to the soak's dead-resolver
+  sightings). Fix: resolver-open now drops the stale rows for any
+  candidate whose rebuilt merge yields no conflict and walks on to the
+  next genuinely-held entry, so `None` means "nothing left to
+  resolve". Pinned by keys-engine
+  `dissolved_held_conflict_clears_badge_at_resolver_open`.
 
 ## Usage
 

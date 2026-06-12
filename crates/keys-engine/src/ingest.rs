@@ -1125,20 +1125,38 @@ fn collect_entries_with_parent(root: &Group) -> Vec<(&Entry, GroupId)> {
 /// a side that carries a resolution record for an entry has *decided* that
 /// conflict. A parse failure degrades to "no resolutions" (a corrupt record
 /// must not block ingest).
+///
+/// `resolved_at` is **floored to whole seconds** before use: the entry mtimes
+/// it is compared against are second-precision once they round-trip a KDBX
+/// (and the projection now floors to match — see `projection::ms_to_dt`), so
+/// the comparison must live at disk precision too. Within the same second,
+/// "edited after the resolution" is therefore *false* — the resolution wins
+/// the tie, on both peers identically, which is what keeps the decision a
+/// pure function of synced bytes (keyhole DESIGN.md Finding #4).
 fn resolution_times(
     custom_data: &[keepass_core::model::CustomDataItem],
 ) -> HashMap<Uuid, DateTime<Utc>> {
     let mut out: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
     for record in parse_conflict_resolutions(custom_data).unwrap_or_default() {
+        let floored = floor_to_second(record.resolved_at);
         out.entry(record.entry)
             .and_modify(|t| {
-                if record.resolved_at > *t {
-                    *t = record.resolved_at;
+                if floored > *t {
+                    *t = floored;
                 }
             })
-            .or_insert(record.resolved_at);
+            .or_insert(floored);
     }
     out
+}
+
+/// Truncate sub-second precision (toward negative infinity, so pre-1970
+/// values floor consistently too).
+fn floor_to_second(t: DateTime<Utc>) -> DateTime<Utc> {
+    let ms = t.timestamp_millis();
+    chrono::TimeZone::timestamp_millis_opt(&Utc, ms - ms.rem_euclid(1000))
+        .single()
+        .unwrap_or(t)
 }
 
 /// Was `mtime` recorded strictly after `resolved_at`? `false` when either is
