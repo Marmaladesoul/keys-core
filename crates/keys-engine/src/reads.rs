@@ -845,9 +845,11 @@ pub(crate) fn history_attachment_bytes(
 }
 
 /// Decode a lowercase hex string into bytes. Returns `None` for any
-/// invalid input (odd length, non-hex chars). Kept private — only the
-/// history attachment lookup needs it.
-fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+/// invalid input (odd length, non-hex chars). `pub(crate)`: shared by
+/// the history-attachment lookup here and the projection's history
+/// pool rebuild (a near-identical copy also lives in `mutations` —
+/// collapse them next time either changes).
+pub(crate) fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
     }

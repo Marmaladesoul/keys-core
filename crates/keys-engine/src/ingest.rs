@@ -503,6 +503,35 @@ fn upsert_tag(conn: &Connection, name: &str) -> Result<i64, rusqlite::Error> {
     })
 }
 
+/// Like [`insert_attachment`], but the link row **upserts**: adopting a
+/// peer's replacement of an existing attachment re-points the link at
+/// the new blob (`INSERT OR IGNORE` would silently keep the old
+/// bytes). Used by the `AttachmentChange::Take` apply in
+/// [`ingest_peer`]; mirrors `mutations::set_attachment`.
+fn insert_attachment_link_upsert(
+    conn: &Connection,
+    entry_uuid: &str,
+    attachment_name: &str,
+    bytes: &[u8],
+) -> Result<(), rusqlite::Error> {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let sha = hasher.finalize();
+    let sha_bytes: &[u8] = sha.as_slice();
+    let size_i64 = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+    conn.execute(
+        "INSERT OR IGNORE INTO attachment_blob (sha256, bytes, size) VALUES (?1, ?2, ?3)",
+        params![sha_bytes, bytes, size_i64],
+    )?;
+    conn.execute(
+        "INSERT INTO entry_attachment (entry_uuid, attachment_name, blob_sha256) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(entry_uuid, attachment_name) DO UPDATE SET blob_sha256 = excluded.blob_sha256",
+        params![entry_uuid, attachment_name, sha_bytes],
+    )?;
+    Ok(())
+}
+
 /// Insert an attachment blob (content-addressed by SHA-256) plus its
 /// `entry_attachment` link row.
 fn insert_attachment(
@@ -938,10 +967,23 @@ pub(crate) fn ingest_peer(
             Granularity::Field,
         ) {
             Classification::InSync => {
+                if std::env::var_os("KEYS_DEBUG_ADOPTION").is_some() {
+                    eprintln!(
+                        "ADOPTION-DEBUG {uuid}: branch=in-sync local_atts={} peer_atts={} \
+                         local_bins={} peer_bins={}",
+                        local_entry.attachments.len(),
+                        peer_entry.attachments.len(),
+                        local.binaries.len(),
+                        peer.binaries.len(),
+                    );
+                }
                 clear_conflict_rows(&tx, owner, &uuid_str)?;
                 outcome.in_sync += 1;
             }
-            Classification::AutoMerged { merged } => {
+            Classification::AutoMerged {
+                merged,
+                attachment_changes,
+            } => {
                 advance_local_entry(
                     &tx,
                     local,
@@ -950,6 +992,32 @@ pub(crate) fn ingest_peer(
                     &session_key,
                     &local_bin_refs,
                 )?;
+                // 5c: apply the LCA-backed one-sided peer attachment
+                // changes the classifier adopted. The bytes ride the
+                // instruction (a merged entry can't reference two
+                // binary pools), landing in the content-addressed
+                // pool exactly like an ingest write.
+                for change in &attachment_changes {
+                    match change {
+                        keepass_merge::AttachmentChange::Take { name, bytes } => {
+                            insert_attachment_link_upsert(&tx, &uuid_str, name, bytes)?;
+                        }
+                        keepass_merge::AttachmentChange::Drop { name } => {
+                            tx.execute(
+                                "DELETE FROM entry_attachment \
+                                 WHERE entry_uuid = ?1 AND attachment_name = ?2",
+                                params![uuid_str, name],
+                            )?;
+                        }
+                        // #[non_exhaustive] upstream: an unknown future
+                        // instruction must not be silently half-applied.
+                        other => {
+                            return Err(EngineError::Ingest(IngestError::Wrap(format!(
+                                "unknown AttachmentChange variant: {other:?}"
+                            ))));
+                        }
+                    }
+                }
                 clear_conflict_rows(&tx, owner, &uuid_str)?;
                 outcome.auto_merged.push(uuid);
             }

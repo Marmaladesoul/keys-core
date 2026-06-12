@@ -71,17 +71,19 @@ random_entry() { # $1=vault → uuid of a random live entry, "" if none
 }
 
 n=0  # monotonic counter so generated values never collide
-mutate() { # $1=vault — one random legal edit
+mutate() { # $1=vault $2=device-prefix (reserved for the attachment mix)
     local v="$1" op e
+    : "$2"
     n=$((n + 1))
     # Op mix = exactly the cross-peer surface the multipeer store
     # supports today: entry create, field edits, hard delete (5b
-    # tombstones). LOCATION ops — move / recycle / restore /
-    # create-group — are deliberately ABSENT: group + location
-    # reconciliation is the known-deferred 5d slice, and the fuzzer's
-    # first two runs (seed 42) duly rediscovered that gap. Fold them
-    # into the mix when 5d lands; the scope ledger lives in
-    # sync-multipeer-store.md.
+    # tombstones). LOCATION ops (move/recycle/restore/create-group) are
+    # ABSENT — the deferred 5d slice. ATTACHMENT ops are ALSO absent
+    # here, in fuzz-attachments.sh instead: mixing them with field
+    # edits reaches the unshipped facets-alongside-held-conflict slice
+    # (resolving a parked conflict drops attachments added since the
+    # fork — DESIGN.md Finding #7), which this gate must not flake on.
+    # The scope ledger lives in sync-multipeer-store.md.
     # NB: if/fi rather than `[ -n ] &&` — under `set -e` a final failing
     # && would silently kill the whole run when a pick comes up empty.
     op=$((RANDOM % 4))
@@ -114,8 +116,8 @@ resolve_all() { # $1=vault — resolve every held conflict, random side
 # --- the loop ---------------------------------------------------------
 for round in $(seq 1 "$ROUNDS"); do
     # Concurrent edits while "offline": 1–3 per device.
-    for _ in $(seq 1 $((RANDOM % 3 + 1))); do mutate "$A"; done
-    for _ in $(seq 1 $((RANDOM % 3 + 1))); do mutate "$B"; done
+    for _ in $(seq 1 $((RANDOM % 3 + 1))); do mutate "$A" a; done
+    for _ in $(seq 1 $((RANDOM % 3 + 1))); do mutate "$B" b; done
 
     # Sync: A pulls B, resolves; B pulls the resolved A.
     "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null

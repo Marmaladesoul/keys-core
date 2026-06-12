@@ -242,6 +242,16 @@ enum Command {
         /// Attachment name.
         name: String,
     },
+    /// Remove an attachment by name (the pool blob stays — GC is a
+    /// separate concern), then persist.
+    RemoveAttachment {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry (see `list`).
+        uuid: String,
+        /// Attachment name.
+        name: String,
+    },
     /// Resolve a held conflict by choosing one side for every delta
     /// (fields, attachments, icon, delete-vs-edit), then persist.
     Resolve {
@@ -393,6 +403,10 @@ async fn main() -> Result<()> {
         Command::CatAttachment { vault, uuid, name } => {
             let session = Session::open(&vault, &password).await?;
             session.cat_attachment(uuid, name)?;
+        }
+        Command::RemoveAttachment { vault, uuid, name } => {
+            let session = Session::open(&vault, &password).await?;
+            session.remove_attachment(uuid, name).await?;
         }
         Command::Resolve {
             vault,
@@ -813,6 +827,16 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("set_attachment: {e:?}"))?;
         self.save().await?;
         println!("set attachment {name:?} on {uuid} and saved to disk");
+        Ok(())
+    }
+
+    /// Remove an attachment by name and persist.
+    async fn remove_attachment(&self, uuid: String, name: String) -> Result<()> {
+        self.engine
+            .remove_attachment(uuid.clone(), name.clone())
+            .map_err(|e| anyhow::anyhow!("remove_attachment: {e:?}"))?;
+        self.save().await?;
+        println!("removed attachment {name:?} from {uuid} and saved to disk");
         Ok(())
     }
 

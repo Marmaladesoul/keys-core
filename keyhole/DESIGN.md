@@ -204,20 +204,73 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   [attachment-roundtrip.sh](scenarios/attachment-roundtrip.sh) pins the
   single-replica storage contract (round-trip, replace-by-name,
   digest visibility).
-- **5c starting point (probed 2026-06-12):** cross-peer attachment
-  propagation does NOT work — an attachment-only peer change verdicts
-  `InSync` because `keepass_merge::classify` deliberately excludes
-  attachments from its verdict (entry_merge.rs ~812: "Attachments are
-  out of classify's scope"). The 5c fix starts there (the
-  AttachmentDelta machinery already exists for the conflict payload),
-  plus `advance_local_entry` copying attachment links + pool blobs
-  when adopting a merged peer entry. The cross-peer attachment
-  scenario lands with that fix.
-- **Next:** 5c content pools (attachment-aware classify → engine
-  adoption of attachment changes → cross-peer scenario → widen fuzz op
-  mix with set-attachment); `empty-bin` verb; value-hash-based
-  adoption matching (timestamp-free) as hardening when resolution
-  records grow fields.
+- **Done (2026-06-12, 5c one-sided attachment propagation):**
+  `keepass_merge::classify` is attachment-aware — LCA-backed one-sided
+  attachment changes feed the verdict and ride
+  `Classification::AutoMerged` as explicit `AttachmentChange`
+  Take/Drop instructions (bytes included: a merged entry can't
+  reference two binary pools), completing the abandoned "slice B3"
+  wiring. keys-engine applies them in the `ingest_peer` AutoMerged arm
+  (content-addressed upsert / link delete). Verbs `remove-attachment`
+  added; [attachment-cross-peer.sh](scenarios/attachment-cross-peer.sh)
+  pins add/replace/remove propagation + digest convergence +
+  persistence; the fuzz op mix gains device-scoped attachment
+  set/remove. Both-sided same-name attachment divergence stays on the
+  conservative no-auto-pick path (no silent pick, no park) until
+  conflict rows store attachments — the remaining 5c slice, along
+  with blob-pool GC.
+- **[FIXED] projection silently stripped history attachments — found
+  while landing 5c (keyhole finding #6).** The mirror's history
+  snapshots store attachments content-addressed (`sha256_hex`), but
+  `projection::snapshot_to_entry` never consumed them: every Keys
+  save emitted history records with NO attachments. Two consequences:
+  (a) round-trip data loss — history attachments other clients wrote
+  were stripped on save; (b) **every attachment replace/remove failed
+  to propagate cross-peer**, because LCA discovery content-hashes
+  history snapshots, and a peer's pre-edit snapshot (attachment
+  stripped) could never match our attachment-bearing current. Fix:
+  projection resolves snapshot shas through the shared binary pool
+  (dedup'd with live attachments); unresolvable refs (pre-widening
+  rows, GC'd blobs) skip, matching `history_attachment_bytes`'s
+  posture.
+- **[OPEN] resolving a parked conflict DROPS attachments added since
+  the fork — found by the widened fuzz mix (keyhole finding #7).**
+  Sequence: A sets an attachment on entry X; B (or A) also field-edits
+  X both-sided so X parks; A resolves choosing remote. The conflict
+  context's "remote" is reconstructed from `conflict_*` rows, which
+  carry NO attachments — so the apply replaces X wholesale and A's own
+  attachment links are wiped (bytes survive unreferenced in the pool,
+  and in the pre-resolve history snapshot, but the live entry loses
+  them; the peer that already adopted the attachment keeps it →
+  replicas diverge). Data-loss-adjacent: this is the concrete shape of
+  the facets-alongside-held-conflict slice. Until it lands, the main
+  convergence fuzzer excludes attachment ops and
+  [fuzz-attachments.sh](scenarios/fuzz-attachments.sh) (no field
+  edits → nothing parks) gates the shipped one-sided surface.
+- **[OPEN] LCA generation-aliasing resurrects removed attachments —
+  found by `fuzz-attachments.sh` on its first soak (keyhole finding
+  #8).** `find_common_ancestor` matches by content hash alone; when an
+  edit returns an entry to a content-state identical to an OLDER
+  shared snapshot (removing an attachment ⇒ back to the pre-add
+  state), the matcher can alias to that ancient generation. Against
+  the wrong ancestor, the peer's not-yet-synced copy reads as a fresh
+  one-sided *add* → auto re-adopt → the removal silently undoes
+  itself and replicas diverge. Mechanism confirmed by replaying
+  preserved artefacts with `KEYS_DEBUG_ADOPTION=1` (entry classified
+  in-sync per-entry while mirror and file disagreed). Any
+  return-to-prior-state edit can alias, not just attachments —
+  attachments just made it easy to reach. Fix direction: disambiguate
+  LCA candidates by generation (prefer the candidate implying the
+  fewest changes, or reinstate an (mtime, hash) compound key now that
+  Finding #4's flooring makes mtimes sync-safe).
+  `fuzz-attachments.sh` reproduces it ~1-in-7 runs and stays
+  manual/diagnostic until fixed.
+- **Next:** the remaining 5c slice — fix Finding #8 (LCA generation
+  disambiguation), fix Finding #7 (conflict rows store attachments;
+  resolve preserves/merges attachment state), then both-sided
+  attachment park/resolve and blob-pool GC, then merge + re-gate the
+  fuzz mixes; `empty-bin` verb; value-hash-based adoption matching
+  (timestamp-free) as hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old

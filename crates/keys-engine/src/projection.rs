@@ -48,7 +48,7 @@ use keepass_core::model::{
     Vault,
 };
 use keepass_core::protector::{FieldProtector, SessionKey, open_with_key};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension as _};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -188,9 +188,14 @@ pub(crate) fn project(
         if let Some(rows) = history.get(&entry_uuid) {
             // rows is sorted oldest-first by history_index.
             for snap in rows {
-                entry
-                    .history
-                    .push(snapshot_to_entry(entry_uuid, snap, &session_key)?);
+                entry.history.push(snapshot_to_entry(
+                    entry_uuid,
+                    snap,
+                    &session_key,
+                    conn,
+                    &mut binary_pool,
+                    &mut sha_to_ref,
+                )?);
             }
         }
 
@@ -664,6 +669,19 @@ struct HistorySnapshot {
     /// before migration 0006 shipped) deserialise as an empty list.
     #[serde(default)]
     custom_data: Vec<HistoryCustomDataItem>,
+    /// Snapshot attachments, content-addressed by SHA-256 into the
+    /// `attachment_blob` pool. Pre-shape rows deserialise empty.
+    #[serde(default)]
+    attachments: Vec<HistoryAttachmentRead>,
+}
+
+#[derive(Deserialize)]
+struct HistoryAttachmentRead {
+    name: String,
+    /// Hex SHA-256 of the payload; empty on pre-widening rows (those
+    /// snapshots' attachments are unresolvable and are skipped).
+    #[serde(default)]
+    sha256_hex: String,
 }
 
 #[derive(Deserialize)]
@@ -684,6 +702,9 @@ fn snapshot_to_entry(
     entry_uuid: Uuid,
     snap: &HistorySnapshot,
     session_key: &SessionKey,
+    conn: &Connection,
+    binary_pool: &mut Vec<Binary>,
+    sha_to_ref: &mut HashMap<[u8; 32], u32>,
 ) -> Result<Entry, EngineError> {
     // History snapshots reuse the live entry's uuid in KeePass — they
     // are *prior versions of the same record*, not new records — so
@@ -720,8 +741,53 @@ fn snapshot_to_entry(
             cd.last_modified_at.and_then(ms_to_dt),
         ));
     }
-    // History entries themselves carry no nested history, no
-    // attachments — those aren't part of the snapshot JSON.
+    // Snapshot attachments: resolve each content-addressed sha into
+    // the shared binary pool (dedup'd alongside live attachments) so
+    // projected history carries its attachments. This is load-bearing
+    // for sync: a peer's pre-edit history snapshot must content-hash-
+    // match our pre-edit current for LCA discovery, and the hash
+    // includes attachment payloads — history projected WITHOUT
+    // attachments broke every replace/remove propagation (keyhole
+    // finding). It is also round-trip fidelity: other clients display
+    // history attachments. Unresolvable refs (pre-widening rows with
+    // no sha, GC'd blobs) are skipped, matching
+    // `reads::history_attachment_bytes`'s NotFound posture.
+    for att in &snap.attachments {
+        if att.sha256_hex.is_empty() {
+            continue;
+        }
+        let Some(sha_vec) = crate::reads::hex_to_bytes(&att.sha256_hex) else {
+            continue;
+        };
+        let Ok(sha) = <[u8; 32]>::try_from(sha_vec.as_slice()) else {
+            continue;
+        };
+        let ref_id = if let Some(id) = sha_to_ref.get(&sha) {
+            *id
+        } else {
+            let bytes: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT bytes FROM attachment_blob WHERE sha256 = ?1",
+                    rusqlite::params![sha_vec],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            let id = u32::try_from(binary_pool.len()).map_err(|_| {
+                EngineError::Projection(ProjectionError::SchemaInvariant(
+                    "binary pool exceeded u32::MAX".into(),
+                ))
+            })?;
+            binary_pool.push(Binary::new(bytes, false));
+            sha_to_ref.insert(sha, id);
+            id
+        };
+        e.attachments
+            .push(Attachment::new(att.name.clone(), ref_id));
+    }
+    // History entries carry no nested history.
     Ok(e)
 }
 
