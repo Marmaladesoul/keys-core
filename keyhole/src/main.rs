@@ -226,10 +226,15 @@ enum Command {
         /// UUID of the held entry to resolve (see `list-conflicts`).
         #[arg(long)]
         entry: String,
-        /// Which side wins every delta: this vault (`local`) or the
+        /// Default side for every delta: this vault (`local`) or the
         /// ingested peer (`remote`).
         #[arg(long, value_parser = ["local", "remote"])]
         choose: String,
+        /// Per-field override: `--field UserName=remote` (repeatable).
+        /// Fields not named fall back to `--choose`. Keys are the
+        /// KDBX field names shown by `show-conflict`.
+        #[arg(long = "field", value_name = "KEY=SIDE")]
+        field: Vec<String>,
     },
 }
 
@@ -354,14 +359,20 @@ async fn main() -> Result<()> {
             vault,
             entry,
             choose,
+            field,
         } => {
-            let side = match choose.as_str() {
-                "local" => ConflictSideFfi::Local,
-                "remote" => ConflictSideFfi::Remote,
-                other => anyhow::bail!("--choose must be local or remote, got {other}"),
-            };
+            let side = parse_side(&choose)?;
+            let overrides = field
+                .iter()
+                .map(|spec| {
+                    let (key, side_str) = spec
+                        .split_once('=')
+                        .ok_or_else(|| anyhow::anyhow!("--field wants KEY=SIDE, got {spec:?}"))?;
+                    Ok((key.to_owned(), parse_side(side_str)?))
+                })
+                .collect::<Result<Vec<(String, ConflictSideFfi)>>>()?;
             let session = Session::open(&vault, &password).await?;
-            session.resolve(entry, side).await?;
+            session.resolve(entry, side, &overrides).await?;
         }
     }
     Ok(())
@@ -767,9 +778,15 @@ impl Session {
         Ok(())
     }
 
-    /// Resolve one held entry's conflict, every delta to `side`, then
-    /// persist the converged state.
-    async fn resolve(&self, entry: String, side: ConflictSideFfi) -> Result<()> {
+    /// Resolve one held entry's conflict — every delta to `side`,
+    /// except fields named in `overrides` — then persist the converged
+    /// state.
+    async fn resolve(
+        &self,
+        entry: String,
+        side: ConflictSideFfi,
+        overrides: &[(String, ConflictSideFfi)],
+    ) -> Result<()> {
         let payload = self
             .engine
             .held_conflict_payload(
@@ -780,7 +797,21 @@ impl Session {
             .await
             .map_err(|e| anyhow::anyhow!("held_conflict_payload: {e:?}"))?
             .ok_or_else(|| anyhow::anyhow!("no held conflict for entry {entry}"))?;
-        let resolution = resolution_choosing(&payload, side);
+
+        // Reject typo'd overrides up front: every named field must be
+        // an actual delta key, or the user is resolving a phantom.
+        for (key, _) in overrides {
+            let known = payload
+                .entry_conflicts
+                .iter()
+                .any(|c| c.field_deltas.iter().any(|d| &d.key == key));
+            anyhow::ensure!(
+                known,
+                "--field {key}: no such field delta in this conflict (see show-conflict)"
+            );
+        }
+
+        let resolution = resolution_choosing(&payload, side, overrides);
         self.engine
             .apply_conflict_resolution(payload.id, resolution)
             .await
@@ -897,10 +928,24 @@ fn print_conflict_payload(p: &ConflictPayloadFfi) {
     }
 }
 
+/// Parse a `local` / `remote` CLI token.
+fn parse_side(s: &str) -> Result<ConflictSideFfi> {
+    match s {
+        "local" => Ok(ConflictSideFfi::Local),
+        "remote" => Ok(ConflictSideFfi::Remote),
+        other => anyhow::bail!("side must be local or remote, got {other}"),
+    }
+}
+
 /// Build a [`ResolutionFfi`] that takes `side` for every delta in the
-/// payload: each field, each attachment (KeepLocal/KeepRemote), the
-/// icon, and delete-vs-edit (local → keep edit, remote → accept delete).
-fn resolution_choosing(p: &ConflictPayloadFfi, side: ConflictSideFfi) -> ResolutionFfi {
+/// payload — each field (unless named in `overrides`), each attachment
+/// (KeepLocal/KeepRemote), the icon, and delete-vs-edit (local → keep
+/// edit, remote → accept delete).
+fn resolution_choosing(
+    p: &ConflictPayloadFfi,
+    side: ConflictSideFfi,
+    overrides: &[(String, ConflictSideFfi)],
+) -> ResolutionFfi {
     // keyhole only ever constructs Local/Remote (see the --choose
     // parse); the wildcard arms satisfy the upstream #[non_exhaustive]
     // and should stay unreachable until keyhole maps a new variant.
@@ -924,7 +969,13 @@ fn resolution_choosing(p: &ConflictPayloadFfi, side: ConflictSideFfi) -> Resolut
                 c.entry_uuid.clone(),
                 c.field_deltas
                     .iter()
-                    .map(|d| FieldChoiceFfi::new(d.key.clone(), side))
+                    .map(|d| {
+                        let chosen = overrides
+                            .iter()
+                            .find(|(k, _)| *k == d.key)
+                            .map_or(side, |(_, s)| *s);
+                        FieldChoiceFfi::new(d.key.clone(), chosen)
+                    })
                     .collect(),
             ));
         }

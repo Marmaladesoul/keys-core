@@ -189,11 +189,17 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   (dissolved held conflicts now clear their badge at resolver-open);
   30/30 fuzz soak green; **`fuzz-convergence.sh` is now a CI gate** in
   `run-all.sh`.
-- **Next:** per-field `resolve` choices (`--field UserName=local …`);
-  delete-vs-edit and attachment conflict scenarios; `empty-bin` verb;
-  widen the fuzz op mix as 5c/5d land; value-hash-based adoption
-  matching (timestamp-free) as hardening when resolution records grow
-  fields.
+- **Done (2026-06-12, resolver-surface push):** per-field `resolve`
+  (`--choose local --field Notes=remote`, typo'd field names rejected),
+  pinned by [per-field-resolve.sh](scenarios/per-field-resolve.sh)
+  (mixed outcome survives reopen + converges across replicas), and
+  [delete-vs-edit.sh](scenarios/delete-vs-edit.sh) pinning the 5b rules
+  at disk precision: post-delete edit wins and resurrects (tombstone
+  scrubbed); same-second tie → delete wins on both sides identically.
+- **Next:** attachment conflict scenarios + attachment verbs (with 5c
+  content pools); `empty-bin` verb; widen the fuzz op mix as 5c/5d
+  land; value-hash-based adoption matching (timestamp-free) as
+  hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old
