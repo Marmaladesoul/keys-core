@@ -167,6 +167,57 @@ enum Command {
         #[arg(long)]
         entry: Option<String>,
     },
+    /// Print the hex SHA-256 digest of the vault's user-visible
+    /// content (fields, locations, icons, group tree, recycle-bin
+    /// state). Equal digests ⇔ converged replicas — the convergence
+    /// oracle the fuzz harness asserts with. Compare only digests from
+    /// the same build; never persist them.
+    Digest {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+    },
+    /// Create a group, then persist.
+    CreateGroup {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// Group name.
+        name: String,
+        /// Parent group UUID. Defaults to the vault root.
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// List every group: UUID, name, and direct entry count, one per
+    /// line (the group-side twin of `list`).
+    ListGroups {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+    },
+    /// Move an entry to another group, then persist.
+    MoveEntry {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry to move (see `list`).
+        uuid: String,
+        /// Destination group UUID (see `list-groups`).
+        #[arg(long)]
+        to: String,
+    },
+    /// Restore a recycled entry out of the bin, then persist.
+    Restore {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry to restore (see `list`).
+        uuid: String,
+    },
+    /// Permanently delete an entry (recording a tombstone so the
+    /// removal propagates to peers instead of zombie-resurrecting),
+    /// then persist.
+    DeleteEntry {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry to delete (see `list`).
+        uuid: String,
+    },
     /// Resolve a held conflict by choosing one side for every delta
     /// (fields, attachments, icon, delete-vs-edit), then persist.
     Resolve {
@@ -182,6 +233,9 @@ enum Command {
     },
 }
 
+// Flat verb dispatch: one match arm per CLI verb, growing linearly
+// with the verb list. Splitting it would add indirection, not clarity.
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -267,6 +321,34 @@ async fn main() -> Result<()> {
         Command::ShowConflict { vault, entry } => {
             let session = Session::open(&vault, &password).await?;
             session.show_conflict(entry).await?;
+        }
+        Command::Digest { vault } => {
+            let session = Session::open(&vault, &password).await?;
+            session.digest()?;
+        }
+        Command::CreateGroup {
+            vault,
+            name,
+            parent,
+        } => {
+            let session = Session::open(&vault, &password).await?;
+            session.create_group(name, parent).await?;
+        }
+        Command::ListGroups { vault } => {
+            let session = Session::open(&vault, &password).await?;
+            session.list_groups()?;
+        }
+        Command::MoveEntry { vault, uuid, to } => {
+            let session = Session::open(&vault, &password).await?;
+            session.move_entry(uuid, to).await?;
+        }
+        Command::Restore { vault, uuid } => {
+            let session = Session::open(&vault, &password).await?;
+            session.restore(uuid).await?;
+        }
+        Command::DeleteEntry { vault, uuid } => {
+            let session = Session::open(&vault, &password).await?;
+            session.delete_entry(uuid).await?;
         }
         Command::Resolve {
             vault,
@@ -602,6 +684,86 @@ impl Session {
             None => println!("(no held conflict)"),
             Some(p) => print_conflict_payload(&p),
         }
+        Ok(())
+    }
+
+    /// Create a group under `parent` (root if `None`) and persist.
+    async fn create_group(&self, name: String, parent: Option<String>) -> Result<()> {
+        let parent_uuid = match parent {
+            Some(p) => p,
+            None => self.root_uuid()?,
+        };
+        let uuid = self
+            .engine
+            .create_group(
+                parent_uuid,
+                keys_ffi::NewGroupFields {
+                    name,
+                    notes: String::new(),
+                    icon: IconRef::Builtin { index: 48 },
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("create_group: {e:?}"))?;
+        self.save().await?;
+        println!("created group {uuid}");
+        Ok(())
+    }
+
+    /// Print every group: uuid, name, direct entry count.
+    fn list_groups(&self) -> Result<()> {
+        let groups = self
+            .engine
+            .group_tree()
+            .map_err(|e| anyhow::anyhow!("group_tree: {e:?}"))?;
+        for g in &groups {
+            let bin = if g.is_recycle_bin { "  [bin]" } else { "" };
+            println!(
+                "{}  {}  ({} entries){bin}",
+                g.uuid, g.name, g.entry_count_direct
+            );
+        }
+        println!("\n{} group(s)", groups.len());
+        Ok(())
+    }
+
+    /// Move an entry to `group_uuid` and persist.
+    async fn move_entry(&self, uuid: String, group_uuid: String) -> Result<()> {
+        self.engine
+            .move_entry(uuid.clone(), group_uuid.clone())
+            .map_err(|e| anyhow::anyhow!("move_entry: {e:?}"))?;
+        self.save().await?;
+        println!("moved {uuid} to {group_uuid} and saved to disk");
+        Ok(())
+    }
+
+    /// Restore a recycled entry and persist.
+    async fn restore(&self, uuid: String) -> Result<()> {
+        self.engine
+            .restore_entry(uuid.clone())
+            .map_err(|e| anyhow::anyhow!("restore_entry: {e:?}"))?;
+        self.save().await?;
+        println!("restored {uuid} and saved to disk");
+        Ok(())
+    }
+
+    /// Permanently delete an entry (tombstoned) and persist.
+    async fn delete_entry(&self, uuid: String) -> Result<()> {
+        self.engine
+            .delete_entry(uuid.clone())
+            .map_err(|e| anyhow::anyhow!("delete_entry: {e:?}"))?;
+        self.save().await?;
+        println!("deleted {uuid} permanently (tombstoned) and saved to disk");
+        Ok(())
+    }
+
+    /// Print the content digest — the convergence oracle. One hex line
+    /// on stdout so scenarios can capture and compare directly.
+    fn digest(&self) -> Result<()> {
+        let d = self
+            .engine
+            .content_digest()
+            .map_err(|e| anyhow::anyhow!("content_digest: {e:?}"))?;
+        println!("{d}");
         Ok(())
     }
 

@@ -67,6 +67,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "owner_conflict_rows",
         sql: include_str!("migrations/0007_owner_conflict_rows.sql"),
     },
+    Migration {
+        version: 8,
+        name: "entry_previous_parent",
+        sql: include_str!("migrations/0008_entry_previous_parent.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.

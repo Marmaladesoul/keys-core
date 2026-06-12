@@ -66,4 +66,16 @@ rm -rf "$VAULT.mirror"
 "$KEYHOLE" list "$VAULT" | grep -q '<bob>' \
     || { echo "FAIL: resolved username (bob) did not persist to the KDBX"; exit 1; }
 
-echo "PASS: offline divergence parks as a held conflict, survives process boundaries, and resolves to a converged on-disk vault"
+# --- the convergence oracle: sync the resolution back to device B ----
+# B ingests A's resolved vault. The resolution record A wrote must be
+# adopted (no re-park on B), and both replicas must digest identically
+# — the exact assertion the fuzz harness loops on.
+"$KEYHOLE" ingest-peer "$PEER" "$VAULT" --owner device-a >/dev/null
+"$KEYHOLE" list-conflicts "$PEER" | grep -q '(no held conflicts)' \
+    || { echo "FAIL: device B re-parked a conflict the peer already resolved"; exit 1; }
+da="$("$KEYHOLE" digest "$VAULT")"
+db="$("$KEYHOLE" digest "$PEER")"
+[ "$da" = "$db" ] \
+    || { echo "FAIL: replicas did not converge after resolution sync-back"; echo "  A: $da"; echo "  B: $db"; exit 1; }
+
+echo "PASS: offline divergence parks, survives process boundaries, resolves, and both replicas converge to the same content digest"

@@ -167,10 +167,27 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   `ParkedConflictsSummaryFfi` onto keys-ffi's `pub use` surface (uniffi
   exported them to Swift, but no Rust re-export existed) — the
   consumer-drives-the-shape loop working as designed.
-- **Next:** per-field `resolve` choices (`--field UserName=local …`);
-  delete-vs-edit and attachment conflict scenarios; `restore` /
-  `empty-bin` verbs; the two-process fuzz harness over the persistent
-  mirrors.
+- **Done (2026-06-12, the fuzz-harness push):** the **content-digest
+  convergence oracle** — `keepass_merge::vault_content_digest` (group
+  tree + per-entry location/content-hash/icon + bin meta; history,
+  timestamps, tombstones excluded) surfaced as
+  `Engine::content_digest` → keys-ffi → the `digest` verb, pinned by
+  `scenarios/digest-oracle.sh` (deterministic, mirror-independent,
+  change-sensitive). New verbs: `create-group`, `list-groups`,
+  `move-entry`, `restore`, `delete-entry`. The restore data-loss bug
+  this surfaced is Finding #3 (fixed, incl. the
+  `<PreviousParentGroup>` round-trip gap). And the **two-process
+  convergence fuzzer** `scenarios/fuzz-convergence.sh` — seeded random
+  concurrent create/edit/delete + park/resolve/sync, digest-asserted
+  every round; op mix deliberately scoped to the supported 5b surface
+  (location ops join when 5d lands). On its first day it correctly
+  rediscovered the deferred 5d gap twice and then found Finding #4
+  (open) — the manual-soak-replacement loop working end to end.
+- **Next:** fix Finding #4 (timestamp-precision asymmetry in adoption
+  guards) and re-gate the fuzzer in `run-all.sh`; per-field `resolve`
+  choices (`--field UserName=local …`); delete-vs-edit and attachment
+  conflict scenarios; `empty-bin` verb; widen the fuzz op mix as
+  5c/5d land.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old
@@ -221,6 +238,54 @@ GUI) instead of one — short-term effort bought for compounding payoff.
     *enabled*? If they default disabled, even the fix leaves fresh-vault
     deletes permanent while the UI says "trash" — so either default-enable
     at creation or branch the UI on the flag.
+
+- **[FIXED] restore left the entry IN the bin group.**
+  `keys-engine::restore_entry` cleared `is_recycled` but never touched
+  `group_uuid`, so a "restored" entry still sat in the Trash for every
+  group-scoped view and every other KDBX client. Found by
+  `scenarios/restore-leaves-bin.sh` going red on its first run (the
+  suspicion was recorded in the backlog when the recycle verbs landed).
+  Root cause one layer deeper: the engine's mirror had **no
+  `previous_parent_uuid` column at all** — KDBX 4.1's
+  `<PreviousParentGroup>` was silently dropped on ingest and stripped
+  from every save (a round-trip fidelity bug affecting other clients'
+  data, not just restore). Fix: migration 0008 adds the column;
+  ingest/projection round-trip it; `recycle_entry` / `move_entry`
+  record the source group; `restore_entry` returns the entry to its
+  recorded previous parent (root when absent/deleted, matching
+  KeePassXC). Proven across reopen incl. the subfolder round-trip.
+
+- **[OPEN] convergence divergence under rapid re-edit around a
+  resolution — found by `scenarios/fuzz-convergence.sh` (excluded from
+  `run-all.sh` until fixed).** Two replicas under seeded concurrent
+  entry create/edit/delete + park/resolve/sync rounds intermittently
+  end a round with different content digests, or with one side
+  re-parking a conflict whose resolution record it should have adopted.
+  Evidence (env `KEYS_DEBUG_ADOPTION=1` instruments
+  `keys-engine/src/ingest.rs`):
+  - The same edit reads as `…T14:16:23.677Z` from the local mirror
+    (millisecond precision) but `…T14:16:23Z` from the peer's KDBX
+    (XML times floor to seconds). Every `edited_after` guard in the
+    adoption logic mixes the two precisions, so supersession decisions
+    wobble by up to a second — same-second races the manual 2-Mac soak
+    can never produce, but real sync absolutely can.
+  - The "fresh local edit re-opens a resolved conflict" rule (design
+    §5.3, correct in isolation) interleaves with that wobble across
+    rounds until the replicas silently disagree (digest mismatch with
+    no held conflict on either side — the worst outcome class).
+  - Repro: `FUZZ_ROUNDS=8 scenarios/fuzz-convergence.sh` fails roughly
+    1 run in 2–10; on failure both vaults + mirrors are preserved
+    under `$TMPDIR/keyhole-fuzz-failure-*` (replay caveat: mirrors are
+    post-failure state — instrument live instead).
+  - Likely fix direction: floor mirror-side mtimes to seconds (or
+    carry sub-second into the comparison consistently) wherever they
+    are compared against KDBX-derived times, and make adoption match
+    on the resolved *values* (content hash) rather than time alone.
+  - Related (LOW, adversarial-review catch, deferred with 5d):
+    cross-peer adoption (`advance_local_entry`) takes the peer's
+    `previous_parent_uuid` wholesale while location reconciliation is
+    otherwise deferred — fold proper previous-parent merge rules into
+    the 5d work.
 
 ## Usage
 

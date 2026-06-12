@@ -424,7 +424,7 @@ impl From<KmAttachmentDeltaKind> for AttachmentDeltaKindFfi {
     }
 }
 
-fn hex_encode(bytes: [u8; 32]) -> String {
+pub(crate) fn hex_encode(bytes: [u8; 32]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(64);
     for b in bytes {

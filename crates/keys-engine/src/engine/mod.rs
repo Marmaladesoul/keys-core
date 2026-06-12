@@ -484,6 +484,28 @@ impl Engine {
         projection::project(&self.conn, &*self.field_protector)
     }
 
+    /// SHA-256 digest of the vault's user-visible content, computed by
+    /// [`keepass_merge::vault_content_digest`] over the projected
+    /// vault. Two replicas that have genuinely converged produce equal
+    /// digests; any user-visible divergence (fields, location, icons,
+    /// group tree, recycle-bin state) produces different ones. History,
+    /// timestamps and tombstones are excluded — see the keepass-merge
+    /// module docs for the scope contract.
+    ///
+    /// Deterministic per `keepass-merge` build, **not** stable across
+    /// releases: compare digests from the same build, never persist
+    /// them. Driving consumer is keyhole's sync-convergence assertions.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::project_to_vault`]'s errors — projection
+    /// invariant violations and `SELECT` failures.
+    pub fn content_digest(&self) -> Result<[u8; 32], EngineError> {
+        Ok(keepass_merge::vault_content_digest(
+            &self.project_to_vault()?,
+        ))
+    }
+
     /// Project the engine's `SQLite` mirror into a fresh
     /// [`keepass_core::model::Vault`], splice it into `kdbx`,
     /// re-encrypt under `kdbx`'s existing crypto envelope, and

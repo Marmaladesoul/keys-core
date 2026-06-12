@@ -930,6 +930,21 @@ pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
         return Err(EngineError::NotFound { entity: "entry" });
     }
 
+    // Recycling an entry that is already in the bin subtree is a no-op.
+    // Without this guard a double-recycle would clobber
+    // `previous_parent_uuid` with the bin itself, permanently losing the
+    // entry's true origin — `restore_entry` would then "restore" it INTO
+    // the Trash. (Adversarial-review catch on the 0008 work.)
+    let current_group: String = tx.query_row(
+        "SELECT group_uuid FROM entry WHERE uuid = ?1",
+        params![uuid_str],
+        |r| r.get(0),
+    )?;
+    if group_in_bin_subtree(&tx, &current_group)? {
+        tx.commit()?;
+        return Ok(());
+    }
+
     // Resolve the bin group, lazily creating it when the vault has the
     // recycle bin *enabled* but no bin group exists yet. This mirrors
     // keepass-core's `Kdbx::recycle_entry` / `find_or_create_recycle_bin`
@@ -946,8 +961,11 @@ pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
     };
 
     if let Some(bin) = bin {
+        // Record where the entry came from (KDBX 4.1
+        // <PreviousParentGroup>) so restore can put it back.
         tx.execute(
-            "UPDATE entry SET is_recycled = 1, group_uuid = ?1, modified_at = ?2 \
+            "UPDATE entry SET is_recycled = 1, previous_parent_uuid = group_uuid, \
+             group_uuid = ?1, modified_at = ?2 \
              WHERE uuid = ?3",
             params![bin, now_ms(), uuid_str],
         )?;
@@ -1018,18 +1036,90 @@ pub(crate) fn ensure_recycle_bin(conn: &mut Connection) -> Result<Option<String>
     Ok(bin)
 }
 
+/// Restore a recycled entry: clear `is_recycled` AND move it out of
+/// the bin group — back to its recorded previous parent
+/// (KDBX 4.1 `<PreviousParentGroup>`, written by `recycle_entry`) when
+/// that group still exists, else to the vault root. Restore is itself
+/// a relocation, so the bin becomes the new previous parent. Matches
+/// `KeePassXC`'s restore semantics.
+///
+/// Found by keyhole's `restore-leaves-bin.sh`: the original
+/// implementation only cleared the flag, leaving a "restored" entry
+/// still sitting in the Trash for every group-scoped view and every
+/// other KDBX client.
 pub(crate) fn restore_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
     if !entry_exists(&tx, &uuid_str)? {
         return Err(EngineError::NotFound { entity: "entry" });
     }
+
+    let (current_group, previous): (String, Option<String>) = tx.query_row(
+        "SELECT group_uuid, previous_parent_uuid FROM entry WHERE uuid = ?1",
+        params![uuid_str],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+
+    if !group_in_bin_subtree(&tx, &current_group)? {
+        // Not in the Trash. Restoring a live entry must not relocate it
+        // (an earlier draft would have bounced it to its previous parent
+        // or even the root — adversarial-review catch). Clear a stale
+        // `is_recycled` flag if one survives from an older mirror, but
+        // leave the entry where it lives.
+        tx.execute(
+            "UPDATE entry SET is_recycled = 0 WHERE uuid = ?1 AND is_recycled = 1",
+            params![uuid_str],
+        )?;
+        tx.commit()?;
+        return Ok(());
+    }
+
+    // Destination: the recorded previous parent (KDBX 4.1
+    // <PreviousParentGroup>, written by recycle_entry) when it still
+    // exists AND is not itself in the Trash subtree — restoring "back"
+    // into the bin is no restore at all. Otherwise the vault root, the
+    // one group guaranteed to exist (KeePassXC does the same).
+    let destination = match previous {
+        Some(prev) if group_exists(&tx, &prev)? && !group_in_bin_subtree(&tx, &prev)? => prev,
+        _ => tx.query_row(
+            "SELECT uuid FROM \"group\" WHERE parent_uuid IS NULL LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?,
+    };
     tx.execute(
-        "UPDATE entry SET is_recycled = 0, modified_at = ?1 WHERE uuid = ?2",
-        params![now_ms(), uuid_str],
+        "UPDATE entry SET is_recycled = 0, previous_parent_uuid = group_uuid, \
+         group_uuid = ?1, modified_at = ?2 WHERE uuid = ?3",
+        params![destination, now_ms(), uuid_str],
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// Is `group_uuid` the recycle bin or anywhere inside its subtree?
+/// Walks the parent chain; the depth guard makes a corrupt (cyclic)
+/// parent graph terminate rather than spin.
+fn group_in_bin_subtree(tx: &Transaction<'_>, group_uuid: &str) -> Result<bool, EngineError> {
+    let Some(bin) = recycle_bin_uuid(tx)? else {
+        return Ok(false);
+    };
+    let mut cur = Some(group_uuid.to_owned());
+    for _ in 0..10_000 {
+        let Some(g) = cur else { return Ok(false) };
+        if g == bin {
+            return Ok(true);
+        }
+        cur = tx
+            .query_row(
+                "SELECT parent_uuid FROM \"group\" WHERE uuid = ?1",
+                params![g],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+    }
+    debug_assert!(false, "group parent chain exceeded 10k — cycle?");
+    Ok(false)
 }
 
 pub(crate) fn delete_entry(
@@ -1082,9 +1172,17 @@ pub(crate) fn move_entry(
     }
     let from_group = Uuid::parse_str(&previous_group_str)
         .map_err(|e| EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+    // Any relocation records the source group (KDBX 4.1
+    // <PreviousParentGroup>), matching KeePassXC's behaviour on move.
+    // `is_recycled` follows the destination: a move into the Trash
+    // subtree IS a recycle, a move out IS a restore — leaving the flag
+    // stale would lie to every flag-scoped read until the next ingest
+    // re-derived it from ancestry. (Adversarial-review catch.)
+    let dest_in_bin = group_in_bin_subtree(&tx, &group_str)?;
     tx.execute(
-        "UPDATE entry SET group_uuid = ?1, modified_at = ?2 WHERE uuid = ?3",
-        params![group_str, now_ms(), uuid_str],
+        "UPDATE entry SET previous_parent_uuid = group_uuid, group_uuid = ?1, \
+         is_recycled = ?2, modified_at = ?3 WHERE uuid = ?4",
+        params![group_str, i64::from(dest_in_bin), now_ms(), uuid_str],
     )?;
     tx.commit()?;
     Ok(MoveEntryOutcome {

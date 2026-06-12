@@ -158,6 +158,28 @@ impl Engine {
         self.with_engine(|e| Ok(e.kdbx_state_signature()?.map(Into::into)))
     }
 
+    /// Hex-encoded SHA-256 digest of the vault's user-visible content
+    /// (fields, locations, icons, group tree, recycle-bin state —
+    /// history/timestamps/tombstones excluded). Equal digests ⇔
+    /// converged replicas, for digests produced by the same build;
+    /// never persist the value. See
+    /// [`keys_engine::Engine::content_digest`] and the scope contract
+    /// in `keepass_merge::digest`. Driving consumer is keyhole's
+    /// sync-convergence assertions.
+    ///
+    /// **Treat the value as secret-adjacent.** Its preimage includes
+    /// plaintext field values with no salt or KDF, so a leaked digest
+    /// is an offline guessing oracle against a vault whose other
+    /// contents are known. Compare in memory; never log it, write it
+    /// to disk, or send it off-device.
+    ///
+    /// Walks the whole mirror (including unwrapping protected fields),
+    /// so it is not free on large vaults — a test/diagnostics surface,
+    /// not a per-frame one.
+    pub fn content_digest(&self) -> Result<String, EngineError> {
+        self.with_engine(|e| Ok(crate::merge::hex_encode(e.content_digest()?)))
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Observers
     // ────────────────────────────────────────────────────────────────────

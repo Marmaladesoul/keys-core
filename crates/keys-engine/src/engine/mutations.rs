@@ -245,8 +245,12 @@ impl Engine {
         Ok(bin)
     }
 
-    /// Restore a recycled entry: clear `is_recycled`. The group does
-    /// not move — callers decide whether to move it elsewhere.
+    /// Restore a recycled entry: clear `is_recycled` AND move it out of
+    /// the Trash, back to its recorded previous parent (KDBX 4.1
+    /// `<PreviousParentGroup>`) when that group still exists outside the
+    /// bin subtree, else to the vault root — `KeePassXC`'s semantics. A
+    /// no-op (bar clearing a stale flag) on an entry that is not in the
+    /// Trash: restoring a live entry must never relocate it.
     ///
     /// # Errors
     ///

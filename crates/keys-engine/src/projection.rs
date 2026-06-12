@@ -420,13 +420,15 @@ struct EntryRow {
     modified_at: i64,
     accessed_at: i64,
     expires_at: Option<i64>,
+    previous_parent_uuid: Option<Uuid>,
 }
 
 fn load_entry_rows(conn: &Connection) -> Result<Vec<EntryRow>, EngineError> {
     let mut stmt = conn.prepare(
         "SELECT uuid, group_uuid, title, username, url, notes, \
                 icon_index, icon_custom_uuid, \
-                created_at, modified_at, accessed_at, expires_at \
+                created_at, modified_at, accessed_at, expires_at, \
+                previous_parent_uuid \
          FROM entry",
     )?;
     let rows = stmt
@@ -454,6 +456,17 @@ fn load_entry_rows(conn: &Connection) -> Result<Vec<EntryRow>, EngineError> {
                 modified_at: row.get(9)?,
                 accessed_at: row.get(10)?,
                 expires_at: row.get(11)?,
+                previous_parent_uuid: row
+                    .get::<_, Option<String>>(12)?
+                    .map(|s| Uuid::parse_str(&s))
+                    .transpose()
+                    .map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            12,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -476,6 +489,7 @@ fn build_entry_from_row(row: &EntryRow) -> Entry {
     );
     entry.icon_id = u32::try_from(icon_idx).unwrap_or(0);
     entry.custom_icon_uuid = row.icon_custom_uuid;
+    entry.previous_parent_group = row.previous_parent_uuid.map(GroupId);
     entry.times = build_times(
         row.created_at,
         row.modified_at,

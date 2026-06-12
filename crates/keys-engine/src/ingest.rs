@@ -368,8 +368,8 @@ fn insert_entry(
             icon_index, icon_custom_uuid, created_at, modified_at, \
             accessed_at, last_used_at, expires_at, \
             password_strength_bucket, password_entropy, password_fingerprint, \
-            is_recycled, has_totp\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            is_recycled, has_totp, previous_parent_uuid\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             entry_uuid,
             group_uuid,
@@ -390,6 +390,7 @@ fn insert_entry(
             pw_fingerprint_param,
             i64::from(is_recycled),
             i64::from(has_totp),
+            entry.previous_parent_group.map(|g| g.0.to_string()),
         ],
     )?;
 
@@ -840,6 +841,9 @@ pub struct IngestPeerOutcome {
 /// `owner` is an opaque peer/device identifier the sync layer supplies; it is
 /// the conflict-row key, so the same string must be used across that peer's
 /// pulls for the refresh-in-place semantics to hold.
+// Flat per-entry classification dispatch — one arm per verdict, same shape
+// (and same allow) as `insert_entry` above.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn ingest_peer(
     conn: &mut Connection,
     fingerprint_key: &[u8; 32],
@@ -864,6 +868,7 @@ pub(crate) fn ingest_peer(
     // has it on exactly one side.
     let peer_resolved = resolution_times(&peer.meta.custom_data);
     let local_resolved = resolution_times(&local.meta.custom_data);
+    debug_adoption_records(peer);
 
     // Tombstone maps (Phase 5b). Deduplicated per uuid with the earliest
     // deletion time winning — the grow-only `<DeletedObjects>` merge rule.
@@ -970,6 +975,15 @@ pub(crate) fn ingest_peer(
                 let local_resolution_holds =
                     local_resolved_at.is_some() && !peer_edited_since_local_res;
 
+                debug_adoption_decision(
+                    uuid,
+                    local_mtime,
+                    peer_mtime,
+                    peer_resolved_at,
+                    local_resolved_at,
+                    local_resolution_holds,
+                    local_supersedes_peer,
+                );
                 clear_conflict_rows(&tx, owner, &uuid_str)?;
                 if local_resolution_holds {
                     // We resolved this exact conflict and the peer hasn't edited
@@ -1132,6 +1146,55 @@ fn resolution_times(
 /// known, strictly-later edit; a missing timestamp is never treated as fresher.
 fn edited_after(mtime: Option<DateTime<Utc>>, resolved_at: Option<DateTime<Utc>>) -> bool {
     matches!((mtime, resolved_at), (Some(m), Some(r)) if m > r)
+}
+
+/// `KEYS_DEBUG_ADOPTION=1` diagnostics: dump every resolution record riding
+/// the peer vault. Uuids + timestamps + the conflict *kind* only — never
+/// field values, and never the field/attachment *name* either: custom-field
+/// names are user-authored and can themselves be sensitive, and stderr may
+/// be captured into persistent logs. Proven necessary by the
+/// fuzz-convergence investigation (keyhole DESIGN.md Finding #4): replaying
+/// a preserved failure mutates the mirror, so the only honest view of an
+/// adoption decision is logging it live.
+fn debug_adoption_records(peer: &Vault) {
+    if std::env::var_os("KEYS_DEBUG_ADOPTION").is_none() {
+        return;
+    }
+    for r in keepass_merge::parse_conflict_resolutions(&peer.meta.custom_data).unwrap_or_default() {
+        eprintln!(
+            "ADOPTION-DEBUG peer record: entry={} kind={:?} resolved_at={:?}",
+            r.entry, r.kind, r.resolved_at
+        );
+    }
+}
+
+/// `KEYS_DEBUG_ADOPTION=1` diagnostics: one line per adoption decision —
+/// the four timestamps the guards compare plus the branch taken. See
+/// [`debug_adoption_records`].
+#[allow(clippy::fn_params_excessive_bools)]
+fn debug_adoption_decision(
+    uuid: Uuid,
+    local_mtime: Option<DateTime<Utc>>,
+    peer_mtime: Option<DateTime<Utc>>,
+    peer_resolved_at: Option<DateTime<Utc>>,
+    local_resolved_at: Option<DateTime<Utc>>,
+    local_resolution_holds: bool,
+    local_supersedes_peer: bool,
+) {
+    if std::env::var_os("KEYS_DEBUG_ADOPTION").is_none() {
+        return;
+    }
+    let branch = if local_resolution_holds {
+        "local-holds"
+    } else if peer_resolved_at.is_some() && !local_supersedes_peer {
+        "adopt-peer"
+    } else {
+        "hold-open"
+    };
+    eprintln!(
+        "ADOPTION-DEBUG {uuid}: local_mtime={local_mtime:?} peer_mtime={peer_mtime:?} \
+         peer_res={peer_resolved_at:?} local_res={local_resolved_at:?} branch={branch}"
+    );
 }
 
 /// Does the local mirror already hold the group `group_id`?
