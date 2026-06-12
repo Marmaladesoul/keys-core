@@ -205,7 +205,18 @@ fn clear_vault_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute("DELETE FROM entry_custom_data", [])?;
     conn.execute("DELETE FROM entry", [])?;
     conn.execute("DELETE FROM tag", [])?;
-    conn.execute("DELETE FROM attachment_blob", [])?;
+    // Pool blobs referenced by a parked conflict survive the wipe: the
+    // conflict_* tables deliberately outlive a full re-ingest (migration
+    // 0007), and a peer's DIVERGENT attachment bytes exist only in the
+    // pool — rebuilding from the vault alone would leave the conflict row
+    // dangling and the resolver's "theirs" silently attachment-less again
+    // (Finding #7). The re-ingest below re-adds vault blobs idempotently
+    // (INSERT OR IGNORE).
+    conn.execute(
+        "DELETE FROM attachment_blob WHERE sha256 NOT IN \
+             (SELECT blob_sha256 FROM conflict_entry_attachment)",
+        [],
+    )?;
     // Group goes last; entries FK to it.
     conn.execute("DELETE FROM \"group\"", [])?;
     Ok(())
@@ -514,20 +525,12 @@ fn insert_attachment_link_upsert(
     attachment_name: &str,
     bytes: &[u8],
 ) -> Result<(), rusqlite::Error> {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let sha = hasher.finalize();
-    let sha_bytes: &[u8] = sha.as_slice();
-    let size_i64 = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
-    conn.execute(
-        "INSERT OR IGNORE INTO attachment_blob (sha256, bytes, size) VALUES (?1, ?2, ?3)",
-        params![sha_bytes, bytes, size_i64],
-    )?;
+    let sha = upsert_attachment_blob(conn, bytes)?;
     conn.execute(
         "INSERT INTO entry_attachment (entry_uuid, attachment_name, blob_sha256) \
          VALUES (?1, ?2, ?3) \
          ON CONFLICT(entry_uuid, attachment_name) DO UPDATE SET blob_sha256 = excluded.blob_sha256",
-        params![entry_uuid, attachment_name, sha_bytes],
+        params![entry_uuid, attachment_name, sha.as_slice()],
     )?;
     Ok(())
 }
@@ -540,22 +543,28 @@ fn insert_attachment(
     attachment_name: &str,
     bytes: &[u8],
 ) -> Result<(), rusqlite::Error> {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let sha = hasher.finalize();
-    let sha_bytes: &[u8] = sha.as_slice();
-    let size_i64 = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
-
-    conn.execute(
-        "INSERT OR IGNORE INTO attachment_blob (sha256, bytes, size) VALUES (?1, ?2, ?3)",
-        params![sha_bytes, bytes, size_i64],
-    )?;
+    let sha = upsert_attachment_blob(conn, bytes)?;
     conn.execute(
         "INSERT OR IGNORE INTO entry_attachment (entry_uuid, attachment_name, blob_sha256) \
          VALUES (?1, ?2, ?3)",
-        params![entry_uuid, attachment_name, sha_bytes],
+        params![entry_uuid, attachment_name, sha.as_slice()],
     )?;
     Ok(())
+}
+
+/// Content-address `bytes` into the shared `attachment_blob` pool
+/// (`INSERT OR IGNORE` — the pool rows are immutable by construction)
+/// and return the SHA-256 key.
+fn upsert_attachment_blob(conn: &Connection, bytes: &[u8]) -> Result<[u8; 32], rusqlite::Error> {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let sha: [u8; 32] = hasher.finalize().into();
+    let size_i64 = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+    conn.execute(
+        "INSERT OR IGNORE INTO attachment_blob (sha256, bytes, size) VALUES (?1, ?2, ?3)",
+        params![sha.as_slice(), bytes, size_i64],
+    )?;
+    Ok(sha)
 }
 
 /// Persist a single non-protected custom field via the
@@ -1081,14 +1090,22 @@ pub(crate) fn ingest_peer(
                     //
                     // KNOWN LIMITATION (deferred to Phase 5, by design —
                     // classify's scope is standard + custom fields + icon): the
-                    // peer's NON-conflicting facets riding alongside this held
-                    // conflict (tags, attachments, group placement) are neither
-                    // folded onto local nor captured in the peer row. They are
-                    // not lost (the peer keeps them); they reach this side once
-                    // the conflict converges or Phase 5 (content pools / groups)
-                    // lands. The eager-merge path folded them immediately —
-                    // the accepted behavioural narrowing of the switch.
-                    insert_conflict_entry(&tx, owner, &conflict.remote, &session_key)?;
+                    // peer's NON-conflicting tags and group placement riding
+                    // alongside this held conflict are neither folded onto
+                    // local nor captured in the peer row. They are not lost
+                    // (the peer keeps them); they reach this side once the
+                    // conflict converges or Phase 5 (groups) lands. The
+                    // eager-merge path folded them immediately — the accepted
+                    // behavioural narrowing of the switch. Attachment state IS
+                    // captured since Finding #7 (the resolver's rebuilt
+                    // "theirs" must carry the peer's true attachment set).
+                    insert_conflict_entry(
+                        &tx,
+                        owner,
+                        &conflict.remote,
+                        &session_key,
+                        &peer_bin_refs,
+                    )?;
                     outcome.conflicted.push(uuid);
                 }
             }
@@ -1350,14 +1367,21 @@ fn advance_local_entry(
 /// Write the peer's value as an `owner`-keyed `conflict_*` row set (the
 /// resolver's "theirs"). Mirrors [`insert_entry`]'s field walk but targets
 /// the parallel conflict tables and omits the engine-internal derived
-/// columns / history / tags / attachments (out of Phase-2 scope). Protected
-/// fields are sealed under the same session key the live rows use — never
-/// stored as plaintext.
+/// columns / history / tags (out of scope). Protected fields are sealed
+/// under the same session key the live rows use — never stored as
+/// plaintext.
+///
+/// Attachment state IS captured (Finding #7): names as
+/// `conflict_entry_attachment` rows, bytes content-addressed into the
+/// shared `attachment_blob` pool via `binaries` (the peer vault's pool).
+/// Without it the resolver's rebuilt "theirs" carried no attachments and a
+/// choose-remote resolution wiped the local links.
 fn insert_conflict_entry(
     tx: &Connection,
     owner: &str,
     entry: &Entry,
     session_key: &SessionKey,
+    binaries: &[&[u8]],
 ) -> Result<(), EngineError> {
     let uuid = entry.id.0.to_string();
     tx.execute(
@@ -1416,6 +1440,22 @@ fn insert_conflict_entry(
         }
     }
 
+    // Attachments: resolve ref_id → bytes via the peer's binary pool,
+    // content-address into the shared blob pool, link by sha. Dangling
+    // ref_ids skip, matching `insert_entry`'s posture.
+    for att in &entry.attachments {
+        let Some(bytes) = binaries.get(att.ref_id as usize).copied() else {
+            continue;
+        };
+        let sha = upsert_attachment_blob(tx, bytes)?;
+        tx.execute(
+            "INSERT INTO conflict_entry_attachment \
+                 (owner, entry_uuid, attachment_name, blob_sha256) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![owner, uuid, att.name, sha.as_slice()],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1432,6 +1472,10 @@ fn clear_conflict_rows(
     )?;
     tx.execute(
         "DELETE FROM conflict_entry_custom_field WHERE owner = ?1 AND entry_uuid = ?2",
+        params![owner, entry_uuid],
+    )?;
+    tx.execute(
+        "DELETE FROM conflict_entry_attachment WHERE owner = ?1 AND entry_uuid = ?2",
         params![owner, entry_uuid],
     )?;
     tx.execute(

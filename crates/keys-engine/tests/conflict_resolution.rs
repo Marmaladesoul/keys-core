@@ -305,6 +305,211 @@ fn held_conflict_payload_enables_parked_resolution() {
     );
 }
 
+/// Finding #7 (keyhole DESIGN.md): resolving a parked conflict must NOT
+/// drop attachments added since the fork. The resolver's "theirs" is
+/// reconstructed from the `conflict_*` rows; before those rows stored
+/// attachment state the rebuilt remote entry had none, the local-vs-theirs
+/// merge read that as "remote removed every attachment", and a
+/// choose-remote resolution wiped the local links. Here both sides carry
+/// the attachment (disk's copy descends from the save that added it), the
+/// title parks, and resolving to remote must keep the attachment.
+#[test]
+fn parked_resolution_preserves_attachments() {
+    let mut f = fixture();
+
+    // Attachment lands locally and is saved, so the disk lineage carries it.
+    f.engine
+        .set_attachment(f.seed_uuid, "doc.txt", b"precious")
+        .expect("set attachment");
+    let mut handle = reopen_kdbx(&f.kdbx_path);
+    f.engine
+        .save_to_kdbx(&f.kdbx_path, &mut handle, None)
+        .expect("save attachment state");
+
+    // Both sides edit Title → park.
+    f.engine
+        .update_entry(
+            f.seed_uuid,
+            keys_engine::EntryUpdate {
+                title: Some("local-title".into()),
+                ..Default::default()
+            },
+        )
+        .expect("local edit");
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .edit_entry(EntryId(f.seed_uuid), HistoryPolicy::Snapshot, |e| {
+            e.set_title("disk-title");
+        })
+        .expect("disk edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+    f.engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park");
+    assert_eq!(
+        f.engine.entries_with_parked_conflict().expect("badge"),
+        vec![f.seed_uuid],
+        "the conflict is held",
+    );
+
+    // Resolve to remote through the resolver-open path.
+    let payload = f
+        .engine
+        .held_conflict_payload(&f.kdbx_path, &composite(), None)
+        .expect("derive")
+        .expect("a held conflict is present");
+    f.engine
+        .apply_conflict_resolution(
+            payload.id,
+            &title_resolution(f.seed_uuid, ConflictSide::Remote),
+        )
+        .expect("apply");
+
+    // The remote field won AND the attachment survived.
+    assert_eq!(
+        f.engine.entry(f.seed_uuid).unwrap().unwrap().title,
+        "disk-title",
+    );
+    assert_eq!(
+        f.engine
+            .attachment_bytes(f.seed_uuid, "doc.txt")
+            .expect("attachment survives a choose-remote resolution"),
+        b"precious",
+    );
+}
+
+/// The pool blobs backing a parked conflict's attachment state must survive
+/// a full re-ingest (`clear_vault_tables` + walk): resolving a DIFFERENT
+/// entry re-ingests the merged vault wholesale, and a peer's DIVERGENT
+/// attachment bytes exist only in the pool — an unconditional pool wipe
+/// left the conflict's attachment row dangling and the rebuilt "theirs"
+/// silently attachment-less (Finding #7 through the re-ingest door).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn held_divergent_attachment_survives_resolving_another_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let seed_uuid = kdbx.add_entry(root, NewEntry::new("seed")).expect("seed").0;
+    let other_uuid = kdbx
+        .add_entry(root, NewEntry::new("other"))
+        .expect("other")
+        .0;
+
+    // Engine A: ingests, saves — the shared fork point on disk.
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    engine_a
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("a save");
+
+    // Engine B: forks from disk, adds a DIVERGENT-bytes attachment to
+    // `other` (A never sees these bytes outside the conflict row), edits
+    // both titles, and saves its lineage to disk.
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_path))
+        .expect("b ingest");
+    engine_b
+        .set_attachment(other_uuid, "doc2.txt", b"divergent-bytes")
+        .expect("b attach");
+    for (uuid, title) in [(seed_uuid, "b-seed"), (other_uuid, "b-other")] {
+        engine_b
+            .update_entry(
+                uuid,
+                keys_engine::EntryUpdate {
+                    title: Some(title.into()),
+                    ..Default::default()
+                },
+            )
+            .expect("b edit");
+    }
+    let mut handle = reopen_kdbx(&kdbx_path);
+    engine_b
+        .save_to_kdbx(&kdbx_path, &mut handle, None)
+        .expect("b save");
+
+    // A edits both titles too → both entries park on reconcile.
+    for (uuid, title) in [(seed_uuid, "a-seed"), (other_uuid, "a-other")] {
+        engine_a
+            .update_entry(
+                uuid,
+                keys_engine::EntryUpdate {
+                    title: Some(title.into()),
+                    ..Default::default()
+                },
+            )
+            .expect("a edit");
+    }
+    engine_a
+        .reconcile_with_disk_park_conflicts(&kdbx_path, &composite(), chrono::Utc::now())
+        .expect("a park");
+    let mut held = engine_a.entries_with_parked_conflict().expect("badge");
+    held.sort();
+    let mut expected = vec![seed_uuid, other_uuid];
+    expected.sort();
+    assert_eq!(held, expected, "both entries held");
+
+    // Resolve `seed` first — this re-ingests the merged vault wholesale
+    // (the pool wipe under test).
+    let payload = engine_a
+        .held_conflict_payload(&kdbx_path, &composite(), Some(seed_uuid))
+        .expect("derive seed")
+        .expect("seed held");
+    engine_a
+        .apply_conflict_resolution(
+            payload.id,
+            &title_resolution(seed_uuid, ConflictSide::Remote),
+        )
+        .expect("apply seed");
+
+    // `other`'s rebuilt "theirs" must STILL carry the divergent attachment.
+    let payload = engine_a
+        .held_conflict_payload(&kdbx_path, &composite(), Some(other_uuid))
+        .expect("derive other")
+        .expect("other still held");
+    assert_eq!(payload.entry_conflicts.len(), 1);
+    assert_eq!(
+        payload.entry_conflicts[0]
+            .attachment_deltas
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["doc2.txt"],
+        "the divergent peer attachment survives the re-ingest",
+    );
+
+    // Resolve `other` to remote, attachment included — the bytes land.
+    let mut resolution = title_resolution(other_uuid, ConflictSide::Remote);
+    let mut attachments: HashMap<String, AttachmentChoice> = HashMap::new();
+    attachments.insert("doc2.txt".into(), AttachmentChoice::KeepRemote);
+    resolution
+        .entry_attachment_choices
+        .insert(EntryId(other_uuid), attachments);
+    engine_a
+        .apply_conflict_resolution(payload.id, &resolution)
+        .expect("apply other");
+    assert_eq!(
+        engine_a
+            .attachment_bytes(other_uuid, "doc2.txt")
+            .expect("divergent attachment adopted"),
+        b"divergent-bytes",
+    );
+    assert!(
+        engine_a
+            .entries_with_parked_conflict()
+            .expect("badge")
+            .is_empty(),
+        "badge cleared after both resolutions",
+    );
+}
+
 /// A held conflict whose values have since converged (e.g. the user edited
 /// local to match the peer, or a peer's resolution synced in) must clear its
 /// badge at resolver-open instead of ghosting forever. Regression for the

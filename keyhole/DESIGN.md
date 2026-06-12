@@ -233,20 +233,36 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   (dedup'd with live attachments); unresolvable refs (pre-widening
   rows, GC'd blobs) skip, matching `history_attachment_bytes`'s
   posture.
-- **[OPEN] resolving a parked conflict DROPS attachments added since
+- **[FIXED] resolving a parked conflict DROPPED attachments added since
   the fork — found by the widened fuzz mix (keyhole finding #7).**
   Sequence: A sets an attachment on entry X; B (or A) also field-edits
   X both-sided so X parks; A resolves choosing remote. The conflict
-  context's "remote" is reconstructed from `conflict_*` rows, which
-  carry NO attachments — so the apply replaces X wholesale and A's own
-  attachment links are wiped (bytes survive unreferenced in the pool,
-  and in the pre-resolve history snapshot, but the live entry loses
-  them; the peer that already adopted the attachment keeps it →
-  replicas diverge). Data-loss-adjacent: this is the concrete shape of
-  the facets-alongside-held-conflict slice. Until it lands, the main
-  convergence fuzzer excludes attachment ops and
-  [fuzz-attachments.sh](scenarios/fuzz-attachments.sh) (no field
-  edits → nothing parks) gates the shipped one-sided surface.
+  context's "remote" was reconstructed from `conflict_*` rows, which
+  carried NO attachments — so the apply replaced X wholesale and A's own
+  attachment links were wiped (bytes survived unreferenced in the pool,
+  and in the pre-resolve history snapshot, but the live entry lost
+  them; the peer that already adopted the attachment kept it →
+  replicas diverged). **Fix:** conflict rows store the peer's attachment
+  state — migration 0009 adds `conflict_entry_attachment` (names linked
+  by sha into the shared content-addressed `attachment_blob` pool;
+  bytes upserted at park time), `reconstruct_peer_entry` returns the
+  attachments alongside the entry, and `held_conflict_payload` binds
+  them into the synthetic "theirs" vault's binary pool — so the
+  local-vs-theirs merge sees the peer's true attachment set and
+  `apply_merge`'s existing attachment machinery does the rest (a
+  genuine divergence now surfaces as a resolver delta instead of a
+  silent wipe). The pre-push security review caught a second door to
+  the same loss: `clear_vault_tables` (any full re-ingest, e.g.
+  resolving a *different* entry) wiped `attachment_blob` wholesale and
+  rebuilt it from the vault — a parked peer attachment with DIVERGENT
+  bytes exists only in the pool, so its row dangled and "theirs" went
+  attachment-less again; the wipe now preserves blobs referenced by
+  `conflict_entry_attachment`. NOTE for blob-pool GC (5c remainder):
+  `conflict_entry_attachment` is a reference root. Pinned by
+  [resolve-keeps-attachments.sh](scenarios/resolve-keeps-attachments.sh)
+  (both resolution sides, across reopen + cross-replica convergence)
+  and keys-engine `parked_resolution_preserves_attachments` +
+  `held_divergent_attachment_survives_resolving_another_entry`.
 - **[OPEN] LCA generation-aliasing resurrects removed attachments —
   found by `fuzz-attachments.sh` on its first soak (keyhole finding
   #8).** `find_common_ancestor` matches by content hash alone; when an
@@ -274,12 +290,16 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   tombstoned delete; enable auto-creates/designates a bin (no group
   picker); disable + delete removes the bin and contents. The GUI
   toggle is now "call the proven path".
+- **Done (2026-06-13, Finding #7 fix):** conflict rows store the
+  peer's attachment state (migration 0009) and the resolver's rebuilt
+  "theirs" carries it — resolving a parked conflict no longer drops
+  attachments added since the fork. See Findings.
 - **Next:** the remaining 5c slice — fix Finding #8 (LCA generation
-  disambiguation), fix Finding #7 (conflict rows store attachments;
-  resolve preserves/merges attachment state), then both-sided
-  attachment park/resolve and blob-pool GC, then merge + re-gate the
-  fuzz mixes; `empty-bin` verb; value-hash-based adoption matching
-  (timestamp-free) as hardening when resolution records grow fields.
+  disambiguation), then both-sided attachment park/resolve and
+  blob-pool GC (GC must treat `conflict_entry_attachment` as a
+  reference root), then merge + re-gate the fuzz mixes; `empty-bin`
+  verb; value-hash-based adoption matching (timestamp-free) as
+  hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old
