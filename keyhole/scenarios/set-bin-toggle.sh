@@ -36,16 +36,16 @@ done
 "$KEYHOLE" set-bin "$VAULT" off >/dev/null
 [ "$(field 'recycle bin')" = "disabled" ] || { echo "FAIL: disable did not persist"; exit 1; }
 [ "$(field 'bin group')" = "absent" ] || { echo "FAIL: designation not cleared"; exit 1; }
-"$KEYHOLE" list-groups "$VAULT" | grep -q "Recycle Bin" \
+"$KEYHOLE" list-groups "$VAULT" | grep "Recycle Bin" >/dev/null \
     || { echo "FAIL: disable (keep) should leave the old group as an ordinary group"; exit 1; }
-"$KEYHOLE" list-groups "$VAULT" | grep "Recycle Bin" | grep -q '\[bin\]' \
+"$KEYHOLE" list-groups "$VAULT" | grep "Recycle Bin" | grep '\[bin\]' >/dev/null \
     && { echo "FAIL: kept group still flagged as the bin"; exit 1; }
 
 # Bin off ⇒ recycling is PERMANENT (engine policy, tombstoned).
 v1="$("$KEYHOLE" list "$VAULT" | awk '/victim-one/ {print $1; exit}')"
 "$KEYHOLE" recycle "$VAULT" "$v1" >/dev/null
 rm -rf "$VAULT.mirror"
-"$KEYHOLE" list "$VAULT" | grep -q "$v1" \
+"$KEYHOLE" list "$VAULT" | grep "$v1" >/dev/null \
     && { echo "FAIL: bin-off recycle did not permanently delete"; exit 1; }
 [ "$(field 'entries')" = "2" ] || { echo "FAIL: expected 2 entries after permanent delete"; exit 1; }
 
@@ -62,7 +62,7 @@ v2="$("$KEYHOLE" list "$VAULT" | awk '/victim-two/ {print $1; exit}')"
 "$KEYHOLE" set-bin "$VAULT" off --delete-bin-contents >/dev/null
 [ "$(field 'recycle bin')" = "disabled" ] || { echo "FAIL: disable(delete) did not persist"; exit 1; }
 rm -rf "$VAULT.mirror"
-"$KEYHOLE" list "$VAULT" | grep -q "$v2" \
+"$KEYHOLE" list "$VAULT" | grep "$v2" >/dev/null \
     && { echo "FAIL: bin contents survived --delete-bin-contents"; exit 1; }
 [ "$(field 'entries')" = "1" ] || { echo "FAIL: expected only 'keeper' to remain"; exit 1; }
 

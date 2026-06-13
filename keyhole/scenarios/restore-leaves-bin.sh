@@ -37,7 +37,7 @@ n="$(bin_count)"
 [ "$n" = "0" ] || { echo "FAIL: restored entry still counted in the bin ($n) — restore didn't move it out of the bin group"; exit 1; }
 
 # And it must be back in a *visible* group (root), not merely flagged.
-"$KEYHOLE" list "$VAULT" --group "$root" | grep -q "$uuid" \
+"$KEYHOLE" list "$VAULT" --group "$root" | grep "$uuid" >/dev/null \
     || { echo "FAIL: restored entry not listed under the root group"; exit 1; }
 
 # --- the sharper half: restore returns to the ORIGINAL group ---------
@@ -63,14 +63,14 @@ rm -rf "$VAULT.mirror"
 
 "$KEYHOLE" restore "$VAULT" "$nuuid" >/dev/null
 rm -rf "$VAULT.mirror"
-"$KEYHOLE" list "$VAULT" --group "$nest" | grep -q "$nuuid" \
+"$KEYHOLE" list "$VAULT" --group "$nest" | grep "$nuuid" >/dev/null \
     || { echo "FAIL: restored entry did not return to its original subfolder (PreviousParentGroup lost in round-trip or clobbered by double-recycle)"; exit 1; }
 
 # Restore-of-live-entry regression: restoring an entry that is NOT in
 # the Trash must not relocate it.
 "$KEYHOLE" restore "$VAULT" "$nuuid" >/dev/null
 rm -rf "$VAULT.mirror"
-"$KEYHOLE" list "$VAULT" --group "$nest" | grep -q "$nuuid" \
+"$KEYHOLE" list "$VAULT" --group "$nest" | grep "$nuuid" >/dev/null \
     || { echo "FAIL: restore of a live entry relocated it out of its group"; exit 1; }
 
 echo "PASS: restore exits the bin to the original group (via full KDBX round-trip); double-recycle and live-restore are safe no-ops"

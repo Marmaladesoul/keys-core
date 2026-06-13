@@ -67,7 +67,7 @@ for round in $(seq 1 "$ROUNDS"); do
 
     "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
     "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
-    "$KEYHOLE" list-conflicts "$A" | grep -q '(no held conflicts)' \
+    "$KEYHOLE" list-conflicts "$A" | grep '(no held conflicts)' >/dev/null \
         || fail "attachment-only ops parked a conflict on A"
 
     da="$("$KEYHOLE" digest "$A")"

@@ -128,11 +128,11 @@ for round in $(seq 1 "$ROUNDS"); do
     # Sync: A pulls B, resolves; B pulls the resolved A.
     "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
     resolve_all "$A"
-    "$KEYHOLE" list-conflicts "$A" | grep -q '(no held conflicts)' \
+    "$KEYHOLE" list-conflicts "$A" | grep '(no held conflicts)' >/dev/null \
         || fail "conflicts remain on A after resolve_all"
 
     "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
-    "$KEYHOLE" list-conflicts "$B" | grep -q '(no held conflicts)' \
+    "$KEYHOLE" list-conflicts "$B" | grep '(no held conflicts)' >/dev/null \
         || fail "B re-parked a conflict A already resolved"
 
     da="$("$KEYHOLE" digest "$A")"
