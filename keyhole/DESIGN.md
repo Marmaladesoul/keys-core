@@ -318,11 +318,19 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 - **Done (2026-06-13, Finding #8 fix):** `find_common_ancestor` is
   generation-aware (min-rank pair selection, keepass-merge); both
   fuzzers are CI gates and the main fuzz mix carries attachment ops.
-  See Findings. The same CI run also surfaced and fixed a latent
+  See Findings. The same CI run also surfaced a latent
   scenario-harness race: keyhole prints a summary line after its
-  greppable output, so `keyhole … | grep -q` + `pipefail` could
-  false-FAIL on an EPIPE panic when grep exited at first match —
-  every `$KEYHOLE`-piped grep is now full-read (`grep X >/dev/null`).
+  greppable output, so a reader that closes the pipe early
+  (`grep -q`, `head -1`, `awk '…; exit'`) makes keyhole's next
+  `println!` hit EPIPE — and because Rust sets `SIGPIPE` to `SIG_IGN`,
+  that surfaces as a panic, which `pipefail` then turns into a
+  false-FAIL. Patched twice: first the `grep -q` sites went full-read
+  (`grep X >/dev/null`), then — when an `awk '…; exit'` capture flaked
+  `move-propagates.sh` on #152's CI — the durable fix landed in keyhole
+  itself: `restore_default_sigpipe` resets `SIGPIPE` to `SIG_DFL` at
+  the top of `main`, so keyhole dies quietly like a normal unix tool on
+  a closed stdout instead of panicking. That kills the whole class
+  regardless of how a scenario reads keyhole's output.
 - **Done (2026-06-13, both-sided attachment park/resolve — the 5c
   conflict slice):** `keepass_merge::classify` treats both-sided
   same-name attachment divergence (and the no-LCA conservative
