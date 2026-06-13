@@ -575,6 +575,7 @@ fn ingest_kdbx_as_owner(
         && outcome.deleted.is_empty()
         && outcome.moved.is_empty()
         && outcome.groups_added.is_empty()
+        && outcome.groups_updated.is_empty()
     {
         return Ok(ParkConflictsResult::NoChange);
     }
@@ -585,6 +586,7 @@ fn ingest_kdbx_as_owner(
         entries_deleted: outcome.deleted.len(),
         entries_moved: outcome.moved.len(),
         groups_added: outcome.groups_added.len(),
+        groups_updated: outcome.groups_updated.len(),
         ..Default::default()
     };
     let parked = ParkedConflictsSummary {

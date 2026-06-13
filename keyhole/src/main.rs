@@ -202,6 +202,16 @@ enum Command {
         #[arg(long)]
         parent: Option<String>,
     },
+    /// Rename a group (its `name` metadata), then persist. The
+    /// divergence-maker for 5d group metadata LWW.
+    RenameGroup {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the group to rename (see `list-groups`).
+        uuid: String,
+        /// New group name.
+        name: String,
+    },
     /// List every group: UUID, name, and direct entry count, one per
     /// line (the group-side twin of `list`).
     ListGroups {
@@ -426,6 +436,10 @@ async fn main() -> Result<()> {
         } => {
             let session = Session::open(&vault, &password).await?;
             session.create_group(name, parent).await?;
+        }
+        Command::RenameGroup { vault, uuid, name } => {
+            let session = Session::open(&vault, &password).await?;
+            session.rename_group(uuid, name).await?;
         }
         Command::ListGroups { vault } => {
             let session = Session::open(&vault, &password).await?;
@@ -880,6 +894,24 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("create_group: {e:?}"))?;
         self.save().await?;
         println!("created group {uuid}");
+        Ok(())
+    }
+
+    /// Rename a group (its `name`), then persist.
+    async fn rename_group(&self, uuid: String, name: String) -> Result<()> {
+        self.engine
+            .update_group(
+                uuid.clone(),
+                keys_ffi::EngineGroupUpdate {
+                    name: Some(name.clone()),
+                    notes: None,
+                    icon: None,
+                    expires_at: None,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("update_group: {e:?}"))?;
+        self.save().await?;
+        println!("renamed group {uuid} to {name:?} and saved to disk");
         Ok(())
     }
 
