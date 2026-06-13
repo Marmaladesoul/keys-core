@@ -318,11 +318,19 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 - **Done (2026-06-13, Finding #8 fix):** `find_common_ancestor` is
   generation-aware (min-rank pair selection, keepass-merge); both
   fuzzers are CI gates and the main fuzz mix carries attachment ops.
-  See Findings. The same CI run also surfaced and fixed a latent
+  See Findings. The same CI run also surfaced a latent
   scenario-harness race: keyhole prints a summary line after its
-  greppable output, so `keyhole … | grep -q` + `pipefail` could
-  false-FAIL on an EPIPE panic when grep exited at first match —
-  every `$KEYHOLE`-piped grep is now full-read (`grep X >/dev/null`).
+  greppable output, so a reader that closes the pipe early
+  (`grep -q`, `head -1`, `awk '…; exit'`) makes keyhole's next
+  `println!` hit EPIPE — and because Rust sets `SIGPIPE` to `SIG_IGN`,
+  that surfaces as a panic, which `pipefail` then turns into a
+  false-FAIL. Patched twice: first the `grep -q` sites went full-read
+  (`grep X >/dev/null`), then — when an `awk '…; exit'` capture flaked
+  `move-propagates.sh` on #152's CI — the durable fix landed in keyhole
+  itself: `restore_default_sigpipe` resets `SIGPIPE` to `SIG_DFL` at
+  the top of `main`, so keyhole dies quietly like a normal unix tool on
+  a closed stdout instead of panicking. That kills the whole class
+  regardless of how a scenario reads keyhole's output.
 - **Done (2026-06-13, both-sided attachment park/resolve — the 5c
   conflict slice):** `keepass_merge::classify` treats both-sided
   same-name attachment divergence (and the no-LCA conservative
@@ -368,15 +376,25 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   [move-lww.sh](scenarios/move-lww.sh) (both-sided, converges on the
   side that didn't make the winning move); `fuzz-convergence.sh` gains
   a move op among pre-seeded shared groups.
+- **Done (2026-06-13, 5d peer-only group adoption):** `ingest_peer`
+  now adopts groups the peer holds that the local mirror lacks —
+  walked top-down (parent before child) in `adopt_peer_groups`, so an
+  entry moved or added into a freshly-created peer group lands there
+  instead of falling back to root (and `reconcile_entry_location` no
+  longer no-ops for want of the destination). Adopted as ordinary
+  groups (`is_recycle_bin = 0`) — bin/`<Meta>` reconciliation is its
+  own slice and a second minted bin would break the single-bin
+  invariant. Pinned by [group-adopt.sh](scenarios/group-adopt.sh) +
+  keys-engine `two_engine_adopts_peer_only_group`;
+  `fuzz-convergence.sh` gains a `create-group` op (peer-only groups
+  adopted under churn) — 30/30 soak.
 - **Next:** icon pool union (the last 5c sliver); then the rest of
-  **5d group structure** — peer-only group adoption (today
-  `reconcile_entry_location` no-ops when the destination group isn't
-  local yet, and the peer-only-entry insert falls back to root), group
-  metadata LWW, consuming group tombstones (recorded since 5b, never
-  consumed), and the deferred previous-parent merge rules; then
-  create-group + recycle/restore join the fuzzer mix. `empty-bin`
-  verb; value-hash-based adoption matching (timestamp-free) as
-  hardening when resolution records grow fields.
+  **5d group structure** — group rename / move / recycle (metadata
+  LWW + tree reconciliation for *existing* groups), consuming group
+  tombstones (recorded since 5b, never consumed), and the deferred
+  previous-parent merge rules; then group rename/recycle join the
+  fuzzer mix. `empty-bin` verb; value-hash-based adoption matching
+  (timestamp-free) as hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old

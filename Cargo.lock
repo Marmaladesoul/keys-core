@@ -2640,6 +2640,7 @@ dependencies = [
  "anyhow",
  "clap",
  "keys-ffi",
+ "libc",
  "tokio",
 ]
 

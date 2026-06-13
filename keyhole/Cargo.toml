@@ -28,3 +28,8 @@ clap = { version = "4", features = ["derive"] }
 # dispatch onto tokio (uniffi `async_runtime = "tokio"`). Multi-thread
 # so the internal spawn_blocking has somewhere to run.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Unix-only: restore SIG_DFL for SIGPIPE so keyhole dies quietly when a
+# scenario's early-exit reader (head/grep -q/awk exit) closes our stdout,
+# instead of panicking on the EPIPE. See `restore_default_sigpipe`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

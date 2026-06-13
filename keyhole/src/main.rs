@@ -290,9 +290,35 @@ enum Command {
 
 // Flat verb dispatch: one match arm per CLI verb, growing linearly
 // with the verb list. Splitting it would add indirection, not clarity.
+/// Restore the default `SIGPIPE` disposition (`SIG_DFL`) on unix.
+///
+/// Rust sets `SIGPIPE` to `SIG_IGN` at startup, so writing to a closed
+/// stdout (a reader that exits early — `head -1`, `grep -q`,
+/// `awk '...; exit'`) surfaces as an `EPIPE` io error that `println!`
+/// then panics on ("failed printing to stdout: Broken pipe"). keyhole's
+/// machine-greppable output is consumed by exactly those early-exit
+/// readers in the scenario scripts, so a default unix tool's behaviour —
+/// die quietly on `SIGPIPE` — is what we want. Without this the panic
+/// fails the pipeline under `set -o pipefail` and flakes CI on a race
+/// that has nothing to do with the behaviour under test (the EPIPE class
+/// the scenario-side grep hardening only partly addressed).
+#[cfg(unix)]
+#[allow(unsafe_code)] // single libc::signal call; justified below
+fn restore_default_sigpipe() {
+    // SAFETY: `signal(2)` with `SIG_DFL` is async-signal-safe and we call
+    // it once at the very top of `main`, before any threads spawn or any
+    // output is written.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(unix)]
+    restore_default_sigpipe();
+
     let cli = Cli::parse();
     let password = read_password(&cli.password_env)?;
 
