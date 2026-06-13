@@ -379,8 +379,8 @@ fn insert_entry(
             icon_index, icon_custom_uuid, created_at, modified_at, \
             accessed_at, last_used_at, expires_at, \
             password_strength_bucket, password_entropy, password_fingerprint, \
-            is_recycled, has_totp, previous_parent_uuid\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            is_recycled, has_totp, previous_parent_uuid, location_changed_at\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             entry_uuid,
             group_uuid,
@@ -402,6 +402,7 @@ fn insert_entry(
             i64::from(is_recycled),
             i64::from(has_totp),
             entry.previous_parent_group.map(|g| g.0.to_string()),
+            entry.times.location_changed.map(|d| d.timestamp_millis()),
         ],
     )?;
 
@@ -868,6 +869,10 @@ pub struct IngestPeerOutcome {
     /// edited since (cross-peer delete propagation, Phase 5b). The local side
     /// changed → the caller must persist.
     pub deleted: Vec<Uuid>,
+    /// Local entries relocated to the peer's group because the peer's
+    /// `<LocationChanged>` is strictly newer (location LWW, Phase 5d). The
+    /// local side changed → the caller must persist.
+    pub moved: Vec<Uuid>,
     /// Count of entries the peer agreed on outright — nothing written.
     pub in_sync: usize,
 }
@@ -1115,6 +1120,21 @@ pub(crate) fn ingest_peer(
             // overwrite) the local side on a verdict we don't understand.
             _ => {}
         }
+
+        // Location LWW (Phase 5d), orthogonal to the content verdict above:
+        // a move changes only the entry's group + `<LocationChanged>`, never
+        // its content, so classify (fields/icon/attachments) verdicts it
+        // InSync and the move would otherwise never propagate. The peer's
+        // location triple is adopted VERBATIM when it wins the total order
+        // (see `reconcile_entry_location`) — never re-stamped (Finding #8:
+        // the same generation must not diverge in time across replicas).
+        // Runs after the verdict arm so it survives the drop+reinsert in
+        // `advance_local_entry` (which preserves the old group). Held
+        // conflicts relocate too — location is independent of the field
+        // clash being resolved.
+        if reconcile_entry_location(&tx, uuid, peer_entry, peer_parent)? {
+            outcome.moved.push(uuid);
+        }
     }
 
     // Cross-peer DELETE propagation + tombstone union (Phase 5b, direction 1).
@@ -1233,6 +1253,102 @@ fn resolution_times(
             .or_insert(floored);
     }
     out
+}
+
+/// Location LWW for one shared entry (Phase 5d). Returns `true` if the local
+/// entry was relocated to the peer's group.
+///
+/// The location facet of an entry is the triple `(location_changed,
+/// group, previous_parent)` — and ALL THREE feed the convergence digest
+/// (`PreviousParentGroup` since keepass-core #223), so all three must
+/// converge, not just the group. We pick a winner by a **total order over
+/// the whole triple**, identical on both replicas, and adopt the winner's
+/// triple **verbatim**:
+///
+/// 1. floored `location_changed` (the real LWW signal; `None` = −∞, so any
+///    real move beats a never-moved side);
+/// 2. on a tie, the destination group uuid (the same-second-move tiebreak —
+///    concurrent moves floored equal have no temporal winner);
+/// 3. on a further tie, the `previous_parent` uuid (purely to converge the
+///    digest's prev facet when two sides reached the same group at the same
+///    second from different sources — `None` sorts smallest).
+///
+/// The peer wins iff its triple is strictly greater. Because the comparison
+/// is over the same two stable triples on both sides, A-vs-B and B-vs-A pick
+/// the same winner → every location field converges. Adopting the peer's
+/// prev verbatim (not recomputing our own) is the Finding-#8 "adopt, don't
+/// re-derive" lesson extended across the triple. `is_recycled` is recomputed
+/// from the destination's bin-subtree membership, mirroring
+/// `mutations::move_entry`, so a synced move into/out of the bin keeps the
+/// flag honest.
+///
+/// Crucially this does NOT early-return on equal groups: a move that lands
+/// in the same group the peer already holds can still differ in prev / stamp
+/// (a self-move, or a move back to a shared group from different sources),
+/// and that difference is digest-visible.
+///
+/// A no-op when the peer's group doesn't exist locally yet (peer-only group
+/// adoption is the next 5d slice — the move lands once the group arrives),
+/// the entry isn't in the local mirror, or our triple already wins/ties.
+fn reconcile_entry_location(
+    tx: &Connection,
+    uuid: Uuid,
+    peer_entry: &Entry,
+    peer_parent: GroupId,
+) -> Result<bool, EngineError> {
+    let uuid_str = uuid.to_string();
+    let Some((local_group_str, local_prev, local_loc_ms)) = tx
+        .query_row(
+            "SELECT group_uuid, previous_parent_uuid, location_changed_at \
+             FROM entry WHERE uuid = ?1",
+            params![uuid_str],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(false);
+    };
+
+    // Build the comparable triple for each side. `None` location sorts below
+    // any real stamp; `None` prev sorts below any uuid — so the ordering is
+    // total and replica-symmetric.
+    let peer_loc = peer_entry
+        .times
+        .location_changed
+        .map(|t| floor_to_second(t).timestamp_millis());
+    let local_loc = local_loc_ms.map(|ms| ms - ms.rem_euclid(1000));
+    let peer_group_str = peer_parent.0.to_string();
+    let peer_prev = peer_entry.previous_parent_group.map(|g| g.0.to_string());
+    let local_triple = (local_loc, local_group_str, local_prev.clone());
+    let peer_triple = (peer_loc, peer_group_str.clone(), peer_prev.clone());
+    if peer_triple <= local_triple {
+        return Ok(false);
+    }
+
+    // The destination must exist locally; otherwise defer to group adoption.
+    if !group_exists(tx, peer_parent)? {
+        return Ok(false);
+    }
+
+    let dest_in_bin = crate::mutations::group_in_bin_subtree(tx, &peer_group_str)?;
+    tx.execute(
+        "UPDATE entry SET previous_parent_uuid = ?1, group_uuid = ?2, \
+         is_recycled = ?3, location_changed_at = ?4 WHERE uuid = ?5",
+        params![
+            peer_prev,
+            peer_group_str,
+            i64::from(dest_in_bin),
+            peer_loc,
+            uuid_str
+        ],
+    )?;
+    Ok(true)
 }
 
 /// Truncate sub-second precision (toward negative infinity, so pre-1970

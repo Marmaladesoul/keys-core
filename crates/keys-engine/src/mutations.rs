@@ -144,7 +144,7 @@ fn group_exists(tx: &Transaction<'_>, uuid: &str) -> Result<bool, EngineError> {
 }
 
 /// Look up the recycle bin group uuid, if one exists.
-fn recycle_bin_uuid(tx: &Transaction<'_>) -> Result<Option<String>, EngineError> {
+fn recycle_bin_uuid(tx: &Connection) -> Result<Option<String>, EngineError> {
     let row = tx
         .query_row(
             "SELECT uuid FROM \"group\" WHERE is_recycle_bin = 1 LIMIT 1",
@@ -1050,7 +1050,7 @@ pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
         // <PreviousParentGroup>) so restore can put it back.
         tx.execute(
             "UPDATE entry SET is_recycled = 1, previous_parent_uuid = group_uuid, \
-             group_uuid = ?1, modified_at = ?2 \
+             group_uuid = ?1, modified_at = ?2, location_changed_at = ?2 \
              WHERE uuid = ?3",
             params![bin, now_ms(), uuid_str],
         )?;
@@ -1174,7 +1174,7 @@ pub(crate) fn restore_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
     };
     tx.execute(
         "UPDATE entry SET is_recycled = 0, previous_parent_uuid = group_uuid, \
-         group_uuid = ?1, modified_at = ?2 WHERE uuid = ?3",
+         group_uuid = ?1, modified_at = ?2, location_changed_at = ?2 WHERE uuid = ?3",
         params![destination, now_ms(), uuid_str],
     )?;
     tx.commit()?;
@@ -1184,7 +1184,7 @@ pub(crate) fn restore_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
 /// Is `group_uuid` the recycle bin or anywhere inside its subtree?
 /// Walks the parent chain; the depth guard makes a corrupt (cyclic)
 /// parent graph terminate rather than spin.
-fn group_in_bin_subtree(tx: &Transaction<'_>, group_uuid: &str) -> Result<bool, EngineError> {
+pub(crate) fn group_in_bin_subtree(tx: &Connection, group_uuid: &str) -> Result<bool, EngineError> {
     let Some(bin) = recycle_bin_uuid(tx)? else {
         return Ok(false);
     };
@@ -1264,10 +1264,15 @@ pub(crate) fn move_entry(
     // stale would lie to every flag-scoped read until the next ingest
     // re-derived it from ancestry. (Adversarial-review catch.)
     let dest_in_bin = group_in_bin_subtree(&tx, &group_str)?;
+    // Stamp <LocationChanged> (5d sync LWW key) — a move is a location
+    // event, distinct from a content edit. `modified_at` is also
+    // bumped (pre-existing behaviour); the content hash is unchanged by
+    // a pure move, so field merge is unaffected either way.
+    let now = now_ms();
     tx.execute(
         "UPDATE entry SET previous_parent_uuid = group_uuid, group_uuid = ?1, \
-         is_recycled = ?2, modified_at = ?3 WHERE uuid = ?4",
-        params![group_str, i64::from(dest_in_bin), now_ms(), uuid_str],
+         is_recycled = ?2, modified_at = ?3, location_changed_at = ?3 WHERE uuid = ?4",
+        params![group_str, i64::from(dest_in_bin), now, uuid_str],
     )?;
     tx.commit()?;
     Ok(MoveEntryOutcome {

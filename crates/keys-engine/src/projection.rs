@@ -389,6 +389,9 @@ fn build_subtree(
         row.modified_at,
         row.modified_at,
         row.expires_at,
+        // Group <LocationChanged> isn't mirrored yet (5d group-move
+        // reconciliation is deferred — see DESIGN.md); entries carry it.
+        None,
     );
 
     if let Some(child_ids) = children_of.get(&uuid) {
@@ -426,6 +429,7 @@ struct EntryRow {
     accessed_at: i64,
     expires_at: Option<i64>,
     previous_parent_uuid: Option<Uuid>,
+    location_changed_at: Option<i64>,
 }
 
 fn load_entry_rows(conn: &Connection) -> Result<Vec<EntryRow>, EngineError> {
@@ -433,7 +437,7 @@ fn load_entry_rows(conn: &Connection) -> Result<Vec<EntryRow>, EngineError> {
         "SELECT uuid, group_uuid, title, username, url, notes, \
                 icon_index, icon_custom_uuid, \
                 created_at, modified_at, accessed_at, expires_at, \
-                previous_parent_uuid \
+                previous_parent_uuid, location_changed_at \
          FROM entry",
     )?;
     let rows = stmt
@@ -472,6 +476,7 @@ fn load_entry_rows(conn: &Connection) -> Result<Vec<EntryRow>, EngineError> {
                             Box::new(e),
                         )
                     })?,
+                location_changed_at: row.get(13)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -500,6 +505,7 @@ fn build_entry_from_row(row: &EntryRow) -> Entry {
         row.modified_at,
         row.accessed_at,
         row.expires_at,
+        row.location_changed_at,
     );
     entry
 }
@@ -721,6 +727,9 @@ fn snapshot_to_entry(
         snap.modified_at,
         snap.accessed_at,
         snap.expires_at,
+        // History snapshots don't carry location_changed (a snapshot is
+        // a content revision, not a move); left None.
+        None,
     );
     for (k, v) in &snap.custom_fields {
         let plaintext = if v.protected {
@@ -851,12 +860,14 @@ fn ms_to_dt(ms: i64) -> Option<DateTime<Utc>> {
 /// `created_at` and `modified_at` are NOT NULL — we mirror their value
 /// straight into `Some(...)`. The `expires` bool is `true` iff
 /// `expires_at` is `Some`. `last_access_time` mirrors `accessed_at`.
-/// `location_changed` is not persisted; left `None`.
+/// `location_changed` mirrors `location_changed_at` (NULL → `None`),
+/// floored to seconds like the others (5d: it's a sync LWW key).
 fn build_times(
     created_at: i64,
     modified_at: i64,
     accessed_at: i64,
     expires_at: Option<i64>,
+    location_changed_at: Option<i64>,
 ) -> Timestamps {
     let mut t = Timestamps::default();
     t.creation_time = ms_to_dt(created_at);
@@ -864,6 +875,7 @@ fn build_times(
     t.last_access_time = ms_to_dt(accessed_at);
     t.expiry_time = expires_at.and_then(ms_to_dt);
     t.expires = expires_at.is_some();
+    t.location_changed = location_changed_at.and_then(ms_to_dt);
     t
 }
 
@@ -873,7 +885,7 @@ mod tests {
 
     #[test]
     fn build_times_marks_expires_when_expires_at_set() {
-        let t = build_times(1_000, 2_000, 3_000, Some(4_000));
+        let t = build_times(1_000, 2_000, 3_000, Some(4_000), None);
         assert!(t.expires);
         assert_eq!(t.expiry_time, ms_to_dt(4_000));
         assert_eq!(t.creation_time, ms_to_dt(1_000));
@@ -881,7 +893,7 @@ mod tests {
 
     #[test]
     fn build_times_marks_no_expiry_when_none() {
-        let t = build_times(1_000, 2_000, 3_000, None);
+        let t = build_times(1_000, 2_000, 3_000, None, None);
         assert!(!t.expires);
         assert!(t.expiry_time.is_none());
     }

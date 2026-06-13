@@ -348,26 +348,35 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   [blob-pool-gc.sh](scenarios/blob-pool-gc.sh) (red pre-GC: deleting
   an entry left its blobs forever) and keys-engine
   `gc_attachment_blobs_reaps_only_unrooted`.
-- **Next:** icon pool union (the last 5c sliver); then **5d
-  (groups/location)**, now opened with evidence:
-  [move-propagates.sh](scenarios/move-propagates.sh) deterministically
-  pins the headline gap — **a one-sided entry move does not propagate
-  at all** (classify's scope excludes location; a pure move is
-  content-identical → `InSync` → the peer never learns; digest
-  divergence forever). Diagnostic / excluded from `run-all.sh` until
-  5d lands, then gate it and re-enable the fuzzer's location ops.
-  Design lead: KDBX natively carries `<Times><LocationChanged>` —
-  keepass-core's model round-trips it (`Timestamps.location_changed`)
-  but the engine mirror never stores it; location LWW on a floored
-  `location_changed` is the natural rule, with the Finding-#8 lesson
-  applied (an adopted move must adopt the peer's `location_changed`,
-  never re-stamp locally, or the same generation diverges in time
-  across replicas). Also in 5d: peer-only group adoption (today's
-  insert falls back to root when the parent is missing), group
+- **Done (2026-06-13, 5d entry-location LWW):** a one-sided entry move
+  now propagates, and a both-sided move resolves last-writer-wins by
+  floored `<LocationChanged>`. Migration 0010 stores
+  `location_changed_at` in the mirror (it was dropped on every save
+  and invisible to sync — a pure move is content-identical so classify
+  verdicts `InSync`); `move_entry`/recycle/restore stamp it; a
+  dedicated `reconcile_entry_location` pass in `ingest_peer` (run after
+  the content verdict, orthogonal to it) relocates the local entry
+  when the peer's floored stamp is strictly newer, adopting the peer's
+  **whole location triple verbatim** — destination, `location_changed`,
+  AND `<PreviousParentGroup>`. That last one matters: the digest
+  covers `PreviousParentGroup` (keepass-core #223), so computing our
+  own prev on adoption diverged the digests even when the group
+  agreed — the Finding-#8 "adopt, don't re-derive" lesson, extended to
+  every location facet. Loop-safe (verbatim stamp ⇒ peer sees nothing
+  newer next pull). Pinned by
+  [move-propagates.sh](scenarios/move-propagates.sh) (one-sided) +
+  [move-lww.sh](scenarios/move-lww.sh) (both-sided, converges on the
+  side that didn't make the winning move); `fuzz-convergence.sh` gains
+  a move op among pre-seeded shared groups.
+- **Next:** icon pool union (the last 5c sliver); then the rest of
+  **5d group structure** — peer-only group adoption (today
+  `reconcile_entry_location` no-ops when the destination group isn't
+  local yet, and the peer-only-entry insert falls back to root), group
   metadata LWW, consuming group tombstones (recorded since 5b, never
-  consumed), and the deferred previous-parent merge rules.
-  `empty-bin` verb; value-hash-based adoption matching
-  (timestamp-free) as hardening when resolution records grow fields.
+  consumed), and the deferred previous-parent merge rules; then
+  create-group + recycle/restore join the fuzzer mix. `empty-bin`
+  verb; value-hash-based adoption matching (timestamp-free) as
+  hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old
