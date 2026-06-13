@@ -139,7 +139,13 @@ pub(crate) fn apply_conflict_resolution(
     //    `apply_merge` does its own read-only validation pass before
     //    any mutation; a validation failure bails here without
     //    touching SQLite or the engine state.
-    let now = chrono::Utc::now();
+    // Stamp the resolution record from the engine's injected clock, not
+    // the system wall clock — otherwise a test / fuzzer that pins edit
+    // times via a FixedClock gets a `resolved_at` in real "now", which
+    // sits after every pinned edit and makes the resolved-since gate in
+    // `ingest_peer` permanently suppress later conflicts on the entry
+    // (Finding #9). Production (SystemClock) is unaffected.
+    let now = engine.now();
     let mut merged = local_vault;
     keepass_merge::apply_merge(&mut merged, &remote_vault, &outcome, resolution).map_err(|e| {
         EngineError::ResolutionMismatch {

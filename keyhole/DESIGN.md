@@ -488,6 +488,58 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 
 ## Findings (surfaced by keyhole)
 
+- **[OPEN] Finding #10 — stale `conflict_entry` row: badge present,
+  payload absent (ghost badge), asymmetric across peers.** Surfaced by
+  the hardened fuzzer once Finding #9 was fixed (`fuzz-convergence.sh`,
+  `FUZZ_SEED=777` round 30, parity oracle): peer A's
+  `entries_with_parked_conflict` returns an entry uuid for which
+  `held_conflict_payload` returns `None` ("(no held conflict)"), while
+  peer B holds no conflict for it at all — the conflict-set differs
+  across peers. The entry itself is present and live on both sides. So
+  a `conflict_entry` row outlived the divergence it recorded (the
+  values converged out-of-band) but was never cleared, leaving a badge
+  the resolver can't open and that never clears — and it's one-sided.
+  This is the badge/payload-disagreement class the 2026-06-12 work
+  touched one face of; the parity oracle proves a residual path. Repro:
+  the fuzzer at seed 777 (artefacts auto-preserved on failure).
+  **Next:** isolate which `ingest_peer` arm leaves a `conflict_entry`
+  row behind when the conflict no longer reconstructs (likely a missing
+  `clear_conflict_rows` on an InSync/AutoMerged transition for an entry
+  that previously parked), and make the badge query + payload agree.
+
+- **[FIXED] Finding #9 — `resolved_at` was stamped from the system
+  clock, not the injected engine clock, so under a pinned clock every
+  later conflict on a resolved entry was silently suppressed.**
+  Surfaced by the hardened convergence fuzzer (`fuzz-convergence.sh`,
+  `FUZZ_SEED=99`) once it was made to (a) sync symmetrically — both
+  peers ingest before anyone resolves — and (b) pin every stamp via
+  `--at`. Symptom: a genuine attachment clash on a previously-resolved
+  entry failed to park (silent divergence — each side kept its own
+  bytes, no badge), or parked but the resolution never propagated
+  (ghost badge on the peer). The single-shot
+  `attachment-both-sided-park.sh` passes, so the trigger was the
+  *prior resolution*, not attachment handling.
+  - **Root cause (via `KEYS_DEBUG_ADOPTION=1`):** `branch=local-holds`
+    fired because `local_res` was real-now (`2026-…`) while the pinned
+    edits were at the `--at` instant. `apply_conflict_resolution`
+    (`conflict_resolution.rs`) stamped the `keys.conflict_resolutions.v1`
+    record's `resolved_at` with `chrono::Utc::now()`. The
+    resolved-since gate in `ingest_peer` (`edited_after(peer_mtime,
+    local_resolved_at)`) then saw every pinned-time edit as *older*
+    than the resolution, so `local_resolution_holds` stayed true and
+    suppressed the new conflict. A clock-threading miss from the
+    controllable-clock slice — the mutation path was threaded, the
+    resolution path wasn't.
+  - **Fix:** route `resolved_at` through the engine clock —
+    `let now = engine.now()` (new `Engine::now() -> DateTime<Utc>`,
+    `= self.clock.now()`) instead of `chrono::Utc::now()`.
+    **Production (`SystemClock`) is byte-for-byte unchanged**
+    (`engine.now()` == `Utc::now()`); only clock-injected test/fuzz
+    engines are affected. Proven by
+    `scenarios/conflict-resolved-facet-isolation.sh` (the deterministic
+    red → green) and the hardened fuzzer (seeds 1 + 99 went red →
+    green). Headless analogue of soak Bug D at multi-round scale.
+
 - **[FIXED] DATA LOSS: recycle silently permanent-deleted on any vault
   without a bin group — keys-engine diverged from keepass-core.** Fix
   landed: `keys-engine::recycle_entry` now lazy-creates the bin when the

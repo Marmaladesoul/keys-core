@@ -69,6 +69,14 @@ done
 for t in alpha beta gamma; do
     "$KEYHOLE" create-entry "$A" "$t" --username "u-$t" >/dev/null
 done
+# A dedicated "battleground" entry that BOTH devices edit (same field,
+# distinct values) every round, guaranteeing a genuine same-field clash
+# parks each round — otherwise the random op mix produces a conflict
+# only ~1 round in 10, leaving the park/resolve/parity paths barely
+# exercised. Excluded from random_entry so a random delete/move can't
+# remove it out from under the contention step.
+"$KEYHOLE" create-entry "$A" "Contested" --username u-contested >/dev/null
+CONTESTED="$("$KEYHOLE" list "$A" | awk '/Contested/ {print $1; exit}')"
 cp "$A" "$B"
 
 # A random group uuid (any of the shared seed groups or root), for moves.
@@ -93,7 +101,13 @@ random_movable_group() { # $1=vault → uuid of a random non-root, non-bin group
 # index→target mapping is stable within a run regardless of the order
 # the engine happens to return rows in.
 random_entry() { # $1=vault → uuid of a random live entry, "" if none
-    "$KEYHOLE" list "$1" 2>/dev/null | awk 'NF>1 && $1 ~ /^[0-9a-f-]{36}$/ {print $2, $1}' \
+    # Excludes $CONTESTED — that entry is driven only by the per-round
+    # contention step, so random ops must never delete/move/edit it. The
+    # exclusion is an awk guard (not `grep -v`): grep exits 1 when it
+    # filters every line, which under `set -o pipefail` would kill the
+    # whole run the moment the contested entry is the only one left.
+    "$KEYHOLE" list "$1" 2>/dev/null \
+        | awk -v c="$CONTESTED" 'NF>1 && $1 ~ /^[0-9a-f-]{36}$/ && $1 != c {print $2, $1}' \
         | sort | awk '{print $2}' \
         | awk -v r=$((RANDOM)) 'BEGIN{srand(r)} {a[NR]=$0} END{if (NR) print a[int(rand()*NR)+1]}'
 }
@@ -120,40 +134,53 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
     # sync-multipeer-store.md.
     # NB: if/fi rather than `[ -n ] &&` — under `set -e` a final failing
     # && would silently kill the whole run when a pick comes up empty.
+    # Every mutation is stamped at $AT (pinned by the loop). A and B
+    # share the same $AT within a round, so concurrent edits genuinely
+    # race; the loop advances $AT a clean second+ past the prior round's
+    # resolution so an edit is never ambiguously in the same floored
+    # second as a resolution (the sub-second hazard that silently
+    # auto-merges a real clash — caught when this fuzzer first ran a
+    # contended edit every round).
     op=$((RANDOM % 11))
     case $op in
-        7) "$KEYHOLE" create-group "$v" "g-$n" >/dev/null ;;
+        7) "$KEYHOLE" --at "$AT" create-group "$v" "g-$n" >/dev/null ;;
         8) g="$(random_group "$v")"
            # Rename a random group (5d group metadata LWW). Every group
            # uuid is shared once adopted, so a rename either propagates
            # one-sided or races + resolves LWW; a just-created g-* not yet
            # on the peer converges next round (adoption + rename both
            # propagate). Renames on the same shared group race.
-           if [ -n "$g" ]; then "$KEYHOLE" rename-group "$v" "$g" "r-$n" >/dev/null 2>&1 || true; fi ;;
+           if [ -n "$g" ]; then "$KEYHOLE" --at "$AT" rename-group "$v" "$g" "r-$n" >/dev/null 2>&1 || true; fi ;;
         9) g="$(random_movable_group "$v")"; dst="$(random_movable_group "$v")"
            # Re-parent a group under another (5d group move). Concurrent
            # mutual moves resolve via the deterministic cycle-break.
-           if [ -n "$g" ] && [ -n "$dst" ]; then "$KEYHOLE" move-group "$v" "$g" --to "$dst" >/dev/null 2>&1 || true; fi ;;
+           if [ -n "$g" ] && [ -n "$dst" ]; then "$KEYHOLE" --at "$AT" move-group "$v" "$g" --to "$dst" >/dev/null 2>&1 || true; fi ;;
         10) g="$(random_movable_group "$v")"
            # Delete a group (5d cross-peer group delete via tombstone).
-           if [ -n "$g" ]; then "$KEYHOLE" delete-group "$v" "$g" >/dev/null 2>&1 || true; fi ;;
-        0) "$KEYHOLE" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
+           if [ -n "$g" ]; then "$KEYHOLE" --at "$AT" delete-group "$v" "$g" >/dev/null 2>&1 || true; fi ;;
+        0) "$KEYHOLE" --at "$AT" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
         1) e="$(random_entry "$v")"
-           if [ -n "$e" ]; then "$KEYHOLE" update-entry "$v" "$e" --username "edit-$n" >/dev/null; fi ;;
+           if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" update-entry "$v" "$e" --username "edit-$n" >/dev/null; fi ;;
         2) e="$(random_entry "$v")"
-           if [ -n "$e" ]; then "$KEYHOLE" update-entry "$v" "$e" --url "https://fz$n.example" --notes "note-$n" >/dev/null; fi ;;
+           if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" update-entry "$v" "$e" --url "https://fz$n.example" --notes "note-$n" >/dev/null; fi ;;
         3) e="$(random_entry "$v")"
-           if [ -n "$e" ]; then "$KEYHOLE" delete-entry "$v" "$e" >/dev/null; fi ;;
+           if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" delete-entry "$v" "$e" >/dev/null; fi ;;
         4) e="$(random_entry "$v")"
-           if [ -n "$e" ]; then "$KEYHOLE" set-attachment "$v" "$e" "att-$((RANDOM % 2))" --text "payload-$n" >/dev/null; fi ;;
+           if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" set-attachment "$v" "$e" "att-$((RANDOM % 2))" --text "payload-$n" >/dev/null; fi ;;
         5) e="$(random_entry "$v")"
-           if [ -n "$e" ]; then "$KEYHOLE" remove-attachment "$v" "$e" "att-$((RANDOM % 2))" >/dev/null 2>&1 || true; fi ;;
+           if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" remove-attachment "$v" "$e" "att-$((RANDOM % 2))" >/dev/null 2>&1 || true; fi ;;
         6) e="$(random_entry "$v")"; g="$(random_group "$v")"
-           if [ -n "$e" ] && [ -n "$g" ]; then "$KEYHOLE" move-entry "$v" "$e" --to "$g" >/dev/null 2>&1 || true; fi ;;
+           if [ -n "$e" ] && [ -n "$g" ]; then "$KEYHOLE" --at "$AT" move-entry "$v" "$e" --to "$g" >/dev/null 2>&1 || true; fi ;;
     esac
 }
 
-resolve_all() { # $1=vault — resolve every held conflict, random side
+conflicts_on() { # $1=vault — sorted parked-conflict uuid set ('' if none)
+    "$KEYHOLE" list-conflicts "$1" \
+        | grep -Ei '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+        | sort | tr '\n' ',' || true
+}
+
+resolve_all() { # $1=vault — resolve every held conflict, random side; stamps $AT
     local v="$1" u side
     "$KEYHOLE" list-conflicts "$v" | awk '$1 ~ /^[0-9a-f-]{36}$/ {print $1}' \
     | while read -r u; do
@@ -163,27 +190,63 @@ resolve_all() { # $1=vault — resolve every held conflict, random side
         # real invariant is the caller's post-loop "no held conflicts"
         # assertion — a resolve that failed while leaving the conflict
         # held still fails the round there.
-        "$KEYHOLE" resolve "$v" --entry "$u" --choose "$side" >/dev/null 2>&1 \
+        "$KEYHOLE" --at "$AT" resolve "$v" --entry "$u" --choose "$side" >/dev/null 2>&1 \
             || echo "note: $u settled between list and resolve" >&2
     done
 }
 
 # --- the loop ---------------------------------------------------------
+# Pinned monotonic clock (epoch-ms). Each round's edits share one
+# instant ($AT) so A and B genuinely race; resolution lands a clean
+# second+ later, and the next round jumps a full minute past that — so
+# no operation is ever ambiguously in the same floored second as the
+# prior round's resolution (KDBX is second-granular). CLOCK_BASE is a
+# fixed constant, not wall-clock, so a seed reproduces byte-for-byte.
+CLOCK_BASE=1800000000000   # 2027-01-15, comfortably future-proof
 for round in $(seq 1 "$ROUNDS"); do
-    # Concurrent edits while "offline": 1–3 per device.
+    AT=$((CLOCK_BASE + round * 60000))   # edits this round: +60s per round
+
+    # Concurrent edits while "offline": 1–3 per device, all at $AT.
     for _ in $(seq 1 $((RANDOM % 3 + 1))); do mutate "$A" a; done
     for _ in $(seq 1 $((RANDOM % 3 + 1))); do mutate "$B" b; done
 
-    # Sync: A pulls B, resolves; B pulls the resolved A.
+    # Guaranteed contention: both devices edit the battleground entry's
+    # same field to distinct values, so a genuine clash parks this round
+    # (gives the parity + resolve assertions real teeth every round).
+    "$KEYHOLE" --at "$AT" update-entry "$A" "$CONTESTED" --username "a-r$round" >/dev/null
+    "$KEYHOLE" --at "$AT" update-entry "$B" "$CONTESTED" --username "b-r$round" >/dev/null
+
+    # Sync, symmetric: BOTH devices ingest each other before anyone
+    # resolves, so each independently derives its parked-conflict set.
     "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
+    "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
+
+    # Oracle 1 — conflict-set PARITY: a genuine clash is symmetric, so
+    # both replicas must hold the SAME set of parked entries (the digest
+    # does NOT cover conflict rows, so a one-sided / ghost badge is
+    # invisible to the digest oracle below — this catches it).
+    ca="$(conflicts_on "$A")"
+    cb="$(conflicts_on "$B")"
+    [ "$ca" = "$cb" ] || fail "held-conflict set differs across peers: A=[$ca] B=[$cb]"
+    # The battleground guarantees a clash every round, so an EMPTY set
+    # here means the clash silently auto-merged instead of parking — a
+    # regression in conflict detection, not benign.
+    [ -n "$ca" ] || fail "round $round: contended edit did not park (auto-merged a genuine clash?)"
+
+    # Resolve on A, then push the resolution to B; settle A against B's
+    # post-adoption state. Both must end clean (no ghost, no re-park).
+    # Resolution lands 10s after this round's edits and 50s before the
+    # next round's, so it never shares a floored second with either.
+    AT=$((CLOCK_BASE + round * 60000 + 10000))
     resolve_all "$A"
     "$KEYHOLE" list-conflicts "$A" | grep '(no held conflicts)' >/dev/null \
         || fail "conflicts remain on A after resolve_all"
-
     "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
-    "$KEYHOLE" list-conflicts "$B" | grep '(no held conflicts)' >/dev/null \
-        || fail "B re-parked a conflict A already resolved"
+    "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
+    [ -z "$(conflicts_on "$B")" ] || fail "B kept a ghost conflict A already resolved"
+    [ -z "$(conflicts_on "$A")" ] || fail "A re-parked after B's adoption"
 
+    # Oracle 2 — content convergence.
     da="$("$KEYHOLE" digest "$A")"
     db="$("$KEYHOLE" digest "$B")"
     [ "$da" = "$db" ] || fail "digest divergence after sync: A=$da B=$db"

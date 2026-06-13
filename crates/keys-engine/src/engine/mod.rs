@@ -1022,6 +1022,16 @@ impl Engine {
         self.clock.now().timestamp_millis()
     }
 
+    /// "Now" as a [`DateTime<Utc>`](chrono::DateTime) from this engine's
+    /// injected [`Clock`] — the [`Self::now_ms`] companion for the
+    /// resolution path, whose `resolved_at` is a `DateTime`. Routing it
+    /// through the clock (not `chrono::Utc::now()`) is what lets
+    /// `--at` / a `FixedClock` pin the resolution timestamp, so the
+    /// resolved-since gate in `ingest_peer` is deterministic.
+    pub(crate) fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.clock.now()
+    }
+
     /// Close the underlying connection, finalising any pending work.
     ///
     /// Consumes `self`. On success the connection is gone. On failure
