@@ -2476,11 +2476,16 @@ pub(crate) fn move_group(
         params![new_parent_str],
         |r| r.get(0),
     )?;
+    // Stamp <LocationChanged> (5d group re-parent LWW key) as well as
+    // modified_at — a move is a location event distinct from a metadata
+    // edit, so the two facets carry independent LWW stamps (mirrors
+    // entry move).
+    let now = now_ms();
     tx.execute(
         "UPDATE \"group\" \
-         SET parent_uuid = ?1, sort_order = ?2, modified_at = ?3 \
+         SET parent_uuid = ?1, sort_order = ?2, modified_at = ?3, location_changed_at = ?3 \
          WHERE uuid = ?4",
-        params![new_parent_str, next_sort_order, now_ms(), uuid_str],
+        params![new_parent_str, next_sort_order, now, uuid_str],
     )?;
     tx.commit()?;
     Ok(MoveGroupOutcome {

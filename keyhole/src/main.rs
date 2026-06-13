@@ -212,6 +212,17 @@ enum Command {
         /// New group name.
         name: String,
     },
+    /// Re-parent a group under another group, then persist. The
+    /// divergence-maker for 5d group move (re-parent LWW).
+    MoveGroup {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the group to move (see `list-groups`).
+        uuid: String,
+        /// Destination parent group UUID.
+        #[arg(long)]
+        to: String,
+    },
     /// List every group: UUID, name, and direct entry count, one per
     /// line (the group-side twin of `list`).
     ListGroups {
@@ -440,6 +451,10 @@ async fn main() -> Result<()> {
         Command::RenameGroup { vault, uuid, name } => {
             let session = Session::open(&vault, &password).await?;
             session.rename_group(uuid, name).await?;
+        }
+        Command::MoveGroup { vault, uuid, to } => {
+            let session = Session::open(&vault, &password).await?;
+            session.move_group(uuid, to).await?;
         }
         Command::ListGroups { vault } => {
             let session = Session::open(&vault, &password).await?;
@@ -912,6 +927,16 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("update_group: {e:?}"))?;
         self.save().await?;
         println!("renamed group {uuid} to {name:?} and saved to disk");
+        Ok(())
+    }
+
+    /// Re-parent a group under `to`, then persist.
+    async fn move_group(&self, uuid: String, to: String) -> Result<()> {
+        self.engine
+            .move_group(uuid.clone(), to.clone())
+            .map_err(|e| anyhow::anyhow!("move_group: {e:?}"))?;
+        self.save().await?;
+        println!("moved group {uuid} under {to} and saved to disk");
         Ok(())
     }
 

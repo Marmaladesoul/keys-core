@@ -401,15 +401,33 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   by [group-rename-lww.sh](scenarios/group-rename-lww.sh) (one-sided +
   both-sided LWW) + keys-engine
   `two_engine_group_rename_reconciles_and_converges`;
-  `fuzz-convergence.sh` gains a `rename-group` op — 30/30 soak. Group
-  *move* (re-parent) and tombstone-driven deletion remain.
-- **Next:** icon pool union (the last 5c sliver); then the rest of
-  **5d group structure** — group MOVE (re-parent LWW on group
-  `location_changed`) + consuming group tombstones (recorded since 5b,
-  never consumed) for cross-peer group deletion, and the deferred
-  previous-parent merge rules; then those join the fuzzer mix.
-  `empty-bin` verb; value-hash-based adoption matching (timestamp-free)
-  as hardening when resolution records grow fields.
+  `fuzz-convergence.sh` gains a `rename-group` op — 30/30 soak.
+- **Done (2026-06-13, 5d group move / re-parent LWW):** a group
+  re-parent now reconciles by LWW on a DEDICATED group
+  `location_changed` (migration 0011, the group twin of 0010 for
+  entries) — separate from metadata's `modified_at` so a concurrent
+  rename and move don't clobber each other. `reconcile_peer_groups`
+  became two-pass (adopt all peer-only groups, then reconcile
+  metadata + parent) so a winning parent always resolves locally.
+  `reconcile_group_location` adopts the peer's parent + stamp verbatim
+  when it wins `(floored location_changed, parent uuid)`, with a
+  **cycle guard** that skips any re-parent which would put a group
+  inside its own subtree — the tree can never go cyclic. New keyhole
+  verb `move-group`; pinned by
+  [group-move-lww.sh](scenarios/group-move-lww.sh) (one-sided +
+  acyclic both-sided LWW) + keys-engine
+  `two_engine_group_move_reconciles_and_converges`. **Not yet in the
+  fuzzer:** the rare concurrent *mutual* move (A→under B while B→under
+  A) leaves the two replicas disagreeing on that one edge (the guard
+  skips both sides) until a deterministic cycle-breaking pass lands —
+  that pass + fuzzer group-move are the final-final 5d item.
+- **Next:** icon pool union (the last 5c sliver); then the last 5d
+  pieces — consuming group tombstones (recorded since 5b, never
+  consumed) for cross-peer group deletion, plus deterministic
+  cycle-breaking for mutual group moves (then group move/delete join
+  the fuzzer); the deferred previous-parent merge rules. `empty-bin`
+  verb; value-hash-based adoption matching (timestamp-free) as
+  hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old

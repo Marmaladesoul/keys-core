@@ -1,0 +1,13 @@
+-- Group <Times><LocationChanged>: the last time the group was moved
+-- between parents. The group twin of migration 0010 (which added it to
+-- entries). The mirror stored only `modified_at` for groups, which both
+-- a rename and a move bump — so re-parent had no dedicated LWW key
+-- distinct from metadata, and group MOVE couldn't sync without
+-- clobbering a concurrent rename. This column gives group re-parent its
+-- own LWW signal (5d), exactly as entries got theirs.
+--
+-- Epoch-ms like the other group times; floored to seconds for the LWW
+-- comparison (KDBX is whole-second). NULL = never moved / not recorded.
+-- An adopted move takes the PEER's stamp verbatim (Finding #8: the same
+-- generation must not diverge in time across replicas).
+ALTER TABLE "group" ADD COLUMN location_changed_at INTEGER NULL;

@@ -1179,3 +1179,86 @@ fn two_engine_group_rename_reconciles_and_converges() {
         "replicas converge after the rename exchange",
     );
 }
+
+/// Phase 5d group move: a group re-parent on one side reconciles across
+/// peers and the replicas CONVERGE. A and B fork from a shared base
+/// with a Home group and two parent candidates; A re-parents Home; both
+/// sync both ways and must agree (digest equal). Convergence is the
+/// contract; the deterministic newer-wins direction is pinned by
+/// keyhole's group-move-lww.sh (sleep-separated seconds).
+#[test]
+fn two_engine_group_move_reconciles_and_converges() {
+    use keys_engine::{IconRef, NewGroupFields};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx_a = dir.path().join("a.kdbx");
+    let kdbx_b = dir.path().join("b.kdbx");
+
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    kdbx.add_entry(root, NewEntry::new("seed")).expect("seed");
+
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    let mk = |name: &str| NewGroupFields {
+        name: name.into(),
+        notes: String::new(),
+        icon: IconRef::Builtin(48),
+    };
+    let home = engine_a.create_group(root.0, mk("Home")).expect("home");
+    let px = engine_a.create_group(root.0, mk("Parent-X")).expect("px");
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save");
+
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut hb0 = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb0, None)
+        .expect("b save");
+
+    // A re-parents Home under Parent-X (B does nothing → A's move newer).
+    engine_a.move_group(home, px).expect("a move group");
+    let mut ha = reopen_kdbx(&kdbx_a);
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut ha, None)
+        .expect("a save 2");
+
+    engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest a");
+    let mut hb = reopen_kdbx(&kdbx_b);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb, None)
+        .expect("b save 2");
+    engine_a
+        .ingest_peer_from_kdbx(&kdbx_b, &composite(), "device-b")
+        .expect("a ingest b");
+
+    // Both replicas agree on Home's parent, and converge.
+    let parent_of = |e: &Engine| {
+        e.group_tree()
+            .expect("groups")
+            .into_iter()
+            .find(|g| g.uuid == home)
+            .expect("home present")
+            .parent_uuid
+    };
+    assert_eq!(
+        parent_of(&engine_a),
+        parent_of(&engine_b),
+        "both replicas agree on the moved group's parent",
+    );
+    assert_eq!(
+        engine_a.content_digest().expect("a digest"),
+        engine_b.content_digest().expect("b digest"),
+        "replicas converge after the group-move exchange",
+    );
+}

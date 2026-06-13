@@ -248,6 +248,7 @@ struct GroupRow {
     /// future read paths that want positional metadata.
     #[allow(dead_code)]
     sort_order: u32,
+    location_changed_at: Option<i64>,
 }
 
 /// Read the explicit `meta.recycle_bin_enabled` setting row written by
@@ -276,7 +277,8 @@ fn load_group_rows(conn: &Connection) -> Result<Vec<GroupRow>, EngineError> {
     // is what determines child order on the projected `Vault`.
     let mut stmt = conn.prepare(
         "SELECT uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
-                created_at, modified_at, expires_at, is_recycle_bin, sort_order \
+                created_at, modified_at, expires_at, is_recycle_bin, sort_order, \
+                location_changed_at \
          FROM \"group\" \
          ORDER BY sort_order ASC, name ASC, uuid ASC",
     )?;
@@ -315,6 +317,7 @@ fn load_group_rows(conn: &Connection) -> Result<Vec<GroupRow>, EngineError> {
                 expires_at: row.get(8)?,
                 is_recycle_bin: row.get::<_, i64>(9)? != 0,
                 sort_order: crate::reads::u32_from_db_column(sort_order_i64, 10)?,
+                location_changed_at: row.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -389,9 +392,8 @@ fn build_subtree(
         row.modified_at,
         row.modified_at,
         row.expires_at,
-        // Group <LocationChanged> isn't mirrored yet (5d group-move
-        // reconciliation is deferred — see DESIGN.md); entries carry it.
-        None,
+        // Group <LocationChanged> (5d group re-parent LWW key).
+        row.location_changed_at,
     );
 
     if let Some(child_ids) = children_of.get(&uuid) {
