@@ -72,18 +72,19 @@ random_entry() { # $1=vault → uuid of a random live entry, "" if none
 }
 
 n=0  # monotonic counter so generated values never collide
-mutate() { # $1=vault $2=device-prefix (namespaces attachment names)
-    local v="$1" p="$2" op e
+mutate() { # $1=vault $2=device-prefix (unused since attachment names went shared)
+    local v="$1" op e
+    : "$2"
     n=$((n + 1))
     # Op mix = exactly the cross-peer surface the multipeer store
     # supports today: entry create, field edits, hard delete (5b
     # tombstones), and attachment set/remove (5c — merged into this
     # gate once Findings #7 + #8 were fixed: conflict rows carry
     # attachment state, and the LCA matcher disambiguates generations).
-    # Attachment names stay DEVICE-PREFIXED: both-sided same-name
-    # divergence has no park/resolve path yet (the remaining 5c
-    # slice), so same-name clashes would stall on the deliberate
-    # no-auto-pick posture rather than reveal merge bugs. LOCATION ops
+    # Attachment names are SHARED across devices: a both-sided
+    # same-name clash parks like a field conflict and resolves through
+    # the same resolve_all loop (the final 5c conflict slice — classify
+    # treats attachment conflicts as genuine). LOCATION ops
     # (move/recycle/restore/create-group) are ABSENT — the deferred 5d
     # slice. The scope ledger lives in sync-multipeer-store.md.
     # NB: if/fi rather than `[ -n ] &&` — under `set -e` a final failing
@@ -98,9 +99,9 @@ mutate() { # $1=vault $2=device-prefix (namespaces attachment names)
         3) e="$(random_entry "$v")"
            if [ -n "$e" ]; then "$KEYHOLE" delete-entry "$v" "$e" >/dev/null; fi ;;
         4) e="$(random_entry "$v")"
-           if [ -n "$e" ]; then "$KEYHOLE" set-attachment "$v" "$e" "${p}-att-$((RANDOM % 2))" --text "payload-$n" >/dev/null; fi ;;
+           if [ -n "$e" ]; then "$KEYHOLE" set-attachment "$v" "$e" "att-$((RANDOM % 2))" --text "payload-$n" >/dev/null; fi ;;
         5) e="$(random_entry "$v")"
-           if [ -n "$e" ]; then "$KEYHOLE" remove-attachment "$v" "$e" "${p}-att-$((RANDOM % 2))" >/dev/null 2>&1 || true; fi ;;
+           if [ -n "$e" ]; then "$KEYHOLE" remove-attachment "$v" "$e" "att-$((RANDOM % 2))" >/dev/null 2>&1 || true; fi ;;
     esac
 }
 
