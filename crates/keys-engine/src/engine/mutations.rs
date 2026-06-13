@@ -52,12 +52,14 @@ impl Engine {
         group_uuid: Uuid,
         fields: NewEntryFields,
     ) -> Result<Uuid, EngineError> {
+        let now = self.now_ms();
         let result = mutations::create_entry(
             &mut self.conn,
             &self.fingerprint_key,
             &*self.field_protector,
             group_uuid,
             fields,
+            now,
         )?;
         self.emit(ChangeEvent::EntriesAdded(vec![result]));
         Ok(result)
@@ -132,12 +134,14 @@ impl Engine {
         portable: PortableEntry,
         target_group_uuid: Uuid,
     ) -> Result<Uuid, EngineError> {
+        let now = self.now_ms();
         let (new_uuid, icon_inserted) = crate::portable::import_entry(
             &mut self.conn,
             &self.fingerprint_key,
             &*self.field_protector,
             target_group_uuid,
             portable,
+            now,
         )?;
         self.emit(ChangeEvent::EntriesAdded(vec![new_uuid]));
         if icon_inserted {
@@ -163,12 +167,14 @@ impl Engine {
     ///   failure (only when `password` is updated).
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn update_entry(&mut self, uuid: Uuid, update: EntryUpdate) -> Result<(), EngineError> {
+        let now = self.now_ms();
         mutations::update_entry(
             &mut self.conn,
             &self.fingerprint_key,
             &*self.field_protector,
             uuid,
             update,
+            now,
         )?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
@@ -200,12 +206,14 @@ impl Engine {
     ///   failure.
     /// - [`EngineError::Sqlite`] on storage failure.
     pub fn save_entry(&mut self, uuid: Uuid, save: EntrySave) -> Result<(), EngineError> {
+        let now = self.now_ms();
         mutations::save_entry(
             &mut self.conn,
             &self.fingerprint_key,
             &*self.field_protector,
             uuid,
             save,
+            now,
         )?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
@@ -219,7 +227,8 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn recycle_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
-        mutations::recycle_entry(&mut self.conn, uuid)?;
+        let now = self.now_ms();
+        mutations::recycle_entry(&mut self.conn, uuid, now)?;
         self.emit(ChangeEvent::EntriesRecycled(vec![uuid]));
         Ok(())
     }
@@ -235,7 +244,8 @@ impl Engine {
     /// - [`EngineError::Sqlite`] on insert/update failure.
     pub fn ensure_recycle_bin(&mut self) -> Result<Option<String>, EngineError> {
         let before = self.recycle_bin_uuid()?;
-        let bin = mutations::ensure_recycle_bin(&mut self.conn)?;
+        let now = self.now_ms();
+        let bin = mutations::ensure_recycle_bin(&mut self.conn, now)?;
         // Emit only when we actually created the group (it was absent before).
         if before.is_none() {
             if let Some(uuid) = bin.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
@@ -257,7 +267,8 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn restore_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
-        mutations::restore_entry(&mut self.conn, uuid)?;
+        let now = self.now_ms();
+        mutations::restore_entry(&mut self.conn, uuid, now)?;
         self.emit(ChangeEvent::EntriesRestored(vec![uuid]));
         Ok(())
     }
@@ -273,7 +284,8 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
     /// - [`EngineError::Sqlite`] on delete failure.
     pub fn delete_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
-        let outcome = mutations::delete_entry(&mut self.conn, uuid)?;
+        let now = self.now_ms();
+        let outcome = mutations::delete_entry(&mut self.conn, uuid, now)?;
         self.emit(ChangeEvent::EntriesDeleted(vec![EntryDeletionInfo {
             uuid,
             previous_group: outcome.previous_group,
@@ -288,7 +300,8 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "entry"` or `"group"`).
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn move_entry(&mut self, uuid: Uuid, new_group_uuid: Uuid) -> Result<(), EngineError> {
-        let outcome = mutations::move_entry(&mut self.conn, uuid, new_group_uuid)?;
+        let now = self.now_ms();
+        let outcome = mutations::move_entry(&mut self.conn, uuid, new_group_uuid, now)?;
         self.emit(ChangeEvent::EntriesMoved(vec![EntryMove {
             uuid,
             from_group: outcome.from_group,
@@ -312,6 +325,7 @@ impl Engine {
         field_name: &str,
         plaintext: SecretString,
     ) -> Result<(), EngineError> {
+        let now = self.now_ms();
         mutations::set_protected_field(
             &mut self.conn,
             &self.fingerprint_key,
@@ -319,6 +333,7 @@ impl Engine {
             uuid,
             field_name,
             plaintext,
+            now,
         )?;
         self.emit(ChangeEvent::ProtectedFieldChanged {
             entry_uuid: uuid,
@@ -340,7 +355,8 @@ impl Engine {
         field_name: &str,
         value: &str,
     ) -> Result<(), EngineError> {
-        mutations::set_non_protected_custom_field(&mut self.conn, uuid, field_name, value)?;
+        let now = self.now_ms();
+        mutations::set_non_protected_custom_field(&mut self.conn, uuid, field_name, value, now)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
     }
@@ -358,7 +374,8 @@ impl Engine {
     ///   or `entity = "custom_field"` if `field_name == "Password"`.
     /// - [`EngineError::Sqlite`].
     pub fn remove_custom_field(&mut self, uuid: Uuid, field_name: &str) -> Result<(), EngineError> {
-        mutations::remove_custom_field(&mut self.conn, uuid, field_name)?;
+        let now = self.now_ms();
+        mutations::remove_custom_field(&mut self.conn, uuid, field_name, now)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
     }
@@ -371,7 +388,8 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "entry"`).
     /// - [`EngineError::Sqlite`].
     pub fn set_tags(&mut self, uuid: Uuid, tags: Vec<String>) -> Result<(), EngineError> {
-        mutations::set_tags(&mut self.conn, uuid, tags)?;
+        let now = self.now_ms();
+        mutations::set_tags(&mut self.conn, uuid, tags, now)?;
         // Two events: the tag set changed (`TagsChanged`), and the
         // entry's `modified_at` was bumped (`EntriesUpdated`). Frontends
         // that only care about tag indices subscribe to the first;
@@ -396,7 +414,8 @@ impl Engine {
         name: &str,
         bytes: Vec<u8>,
     ) -> Result<(), EngineError> {
-        mutations::attach_file(&mut self.conn, uuid, name, bytes)?;
+        let now = self.now_ms();
+        mutations::attach_file(&mut self.conn, uuid, name, bytes, now)?;
         self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())
     }
@@ -416,7 +435,8 @@ impl Engine {
         name: &str,
         bytes: &[u8],
     ) -> Result<(), EngineError> {
-        mutations::set_attachment(&mut self.conn, uuid, name, bytes)?;
+        let now = self.now_ms();
+        mutations::set_attachment(&mut self.conn, uuid, name, bytes, now)?;
         self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())
     }
@@ -429,7 +449,8 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "entry"`).
     /// - [`EngineError::Sqlite`].
     pub fn remove_attachment(&mut self, uuid: Uuid, name: &str) -> Result<(), EngineError> {
-        mutations::remove_attachment(&mut self.conn, uuid, name)?;
+        let now = self.now_ms();
+        mutations::remove_attachment(&mut self.conn, uuid, name, now)?;
         self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())
     }
@@ -446,7 +467,8 @@ impl Engine {
         parent_uuid: Uuid,
         fields: NewGroupFields,
     ) -> Result<Uuid, EngineError> {
-        let uuid = mutations::create_group(&mut self.conn, parent_uuid, fields)?;
+        let now = self.now_ms();
+        let uuid = mutations::create_group(&mut self.conn, parent_uuid, fields, now)?;
         self.emit(ChangeEvent::GroupsAdded(vec![uuid]));
         Ok(uuid)
     }
@@ -459,7 +481,8 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "group"`).
     /// - [`EngineError::Sqlite`].
     pub fn update_group(&mut self, uuid: Uuid, update: GroupUpdate) -> Result<(), EngineError> {
-        mutations::update_group(&mut self.conn, uuid, update)?;
+        let now = self.now_ms();
+        mutations::update_group(&mut self.conn, uuid, update, now)?;
         self.emit(ChangeEvent::GroupsUpdated(vec![uuid]));
         Ok(())
     }
@@ -483,7 +506,8 @@ impl Engine {
     ///   own uuid.
     /// - [`EngineError::Sqlite`].
     pub fn recycle_group(&mut self, uuid: Uuid) -> Result<(), EngineError> {
-        mutations::recycle_group(&mut self.conn, uuid)?;
+        let now = self.now_ms();
+        mutations::recycle_group(&mut self.conn, uuid, now)?;
         // Only the group event fires — descendant entries and groups
         // are implicitly recycled by sitting under a recycled ancestor.
         // Frontends listening on group events know to re-query their
@@ -504,7 +528,8 @@ impl Engine {
     ///   itself or a descendant.
     /// - [`EngineError::Sqlite`].
     pub fn restore_group(&mut self, uuid: Uuid, new_parent_uuid: Uuid) -> Result<(), EngineError> {
-        mutations::restore_group(&mut self.conn, uuid, new_parent_uuid)?;
+        let now = self.now_ms();
+        mutations::restore_group(&mut self.conn, uuid, new_parent_uuid, now)?;
         // Same shape as recycle — emit only the group event. Descendant
         // recycle status is determined by ancestor walk, not a column,
         // so there's nothing to fan out per row.
@@ -523,7 +548,8 @@ impl Engine {
     /// - [`EngineError::NotFound`] (`entity = "group"`).
     /// - [`EngineError::Sqlite`].
     pub fn delete_group(&mut self, uuid: Uuid) -> Result<(), EngineError> {
-        let outcome = mutations::delete_group(&mut self.conn, uuid)?;
+        let now = self.now_ms();
+        let outcome = mutations::delete_group(&mut self.conn, uuid, now)?;
         // One combined `EntriesDeleted` and one combined `GroupsDeleted`
         // covering the entire cascade. Order: entries first, then
         // groups — leaves-up, mirroring the delete order inside the
@@ -560,7 +586,8 @@ impl Engine {
     /// - [`EngineError::CycleDetected`].
     /// - [`EngineError::Sqlite`].
     pub fn move_group(&mut self, uuid: Uuid, new_parent_uuid: Uuid) -> Result<(), EngineError> {
-        let outcome = mutations::move_group(&mut self.conn, uuid, new_parent_uuid)?;
+        let now = self.now_ms();
+        let outcome = mutations::move_group(&mut self.conn, uuid, new_parent_uuid, now)?;
         self.emit(ChangeEvent::GroupsMoved(vec![GroupMove {
             uuid,
             from_parent: outcome.from_parent,
@@ -586,7 +613,8 @@ impl Engine {
     ///   with that UUID exists or the target is the root group.
     /// - [`EngineError::Sqlite`].
     pub fn reorder_group(&mut self, uuid: Uuid, new_position: u32) -> Result<(), EngineError> {
-        let outcome = mutations::reorder_group(&mut self.conn, uuid, new_position)?;
+        let now = self.now_ms();
+        let outcome = mutations::reorder_group(&mut self.conn, uuid, new_position, now)?;
         self.emit(ChangeEvent::GroupsReordered(outcome.siblings_in_order));
         Ok(())
     }
@@ -680,6 +708,7 @@ impl Engine {
         history_index: u32,
     ) -> Result<(), EngineError> {
         let max_items = crate::meta::read_history_max_items(&self.conn)?;
+        let now = self.now_ms();
         mutations::restore_entry_from_history(
             &mut self.conn,
             &self.fingerprint_key,
@@ -687,6 +716,7 @@ impl Engine {
             entry_uuid,
             history_index,
             max_items,
+            now,
         )?;
         self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
         Ok(())

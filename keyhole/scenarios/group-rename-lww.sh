@@ -21,8 +21,11 @@ trap 'rm -rf "$TMP"' EXIT
 A="$TMP/device-a.kdbx"
 B="$TMP/device-b.kdbx"
 
+# `--at` pins every stamp so LWW direction is an input, not a sleep
+# race. The group is created at t=1s; each later rename uses a strictly
+# larger pinned second, so "newer" is exact (KDBX floors to seconds).
 "$KEYHOLE" create "$A" >/dev/null
-"$KEYHOLE" create-group "$A" "Shared" >/dev/null
+"$KEYHOLE" --at 1000000 create-group "$A" "Shared" >/dev/null
 g="$("$KEYHOLE" list-groups "$A" | awk '/Shared/ {print $1}' | head -1)"
 cp "$A" "$B"
 
@@ -30,17 +33,16 @@ converged() { [ "$("$KEYHOLE" digest "$A")" = "$("$KEYHOLE" digest "$B")" ]; }
 name_on() { "$KEYHOLE" list-groups "$1" | awk -v u="$g" '$1==u {print $2}'; }
 
 # --- one-sided rename on A → B must adopt it ------------------------
-sleep 1.1
-"$KEYHOLE" rename-group "$A" "$g" "Renamed-A" >/dev/null
+# A's rename (t=2s) out-stamps B's copied creation (t=1s).
+"$KEYHOLE" --at 2000000 rename-group "$A" "$g" "Renamed-A" >/dev/null
 "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
 [ "$(name_on "$B")" = "Renamed-A" ] \
     || { echo "FAIL: one-sided group rename did not propagate (got: $(name_on "$B"))"; exit 1; }
 converged || { echo "FAIL: replicas diverged after one-sided rename"; exit 1; }
 
 # --- both-sided rename → newer wins on both replicas ----------------
-"$KEYHOLE" rename-group "$B" "$g" "Renamed-B-old" >/dev/null
-sleep 1.1
-"$KEYHOLE" rename-group "$A" "$g" "Renamed-A-new" >/dev/null
+"$KEYHOLE" --at 3000000 rename-group "$B" "$g" "Renamed-B-old" >/dev/null
+"$KEYHOLE" --at 5000000 rename-group "$A" "$g" "Renamed-A-new" >/dev/null
 "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
 "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
 [ "$(name_on "$A")" = "Renamed-A-new" ] \

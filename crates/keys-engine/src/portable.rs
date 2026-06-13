@@ -256,6 +256,7 @@ pub(crate) fn import_entry(
     protector: &dyn FieldProtector,
     target_group_uuid: Uuid,
     portable: PortableEntry,
+    now: i64,
 ) -> Result<(Uuid, bool), EngineError> {
     // Custom-icon rehoming runs *before* the create-entry transaction
     // so the resulting UUID is available to thread through
@@ -310,8 +311,14 @@ pub(crate) fn import_entry(
         tags: portable.tags,
     };
 
-    let new_uuid =
-        mutations::create_entry(conn, fingerprint_key, protector, target_group_uuid, fields)?;
+    let new_uuid = mutations::create_entry(
+        conn,
+        fingerprint_key,
+        protector,
+        target_group_uuid,
+        fields,
+        now,
+    )?;
 
     // Preserve `expires_at` if the carrier had one. `create_entry`
     // never writes an expiry; do it as a separate `update_entry`
@@ -321,14 +328,14 @@ pub(crate) fn import_entry(
             expires_at: Some(Some(expiry)),
             ..Default::default()
         };
-        mutations::update_entry(conn, fingerprint_key, protector, new_uuid, patch)?;
+        mutations::update_entry(conn, fingerprint_key, protector, new_uuid, patch, now)?;
     }
 
     // Replay attachments through the regular `attach_file` path so the
     // content-addressed pool dedup runs (bytes shared with other entries
     // in the target won't be re-inserted).
     for att in portable.attachments {
-        mutations::attach_file(conn, new_uuid, &att.name, att.bytes)?;
+        mutations::attach_file(conn, new_uuid, &att.name, att.bytes, now)?;
     }
 
     Ok((new_uuid, icon_inserted))

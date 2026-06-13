@@ -325,7 +325,8 @@ impl Engine {
     ///   row matches the uuid.
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn clear_entry_custom_icon(&mut self, entry_uuid: Uuid) -> Result<(), EngineError> {
-        mutations::clear_entry_custom_icon(&mut self.conn, entry_uuid)?;
+        let now = self.now_ms();
+        mutations::clear_entry_custom_icon(&mut self.conn, entry_uuid, now)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
         Ok(())
     }
@@ -375,7 +376,8 @@ impl Engine {
     ///   row matches the uuid.
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn touch_entry(&mut self, entry_uuid: Uuid) -> Result<(), EngineError> {
-        mutations::touch_entry(&mut self.conn, entry_uuid)?;
+        let now = self.now_ms();
+        mutations::touch_entry(&mut self.conn, entry_uuid, now)?;
         self.emit(ChangeEvent::EntryTouched { uuid: entry_uuid });
         Ok(())
     }

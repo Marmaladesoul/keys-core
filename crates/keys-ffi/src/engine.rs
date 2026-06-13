@@ -121,6 +121,48 @@ impl Engine {
         }))
     }
 
+    /// Like [`Engine::open`] but pins the engine's clock to a fixed
+    /// instant (`clock_ms`, epoch-milliseconds). Every local mutation
+    /// through this handle then stamps that exact time on
+    /// `modified_at` / `location_changed_at` / tombstones, making the
+    /// timestamps that drive sync LWW reconciliation deterministic.
+    ///
+    /// **Test / fuzz scaffolding only.** Production clients use
+    /// [`Engine::open`] (system clock). The keyhole driver exposes this
+    /// via its `--at` flag so scenarios can force a same-second tie or
+    /// pin an exact LWW winner without `sleep`ing between processes.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Internal`] if `clock_ms` is not a representable
+    ///   UTC instant.
+    /// - Otherwise as [`Engine::open`].
+    #[uniffi::constructor]
+    pub fn open_with_fixed_clock(
+        path: String,
+        key_provider: Arc<dyn VaultDbKeyProvider>,
+        field_protector: Arc<dyn VaultFieldProtector>,
+        file_watcher: Option<Arc<dyn VaultFileWatcher>>,
+        clock_ms: i64,
+    ) -> Result<Arc<Self>, EngineError> {
+        let fixed = chrono::DateTime::from_timestamp_millis(clock_ms).ok_or_else(|| {
+            EngineError::Internal(format!(
+                "clock_ms {clock_ms} is not a representable UTC instant"
+            ))
+        })?;
+        let path_buf = PathBuf::from(path);
+        let kp = BridgeDbKeyProvider::new(key_provider);
+        let fp: Arc<dyn keepass_core::protector::FieldProtector> =
+            Arc::new(BridgeProtector::new(field_protector));
+        let watcher = engine_file_watcher::bridge(file_watcher);
+        let clock: Arc<dyn keepass_core::model::Clock> =
+            Arc::new(keepass_core::model::FixedClock(fixed));
+        let inner = eng::Engine::open_with_clock(&path_buf, &kp, fp, watcher, clock)?;
+        Ok(Arc::new(Self {
+            inner: Mutex::new(Some(inner)),
+        }))
+    }
+
     /// Close the engine; subsequent method calls return
     /// [`EngineError::NotFound`] (`entity = "engine"`). Idempotent.
     ///

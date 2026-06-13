@@ -13,7 +13,6 @@
 //! etc.), and the engine fires events after the commit returns.
 
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use std::collections::HashMap;
 
@@ -79,15 +78,6 @@ pub(crate) struct DeleteGroupOutcome {
     /// Every entry removed by the cascade, paired with the group it
     /// was in immediately before deletion.
     pub deleted_entries: Vec<(Uuid, Uuid)>,
-}
-
-/// Wall-clock `now` in ms since the Unix epoch. Saturates on platform
-/// edge cases rather than panicking — a mutation should never abort
-/// because the host clock is set to 1969.
-pub(crate) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Acquire one session key for the duration of a single mutation.
@@ -262,10 +252,10 @@ fn hex_decode32(hex: &str) -> Option<[u8; 32]> {
 /// shouldn't already carry a tombstone, but re-deletion mustn't error). Shared
 /// by `delete_entry` and the `delete_group` cascade so *every* removed entry
 /// and group leaves a tombstone.
-fn record_tombstone(tx: &Connection, uuid: &str) -> Result<(), rusqlite::Error> {
+fn record_tombstone(tx: &Connection, uuid: &str, now: i64) -> Result<(), rusqlite::Error> {
     tx.execute(
         "INSERT OR REPLACE INTO meta_deleted_object (uuid, deleted_at) VALUES (?1, ?2)",
-        params![uuid, now_ms()],
+        params![uuid, now],
     )?;
     Ok(())
 }
@@ -494,10 +484,10 @@ pub(crate) fn create_entry(
     protector: &dyn FieldProtector,
     group_uuid: Uuid,
     fields: NewEntryFields,
+    now: i64,
 ) -> Result<Uuid, EngineError> {
     let session = session_key(protector)?;
     let entry_uuid = Uuid::new_v4();
-    let now = now_ms();
     let group_uuid_str = group_uuid.to_string();
     let entry_uuid_str = entry_uuid.to_string();
 
@@ -609,6 +599,7 @@ pub(crate) fn update_entry(
     protector: &dyn FieldProtector,
     uuid: Uuid,
     update: EntryUpdate,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -688,7 +679,7 @@ pub(crate) fn update_entry(
     if url_changed {
         recompute_has_totp(&tx, &uuid_str)?;
     }
-    bump_modified(&tx, &uuid_str)?;
+    bump_modified(&tx, &uuid_str, now)?;
     tx.commit()?;
     Ok(())
 }
@@ -733,6 +724,7 @@ pub(crate) fn save_entry(
     protector: &dyn FieldProtector,
     uuid: Uuid,
     save: EntrySave,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let session = session_key(protector)?;
@@ -825,15 +817,15 @@ pub(crate) fn save_entry(
 
     // ── Derived bit + modified stamp ──
     recompute_has_totp(&tx, &uuid_str)?;
-    bump_modified(&tx, &uuid_str)?;
+    bump_modified(&tx, &uuid_str, now)?;
     tx.commit()?;
     Ok(())
 }
 
-fn bump_modified(tx: &Transaction<'_>, uuid: &str) -> Result<(), EngineError> {
+fn bump_modified(tx: &Transaction<'_>, uuid: &str, now: i64) -> Result<(), EngineError> {
     tx.execute(
         "UPDATE entry SET modified_at = ?1 WHERE uuid = ?2",
-        params![now_ms(), uuid],
+        params![now, uuid],
     )?;
     Ok(())
 }
@@ -892,6 +884,7 @@ fn recompute_has_totp(tx: &Transaction<'_>, uuid: &str) -> Result<(), EngineErro
 pub(crate) fn clear_entry_custom_icon(
     conn: &mut Connection,
     uuid: Uuid,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -903,7 +896,7 @@ pub(crate) fn clear_entry_custom_icon(
         "UPDATE entry SET icon_custom_uuid = NULL WHERE uuid = ?1",
         params![uuid_str],
     )?;
-    bump_modified(&tx, &uuid_str)?;
+    bump_modified(&tx, &uuid_str, now)?;
     tx.commit()?;
     Ok(())
 }
@@ -940,7 +933,7 @@ pub(crate) fn link_entry_custom_icon(
 /// as a benign last-access stamp rather than a real edit. The engine
 /// emits [`crate::ChangeEvent::EntryTouched`] for this rather than
 /// [`crate::ChangeEvent::EntriesUpdated`].
-pub(crate) fn touch_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
+pub(crate) fn touch_entry(conn: &mut Connection, uuid: Uuid, now: i64) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
     if !entry_exists(&tx, &uuid_str)? {
@@ -948,7 +941,7 @@ pub(crate) fn touch_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Engin
     }
     tx.execute(
         "UPDATE entry SET last_used_at = ?1 WHERE uuid = ?2",
-        params![now_ms(), uuid_str],
+        params![now, uuid_str],
     )?;
     tx.commit()?;
     Ok(())
@@ -1008,7 +1001,11 @@ pub(crate) fn set_recycle_bin(
     Ok(())
 }
 
-pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
+pub(crate) fn recycle_entry(
+    conn: &mut Connection,
+    uuid: Uuid,
+    now: i64,
+) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
     if !entry_exists(&tx, &uuid_str)? {
@@ -1041,7 +1038,9 @@ pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
     // entry under a "Move to Trash" label.
     let bin = match recycle_bin_uuid(&tx)? {
         Some(bin) => Some(bin),
-        None if crate::meta::read_recycle_bin_enabled(&tx)? => Some(create_recycle_bin_group(&tx)?),
+        None if crate::meta::read_recycle_bin_enabled(&tx)? => {
+            Some(create_recycle_bin_group(&tx, now)?)
+        }
         None => None,
     };
 
@@ -1052,7 +1051,7 @@ pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
             "UPDATE entry SET is_recycled = 1, previous_parent_uuid = group_uuid, \
              group_uuid = ?1, modified_at = ?2, location_changed_at = ?2 \
              WHERE uuid = ?3",
-            params![bin, now_ms(), uuid_str],
+            params![bin, now, uuid_str],
         )?;
     } else {
         // Recycle bin genuinely disabled and none exists. KeePass semantics
@@ -1064,7 +1063,7 @@ pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
         // peers (Phase 5b). Child rows cascade on entry delete.
         tx.execute("DELETE FROM entry WHERE uuid = ?1", params![uuid_str])?;
         gc_orphan_tags(&tx)?;
-        record_tombstone(&tx, &uuid_str)?;
+        record_tombstone(&tx, &uuid_str, now)?;
     }
     tx.commit()?;
     Ok(())
@@ -1075,14 +1074,13 @@ pub(crate) fn recycle_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
 /// group UUID. Mirrors keepass-core's `find_or_create_recycle_bin` — same
 /// name and icon (43) — so a bin created here is indistinguishable from one
 /// the model layer would mint, and projects/syncs identically.
-fn create_recycle_bin_group(tx: &Transaction<'_>) -> Result<String, EngineError> {
+fn create_recycle_bin_group(tx: &Transaction<'_>, now: i64) -> Result<String, EngineError> {
     let root_uuid: String = tx.query_row(
         "SELECT uuid FROM \"group\" WHERE parent_uuid IS NULL LIMIT 1",
         [],
         |r| r.get(0),
     )?;
     let new_uuid = Uuid::new_v4().to_string();
-    let now = now_ms();
     let next_sort_order: i64 = tx.query_row(
         "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM \"group\" WHERE parent_uuid = ?1",
         params![root_uuid],
@@ -1110,11 +1108,16 @@ fn create_recycle_bin_group(tx: &Transaction<'_>) -> Result<String, EngineError>
 /// enabled-but-binless vault into normal use — fixing the bin's uuid up
 /// front (before sync) avoids two peers each lazily minting their own bin.
 /// `recycle_entry`'s lazy-create remains the last-ditch safety net.
-pub(crate) fn ensure_recycle_bin(conn: &mut Connection) -> Result<Option<String>, EngineError> {
+pub(crate) fn ensure_recycle_bin(
+    conn: &mut Connection,
+    now: i64,
+) -> Result<Option<String>, EngineError> {
     let tx = conn.transaction()?;
     let bin = match recycle_bin_uuid(&tx)? {
         Some(bin) => Some(bin),
-        None if crate::meta::read_recycle_bin_enabled(&tx)? => Some(create_recycle_bin_group(&tx)?),
+        None if crate::meta::read_recycle_bin_enabled(&tx)? => {
+            Some(create_recycle_bin_group(&tx, now)?)
+        }
         None => None,
     };
     tx.commit()?;
@@ -1132,7 +1135,11 @@ pub(crate) fn ensure_recycle_bin(conn: &mut Connection) -> Result<Option<String>
 /// implementation only cleared the flag, leaving a "restored" entry
 /// still sitting in the Trash for every group-scoped view and every
 /// other KDBX client.
-pub(crate) fn restore_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
+pub(crate) fn restore_entry(
+    conn: &mut Connection,
+    uuid: Uuid,
+    now: i64,
+) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
     if !entry_exists(&tx, &uuid_str)? {
@@ -1175,7 +1182,7 @@ pub(crate) fn restore_entry(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
     tx.execute(
         "UPDATE entry SET is_recycled = 0, previous_parent_uuid = group_uuid, \
          group_uuid = ?1, modified_at = ?2, location_changed_at = ?2 WHERE uuid = ?3",
-        params![destination, now_ms(), uuid_str],
+        params![destination, now, uuid_str],
     )?;
     tx.commit()?;
     Ok(())
@@ -1210,6 +1217,7 @@ pub(crate) fn group_in_bin_subtree(tx: &Connection, group_uuid: &str) -> Result<
 pub(crate) fn delete_entry(
     conn: &mut Connection,
     uuid: Uuid,
+    now: i64,
 ) -> Result<DeleteEntryOutcome, EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -1228,7 +1236,7 @@ pub(crate) fn delete_entry(
         .map_err(|e| EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
     tx.execute("DELETE FROM entry WHERE uuid = ?1", params![uuid_str])?;
     gc_orphan_tags(&tx)?;
-    record_tombstone(&tx, &uuid_str)?;
+    record_tombstone(&tx, &uuid_str, now)?;
     tx.commit()?;
     Ok(DeleteEntryOutcome { previous_group })
 }
@@ -1237,6 +1245,7 @@ pub(crate) fn move_entry(
     conn: &mut Connection,
     uuid: Uuid,
     new_group_uuid: Uuid,
+    now: i64,
 ) -> Result<MoveEntryOutcome, EngineError> {
     let uuid_str = uuid.to_string();
     let group_str = new_group_uuid.to_string();
@@ -1268,7 +1277,6 @@ pub(crate) fn move_entry(
     // event, distinct from a content edit. `modified_at` is also
     // bumped (pre-existing behaviour); the content hash is unchanged by
     // a pure move, so field merge is unaffected either way.
-    let now = now_ms();
     tx.execute(
         "UPDATE entry SET previous_parent_uuid = group_uuid, group_uuid = ?1, \
          is_recycled = ?2, modified_at = ?3, location_changed_at = ?3 WHERE uuid = ?4",
@@ -1289,6 +1297,7 @@ pub(crate) fn set_protected_field(
     uuid: Uuid,
     field_name: &str,
     plaintext: SecretString,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let session = session_key(protector)?;
@@ -1325,7 +1334,7 @@ pub(crate) fn set_protected_field(
         recompute_has_totp(&tx, &uuid_str)?;
     }
 
-    bump_modified(&tx, &uuid_str)?;
+    bump_modified(&tx, &uuid_str, now)?;
     tx.commit()?;
     Ok(())
 }
@@ -1335,6 +1344,7 @@ pub(crate) fn set_non_protected_custom_field(
     uuid: Uuid,
     field_name: &str,
     value: &str,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -1351,7 +1361,7 @@ pub(crate) fn set_non_protected_custom_field(
     if totp::is_totp_field(field_name) {
         recompute_has_totp(&tx, &uuid_str)?;
     }
-    bump_modified(&tx, &uuid_str)?;
+    bump_modified(&tx, &uuid_str, now)?;
     tx.commit()?;
     Ok(())
 }
@@ -1360,6 +1370,7 @@ pub(crate) fn remove_custom_field(
     conn: &mut Connection,
     uuid: Uuid,
     field_name: &str,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -1387,7 +1398,7 @@ pub(crate) fn remove_custom_field(
     if totp::is_totp_field(field_name) {
         recompute_has_totp(&tx, &uuid_str)?;
     }
-    bump_modified(&tx, &uuid_str)?;
+    bump_modified(&tx, &uuid_str, now)?;
     tx.commit()?;
     Ok(())
 }
@@ -1397,6 +1408,7 @@ pub(crate) fn set_tags(
     conn: &mut Connection,
     uuid: Uuid,
     tags: Vec<String>,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -1434,7 +1446,7 @@ pub(crate) fn set_tags(
     )?;
     insert_tags(&tx, &uuid_str, &tags)?;
     if changed {
-        bump_modified(&tx, &uuid_str)?;
+        bump_modified(&tx, &uuid_str, now)?;
     }
     gc_orphan_tags(&tx)?;
     tx.commit()?;
@@ -1447,6 +1459,7 @@ pub(crate) fn attach_file(
     uuid: Uuid,
     name: &str,
     bytes: Vec<u8>,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let mut hasher = Sha256::new();
@@ -1470,7 +1483,7 @@ pub(crate) fn attach_file(
          ON CONFLICT(entry_uuid, attachment_name) DO UPDATE SET blob_sha256 = excluded.blob_sha256",
         params![uuid_str, name, sha_bytes],
     )?;
-    bump_modified(&tx, &uuid_str)?;
+    bump_modified(&tx, &uuid_str, now)?;
     tx.commit()?;
     Ok(())
 }
@@ -1581,6 +1594,7 @@ pub(crate) fn restore_entry_from_history(
     uuid: Uuid,
     history_index: u32,
     history_max_items: i32,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let session = session_key(protector)?;
@@ -1625,7 +1639,6 @@ pub(crate) fn restore_entry_from_history(
     let fp_param: Option<&[u8]> = fp.as_ref().map(|b| &b[..]);
 
     // ── 4. Overwrite the live entry row ──────────────────────────────
-    let now = now_ms();
     let url_host = parse_host(&snap.url);
     let icon_index_i64 = snap.icon_index.map(i64::from);
     tx.execute(
@@ -2133,6 +2146,7 @@ pub(crate) fn set_attachment(
     uuid: Uuid,
     name: &str,
     bytes: &[u8],
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -2158,7 +2172,7 @@ pub(crate) fn set_attachment(
          ON CONFLICT(entry_uuid, attachment_name) DO UPDATE SET blob_sha256 = excluded.blob_sha256",
         params![uuid_str, name, sha_bytes],
     )?;
-    bump_modified(&tx, &uuid_str)?;
+    bump_modified(&tx, &uuid_str, now)?;
     tx.commit()?;
     Ok(())
 }
@@ -2167,6 +2181,7 @@ pub(crate) fn remove_attachment(
     conn: &mut Connection,
     uuid: Uuid,
     name: &str,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -2180,7 +2195,7 @@ pub(crate) fn remove_attachment(
         "DELETE FROM entry_attachment WHERE entry_uuid = ?1 AND attachment_name = ?2",
         params![uuid_str, name],
     )?;
-    bump_modified(&tx, &uuid_str)?;
+    bump_modified(&tx, &uuid_str, now)?;
     tx.commit()?;
     Ok(())
 }
@@ -2192,11 +2207,11 @@ pub(crate) fn create_group(
     conn: &mut Connection,
     parent_uuid: Uuid,
     fields: NewGroupFields,
+    now: i64,
 ) -> Result<Uuid, EngineError> {
     let parent_str = parent_uuid.to_string();
     let new_uuid = Uuid::new_v4();
     let new_uuid_str = new_uuid.to_string();
-    let now = now_ms();
     let (icon_index, icon_custom_uuid) = icon_parts(&fields.icon);
 
     let tx = conn.transaction()?;
@@ -2236,6 +2251,7 @@ pub(crate) fn update_group(
     conn: &mut Connection,
     uuid: Uuid,
     update: GroupUpdate,
+    now: i64,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -2269,7 +2285,7 @@ pub(crate) fn update_group(
     }
     tx.execute(
         "UPDATE \"group\" SET modified_at = ?1 WHERE uuid = ?2",
-        params![now_ms(), uuid_str],
+        params![now, uuid_str],
     )?;
     tx.commit()?;
     Ok(())
@@ -2287,7 +2303,11 @@ pub(crate) fn update_group(
 /// Read paths that need to surface "is this row in the bin?" should
 /// walk ancestors or consult the entry's `is_recycled` column for
 /// entries moved into the bin directly.
-pub(crate) fn recycle_group(conn: &mut Connection, uuid: Uuid) -> Result<(), EngineError> {
+pub(crate) fn recycle_group(
+    conn: &mut Connection,
+    uuid: Uuid,
+    now: i64,
+) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
     if !group_exists(&tx, &uuid_str)? {
@@ -2304,7 +2324,7 @@ pub(crate) fn recycle_group(conn: &mut Connection, uuid: Uuid) -> Result<(), Eng
     }
     tx.execute(
         "UPDATE \"group\" SET parent_uuid = ?1, modified_at = ?2 WHERE uuid = ?3",
-        params![bin, now_ms(), uuid_str],
+        params![bin, now, uuid_str],
     )?;
     tx.commit()?;
     Ok(())
@@ -2317,8 +2337,9 @@ pub(crate) fn restore_group(
     conn: &mut Connection,
     uuid: Uuid,
     new_parent_uuid: Uuid,
+    now: i64,
 ) -> Result<MoveGroupOutcome, EngineError> {
-    move_group(conn, uuid, new_parent_uuid)
+    move_group(conn, uuid, new_parent_uuid, now)
 }
 
 /// Hard-delete a group and every descendant group / entry.
@@ -2331,6 +2352,7 @@ pub(crate) fn restore_group(
 pub(crate) fn delete_group(
     conn: &mut Connection,
     uuid: Uuid,
+    now: i64,
 ) -> Result<DeleteGroupOutcome, EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -2356,7 +2378,7 @@ pub(crate) fn delete_group(
     };
 
     let mut outcome = DeleteGroupOutcome::default();
-    delete_group_recursive(&tx, &uuid_str, previous_parent, &mut outcome)?;
+    delete_group_recursive(&tx, &uuid_str, previous_parent, &mut outcome, now)?;
     // The recursive cascade may have deleted entries that were the
     // last referencers of one or more tag rows. Sweep here once at the
     // end of the cascade rather than per recursive frame — every
@@ -2372,6 +2394,7 @@ fn delete_group_recursive(
     uuid: &str,
     parent_uuid: Option<Uuid>,
     outcome: &mut DeleteGroupOutcome,
+    now: i64,
 ) -> Result<(), EngineError> {
     let self_uuid = Uuid::parse_str(uuid)
         .map_err(|e| EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
@@ -2383,7 +2406,7 @@ fn delete_group_recursive(
             .collect::<Result<Vec<_>, _>>()?
     };
     for child in children {
-        delete_group_recursive(tx, &child, Some(self_uuid), outcome)?;
+        delete_group_recursive(tx, &child, Some(self_uuid), outcome, now)?;
     }
 
     // Direct child entries — collect uuids first for the event.
@@ -2401,7 +2424,7 @@ fn delete_group_recursive(
         // (Phase 5b) — the owner-rows ingest reconciles deletes per entry uuid,
         // so without this a peer would resurrect these entries (re-parented to
         // root) on the next sync.
-        record_tombstone(tx, &entry_uuid_str)?;
+        record_tombstone(tx, &entry_uuid_str, now)?;
     }
 
     tx.execute("DELETE FROM entry WHERE group_uuid = ?1", params![uuid])?;
@@ -2411,7 +2434,7 @@ fn delete_group_recursive(
     // entries *and* groups — sync-merge-strategies §4). Consuming group
     // tombstones to remove a peer's live group is Phase 5d; recording them now
     // is forward-compatible and stops the group resurrecting later.
-    record_tombstone(tx, uuid)?;
+    record_tombstone(tx, uuid, now)?;
     Ok(())
 }
 
@@ -2419,6 +2442,7 @@ pub(crate) fn move_group(
     conn: &mut Connection,
     uuid: Uuid,
     new_parent_uuid: Uuid,
+    now: i64,
 ) -> Result<MoveGroupOutcome, EngineError> {
     let uuid_str = uuid.to_string();
     let new_parent_str = new_parent_uuid.to_string();
@@ -2480,7 +2504,6 @@ pub(crate) fn move_group(
     // modified_at — a move is a location event distinct from a metadata
     // edit, so the two facets carry independent LWW stamps (mirrors
     // entry move).
-    let now = now_ms();
     tx.execute(
         "UPDATE \"group\" \
          SET parent_uuid = ?1, sort_order = ?2, modified_at = ?3, location_changed_at = ?3 \
@@ -2515,6 +2538,7 @@ pub(crate) fn reorder_group(
     conn: &mut Connection,
     uuid: Uuid,
     new_position: u32,
+    now: i64,
 ) -> Result<ReorderGroupOutcome, EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -2571,7 +2595,6 @@ pub(crate) fn reorder_group(
     // Rewrite every sibling's sort_order to its new index. A single
     // statement per row keeps the SQL trivial; bulk-update via a CTE
     // would be cleverer but not measurably faster at these row counts.
-    let now = now_ms();
     for (idx, sibling_uuid) in siblings.iter().enumerate() {
         let pos = i64::try_from(idx).unwrap_or(i64::MAX);
         tx.execute(

@@ -55,19 +55,50 @@ a migration candidate.
 
 ## Ports / adapters
 
-`Engine::open` injects three platform *ports*:
+`Engine::open` injects three platform *ports*; a fourth, the clock, is
+injected via `Engine::open_with_clock` (the no-clock `open` defaults to
+`SystemClock`):
 
 | Port                  | Mac/iOS adapter            | keyhole adapter (`src/adapters.rs`) |
 | --------------------- | -------------------------- | ----------------------------------- |
 | `VaultDbKeyProvider`  | Keychain-stored mirror key | fixed 32-byte key                   |
 | `VaultFieldProtector` | Secure Enclave session key | fixed 32-byte key                   |
 | `VaultFileWatcher`    | NSFilePresenter            | `None` (keyhole drives state)       |
+| `Clock` (engine)      | `SystemClock`              | `SystemClock`, or `FixedClock` via `--at` |
 
 keyhole is just *another platform*. Its adapters are deliberately boring
 and deterministic — that's a **fuzzing feature** (controllable clock /
 file-events / inputs), not a shortcut. They protect only keyhole's
 local mirror; they are unrelated to the KDBX master password,
 which flows through `ingest_from_kdbx` / `save_to_kdbx`.
+
+### The controllable clock (`--at <epoch-ms>`)
+
+Every engine mutation stamps its timestamps (`modified_at`,
+`location_changed_at`, tombstone `deleted_at`, created/accessed) from an
+injected `keepass_core::model::Clock`, resolved once per mutation in
+`Engine::now_ms` and threaded as an explicit `now: i64` into the
+`mutations` layer. (Peer stamps adopted during `ingest_peer` come
+verbatim from the peer — the clock is for *local* writes only.)
+
+`keyhole --at <epoch-ms>` opens the engine with a `FixedClock` pinned to
+that instant, so the timestamps that drive sync LWW are an **input**,
+not a wall-clock race. This is what lets a scenario:
+
+- **pin an exact LWW winner** — give the winning edit a strictly larger
+  pinned second (KDBX floors to whole seconds), and it wins both ingest
+  directions deterministically (`clock-lww.sh`, `group-rename-lww.sh`,
+  `group-move-lww.sh`, `move-lww.sh` — all sleep-free);
+- **force a same-second tie** — give both edits the *same* `--at`, and
+  the deterministic replica-symmetric tiebreak must still converge
+  (`clock-lww.sh`).
+
+Note the lever: `--at` controls per-record LWW stamps. It does **not**
+control the KDBX file's mtime (the kdbx-state signature the warm-mirror
+skip uses) — scenarios that `sleep` to advance *file* mtime are a
+different concern and keep their sleeps. Remaining `sleep`s in the
+scenario set are either file-signature waits or not-yet-retrofitted
+LWW cases; converting the rest is a mechanical follow-up.
 
 ## The persistent mirror
 
@@ -577,4 +608,7 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 export KEYHOLE_PASSWORD=…          # read from env, never argv/history
 keyhole inspect path/to/test.kdbx
 keyhole list    path/to/test.kdbx --group <uuid>
+
+# --at pins the engine clock (epoch-ms) for deterministic LWW stamps:
+keyhole --at 5000000 rename-group path/to/test.kdbx <uuid> "New Name"
 ```

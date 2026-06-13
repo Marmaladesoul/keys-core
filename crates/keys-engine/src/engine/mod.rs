@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
+use keepass_core::model::{Clock, SystemClock};
 use keepass_core::protector::FieldProtector;
 use rusqlite::{Connection, OpenFlags};
 use zeroize::Zeroizing;
@@ -124,6 +125,17 @@ pub struct Engine {
     /// `Arc<dyn FieldProtector>` because the trait is also held by
     /// the unlocked Kdbx and by future per-thread reveal paths.
     field_protector: Arc<dyn FieldProtector>,
+    /// Source of "now" for every timestamp this engine stamps
+    /// (`modified_at`, `location_changed_at`, tombstone `deleted_at`,
+    /// created/accessed times). Defaults to [`SystemClock`] via
+    /// [`Engine::open`]; [`Engine::open_with_clock`] injects a fixed or
+    /// scripted clock so tests and the keyhole fuzzer can drive LWW
+    /// reconciliation deterministically (force same-second ties, pin an
+    /// exact winner) instead of leaning on `sleep` between mutations.
+    /// Resolved once per mutation via [`Engine::now_ms`] and threaded as
+    /// an explicit `now` into the `mutations` layer — peer-adopted
+    /// stamps still come verbatim from the peer, never re-derived here.
+    clock: Arc<dyn Clock>,
     /// Shared lifecycle / signature state that the optional
     /// [`FileWatcher`] observer needs read/write access to from another
     /// thread. The engine reads through this on every call; the file-
@@ -309,6 +321,38 @@ impl Engine {
         field_protector: Arc<dyn FieldProtector>,
         file_watcher: Option<Arc<dyn FileWatcher>>,
     ) -> Result<Self, EngineError> {
+        Self::open_with_clock(
+            path,
+            key_provider,
+            field_protector,
+            file_watcher,
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// Like [`Engine::open`] but with an injected [`Clock`].
+    ///
+    /// Production callers use [`Engine::open`] (which supplies
+    /// [`SystemClock`]). Tests and the keyhole fuzzer pass a fixed or
+    /// scripted clock so the timestamps that drive LWW reconciliation
+    /// (`modified_at`, `location_changed_at`, tombstone `deleted_at`)
+    /// are deterministic — forcing same-second ties or pinning an exact
+    /// winner without `sleep` between mutations.
+    ///
+    /// The clock is stamped only on *local* mutations through this
+    /// engine; peer stamps adopted during `ingest_peer` come verbatim
+    /// from the peer and are never re-derived from this clock.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Engine::open`].
+    pub fn open_with_clock(
+        path: &Path,
+        key_provider: &dyn KeyProvider,
+        field_protector: Arc<dyn FieldProtector>,
+        file_watcher: Option<Arc<dyn FileWatcher>>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, EngineError> {
         let key = key_provider.acquire_db_key()?;
 
         let mut conn = Connection::open_with_flags(
@@ -383,6 +427,7 @@ impl Engine {
             conn,
             fingerprint_key,
             field_protector,
+            clock,
             shared,
             observer: None,
             file_watcher,
@@ -966,6 +1011,15 @@ impl Engine {
     #[must_use]
     pub fn strength(&self, password: &str) -> Strength {
         strength::strength(password)
+    }
+
+    /// Resolve "now" in epoch-milliseconds from this engine's injected
+    /// [`Clock`]. Called once at the top of each mutation method and
+    /// threaded as an explicit `now` into the `mutations` layer, so a
+    /// single logical operation stamps one consistent instant and tests
+    /// / the fuzzer can pin it deterministically.
+    pub(crate) fn now_ms(&self) -> i64 {
+        self.clock.now().timestamp_millis()
     }
 
     /// Close the underlying connection, finalising any pending work.

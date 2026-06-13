@@ -7,9 +7,10 @@
 # the merge picks a winner silently (matching KeePassXC / the design's
 # "groups: LWW, likely no conflict UI").
 #
-# Teeth: A's move is strictly later (separated by a second boundary —
-# KDBX floors to seconds), so BOTH replicas must converge on A's
-# destination, including the side that didn't make the winning move.
+# Teeth: A's move is strictly later (pinned a clean second apart via
+# `--at` — KDBX floors to seconds), so BOTH replicas must converge on
+# A's destination, including the side that didn't make the winning
+# move. The clock is an input here, not a `sleep` race.
 
 set -euo pipefail
 
@@ -34,10 +35,10 @@ cp "$A" "$B"
 converged() { [ "$("$KEYHOLE" digest "$A")" = "$("$KEYHOLE" digest "$B")" ]; }
 in_group() { "$KEYHOLE" list "$1" --group "$2" | grep "$uuid" >/dev/null; }
 
-# B moves first (older), A moves second (newer) — distinct seconds.
-"$KEYHOLE" move-entry "$B" "$uuid" --to "$fy" >/dev/null
-sleep 1.1
-"$KEYHOLE" move-entry "$A" "$uuid" --to "$fx" >/dev/null
+# B moves first (older), A moves second (newer) — pinned to distinct
+# seconds via --at, no wall-clock dependence.
+"$KEYHOLE" --at 1000000 move-entry "$B" "$uuid" --to "$fy" >/dev/null
+"$KEYHOLE" --at 2000000 move-entry "$A" "$uuid" --to "$fx" >/dev/null
 
 # Exchange both ways. A's later move must win on both replicas.
 "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
