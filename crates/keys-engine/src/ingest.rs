@@ -243,8 +243,9 @@ fn walk_groups(
     conn.execute(
         "INSERT INTO \"group\" (\
             uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
-            created_at, modified_at, expires_at, is_recycle_bin, sort_order\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            created_at, modified_at, expires_at, is_recycle_bin, sort_order, \
+            location_changed_at\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             uuid_str,
             parent_str,
@@ -257,6 +258,7 @@ fn walk_groups(
             expiry_ms(&group.times),
             i64::from(is_recycle_bin),
             i64::from(sort_order),
+            group.times.location_changed.map(|d| d.timestamp_millis()),
         ],
     )?;
 
@@ -882,6 +884,10 @@ pub struct IngestPeerOutcome {
     /// `modified_at` (Phase 5d group metadata). The local side changed →
     /// the caller must persist.
     pub groups_updated: Vec<Uuid>,
+    /// Existing groups the peer re-parented (moved) more recently than us —
+    /// adopted by LWW on the group's `location_changed` (Phase 5d group
+    /// move). The local side changed → the caller must persist.
+    pub groups_moved: Vec<Uuid>,
     /// Count of entries the peer agreed on outright — nothing written.
     pub in_sync: usize,
 }
@@ -1283,74 +1289,81 @@ fn resolution_times(
 /// - **present locally** → metadata LWW: if the peer's group changed more
 ///   recently, adopt its name / notes / icon, id → `outcome.groups_updated`.
 ///
-/// Group *re-parenting* (move) and tombstone-driven *deletion* are the next
-/// 5d slice — this pass never changes a group's `parent_uuid` or removes a
-/// group. Metadata LWW keys on the group's `modified_at` (bumped by
-/// `update_group` on every metadata edit), with a deterministic,
-/// replica-symmetric tiebreak for same-second edits, and adopts the peer's
-/// `modified_at` VERBATIM (Finding #8: the same generation must not diverge
-/// in time across replicas).
+/// Group *tombstone-driven deletion* is the final 5d slice — this pass never
+/// removes a group. Metadata LWW keys on `modified_at`; re-parent LWW keys on
+/// `location_changed` (a dedicated stamp so a concurrent rename + move don't
+/// clobber each other) — both adopt the peer's stamp VERBATIM (Finding #8).
+///
+/// **Two passes** so re-parenting never references a not-yet-inserted group:
+/// pass 1 inserts every peer-only group (top-down, parent before child);
+/// pass 2 reconciles metadata + parent for every group now that all exist.
 fn reconcile_peer_groups(
     tx: &Connection,
     peer: &Vault,
     outcome: &mut IngestPeerOutcome,
 ) -> Result<(), EngineError> {
-    fn walk(
-        tx: &Connection,
-        group: &Group,
+    fn collect<'g>(
+        group: &'g Group,
         parent: Option<Uuid>,
         sort_order: u32,
-        outcome: &mut IngestPeerOutcome,
-    ) -> Result<(), EngineError> {
-        if group_exists(tx, group.id)? {
-            reconcile_group_metadata(tx, group, outcome)?;
-        } else {
-            tx.execute(
-                "INSERT INTO \"group\" (\
-                    uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
-                    created_at, modified_at, expires_at, is_recycle_bin, sort_order\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
-                params![
-                    group.id.0.to_string(),
-                    parent.map(|p| p.to_string()),
-                    group.name,
-                    i64::from(group.icon_id),
-                    group.custom_icon_uuid.map(|u| u.to_string()),
-                    group.notes,
-                    dt_to_ms(group.times.creation_time),
-                    dt_to_ms(group.times.last_modification_time),
-                    expiry_ms(&group.times),
-                    i64::from(sort_order),
-                ],
-            )?;
-            outcome.groups_added.push(group.id.0);
-        }
+        out: &mut Vec<(&'g Group, Option<Uuid>, u32)>,
+    ) {
+        out.push((group, parent, sort_order));
         for (idx, child) in group.groups.iter().enumerate() {
-            walk(
-                tx,
+            collect(
                 child,
                 Some(group.id.0),
                 u32::try_from(idx).unwrap_or(u32::MAX),
-                outcome,
-            )?;
+                out,
+            );
         }
-        Ok(())
     }
 
-    // The peer's root maps 1:1 onto the local root (same uuid — both forked
-    // from one base), so it's never inserted, but its OWN metadata (name /
-    // notes / icon) still reconciles by LWW: the root group's name is in the
-    // convergence digest, so a root rename must propagate like any other.
-    reconcile_group_metadata(tx, &peer.root, outcome)?;
-    // Then descend into its children.
-    for (idx, child) in peer.root.groups.iter().enumerate() {
-        walk(
-            tx,
-            child,
-            Some(peer.root.id.0),
-            u32::try_from(idx).unwrap_or(u32::MAX),
-            outcome,
+    // Flatten the peer tree top-down into (group, peer_parent, sort_order);
+    // root carries `None` parent and is never inserted (it maps 1:1 onto the
+    // local root), but still reconciles its own metadata in pass 2.
+    let mut flat: Vec<(&Group, Option<Uuid>, u32)> = Vec::new();
+    collect(&peer.root, None, 0, &mut flat);
+
+    // Pass 1: adopt peer-only groups (top-down order ⇒ parent before child).
+    // Adopted as ORDINARY groups (`is_recycle_bin = 0`) — bin/`<Meta>`
+    // reconciliation is its own slice; a second minted bin would corrupt the
+    // single-bin invariant.
+    for (group, parent, sort_order) in &flat {
+        if parent.is_none() || group_exists(tx, group.id)? {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO \"group\" (\
+                uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
+                created_at, modified_at, expires_at, is_recycle_bin, sort_order, \
+                location_changed_at\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
+            params![
+                group.id.0.to_string(),
+                parent.map(|p| p.to_string()),
+                group.name,
+                i64::from(group.icon_id),
+                group.custom_icon_uuid.map(|u| u.to_string()),
+                group.notes,
+                dt_to_ms(group.times.creation_time),
+                dt_to_ms(group.times.last_modification_time),
+                expiry_ms(&group.times),
+                i64::from(*sort_order),
+                group.times.location_changed.map(|d| d.timestamp_millis()),
+            ],
         )?;
+        outcome.groups_added.push(group.id.0);
+    }
+
+    // Pass 2: metadata LWW for every group (incl. root — its name is in the
+    // digest), plus re-parent LWW for non-root groups (now that every group
+    // exists, a winning parent always resolves locally).
+    for (group, parent, _) in &flat {
+        reconcile_group_metadata(tx, group, outcome)?;
+        if let Some(peer_parent) = parent {
+            reconcile_group_location(tx, group, *peer_parent, outcome)?;
+        }
     }
     Ok(())
 }
@@ -1428,6 +1441,83 @@ fn reconcile_group_metadata(
         ],
     )?;
     outcome.groups_updated.push(peer_group.id.0);
+    Ok(())
+}
+
+/// Re-parent LWW for one group present on both sides (Phase 5d group move).
+/// Adopts the peer's `parent_uuid` iff the peer wins a total order over
+/// `(floored location_changed, parent uuid)` — `location_changed` (a
+/// dedicated move stamp, separate from metadata's `modified_at`, so a
+/// concurrent rename and move don't clobber each other) is the LWW signal;
+/// the parent uuid is the same-second tiebreak. The peer's
+/// `location_changed` is adopted VERBATIM (Finding #8). `sort_order` is left
+/// as-is — it isn't in the convergence digest.
+///
+/// **Cycle guard:** a re-parent that would put `group` inside its own
+/// subtree is SKIPPED (never applied), so the local tree can never become
+/// cyclic — a transient cycle would break the projection's tree walk. This
+/// keeps the common case correct and the tree always valid; the rare
+/// concurrent *mutual* move (A→under B while B→under A) can leave the two
+/// replicas disagreeing on that one edge until a deterministic
+/// cycle-breaking pass lands (the final 5d slice — see DESIGN.md). Group
+/// move is therefore NOT yet in the fuzzer mix.
+fn reconcile_group_location(
+    tx: &Connection,
+    peer_group: &Group,
+    peer_parent: Uuid,
+    outcome: &mut IngestPeerOutcome,
+) -> Result<(), EngineError> {
+    let uuid_str = peer_group.id.0.to_string();
+    let Some((local_parent, local_loc)): Option<(Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT parent_uuid, location_changed_at FROM \"group\" WHERE uuid = ?1",
+            params![uuid_str],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
+
+    let peer_loc = peer_group
+        .times
+        .location_changed
+        .map(|t| floor_to_second(t).timestamp_millis());
+    let local_loc_floored = local_loc.map(|ms| ms - ms.rem_euclid(1000));
+    let peer_parent_str = peer_parent.to_string();
+    let local_tuple = (local_loc_floored, local_parent.clone());
+    let peer_tuple = (peer_loc, Some(peer_parent_str.clone()));
+    if peer_tuple <= local_tuple {
+        return Ok(());
+    }
+    // Same parent already → nothing to move (the tuple compare can still
+    // favour the peer on a newer stamp alone; skip the redundant UPDATE).
+    if local_parent.as_deref() == Some(peer_parent_str.as_str()) {
+        return Ok(());
+    }
+    // Cycle guard: refuse to move `group` under one of its own descendants
+    // (or itself). Walk up from the proposed parent; if we reach `group`,
+    // applying the move would create a cycle — skip it.
+    let mut cursor = Some(peer_parent_str.clone());
+    while let Some(cur) = cursor {
+        if cur == uuid_str {
+            return Ok(());
+        }
+        cursor = tx
+            .query_row(
+                "SELECT parent_uuid FROM \"group\" WHERE uuid = ?1",
+                params![cur],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+    }
+
+    tx.execute(
+        "UPDATE \"group\" SET parent_uuid = ?1, location_changed_at = ?2 WHERE uuid = ?3",
+        params![peer_parent_str, peer_loc, uuid_str],
+    )?;
+    outcome.groups_moved.push(peer_group.id.0);
     Ok(())
 }
 

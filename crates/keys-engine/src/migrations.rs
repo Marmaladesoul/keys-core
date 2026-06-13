@@ -82,6 +82,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "entry_location_changed",
         sql: include_str!("migrations/0010_entry_location_changed.sql"),
     },
+    Migration {
+        version: 11,
+        name: "group_location_changed",
+        sql: include_str!("migrations/0011_group_location_changed.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.
