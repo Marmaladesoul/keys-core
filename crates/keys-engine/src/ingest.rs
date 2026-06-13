@@ -945,10 +945,10 @@ pub(crate) fn ingest_peer(
 
     // Phase 5d: reconcile the peer's GROUP tree before the entry passes —
     // adopt peer-only groups (so an entry moved/added into a group the peer
-    // just created lands there instead of falling back to root) and apply
-    // metadata LWW (rename / notes / icon) to groups we already hold.
-    // Top-down so a parent is handled before its children. Group move
-    // (re-parent) + tombstone deletion are later 5d slices.
+    // just created lands there instead of falling back to root), apply
+    // metadata + parent LWW to groups we already hold, and break any cycle
+    // the move-LWW produced. `local_tomb` lets adoption refuse to resurrect
+    // a group we deleted (the group twin of the entry zombie guard).
     reconcile_peer_groups(&tx, peer, &mut outcome)?;
 
     for (peer_entry, peer_parent) in collect_entries_with_parent(&peer.root) {
@@ -1164,16 +1164,21 @@ pub(crate) fn ingest_peer(
         }
     }
 
-    // Cross-peer DELETE propagation (Phase 5b/5d), ordered so the tombstone
-    // union runs last (a removed object must end up carrying its tombstone):
-    //   1. entries the peer tombstoned (5b);
-    //   2. groups the peer tombstoned — AFTER (1) so a cascade-deleted
-    //      group is empty locally by the time we consider removing it (5d);
-    //   3. union both sides' `<DeletedObjects>`, now that every propagated
-    //      removal has happened, skipping uuids still backing a live object.
+    // Cross-peer DELETE propagation (Phase 5b/5d):
+    //   1. entries the peer tombstoned (5b).
+    //   2. union both sides' `<DeletedObjects>` — grow-only. Group
+    //      tombstones are unioned even when a live group row still exists,
+    //      because (3) is what decides a group's fate from the MERGED tree
+    //      and scrubs the tombstone of any group it keeps (so no live group
+    //      carries its own tombstone at commit — interop preserved).
+    //   3. materialise group tombstones from the merged tree (5d, option 2):
+    //      a tombstoned group with NO live descendant is deleted; one that
+    //      still holds content is resurrected (kept, tombstone scrubbed).
+    //      Deciding from the merged tree — not transient ingest-time
+    //      emptiness — is what makes cross-peer group delete converge.
     reconcile_peer_deletes(&tx, &local_by_uuid, &peer_uuids, &peer_tomb, &mut outcome)?;
-    reconcile_peer_group_deletes(&tx, &peer_tomb, &mut outcome)?;
     union_peer_tombstones(&tx, &peer_tomb)?;
+    materialize_group_tombstones(&tx, &mut outcome)?;
 
     tx.commit()?;
     Ok(outcome)
@@ -1217,93 +1222,144 @@ fn reconcile_peer_deletes(
     Ok(())
 }
 
-/// Cross-peer GROUP delete (Phase 5d, direction 1): remove a live local
-/// group the peer tombstoned. Runs AFTER [`reconcile_peer_deletes`] so a
-/// cascade-deleted group's entries are already gone and the group reads
-/// empty here.
-///
-/// Conservative, mirroring the entry rule plus a structural guard:
-/// - **empty only** — a group still holding a live child group or entry is
-///   kept (e.g. we added content into it concurrently; never silently drop
-///   live data). The group survives and re-propagates; convergence still
-///   holds (the other side re-adopts it).
-/// - **edit-wins** — if we renamed or moved the group strictly after the
-///   peer's deletion (`max(modified_at, location_changed) > deleted_at`),
-///   keep it (a live structural edit beats a stale delete).
-///
-/// The tombstone itself is folded in by [`union_peer_tombstones`] afterwards.
-fn reconcile_peer_group_deletes(
-    tx: &Connection,
-    peer_tomb: &HashMap<Uuid, Option<DateTime<Utc>>>,
-    outcome: &mut IngestPeerOutcome,
-) -> Result<(), EngineError> {
-    for (uuid, deleted_at) in peer_tomb {
-        let uuid_str = uuid.to_string();
-        // Read the group's change stamps; skip if it isn't a live local group.
-        let Some((modified_at, location_changed_at)): Option<(i64, Option<i64>)> = tx
-            .query_row(
-                "SELECT modified_at, location_changed_at FROM \"group\" WHERE uuid = ?1",
-                params![uuid_str],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?
-        else {
-            continue;
-        };
-        // Empty only: a live child group or entry means keep.
-        let has_child_group = group_child_exists(tx, "\"group\"", "parent_uuid", &uuid_str)?;
-        let has_child_entry = group_child_exists(tx, "entry", "group_uuid", &uuid_str)?;
-        if has_child_group || has_child_entry {
-            continue;
-        }
-        // Edit-wins: a local rename/move strictly after the deletion keeps it.
-        let local_changed = modified_at.max(location_changed_at.unwrap_or(i64::MIN));
-        if let Some(deleted) = deleted_at {
-            if local_changed > deleted.timestamp_millis() {
-                continue;
-            }
-        }
-        tx.execute("DELETE FROM \"group\" WHERE uuid = ?1", params![uuid_str])?;
-        outcome.groups_deleted.push(*uuid);
-    }
-    Ok(())
-}
-
-/// `true` if `table.column = parent` matches any row — the "is this group
-/// non-empty?" probe (child groups via `group.parent_uuid`, child entries
-/// via `entry.group_uuid`). Table/column names are crate-internal literals,
-/// never user input.
-fn group_child_exists(
-    tx: &Connection,
-    table: &str,
-    column: &str,
-    parent: &str,
-) -> Result<bool, EngineError> {
-    let sql = format!("SELECT 1 FROM {table} WHERE {column} = ?1 LIMIT 1");
-    Ok(tx
-        .query_row(&sql, params![parent], |_| Ok(()))
-        .optional()?
-        .is_some())
-}
-
 /// Fold the peer's `<DeletedObjects>` into ours so deletions propagate onward
-/// (grow-only set, earliest deletion time wins). Skip any uuid still backing
-/// a live local object (entry or group): a live record must never carry its
-/// own tombstone, or other KDBX clients re-delete it. Runs last, after entry
-/// and group deletes, so a just-removed object now correctly gets its
-/// tombstone unioned (it no longer exists locally).
+/// (grow-only set, earliest deletion time wins). Skip a uuid still backing a
+/// live local ENTRY — a live entry must never carry its own tombstone, or
+/// other KDBX clients re-delete it. GROUP tombstones are unioned even when a
+/// live group row exists, because [`materialize_group_tombstones`] runs right
+/// after (same transaction) and scrubs the tombstone of any group it keeps —
+/// so no live group carries its own tombstone at commit either.
 fn union_peer_tombstones(
     tx: &Connection,
     peer_tomb: &HashMap<Uuid, Option<DateTime<Utc>>>,
 ) -> Result<(), EngineError> {
     for (uuid, deleted_at) in peer_tomb {
         let uuid_str = uuid.to_string();
-        if entry_exists(tx, &uuid_str)? || group_exists(tx, GroupId(*uuid))? {
+        if entry_exists(tx, &uuid_str)? {
             continue;
         }
         union_tombstone(tx, &uuid_str, *deleted_at)?;
     }
     Ok(())
+}
+
+/// Materialise group tombstones against the MERGED tree (Phase 5d, option 2:
+/// content saves a deleted group). For every group that carries a tombstone:
+///
+/// - **dead** (no live descendant — no direct live entry, and every child is
+///   itself dead) → delete the group row, leaving the tombstone so the delete
+///   propagates. Bottom-up-safe: a dead group's children are all dead, so no
+///   live object is ever orphaned.
+/// - **alive** (a live entry survives somewhere in its subtree, or it holds a
+///   non-tombstoned subgroup) → resurrect: keep the row and SCRUB the
+///   tombstone, so the once-deleted group becomes an ordinary group again and
+///   no live group carries its own tombstone (KDBX interop).
+///
+/// Deciding from the converged tree — not from transient ingest-time
+/// emptiness — is what makes cross-peer group delete CONVERGE: "does this
+/// tombstoned group have live content?" is a pure function of the merged
+/// state, so both replicas reach the identical verdict. Runs after the entry
+/// passes (so content placement is settled) and after the tombstone union
+/// (so it sees every tombstone). The tree is acyclic here —
+/// [`reconcile_peer_groups`] ran `break_group_cycles` earlier.
+fn materialize_group_tombstones(
+    tx: &Connection,
+    outcome: &mut IngestPeerOutcome,
+) -> Result<(), EngineError> {
+    // All group rows: uuid + parent/child indices.
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    let mut parent_of: HashMap<String, String> = HashMap::new();
+    let mut all_groups: Vec<String> = Vec::new();
+    {
+        let mut stmt = tx.prepare("SELECT uuid, parent_uuid FROM \"group\"")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (uuid, parent) = row?;
+            all_groups.push(uuid.clone());
+            if let Some(p) = parent {
+                children.entry(p.clone()).or_default().push(uuid.clone());
+                parent_of.insert(uuid, p);
+            }
+        }
+    }
+    // Groups holding ≥1 direct live entry.
+    let groups_with_entries: HashSet<String> = {
+        let mut stmt = tx.prepare("SELECT DISTINCT group_uuid FROM entry")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    // Tombstoned uuids that are actually groups (the deleted-objects table
+    // mingles entry + group tombstones).
+    let group_set: HashSet<&String> = all_groups.iter().collect();
+    let tombstoned: HashSet<String> = {
+        let mut stmt = tx.prepare("SELECT uuid FROM meta_deleted_object")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.filter_map(Result::ok)
+            .filter(|u| group_set.contains(u))
+            .collect()
+    };
+    if tombstoned.is_empty() {
+        return Ok(());
+    }
+
+    // Partition tombstoned groups into resurrected (scrub) vs dead (delete).
+    let mut dead: Vec<String> = Vec::new();
+    for uuid in &tombstoned {
+        if group_alive(uuid, &tombstoned, &groups_with_entries, &children) {
+            // Resurrected by surviving content → scrub the tombstone.
+            remove_tombstone(tx, uuid)?;
+        } else {
+            dead.push(uuid.clone());
+        }
+    }
+    // Delete dead groups CHILDREN-FIRST: a dead group's children are all dead
+    // too, and deleting a parent before its child would break the child's
+    // `parent_uuid` FK. Order by tree depth descending (deepest first) — a
+    // total order in which every child precedes its parent.
+    dead.sort_by_key(|u| std::cmp::Reverse(group_depth(u, &parent_of)));
+    for uuid in dead {
+        tx.execute("DELETE FROM \"group\" WHERE uuid = ?1", params![uuid])?;
+        if let Ok(u) = Uuid::parse_str(&uuid) {
+            outcome.groups_deleted.push(u);
+        }
+    }
+    Ok(())
+}
+
+/// Depth of a group from the root (root children = 1), by walking
+/// `parent_of`. Bounded by the group count; used only to order deletions
+/// children-before-parents.
+fn group_depth(uuid: &str, parent_of: &HashMap<String, String>) -> usize {
+    let mut depth = 0;
+    let mut cur = uuid;
+    while let Some(parent) = parent_of.get(cur) {
+        depth += 1;
+        cur = parent.as_str();
+        if depth > 100_000 {
+            break; // cycle backstop; the tree is acyclic here in practice
+        }
+    }
+    depth
+}
+
+/// A group is alive iff it is NOT tombstoned, OR it directly holds a live
+/// entry, OR some descendant is alive. (The tree is acyclic by the time this
+/// runs, so the recursion terminates.)
+fn group_alive(
+    uuid: &str,
+    tombstoned: &HashSet<String>,
+    groups_with_entries: &HashSet<String>,
+    children: &HashMap<String, Vec<String>>,
+) -> bool {
+    if !tombstoned.contains(uuid) || groups_with_entries.contains(uuid) {
+        return true;
+    }
+    children.get(uuid).is_some_and(|kids| {
+        kids.iter()
+            .any(|c| group_alive(c, tombstoned, groups_with_entries, children))
+    })
 }
 
 /// Depth-first collection of every entry under `root` (read-only — the
@@ -1422,6 +1478,14 @@ fn reconcile_peer_groups(
         if parent.is_none() || group_exists(tx, group.id)? {
             continue;
         }
+        // Adopt unconditionally — even a group WE tombstoned. The
+        // merged-tree materialisation pass at the end of the ingest
+        // (`materialize_group_tombstones`) is the single decider of a
+        // tombstoned group's fate: it re-deletes this group right back if
+        // it has no live descendant, or keeps it (scrubbing the tombstone)
+        // if content survives under it. Deciding there — from the converged
+        // tree rather than from transient ingest-time emptiness here —
+        // is what makes cross-peer group delete converge.
         tx.execute(
             "INSERT INTO \"group\" (\
                 uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
@@ -1454,6 +1518,11 @@ fn reconcile_peer_groups(
             reconcile_group_location(tx, group, *peer_parent, outcome)?;
         }
     }
+
+    // The symmetric move-LWW above can leave a cyclic parent map (concurrent
+    // mutual moves); break it deterministically so both replicas land the
+    // same acyclic tree. `peer.root.id` == the local root (shared uuid).
+    break_group_cycles(tx, peer.root.id.0, outcome)?;
     Ok(())
 }
 
@@ -1466,7 +1535,8 @@ fn reconcile_peer_groups(
 /// each keep their own name forever — the group twin of the entry
 /// same-second race). The peer's `modified_at` is adopted VERBATIM so the
 /// same generation can't carry different stamps across replicas. Never
-/// touches `parent_uuid` (group move is the next slice) or `is_recycle_bin`.
+/// touches `parent_uuid` (that's `reconcile_group_location`'s job) or
+/// `is_recycle_bin`.
 fn reconcile_group_metadata(
     tx: &Connection,
     peer_group: &Group,
@@ -1542,14 +1612,20 @@ fn reconcile_group_metadata(
 /// `location_changed` is adopted VERBATIM (Finding #8). `sort_order` is left
 /// as-is — it isn't in the convergence digest.
 ///
-/// **Cycle guard:** a re-parent that would put `group` inside its own
-/// subtree is SKIPPED (never applied), so the local tree can never become
-/// cyclic — a transient cycle would break the projection's tree walk. This
-/// keeps the common case correct and the tree always valid; the rare
-/// concurrent *mutual* move (A→under B while B→under A) can leave the two
-/// replicas disagreeing on that one edge until a deterministic
-/// cycle-breaking pass lands (the final 5d slice — see DESIGN.md). Group
-/// move is therefore NOT yet in the fuzzer mix.
+/// The winning edge is applied **unconditionally** — even if it transiently
+/// makes the mirror tree cyclic. That is deliberate and load-bearing for
+/// convergence: the LWW *winner* per group is symmetric (it depends only on
+/// the two candidate `(parent, loc)` values, not on which side is "local"),
+/// so BOTH replicas compute the identical winning-edge set. A concurrent
+/// *mutual* move (A→under B while B→under A) yields the same cyclic edge set
+/// {A→B, B→A} on both — which [`break_group_cycles`] then resolves
+/// identically at the end of the pass. (An earlier skip-on-cycle guard kept
+/// the tree acyclic but, because the skip depended on application order,
+/// left the two replicas in *different* acyclic trees — divergence. Applying
+/// the symmetric winner + a deterministic break is what actually converges.)
+/// `SQLite` has no FK cycle check on `parent_uuid`, and the projection only
+/// ever reads committed state, so the transient mid-transaction cycle is
+/// harmless.
 fn reconcile_group_location(
     tx: &Connection,
     peer_group: &Group,
@@ -1584,23 +1660,6 @@ fn reconcile_group_location(
     if local_parent.as_deref() == Some(peer_parent_str.as_str()) {
         return Ok(());
     }
-    // Cycle guard: refuse to move `group` under one of its own descendants
-    // (or itself). Walk up from the proposed parent; if we reach `group`,
-    // applying the move would create a cycle — skip it.
-    let mut cursor = Some(peer_parent_str.clone());
-    while let Some(cur) = cursor {
-        if cur == uuid_str {
-            return Ok(());
-        }
-        cursor = tx
-            .query_row(
-                "SELECT parent_uuid FROM \"group\" WHERE uuid = ?1",
-                params![cur],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten();
-    }
 
     tx.execute(
         "UPDATE \"group\" SET parent_uuid = ?1, location_changed_at = ?2 WHERE uuid = ?3",
@@ -1608,6 +1667,84 @@ fn reconcile_group_location(
     )?;
     outcome.groups_moved.push(peer_group.id.0);
     Ok(())
+}
+
+/// Break any cycle the symmetric group-move LWW produced, deterministically,
+/// so both replicas resolve to the SAME acyclic tree (Phase 5d).
+///
+/// A concurrent mutual move leaves the winning-edge map cyclic (e.g.
+/// `{X→Y, Y→X}`); both replicas reach the identical map, so re-rooting each
+/// cycle's **smallest-uuid member** to the root group is a pure function of
+/// that shared map → identical result → convergence. The re-rooted group
+/// keeps its `location_changed` (the winning stamp), so its row stays
+/// byte-identical across replicas.
+///
+/// Bounded by the group count (each iteration breaks one cycle by removing
+/// an edge); groups are few, so the repeated scan is cheap.
+fn break_group_cycles(
+    tx: &Connection,
+    root_uuid: Uuid,
+    outcome: &mut IngestPeerOutcome,
+) -> Result<(), EngineError> {
+    let root_str = root_uuid.to_string();
+    loop {
+        // Load the parent map (non-root groups only).
+        let parent_of: HashMap<String, String> = {
+            let mut stmt = tx
+                .prepare("SELECT uuid, parent_uuid FROM \"group\" WHERE parent_uuid IS NOT NULL")?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut m = HashMap::new();
+            for row in rows {
+                let (u, p) = row?;
+                m.insert(u, p);
+            }
+            m
+        };
+
+        // Find one cycle: walk parents from each node; a node that revisits
+        // a node already on its own path (without reaching root/None) is in
+        // a cycle. Collect that cycle's members.
+        let Some(cycle) = find_one_cycle(&parent_of) else {
+            return Ok(()); // acyclic — done.
+        };
+        // Re-root the smallest-uuid member (deterministic + replica-symmetric).
+        let victim = cycle
+            .iter()
+            .min()
+            .expect("a cycle has at least one member")
+            .clone();
+        tx.execute(
+            "UPDATE \"group\" SET parent_uuid = ?1 WHERE uuid = ?2",
+            params![root_str, victim],
+        )?;
+        if let Ok(u) = Uuid::parse_str(&victim) {
+            outcome.groups_moved.push(u);
+        }
+    }
+}
+
+/// Return the members of one cycle in `parent_of` (uuid → parent uuid), or
+/// `None` if the map is acyclic. Walks parents from each node; reaching a
+/// node with no parent entry (a root child) ends that walk, while revisiting
+/// a node already on the current path means a cycle — the members are the
+/// path from that node onward.
+fn find_one_cycle(parent_of: &HashMap<String, String>) -> Option<Vec<String>> {
+    for start in parent_of.keys() {
+        let mut path: Vec<String> = Vec::new();
+        let mut cur = start.clone();
+        loop {
+            if let Some(pos) = path.iter().position(|n| n == &cur) {
+                return Some(path[pos..].to_vec());
+            }
+            path.push(cur.clone());
+            match parent_of.get(&cur) {
+                Some(parent) => cur = parent.clone(),
+                None => break, // reached a root child — no cycle on this walk.
+            }
+        }
+    }
+    None
 }
 
 /// Location LWW for one shared entry (Phase 5d). Returns `true` if the local

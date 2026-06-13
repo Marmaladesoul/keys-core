@@ -55,12 +55,14 @@ fail() {
 }
 
 # --- seed: a small shared world, then split into two devices ---------
-# Several SHARED groups so the move op (5d location LWW) has somewhere
-# to move TO that both replicas already hold. Peer-only group adoption
-# (moving into a group the other side hasn't seen) is the next 5d
-# slice; until it lands the mix moves only among these pre-seeded
-# groups, so a one-sided move always finds its destination on the peer.
+# Several SHARED groups give the move ops (5d) somewhere to move TO that
+# both replicas already hold; the device-local g-* groups created during
+# the run get adopted by the peer (5d group adoption). ROOT is captured
+# right after `create` (the only group then) so the move/delete target
+# picker can exclude it — root has no parent and deleting it would wipe
+# the vault.
 "$KEYHOLE" create "$A" >/dev/null
+ROOT="$("$KEYHOLE" list-groups "$A" | awk '$1 ~ /^[0-9a-f-]{36}$/ {print $1; exit}')"
 for f in Folder Folder-2 Folder-3; do
     "$KEYHOLE" create-group "$A" "$f" >/dev/null
 done
@@ -72,6 +74,18 @@ cp "$A" "$B"
 # A random group uuid (any of the shared seed groups or root), for moves.
 random_group() { # $1=vault → uuid of a random group
     "$KEYHOLE" list-groups "$1" 2>/dev/null | awk '$1 ~ /^[0-9a-f-]{36}$/ {print $1}' \
+        | awk -v r=$((RANDOM)) 'BEGIN{srand(r)} {a[NR]=$0} END{if (NR) print a[int(rand()*NR)+1]}'
+}
+
+# A random NON-root, non-bin group — a safe move/delete target. Root has no
+# parent and the bin is structural; list-groups marks the bin "[bin]" and
+# root is the first row (the only one create made before the seed folders),
+# but rather than rely on position we exclude by the fields list-groups
+# prints: skip the row whose name is the bin's and skip root by its known
+# uuid (captured at seed time as $ROOT).
+random_movable_group() { # $1=vault → uuid of a random non-root, non-bin group
+    "$KEYHOLE" list-groups "$1" 2>/dev/null \
+        | awk -v root="$ROOT" '$1 ~ /^[0-9a-f-]{36}$/ && $1 != root && $0 !~ /\[bin\]/ {print $1}' \
         | awk -v r=$((RANDOM)) 'BEGIN{srand(r)} {a[NR]=$0} END{if (NR) print a[int(rand()*NR)+1]}'
 }
 
@@ -97,12 +111,16 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
     # as each finding/slice landed (#7 conflict-row attachments, #8 LCA
     # disambiguation, 5d location LWW + group adoption). Attachment names
     # are SHARED across devices (both-sided clash parks + resolves in
-    # resolve_all). Still ABSENT — the remaining 5d slices: group
-    # rename/move/recycle and group-tombstone deletion. Scope ledger:
+    # resolve_all). The FULL group-structure surface is now exercised:
+    # create (adoption), rename (metadata LWW), move (re-parent LWW +
+    # deterministic cycle-break for concurrent mutual moves), delete
+    # (tombstone consumption) — moves/deletes target non-root, non-bin
+    # groups (random_movable_group) since deleting root would wipe the
+    # vault and root has no parent to move. Scope ledger:
     # sync-multipeer-store.md.
     # NB: if/fi rather than `[ -n ] &&` — under `set -e` a final failing
     # && would silently kill the whole run when a pick comes up empty.
-    op=$((RANDOM % 9))
+    op=$((RANDOM % 11))
     case $op in
         7) "$KEYHOLE" create-group "$v" "g-$n" >/dev/null ;;
         8) g="$(random_group "$v")"
@@ -112,6 +130,13 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
            # on the peer converges next round (adoption + rename both
            # propagate). Renames on the same shared group race.
            if [ -n "$g" ]; then "$KEYHOLE" rename-group "$v" "$g" "r-$n" >/dev/null 2>&1 || true; fi ;;
+        9) g="$(random_movable_group "$v")"; dst="$(random_movable_group "$v")"
+           # Re-parent a group under another (5d group move). Concurrent
+           # mutual moves resolve via the deterministic cycle-break.
+           if [ -n "$g" ] && [ -n "$dst" ]; then "$KEYHOLE" move-group "$v" "$g" --to "$dst" >/dev/null 2>&1 || true; fi ;;
+        10) g="$(random_movable_group "$v")"
+           # Delete a group (5d cross-peer group delete via tombstone).
+           if [ -n "$g" ]; then "$KEYHOLE" delete-group "$v" "$g" >/dev/null 2>&1 || true; fi ;;
         0) "$KEYHOLE" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
         1) e="$(random_entry "$v")"
            if [ -n "$e" ]; then "$KEYHOLE" update-entry "$v" "$e" --username "edit-$n" >/dev/null; fi ;;
