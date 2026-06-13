@@ -348,8 +348,24 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   [blob-pool-gc.sh](scenarios/blob-pool-gc.sh) (red pre-GC: deleting
   an entry left its blobs forever) and keys-engine
   `gc_attachment_blobs_reaps_only_unrooted`.
-- **Next:** icon pool union (the last 5c sliver); then 5d
-  (groups/location — re-enable the fuzzer's location ops);
+- **Next:** icon pool union (the last 5c sliver); then **5d
+  (groups/location)**, now opened with evidence:
+  [move-propagates.sh](scenarios/move-propagates.sh) deterministically
+  pins the headline gap — **a one-sided entry move does not propagate
+  at all** (classify's scope excludes location; a pure move is
+  content-identical → `InSync` → the peer never learns; digest
+  divergence forever). Diagnostic / excluded from `run-all.sh` until
+  5d lands, then gate it and re-enable the fuzzer's location ops.
+  Design lead: KDBX natively carries `<Times><LocationChanged>` —
+  keepass-core's model round-trips it (`Timestamps.location_changed`)
+  but the engine mirror never stores it; location LWW on a floored
+  `location_changed` is the natural rule, with the Finding-#8 lesson
+  applied (an adopted move must adopt the peer's `location_changed`,
+  never re-stamp locally, or the same generation diverges in time
+  across replicas). Also in 5d: peer-only group adoption (today's
+  insert falls back to root when the parent is missing), group
+  metadata LWW, consuming group tombstones (recorded since 5b, never
+  consumed), and the deferred previous-parent merge rules.
   `empty-bin` verb; value-hash-based adoption matching
   (timestamp-free) as hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
