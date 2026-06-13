@@ -1262,3 +1262,90 @@ fn two_engine_group_move_reconciles_and_converges() {
         "replicas converge after the group-move exchange",
     );
 }
+
+/// Phase 5d cross-peer group delete: a group deleted on one side is
+/// removed on the other (its `<DeletedObjects>` tombstone is consumed),
+/// and the replicas converge — including the cascade case where the
+/// deleted group held an entry (the entry tombstone clears it first, so
+/// the group reads empty and is removed).
+#[test]
+fn two_engine_group_delete_propagates_and_converges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx_a = dir.path().join("a.kdbx");
+    let kdbx_b = dir.path().join("b.kdbx");
+
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let doomed = kdbx
+        .add_group(root, NewGroup::new("Doomed"))
+        .expect("group");
+    // An entry inside the doomed group, so the delete cascades.
+    kdbx.add_entry(doomed, NewEntry::new("inside")).expect("e");
+
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save");
+
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut hb0 = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb0, None)
+        .expect("b save");
+
+    // Precondition: B holds the doomed group.
+    assert!(
+        engine_b
+            .group_tree()
+            .expect("b groups")
+            .iter()
+            .any(|g| g.uuid == doomed.0),
+        "precondition: B has the group before the delete",
+    );
+
+    // A deletes the group (cascading the entry + recording tombstones).
+    engine_a.delete_group(doomed.0).expect("a delete group");
+    let mut ha = reopen_kdbx(&kdbx_a);
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut ha, None)
+        .expect("a save 2");
+
+    // B ingests A → the group (and its cascaded entry) are removed; Applied.
+    let result = engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest a");
+    assert!(
+        matches!(result, ParkConflictsResult::Applied { .. }),
+        "a propagated group delete is a local change → Applied, got {result:?}",
+    );
+    assert!(
+        !engine_b
+            .group_tree()
+            .expect("b groups")
+            .iter()
+            .any(|g| g.uuid == doomed.0),
+        "B removed the peer-deleted group",
+    );
+
+    // Converge: B re-saves, A pulls back, both agree (incl. tombstones).
+    let mut hb = reopen_kdbx(&kdbx_b);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb, None)
+        .expect("b save 2");
+    engine_a
+        .ingest_peer_from_kdbx(&kdbx_b, &composite(), "device-b")
+        .expect("a ingest b");
+    assert_eq!(
+        engine_a.content_digest().expect("a digest"),
+        engine_b.content_digest().expect("b digest"),
+        "replicas converge after the group delete",
+    );
+}

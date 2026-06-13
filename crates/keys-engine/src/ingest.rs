@@ -888,6 +888,10 @@ pub struct IngestPeerOutcome {
     /// adopted by LWW on the group's `location_changed` (Phase 5d group
     /// move). The local side changed → the caller must persist.
     pub groups_moved: Vec<Uuid>,
+    /// Local groups removed because the peer tombstoned them, they were
+    /// empty locally, and we hadn't changed them since (cross-peer group
+    /// delete, Phase 5d). The local side changed → the caller must persist.
+    pub groups_deleted: Vec<Uuid>,
     /// Count of entries the peer agreed on outright — nothing written.
     pub in_sync: usize,
 }
@@ -1160,8 +1164,16 @@ pub(crate) fn ingest_peer(
         }
     }
 
-    // Cross-peer DELETE propagation + tombstone union (Phase 5b, direction 1).
+    // Cross-peer DELETE propagation (Phase 5b/5d), ordered so the tombstone
+    // union runs last (a removed object must end up carrying its tombstone):
+    //   1. entries the peer tombstoned (5b);
+    //   2. groups the peer tombstoned — AFTER (1) so a cascade-deleted
+    //      group is empty locally by the time we consider removing it (5d);
+    //   3. union both sides' `<DeletedObjects>`, now that every propagated
+    //      removal has happened, skipping uuids still backing a live object.
     reconcile_peer_deletes(&tx, &local_by_uuid, &peer_uuids, &peer_tomb, &mut outcome)?;
+    reconcile_peer_group_deletes(&tx, &peer_tomb, &mut outcome)?;
+    union_peer_tombstones(&tx, &peer_tomb)?;
 
     tx.commit()?;
     Ok(outcome)
@@ -1202,11 +1214,88 @@ fn reconcile_peer_deletes(
         delete_local_entry(tx, &uuid.to_string())?;
         outcome.deleted.push(*uuid);
     }
+    Ok(())
+}
 
-    // Fold the peer's `<DeletedObjects>` into ours so deletions propagate
-    // onward (grow-only set, earliest deletion time wins). Skip any uuid still
-    // backing a live local object (entry or group): a live record must never
-    // carry its own tombstone, or other KDBX clients re-delete it.
+/// Cross-peer GROUP delete (Phase 5d, direction 1): remove a live local
+/// group the peer tombstoned. Runs AFTER [`reconcile_peer_deletes`] so a
+/// cascade-deleted group's entries are already gone and the group reads
+/// empty here.
+///
+/// Conservative, mirroring the entry rule plus a structural guard:
+/// - **empty only** — a group still holding a live child group or entry is
+///   kept (e.g. we added content into it concurrently; never silently drop
+///   live data). The group survives and re-propagates; convergence still
+///   holds (the other side re-adopts it).
+/// - **edit-wins** — if we renamed or moved the group strictly after the
+///   peer's deletion (`max(modified_at, location_changed) > deleted_at`),
+///   keep it (a live structural edit beats a stale delete).
+///
+/// The tombstone itself is folded in by [`union_peer_tombstones`] afterwards.
+fn reconcile_peer_group_deletes(
+    tx: &Connection,
+    peer_tomb: &HashMap<Uuid, Option<DateTime<Utc>>>,
+    outcome: &mut IngestPeerOutcome,
+) -> Result<(), EngineError> {
+    for (uuid, deleted_at) in peer_tomb {
+        let uuid_str = uuid.to_string();
+        // Read the group's change stamps; skip if it isn't a live local group.
+        let Some((modified_at, location_changed_at)): Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT modified_at, location_changed_at FROM \"group\" WHERE uuid = ?1",
+                params![uuid_str],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        else {
+            continue;
+        };
+        // Empty only: a live child group or entry means keep.
+        let has_child_group = group_child_exists(tx, "\"group\"", "parent_uuid", &uuid_str)?;
+        let has_child_entry = group_child_exists(tx, "entry", "group_uuid", &uuid_str)?;
+        if has_child_group || has_child_entry {
+            continue;
+        }
+        // Edit-wins: a local rename/move strictly after the deletion keeps it.
+        let local_changed = modified_at.max(location_changed_at.unwrap_or(i64::MIN));
+        if let Some(deleted) = deleted_at {
+            if local_changed > deleted.timestamp_millis() {
+                continue;
+            }
+        }
+        tx.execute("DELETE FROM \"group\" WHERE uuid = ?1", params![uuid_str])?;
+        outcome.groups_deleted.push(*uuid);
+    }
+    Ok(())
+}
+
+/// `true` if `table.column = parent` matches any row — the "is this group
+/// non-empty?" probe (child groups via `group.parent_uuid`, child entries
+/// via `entry.group_uuid`). Table/column names are crate-internal literals,
+/// never user input.
+fn group_child_exists(
+    tx: &Connection,
+    table: &str,
+    column: &str,
+    parent: &str,
+) -> Result<bool, EngineError> {
+    let sql = format!("SELECT 1 FROM {table} WHERE {column} = ?1 LIMIT 1");
+    Ok(tx
+        .query_row(&sql, params![parent], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Fold the peer's `<DeletedObjects>` into ours so deletions propagate onward
+/// (grow-only set, earliest deletion time wins). Skip any uuid still backing
+/// a live local object (entry or group): a live record must never carry its
+/// own tombstone, or other KDBX clients re-delete it. Runs last, after entry
+/// and group deletes, so a just-removed object now correctly gets its
+/// tombstone unioned (it no longer exists locally).
+fn union_peer_tombstones(
+    tx: &Connection,
+    peer_tomb: &HashMap<Uuid, Option<DateTime<Utc>>>,
+) -> Result<(), EngineError> {
     for (uuid, deleted_at) in peer_tomb {
         let uuid_str = uuid.to_string();
         if entry_exists(tx, &uuid_str)? || group_exists(tx, GroupId(*uuid))? {
