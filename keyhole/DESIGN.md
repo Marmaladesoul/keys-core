@@ -318,14 +318,29 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 - **Done (2026-06-13, Finding #8 fix):** `find_common_ancestor` is
   generation-aware (min-rank pair selection, keepass-merge); both
   fuzzers are CI gates and the main fuzz mix carries attachment ops.
-  See Findings.
-- **Next:** the remaining 5c slice — both-sided attachment
-  park/resolve and blob-pool GC (GC must treat
-  `conflict_entry_attachment` as a reference root; same-name
-  both-sided divergence currently neither parks nor auto-picks, and
-  with #7's conflict rows storing attachments the park path is now
-  buildable), then 5d (groups/location — re-enable the fuzzer's
-  location ops); `empty-bin` verb; value-hash-based adoption matching
+  See Findings. The same CI run also surfaced and fixed a latent
+  scenario-harness race: keyhole prints a summary line after its
+  greppable output, so `keyhole … | grep -q` + `pipefail` could
+  false-FAIL on an EPIPE panic when grep exited at first match —
+  every `$KEYHOLE`-piped grep is now full-read (`grep X >/dev/null`).
+- **Done (2026-06-13, both-sided attachment park/resolve — the 5c
+  conflict slice):** `keepass_merge::classify` treats both-sided
+  same-name attachment divergence (and the no-LCA conservative
+  posture) as a genuine Conflict — it parks with
+  `attachment_deltas` surfaced instead of silently coexisting
+  un-badged forever. No keys-engine change needed: Finding #7's
+  plumbing (conflict rows store attachments; rebuilt "theirs"
+  carries them; per-attachment resolve) carries the whole flow.
+  Pinned by
+  [attachment-both-sided-park.sh](scenarios/attachment-both-sided-park.sh)
+  (park → hold-open keeps local → resolver delta → choose-remote
+  adopts peer bytes → propagates without re-park → digest converges →
+  persists); `fuzz-convergence.sh`'s attachment names went SHARED
+  (both-sided clashes park + resolve in the round loop) — 30/30 soak.
+- **Next:** the remaining 5c housekeeping — blob-pool GC
+  (`conflict_entry_attachment` is a reference root) and icon pool
+  union; then 5d (groups/location — re-enable the fuzzer's location
+  ops); `empty-bin` verb; value-hash-based adoption matching
   (timestamp-free) as hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
