@@ -402,44 +402,49 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   both-sided LWW) + keys-engine
   `two_engine_group_rename_reconciles_and_converges`;
   `fuzz-convergence.sh` gains a `rename-group` op — 30/30 soak.
-- **Done (2026-06-13, 5d group move / re-parent LWW):** a group
-  re-parent now reconciles by LWW on a DEDICATED group
+- **Done (2026-06-13, 5d group move / re-parent LWW + cycle-break):** a
+  group re-parent reconciles by LWW on a DEDICATED group
   `location_changed` (migration 0011, the group twin of 0010 for
   entries) — separate from metadata's `modified_at` so a concurrent
-  rename and move don't clobber each other. `reconcile_peer_groups`
-  became two-pass (adopt all peer-only groups, then reconcile
-  metadata + parent) so a winning parent always resolves locally.
-  `reconcile_group_location` adopts the peer's parent + stamp verbatim
-  when it wins `(floored location_changed, parent uuid)`, with a
-  **cycle guard** that skips any re-parent which would put a group
-  inside its own subtree — the tree can never go cyclic. New keyhole
-  verb `move-group`; pinned by
-  [group-move-lww.sh](scenarios/group-move-lww.sh) (one-sided +
-  acyclic both-sided LWW) + keys-engine
-  `two_engine_group_move_reconciles_and_converges`. **Not yet in the
-  fuzzer:** the rare concurrent *mutual* move (A→under B while B→under
-  A) leaves the two replicas disagreeing on that one edge (the guard
-  skips both sides) until a deterministic cycle-breaking pass lands —
-  that pass + fuzzer group-move are the final-final 5d item.
-- **Done (2026-06-13, 5d cross-peer group delete):** `ingest_peer` now
-  CONSUMES peer group tombstones (recorded since 5b, never consumed) —
-  `reconcile_peer_group_deletes` removes a live local group the peer
-  tombstoned, **empty-only** (a group still holding a live child group
-  or entry is kept — never silently drop concurrently-added content)
-  and **edit-wins** (a local rename/move strictly after the deletion
-  keeps it). Ordered after the entry-delete pass (so a cascade-deleted
-  group reads empty) and before the tombstone-union (extracted into
-  `union_peer_tombstones`, run last so a just-removed object correctly
-  carries its tombstone — else a third peer would resurrect it). New
-  keyhole verb `delete-group`; pinned by
+  rename and move don't clobber each other. `reconcile_peer_groups` is
+  two-pass (adopt all peer-only groups, then reconcile metadata +
+  parent). The move-LWW winner per group is symmetric, so a concurrent
+  *mutual* move (A→under B while B→under A) yields the SAME cyclic
+  edge set on both replicas; `break_group_cycles` then resolves it
+  identically (re-root each cycle's smallest-uuid member). Applying the
+  winning edge is unconditional (transient in-tx cycles are fine —
+  SQLite has no FK cycle check on `parent_uuid`, projection reads only
+  committed state); the earlier skip-on-cycle guard was REMOVED because
+  it diverged (the skip's order-dependence left the replicas in
+  different acyclic trees). New keyhole verb `move-group`; pinned by
+  [group-move-lww.sh](scenarios/group-move-lww.sh),
+  [group-move-cycle.sh](scenarios/group-move-cycle.sh), and keys-engine
+  `two_engine_group_move_reconciles_and_converges`.
+- **Done (2026-06-13, 5d cross-peer group delete — option 2, content
+  saves the group):** `ingest_peer` consumes peer group tombstones via
+  `materialize_group_tombstones`, run after the entry passes + tombstone
+  union: liveness is **derived from the merged tree**, not transient
+  ingest-time emptiness — a tombstoned group with no live descendant is
+  deleted (children-first, FK-safe), one that still holds content is
+  **resurrected** (kept, tombstone scrubbed so no live group carries its
+  own tombstone). the maintainer's call: **content saves a deleted group** — if
+  one device deletes a group while another fills it, the group survives
+  with the content; a group empty everywhere stays deleted. Non-sticky
+  (a resurrected group becomes ordinary; a later emptying does NOT
+  re-delete — sticky would need a Keys-private marker, deferred). This
+  REPLACED an earlier empty-only/edit-wins consume that diverged ~5–13%
+  (keep/delete decided from per-pass transient emptiness, which differs
+  across sync directions). New keyhole verb `delete-group`; pinned by
   [group-delete.sh](scenarios/group-delete.sh) (empty + cascade) +
-  keys-engine `two_engine_group_delete_propagates_and_converges`.
-- **Next:** icon pool union (the last 5c sliver); then the final-final
-  5d item — deterministic cycle-breaking for concurrent mutual group
-  moves, after which group move + delete join the fuzzer mix; the
-  deferred previous-parent merge rules. `empty-bin` verb;
-  value-hash-based adoption matching (timestamp-free) as hardening when
-  resolution records grow fields.
+  [group-delete-keeps-content.sh](scenarios/group-delete-keeps-content.sh)
+  + keys-engine `two_engine_group_delete_content_saves_group`.
+  **`fuzz-convergence.sh` now drives the entire CRUD + group-structure
+  surface** (create/rename/move/delete groups, all entry CRUD,
+  attachments, conflicts) — 60/60 soak. 5d's core reconciliation is
+  complete.
+- **Next:** icon pool union (the last 5c sliver); previous-parent merge
+  rules; `empty-bin` verb; value-hash-based adoption matching
+  (timestamp-free) as hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old
