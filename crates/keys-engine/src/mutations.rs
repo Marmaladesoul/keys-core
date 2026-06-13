@@ -170,6 +170,91 @@ fn gc_orphan_tags(tx: &Transaction<'_>) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// Garbage-collect `attachment_blob` rows nothing references — the
+/// mirror-side twin of keepass-core's save-time `gc_binaries_pool` for
+/// the KDBX file. Without it the pool only ever grew: remove/replace
+/// left blobs in place by design (content-addressed rows are shared),
+/// and deleting an entry cascaded away the links and history that
+/// referenced its blobs while the bytes lingered forever.
+///
+/// Reference roots, all of which must survive:
+/// - live `entry_attachment` links;
+/// - `conflict_entry_attachment` rows — a parked conflict's divergent
+///   peer bytes exist ONLY in the pool until the conflict resolves
+///   (keyhole Finding #7);
+/// - history-snapshot attachments (`entry_history.snapshot_json`,
+///   shas stored hex). Malformed JSON and pre-widening rows (empty
+///   hex) skip, matching the read side's posture.
+///
+/// Runs at save time ([`crate::save::save`]), transactionally, so the
+/// collected set can never desync from the state being serialised.
+pub(crate) fn gc_attachment_blobs(conn: &mut Connection) -> Result<u64, EngineError> {
+    /// The one slice of `snapshot_json` the GC needs; serde ignores the
+    /// snapshot's other fields.
+    #[derive(Deserialize)]
+    struct SnapshotAttachmentsOnly {
+        #[serde(default)]
+        attachments: Vec<HistoryAttachmentIo>,
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS gc_attachment_roots (sha BLOB PRIMARY KEY); \
+         DELETE FROM gc_attachment_roots;",
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO gc_attachment_roots \
+             SELECT blob_sha256 FROM entry_attachment",
+        [],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO gc_attachment_roots \
+             SELECT blob_sha256 FROM conflict_entry_attachment",
+        [],
+    )?;
+
+    // History roots. Only the attachment list is needed; serde ignores
+    // the snapshot's other fields.
+    {
+        let mut read = tx.prepare("SELECT snapshot_json FROM entry_history")?;
+        let mut write =
+            tx.prepare("INSERT OR IGNORE INTO gc_attachment_roots (sha) VALUES (?1)")?;
+        let rows = read.query_map([], |r| r.get::<_, String>(0))?;
+        for json in rows {
+            let Ok(snap) = serde_json::from_str::<SnapshotAttachmentsOnly>(&json?) else {
+                continue;
+            };
+            for att in snap.attachments {
+                if let Some(sha) = hex_decode32(&att.sha256_hex) {
+                    write.execute(params![sha.as_slice()])?;
+                }
+            }
+        }
+    }
+
+    let removed = tx.execute(
+        "DELETE FROM attachment_blob \
+         WHERE sha256 NOT IN (SELECT sha FROM gc_attachment_roots)",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(removed as u64)
+}
+
+/// Decode a 64-char lowercase/uppercase hex string into 32 bytes.
+/// `None` on any malformation — the GC treats an undecodable root as
+/// absent rather than failing the save.
+fn hex_decode32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Record a `<DeletedObjects>` tombstone for `uuid` so the deletion propagates
 /// cross-peer (Phase 5b). Without it a peer that still holds the object can't
 /// tell "deleted here" from "never seen there" and would resurrect it on the
@@ -2638,5 +2723,74 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(idxs, vec![0, 1], "re-packed to dense 0..N");
+    }
+
+    /// One blob per root class plus a genuine orphan: the sweep must
+    /// reap exactly the orphan and spare live links, history-snapshot
+    /// shas, and parked-conflict rows (the Finding-#7 GC root).
+    #[test]
+    fn gc_attachment_blobs_reaps_only_unrooted() {
+        let (mut conn, entry) = bare_db_with_entry();
+        let put_blob = |conn: &Connection, byte: u8| -> [u8; 32] {
+            let sha = [byte; 32];
+            conn.execute(
+                "INSERT INTO attachment_blob (sha256, bytes, size) VALUES (?1, x'00', 1)",
+                params![sha.as_slice()],
+            )
+            .unwrap();
+            sha
+        };
+        let live = put_blob(&conn, 1);
+        let hist = put_blob(&conn, 2);
+        let parked = put_blob(&conn, 3);
+        let orphan = put_blob(&conn, 4);
+
+        conn.execute(
+            "INSERT INTO entry_attachment (entry_uuid, attachment_name, blob_sha256) \
+             VALUES (?1, 'live.txt', ?2)",
+            params![entry, live.as_slice()],
+        )
+        .unwrap();
+        let hist_hex = hist.iter().fold(String::with_capacity(64), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        let json = format!(
+            r#"{{"title":"t","username":"","url":"","attachments":[{{"name":"h.txt","size":1,"sha256_hex":"{hist_hex}"}}]}}"#
+        );
+        conn.execute(
+            "INSERT INTO entry_history (entry_uuid, history_index, snapshot_json) \
+             VALUES (?1, 0, ?2)",
+            params![entry, json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conflict_entry (owner, entry_uuid, title, username, url, notes, icon_index) \
+             VALUES ('peer', ?1, '', '', '', '', 0)",
+            params![entry],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conflict_entry_attachment (owner, entry_uuid, attachment_name, blob_sha256) \
+             VALUES ('peer', ?1, 'parked.txt', ?2)",
+            params![entry, parked.as_slice()],
+        )
+        .unwrap();
+
+        let removed = gc_attachment_blobs(&mut conn).expect("gc");
+        assert_eq!(removed, 1, "exactly the orphan is reaped");
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM attachment_blob", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 3, "live + history + parked roots survive");
+        let orphan_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM attachment_blob WHERE sha256 = ?1",
+                params![orphan.as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_left, 0, "the orphan is the one that went");
     }
 }

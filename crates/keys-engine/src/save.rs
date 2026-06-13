@@ -151,6 +151,19 @@ pub(crate) fn save(
     //    external-change event.
     engine.record_kdbx_state_signature(path)?;
 
+    // 8. Sweep the mirror's attachment blob pool — the mirror-side twin
+    //    of keepass-core's save-time `gc_binaries_pool` for the file
+    //    just written. Runs after the projection so the serialised
+    //    state never references a row this removes (it only ever drops
+    //    rows nothing references: no live link, no history snapshot, no
+    //    parked-conflict root). A GC failure must not fail a save that
+    //    already landed on disk — surfaced on stderr, never swallowed
+    //    silently (the transaction rolls back, so a failed sweep just
+    //    leaves the garbage for the next save).
+    if let Err(e) = crate::mutations::gc_attachment_blobs(engine.conn_mut()) {
+        eprintln!("keys-engine: attachment blob GC failed (save unaffected): {e}");
+    }
+
     Ok(())
 }
 

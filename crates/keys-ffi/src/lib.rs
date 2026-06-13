@@ -39,7 +39,7 @@ pub use engine_observer::{
 };
 pub use engine_portable::EnginePortableEntry;
 pub use engine_types::{
-    AttachmentRef as EngineAttachmentRef, ConflictPayloadFfi,
+    AttachmentBlobStats, AttachmentRef as EngineAttachmentRef, ConflictPayloadFfi,
     CustomFieldRef as EngineCustomFieldRef, EngineEntrySummary, EntryFull,
     EntryUpdate as EngineEntryUpdate, GroupNode, GroupUpdate as EngineGroupUpdate, HistoricEntry,
     IconRef, KdbxStateSignatureFfi, MergeResult, MergeStats, NewCustomField, NewEntryFields,

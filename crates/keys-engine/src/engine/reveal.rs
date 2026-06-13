@@ -141,6 +141,17 @@ impl Engine {
         crate::reads::attachment_bytes(&self.conn, uuid, attachment_name)
     }
 
+    /// `(row count, total payload bytes)` of the content-addressed
+    /// attachment blob pool. Observability for the save-time blob GC —
+    /// the assertion surface for "the pool does not retain garbage".
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Sqlite`] for query failure.
+    pub fn attachment_blob_stats(&self) -> Result<(u64, u64), EngineError> {
+        crate::reads::attachment_blob_stats(&self.conn)
+    }
+
     /// Fetch the bytes of an attachment as it existed in a specific
     /// history snapshot of an entry.
     ///

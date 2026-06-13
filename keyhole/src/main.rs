@@ -575,6 +575,10 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("recycle_bin_uuid: {e:?}"))?
             .is_some();
         let recycled = self.recycled_count()?;
+        let pool = self
+            .engine
+            .attachment_blob_stats()
+            .map_err(|e| anyhow::anyhow!("attachment_blob_stats: {e:?}"))?;
 
         println!("state:        {state:?}");
         println!("entries:      {total}");
@@ -585,6 +589,10 @@ impl Session {
             if bin_present { "present" } else { "absent" }
         );
         println!("recycled:     {recycled}");
+        println!(
+            "blob pool:    {} blob(s), {} byte(s)",
+            pool.count, pool.bytes
+        );
         Ok(())
     }
 
