@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
-use keepass_core::model::NewEntry;
+use keepass_core::model::{NewEntry, NewGroup};
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError, ParkConflictsResult};
 
@@ -855,4 +855,99 @@ fn two_engine_one_sided_title_edit_updates_without_parking() {
 
     let after = engine_b.entry(seed_uuid).expect("entry").expect("present");
     assert_eq!(after.title, "edited-on-A");
+}
+
+/// Phase 5d: a one-sided entry MOVE reconciles across peers via
+/// `<LocationChanged>` LWW, and the replicas CONVERGE on one location.
+/// A and B fork from a shared base holding a Folder group; A moves the
+/// seed into Folder; both sync both ways. A pure move is
+/// content-identical, so classify alone verdicts `InSync` —
+/// `reconcile_entry_location` is what carries it; the two sides must
+/// end up agreeing on the entry's group (whichever the deterministic
+/// LWW + tiebreak selects).
+///
+/// We assert *convergence* rather than a fixed destination: the move's
+/// `location_changed` and the entry's creation-time stamp can land in
+/// the same floored second in a fast test (keepass-core stamps
+/// `location_changed` on creation too), so the same-second tiebreak —
+/// not wall-clock — decides the winner. Convergence is the contract;
+/// the deterministic-winner direction is pinned by keyhole's
+/// `move-lww.sh` (which separates the seconds with a sleep).
+#[test]
+fn two_engine_move_reconciles_and_converges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Shared base: one entry at root + a Folder group, so the move has a
+    // destination both replicas already hold (peer-only group adoption is
+    // a later 5d slice).
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let folder = kdbx
+        .add_group(root, NewGroup::new("Folder"))
+        .expect("add folder");
+    let seed = kdbx
+        .add_entry(root, NewEntry::new("Mover"))
+        .expect("seed")
+        .0;
+
+    let kdbx_a = dir.path().join("a.kdbx");
+    let kdbx_b = dir.path().join("b.kdbx");
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save");
+
+    // B forks from the same on-disk base and keeps its own KDBX file.
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut handle_b = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut handle_b, None)
+        .expect("b save");
+
+    // Pre-state: the two replicas disagree on the entry's group (B at
+    // root, A about to move it), so a no-op reconcile would leave them
+    // diverged — the assertion below has teeth.
+    engine_a.move_entry(seed, folder.0).expect("a move");
+    let mut handle_a = reopen_kdbx(&kdbx_a);
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut handle_a, None)
+        .expect("a save 2");
+
+    // Exchange both ways: B ingests A, then A ingests B (re-saving each
+    // so the next pull reads the reconciled state).
+    engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest a");
+    let mut hb = reopen_kdbx(&kdbx_b);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb, None)
+        .expect("b save 2");
+    engine_a
+        .ingest_peer_from_kdbx(&kdbx_b, &composite(), "device-b")
+        .expect("a ingest b");
+
+    // Converged: both digests equal, and the entry sits in exactly one
+    // group on each side — the same group.
+    assert_eq!(
+        engine_a.content_digest().expect("a digest"),
+        engine_b.content_digest().expect("b digest"),
+        "replicas converged after the move exchange",
+    );
+    let a_in_folder = !engine_a
+        .list_entries(Some(folder.0), keys_engine::Pagination::all())
+        .expect("a folder")
+        .is_empty();
+    let b_in_folder = !engine_b
+        .list_entries(Some(folder.0), keys_engine::Pagination::all())
+        .expect("b folder")
+        .is_empty();
+    assert_eq!(a_in_folder, b_in_folder, "both agree on the entry's group");
 }

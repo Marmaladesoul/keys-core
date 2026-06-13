@@ -55,12 +55,25 @@ fail() {
 }
 
 # --- seed: a small shared world, then split into two devices ---------
+# Several SHARED groups so the move op (5d location LWW) has somewhere
+# to move TO that both replicas already hold. Peer-only group adoption
+# (moving into a group the other side hasn't seen) is the next 5d
+# slice; until it lands the mix moves only among these pre-seeded
+# groups, so a one-sided move always finds its destination on the peer.
 "$KEYHOLE" create "$A" >/dev/null
-"$KEYHOLE" create-group "$A" "Folder" >/dev/null
+for f in Folder Folder-2 Folder-3; do
+    "$KEYHOLE" create-group "$A" "$f" >/dev/null
+done
 for t in alpha beta gamma; do
     "$KEYHOLE" create-entry "$A" "$t" --username "u-$t" >/dev/null
 done
 cp "$A" "$B"
+
+# A random group uuid (any of the shared seed groups or root), for moves.
+random_group() { # $1=vault → uuid of a random group
+    "$KEYHOLE" list-groups "$1" 2>/dev/null | awk '$1 ~ /^[0-9a-f-]{36}$/ {print $1}' \
+        | awk -v r=$((RANDOM)) 'BEGIN{srand(r)} {a[NR]=$0} END{if (NR) print a[int(rand()*NR)+1]}'
+}
 
 # Pick a random live entry, indexing into a TITLE-sorted list so the
 # index→target mapping is stable within a run regardless of the order
@@ -78,18 +91,19 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
     n=$((n + 1))
     # Op mix = exactly the cross-peer surface the multipeer store
     # supports today: entry create, field edits, hard delete (5b
-    # tombstones), and attachment set/remove (5c — merged into this
-    # gate once Findings #7 + #8 were fixed: conflict rows carry
-    # attachment state, and the LCA matcher disambiguates generations).
-    # Attachment names are SHARED across devices: a both-sided
-    # same-name clash parks like a field conflict and resolves through
-    # the same resolve_all loop (the final 5c conflict slice — classify
-    # treats attachment conflicts as genuine). LOCATION ops
-    # (move/recycle/restore/create-group) are ABSENT — the deferred 5d
-    # slice. The scope ledger lives in sync-multipeer-store.md.
+    # tombstones), attachment set/remove (5c), and entry MOVE among the
+    # shared seed groups (5d location LWW — propagates via
+    # <LocationChanged>, last-writer-wins). Merged into this gate as the
+    # respective findings/slices landed (#7 conflict-row attachments, #8
+    # LCA generation disambiguation, 5d location LWW). Attachment names
+    # are SHARED across devices (both-sided clash parks + resolves in
+    # resolve_all). GROUP-STRUCTURE ops (create-group/recycle/restore,
+    # and moves into a group the peer lacks) are ABSENT — the next 5d
+    # slice (peer-only group adoption + tombstones). Scope ledger:
+    # sync-multipeer-store.md.
     # NB: if/fi rather than `[ -n ] &&` — under `set -e` a final failing
     # && would silently kill the whole run when a pick comes up empty.
-    op=$((RANDOM % 6))
+    op=$((RANDOM % 7))
     case $op in
         0) "$KEYHOLE" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
         1) e="$(random_entry "$v")"
@@ -102,6 +116,8 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
            if [ -n "$e" ]; then "$KEYHOLE" set-attachment "$v" "$e" "att-$((RANDOM % 2))" --text "payload-$n" >/dev/null; fi ;;
         5) e="$(random_entry "$v")"
            if [ -n "$e" ]; then "$KEYHOLE" remove-attachment "$v" "$e" "att-$((RANDOM % 2))" >/dev/null 2>&1 || true; fi ;;
+        6) e="$(random_entry "$v")"; g="$(random_group "$v")"
+           if [ -n "$e" ] && [ -n "$g" ]; then "$KEYHOLE" move-entry "$v" "$e" --to "$g" >/dev/null 2>&1 || true; fi ;;
     esac
 }
 

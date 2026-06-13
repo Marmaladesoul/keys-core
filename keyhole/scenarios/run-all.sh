@@ -21,11 +21,6 @@ failed_names=()
 for s in "$DIR"/*.sh; do
     name="$(basename "$s")"
     [ "$name" = "run-all.sh" ] && continue
-    # move-propagates is the 5d opener — a deterministic red while
-    # location reconciliation is unbuilt (one-sided moves don't
-    # propagate: classify's scope excludes location). Gate it when 5d
-    # lands.
-    [ "$name" = "move-propagates.sh" ] && continue
     # Both fuzzers are full CI gates: fuzz-convergence since Findings
     # #4 + #5 (timestamp flooring + dissolved-conflict badge clearing),
     # fuzz-attachments since Finding #8 (LCA generation disambiguation)

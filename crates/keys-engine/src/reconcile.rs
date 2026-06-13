@@ -562,12 +562,19 @@ fn ingest_kdbx_as_owner(
     let outcome = engine.ingest_peer(owner, &remote_vault)?;
 
     // Loop-safety discriminator: only an advanced local side (a non-empty
-    // `auto_merged`, `added`, or `deleted`) is something to save. A held
-    // conflict advanced nothing → NoChange → no save → no re-push → the loop
-    // never starts. The badge reads the owner rows directly, so `conflicted`
-    // does NOT make this `Applied`. A propagated cross-peer delete (Phase 5b) is
-    // a real local change, so it does (mirrors the `added` bucket).
-    if outcome.auto_merged.is_empty() && outcome.added.is_empty() && outcome.deleted.is_empty() {
+    // `auto_merged`, `added`, `deleted`, or `moved`) is something to save. A
+    // held conflict advanced nothing → NoChange → no save → no re-push → the
+    // loop never starts. The badge reads the owner rows directly, so
+    // `conflicted` does NOT make this `Applied`. A propagated cross-peer delete
+    // (Phase 5b) or location move (Phase 5d) is a real local change, so it does
+    // (mirrors the `added` bucket). Loop-safe: an adopted move takes the peer's
+    // verbatim `location_changed`, so the re-saved value equals what the peer
+    // sent → the peer's next pull sees no newer stamp → no re-move.
+    if outcome.auto_merged.is_empty()
+        && outcome.added.is_empty()
+        && outcome.deleted.is_empty()
+        && outcome.moved.is_empty()
+    {
         return Ok(ParkConflictsResult::NoChange);
     }
 
@@ -575,6 +582,7 @@ fn ingest_kdbx_as_owner(
         entries_added: outcome.added.len(),
         entries_updated: outcome.auto_merged.len(),
         entries_deleted: outcome.deleted.len(),
+        entries_moved: outcome.moved.len(),
         ..Default::default()
     };
     let parked = ParkedConflictsSummary {

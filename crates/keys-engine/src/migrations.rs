@@ -77,6 +77,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "conflict_entry_attachment",
         sql: include_str!("migrations/0009_conflict_entry_attachment.sql"),
     },
+    Migration {
+        version: 10,
+        name: "entry_location_changed",
+        sql: include_str!("migrations/0010_entry_location_changed.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.

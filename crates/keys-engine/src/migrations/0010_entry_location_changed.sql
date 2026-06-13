@@ -1,0 +1,15 @@
+-- KDBX <Times><LocationChanged>: the last time the entry was moved
+-- between groups. keepass-core's model round-trips it
+-- (Timestamps.location_changed), but the mirror never stored it, so it
+-- was stripped from every save AND invisible to sync — a one-sided
+-- move was content-identical and so classified InSync, never reaching
+-- the peer (keyhole 5d opener, scenarios/move-propagates.sh).
+--
+-- Stored as epoch-ms like the other entry times; the projection floors
+-- to seconds on the way out (KDBX is whole-second). NULL = never moved
+-- / not recorded (older rows, pre-move entries). Location LWW in
+-- ingest_peer compares the floored value; an adopted move takes the
+-- PEER's stamp verbatim (never re-stamps locally) so the same logical
+-- generation can't diverge in time across replicas — the Finding-#8
+-- lesson applied to location.
+ALTER TABLE entry ADD COLUMN location_changed_at INTEGER NULL;
