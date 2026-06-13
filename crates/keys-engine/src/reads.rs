@@ -752,6 +752,21 @@ pub(crate) fn history(conn: &Connection, uuid: Uuid) -> Result<Vec<HistoricEntry
     Ok(out)
 }
 
+/// `(row count, total payload bytes)` of the content-addressed
+/// `attachment_blob` pool — the observability surface for blob-pool GC
+/// (a pool that only ever grows is the bug keyhole's GC scenario pins).
+pub(crate) fn attachment_blob_stats(conn: &Connection) -> Result<(u64, u64), EngineError> {
+    let (count, bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM attachment_blob",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((
+        u64::try_from(count).unwrap_or(0),
+        u64::try_from(bytes).unwrap_or(0),
+    ))
+}
+
 /// Fetch the raw bytes of a named attachment on an entry.
 ///
 /// `EngineError::NotFound { entity: "attachment" }` if no matching

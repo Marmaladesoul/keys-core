@@ -61,8 +61,8 @@ use crate::engine_file_watcher::{self, VaultFileWatcher};
 use crate::engine_observer::{BridgeObserver, VaultDataChangeObserver};
 use crate::engine_portable::EnginePortableEntry;
 use crate::engine_types::{
-    ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull, EntrySave,
-    EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi,
+    AttachmentBlobStats, ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull,
+    EntrySave, EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi,
     MergeResult, NewEntryFields, NewGroupFields, Page, ParkConflictsResultFfi, Predicate,
     SearchScope, SmartFolder, TagUsageCount, VaultState, parse_uuid,
 };
@@ -267,6 +267,14 @@ impl Engine {
 
     pub fn list_tags(&self) -> Result<Vec<String>, EngineError> {
         self.with_engine(|e| Ok(e.list_tags()?))
+    }
+
+    /// See [`keys_engine::Engine::attachment_blob_stats`].
+    pub fn attachment_blob_stats(&self) -> Result<AttachmentBlobStats, EngineError> {
+        self.with_engine(|e| {
+            let (count, bytes) = e.attachment_blob_stats()?;
+            Ok(AttachmentBlobStats { count, bytes })
+        })
     }
 
     /// See [`keys_engine::Engine::tag_usage_counts`].

@@ -337,10 +337,20 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   adopts peer bytes → propagates without re-park → digest converges →
   persists); `fuzz-convergence.sh`'s attachment names went SHARED
   (both-sided clashes park + resolve in the round loop) — 30/30 soak.
-- **Next:** the remaining 5c housekeeping — blob-pool GC
-  (`conflict_entry_attachment` is a reference root) and icon pool
-  union; then 5d (groups/location — re-enable the fuzzer's location
-  ops); `empty-bin` verb; value-hash-based adoption matching
+- **Done (2026-06-13, blob-pool GC):** the mirror's `attachment_blob`
+  pool is swept at save time (`mutations::gc_attachment_blobs` from
+  `save::save` — the mirror twin of keepass-core's `gc_binaries_pool`
+  for the file). Roots that survive: live links, history-snapshot
+  shas, and `conflict_entry_attachment` (the Finding-#7 obligation —
+  a parked conflict's divergent peer bytes exist only in the pool).
+  Observability: `Engine::attachment_blob_stats` → keys-ffi
+  `AttachmentBlobStats` → `inspect`'s "blob pool" line. Pinned by
+  [blob-pool-gc.sh](scenarios/blob-pool-gc.sh) (red pre-GC: deleting
+  an entry left its blobs forever) and keys-engine
+  `gc_attachment_blobs_reaps_only_unrooted`.
+- **Next:** icon pool union (the last 5c sliver); then 5d
+  (groups/location — re-enable the fuzzer's location ops);
+  `empty-bin` verb; value-hash-based adoption matching
   (timestamp-free) as hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep

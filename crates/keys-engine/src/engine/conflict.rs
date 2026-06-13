@@ -136,6 +136,13 @@ impl Engine {
         &self.conn
     }
 
+    /// Crate-internal: mutably borrow the engine's `SQLite` connection.
+    /// Used by the save path to run the transactional blob-pool GC
+    /// ([`crate::mutations::gc_attachment_blobs`]).
+    pub(crate) fn conn_mut(&mut self) -> &mut rusqlite::Connection {
+        &mut self.conn
+    }
+
     /// Crate-internal: drop the peek-only [`ConflictPayload`] mirror
     /// for `id`. Called by `apply_conflict_resolution` so the public
     /// [`Self::pending_conflict`] surface stops returning the payload

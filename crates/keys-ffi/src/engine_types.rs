@@ -75,6 +75,17 @@ impl From<eng::KdbxStateSignature> for KdbxStateSignatureFfi {
     }
 }
 
+/// Blob-pool stats returned by [`crate::Engine::attachment_blob_stats`].
+/// Uniffi can't return a tuple from a method elegantly, so this is the
+/// FFI carrier.
+#[derive(uniffi::Record, Debug, Clone, Copy)]
+pub struct AttachmentBlobStats {
+    /// Number of rows in the content-addressed `attachment_blob` pool.
+    pub count: u64,
+    /// Sum of the pool rows' payload sizes, in bytes.
+    pub bytes: u64,
+}
+
 /// `(tag_name, count)` pair returned by
 /// [`crate::Engine::tag_usage_counts`]. Uniffi can't return a tuple
 /// from a method elegantly, so this is the FFI carrier.
