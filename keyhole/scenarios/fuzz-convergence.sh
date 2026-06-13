@@ -86,25 +86,25 @@ random_entry() { # $1=vault → uuid of a random live entry, "" if none
 
 n=0  # monotonic counter so generated values never collide
 mutate() { # $1=vault $2=device-prefix (unused since attachment names went shared)
-    local v="$1" op e
+    local v="$1" op e g
     : "$2"
     n=$((n + 1))
-    # Op mix = exactly the cross-peer surface the multipeer store
-    # supports today: entry create, field edits, hard delete (5b
-    # tombstones), attachment set/remove (5c), and entry MOVE among the
-    # shared seed groups (5d location LWW — propagates via
-    # <LocationChanged>, last-writer-wins). Merged into this gate as the
-    # respective findings/slices landed (#7 conflict-row attachments, #8
-    # LCA generation disambiguation, 5d location LWW). Attachment names
+    # Op mix = the cross-peer surface the multipeer store supports today:
+    # entry create, field edits, hard delete (5b tombstones), attachment
+    # set/remove (5c), entry MOVE (5d location LWW), and group CREATE
+    # (5d peer-only group adoption — a device-local new group the peer
+    # adopts on ingest, into which subsequent moves can land). Merged in
+    # as each finding/slice landed (#7 conflict-row attachments, #8 LCA
+    # disambiguation, 5d location LWW + group adoption). Attachment names
     # are SHARED across devices (both-sided clash parks + resolves in
-    # resolve_all). GROUP-STRUCTURE ops (create-group/recycle/restore,
-    # and moves into a group the peer lacks) are ABSENT — the next 5d
-    # slice (peer-only group adoption + tombstones). Scope ledger:
+    # resolve_all). Still ABSENT — the remaining 5d slices: group
+    # rename/move/recycle and group-tombstone deletion. Scope ledger:
     # sync-multipeer-store.md.
     # NB: if/fi rather than `[ -n ] &&` — under `set -e` a final failing
     # && would silently kill the whole run when a pick comes up empty.
-    op=$((RANDOM % 7))
+    op=$((RANDOM % 8))
     case $op in
+        7) "$KEYHOLE" create-group "$v" "g-$n" >/dev/null ;;
         0) "$KEYHOLE" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
         1) e="$(random_entry "$v")"
            if [ -n "$e" ]; then "$KEYHOLE" update-entry "$v" "$e" --username "edit-$n" >/dev/null; fi ;;

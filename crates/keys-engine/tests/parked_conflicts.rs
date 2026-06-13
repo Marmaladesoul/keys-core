@@ -951,3 +951,109 @@ fn two_engine_move_reconciles_and_converges() {
         .is_empty();
     assert_eq!(a_in_folder, b_in_folder, "both agree on the entry's group");
 }
+
+/// Phase 5d group adoption: a peer-only GROUP (one B has never seen)
+/// is adopted on ingest, and an entry the peer moved into it lands
+/// there rather than at root. Group adoption is unconditional (not
+/// LWW-gated), so this asserts the group's presence directly; the
+/// entry placement converges via the same ingest.
+#[test]
+fn two_engine_adopts_peer_only_group() {
+    use keys_engine::{IconRef, NewGroupFields};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx_a = dir.path().join("a.kdbx");
+
+    // Shared base: one entry at root, no extra groups.
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let seed = kdbx
+        .add_entry(root, NewEntry::new("Mover"))
+        .expect("seed")
+        .0;
+
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save");
+
+    let kdbx_b = dir.path().join("b.kdbx");
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut hb0 = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb0, None)
+        .expect("b save");
+
+    // A creates a brand-new group B has never seen and moves the entry in.
+    let fresh = engine_a
+        .create_group(
+            root.0,
+            NewGroupFields {
+                name: "Fresh".into(),
+                notes: String::new(),
+                icon: IconRef::Builtin(0),
+            },
+        )
+        .expect("a create group");
+    engine_a.move_entry(seed, fresh).expect("a move");
+    let mut handle = reopen_kdbx(&kdbx_a);
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut handle, None)
+        .expect("a save 2");
+
+    // Precondition: B doesn't hold the group yet.
+    assert!(
+        !engine_b
+            .group_tree()
+            .expect("b groups")
+            .iter()
+            .any(|g| g.uuid == fresh),
+        "precondition: B lacks the peer-only group before ingest",
+    );
+
+    // B ingests A — adopts the group, and the move lands in it.
+    let result = engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest peer");
+    assert!(
+        matches!(result, ParkConflictsResult::Applied { .. }),
+        "adopting a peer-only group is a local change → Applied, got {result:?}",
+    );
+    assert!(
+        engine_b
+            .group_tree()
+            .expect("b groups")
+            .iter()
+            .any(|g| g.uuid == fresh && g.parent_uuid == Some(root.0)),
+        "B adopted the peer-only group under root",
+    );
+
+    // Entry PLACEMENT into the adopted group rides location LWW, which can
+    // tie on the floored second in a fast test (create + move land in the
+    // same second as the base entry's creation stamp). So assert the
+    // timing-independent contract — the replicas CONVERGE on one placement
+    // — rather than a fixed destination (the deterministic
+    // entry-lands-in-the-group direction is pinned by keyhole's
+    // group-adopt.sh, which separates the seconds with a sleep). Sync the
+    // other way and compare digests.
+    let mut hb = reopen_kdbx(&kdbx_b);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb, None)
+        .expect("b save back");
+    engine_a
+        .ingest_peer_from_kdbx(&kdbx_b, &composite(), "device-b")
+        .expect("a ingest b");
+    assert_eq!(
+        engine_a.content_digest().expect("a digest"),
+        engine_b.content_digest().expect("b digest"),
+        "replicas converge after adopting the peer-only group",
+    );
+}

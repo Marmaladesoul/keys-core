@@ -873,6 +873,10 @@ pub struct IngestPeerOutcome {
     /// `<LocationChanged>` is strictly newer (location LWW, Phase 5d). The
     /// local side changed → the caller must persist.
     pub moved: Vec<Uuid>,
+    /// Peer-only GROUPS the peer created that we didn't hold — inserted
+    /// locally so entries can be placed into them (Phase 5d group adoption).
+    /// The local side changed → the caller must persist.
+    pub groups_added: Vec<Uuid>,
     /// Count of entries the peer agreed on outright — nothing written.
     pub in_sync: usize,
 }
@@ -923,6 +927,13 @@ pub(crate) fn ingest_peer(
 
     let mut outcome = IngestPeerOutcome::default();
     let tx = conn.transaction()?;
+
+    // Phase 5d: adopt peer-only GROUPS before the entry passes, so an
+    // entry moved/added into a group the peer just created lands there
+    // instead of falling back to root. Top-down so a parent is inserted
+    // before its children; only groups we lack are touched (group
+    // rename/move LWW + tombstones are later 5d slices).
+    adopt_peer_groups(&tx, peer, &mut outcome)?;
 
     for (peer_entry, peer_parent) in collect_entries_with_parent(&peer.root) {
         let uuid = peer_entry.id.0;
@@ -1253,6 +1264,78 @@ fn resolution_times(
             .or_insert(floored);
     }
     out
+}
+
+/// Adopt every group the peer holds that the local mirror lacks (Phase 5d
+/// group adoption). Walks the peer tree top-down (pre-order), so a parent
+/// is always inserted before its children; a group already present locally
+/// is left untouched (rename / move / metadata LWW for existing groups, and
+/// tombstone-driven deletion, are later 5d slices). New ids land in
+/// `outcome.groups_added`.
+///
+/// Adopted groups are inserted as ORDINARY groups (`is_recycle_bin = 0`):
+/// recycle-bin / `<Meta>` reconciliation is its own deferred slice, and
+/// minting a second bin from a peer's would corrupt the single-bin
+/// invariant. A peer's bin therefore adopts as a plain group until that
+/// slice lands — acceptable because the bin is part of the shared base in
+/// every real 2-device flow.
+fn adopt_peer_groups(
+    tx: &Connection,
+    peer: &Vault,
+    outcome: &mut IngestPeerOutcome,
+) -> Result<(), EngineError> {
+    fn walk(
+        tx: &Connection,
+        group: &Group,
+        parent: Option<Uuid>,
+        sort_order: u32,
+        outcome: &mut IngestPeerOutcome,
+    ) -> Result<(), EngineError> {
+        if !group_exists(tx, group.id)? {
+            tx.execute(
+                "INSERT INTO \"group\" (\
+                    uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
+                    created_at, modified_at, expires_at, is_recycle_bin, sort_order\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
+                params![
+                    group.id.0.to_string(),
+                    parent.map(|p| p.to_string()),
+                    group.name,
+                    i64::from(group.icon_id),
+                    group.custom_icon_uuid.map(|u| u.to_string()),
+                    group.notes,
+                    dt_to_ms(group.times.creation_time),
+                    dt_to_ms(group.times.last_modification_time),
+                    expiry_ms(&group.times),
+                    i64::from(sort_order),
+                ],
+            )?;
+            outcome.groups_added.push(group.id.0);
+        }
+        for (idx, child) in group.groups.iter().enumerate() {
+            walk(
+                tx,
+                child,
+                Some(group.id.0),
+                u32::try_from(idx).unwrap_or(u32::MAX),
+                outcome,
+            )?;
+        }
+        Ok(())
+    }
+
+    // The peer's root maps onto the local root (same vault) — never inserted;
+    // descend straight into its children.
+    for (idx, child) in peer.root.groups.iter().enumerate() {
+        walk(
+            tx,
+            child,
+            Some(peer.root.id.0),
+            u32::try_from(idx).unwrap_or(u32::MAX),
+            outcome,
+        )?;
+    }
+    Ok(())
 }
 
 /// Location LWW for one shared entry (Phase 5d). Returns `true` if the local
