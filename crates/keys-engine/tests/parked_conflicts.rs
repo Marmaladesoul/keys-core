@@ -390,15 +390,16 @@ fn park_conflicts_held_entry_does_not_fold_peer_tag() {
     );
 }
 
-/// Owner-rows contract (Phase 4): a concurrent **group** rename alongside a
-/// held entry conflict does not change the loop-safety verdict. Group
-/// reconciliation is Phase-5 scope, so the owner-rows ingest neither advances
-/// the held entry nor applies the group rename — the reconcile is `NoChange`
-/// (loop-safe). The peer's group rename is simply not adopted yet; it is not
-/// lost (a future Phase-5 group pass handles it). The held entry keeps local's
-/// title and stays badged.
+/// Phase 5d: a concurrent **group** rename alongside a held entry conflict is
+/// adopted (group metadata LWW), while the entry conflict still holds —
+/// the two facets are orthogonal. The reconcile is therefore `Applied` (the
+/// group rename advanced the local side), the held entry keeps local's title
+/// and stays badged, and a re-reconcile against the unchanged disk is a
+/// stable no-op (loop-safe — the group name converged, the entry is still
+/// held). Was `NoChange` before 5d group reconciliation, when the rename was
+/// deferred rather than applied.
 #[test]
-fn park_conflicts_held_entry_group_rename_stays_loop_safe() {
+fn park_conflicts_held_entry_group_rename_adopts_and_stays_loop_safe() {
     let mut f = fixture();
     let seed_uuid = f
         .engine
@@ -436,15 +437,34 @@ fn park_conflicts_held_entry_group_rename_stays_loop_safe() {
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    // Held conflict + Phase-5 group rename ⇒ nothing advances ⇒ NoChange.
+    // Held entry conflict + group rename ⇒ the rename is adopted (group
+    // metadata LWW) ⇒ Applied; the entry stays held.
     let result = f
         .engine
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile");
-    assert!(
-        matches!(result, ParkConflictsResult::NoChange),
-        "owner-rows holds the entry and defers the group rename ⇒ NoChange, got {result:?}",
-    );
+    match result {
+        ParkConflictsResult::Applied { applied, parked } => {
+            assert_eq!(applied.groups_updated, 1, "the group rename was adopted");
+            assert_eq!(
+                parked.entries_with_parked_conflict,
+                vec![seed_uuid.to_string()],
+                "the entry conflict is still held alongside the group rename",
+            );
+        }
+        other => panic!("expected Applied (group rename adopted), got {other:?}"),
+    }
+
+    // The group rename landed locally.
+    let root_name = f
+        .engine
+        .group_tree()
+        .expect("groups")
+        .into_iter()
+        .find(|g| g.uuid == root_id.0)
+        .expect("root group")
+        .name;
+    assert_eq!(root_name, "disk-renamed-group", "group rename adopted");
 
     // The held entry kept local's conflicting title and stays badged.
     let after = f.engine.entry(seed_uuid).expect("entry").expect("present");
@@ -454,14 +474,15 @@ fn park_conflicts_held_entry_group_rename_stays_loop_safe() {
         vec![seed_uuid],
     );
 
-    // Loop-safety: disk unchanged → second reconcile is a stable no-op.
+    // Loop-safety: disk unchanged + group rename converged → second
+    // reconcile is a stable no-op (nothing new to advance; entry still held).
     let again = f
         .engine
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile 2");
     assert!(
         matches!(again, ParkConflictsResult::NoChange),
-        "re-reconcile must stay a no-op, got {again:?}",
+        "re-reconcile must stay a no-op once the rename converged, got {again:?}",
     );
 }
 
@@ -1055,5 +1076,106 @@ fn two_engine_adopts_peer_only_group() {
         engine_a.content_digest().expect("a digest"),
         engine_b.content_digest().expect("b digest"),
         "replicas converge after adopting the peer-only group",
+    );
+}
+
+/// Phase 5d group metadata LWW: a group rename on one side reconciles
+/// across peers and the replicas CONVERGE. A and B fork from a shared
+/// base holding a "Shared" group; A renames it; both sync both ways
+/// and must agree (digest equal). Convergence is the contract;
+/// the deterministic newer-wins direction is pinned by keyhole's
+/// group-rename-lww.sh (sleep-separated seconds).
+#[test]
+fn two_engine_group_rename_reconciles_and_converges() {
+    use keys_engine::{GroupUpdate, IconRef, NewGroupFields};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx_a = dir.path().join("a.kdbx");
+    let kdbx_b = dir.path().join("b.kdbx");
+
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    kdbx.add_entry(root, NewEntry::new("seed")).expect("seed");
+
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    // Create the shared group on A, save — both replicas fork from this.
+    let shared = engine_a
+        .create_group(
+            root.0,
+            NewGroupFields {
+                name: "Shared".into(),
+                notes: String::new(),
+                icon: IconRef::Builtin(48),
+            },
+        )
+        .expect("a create group");
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save");
+
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut hb0 = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb0, None)
+        .expect("b save");
+
+    // A renames the shared group (B does nothing → A's rename is newer).
+    engine_a
+        .update_group(
+            shared,
+            GroupUpdate {
+                name: Some("Renamed".into()),
+                ..Default::default()
+            },
+        )
+        .expect("a rename");
+    let mut ha = reopen_kdbx(&kdbx_a);
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut ha, None)
+        .expect("a save 2");
+
+    // Exchange both ways.
+    engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest a");
+    let mut hb = reopen_kdbx(&kdbx_b);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb, None)
+        .expect("b save 2");
+    engine_a
+        .ingest_peer_from_kdbx(&kdbx_b, &composite(), "device-b")
+        .expect("a ingest b");
+
+    // The group's name reconciled to a SINGLE value on both replicas.
+    // (Which value rides metadata LWW, which can tie on the floored
+    // second when create + rename land together in a fast test — so this
+    // asserts agreement + convergence, not a fixed name; the
+    // deterministic newer-wins direction is pinned by keyhole's
+    // group-rename-lww.sh with its sleep-separated seconds.)
+    let group_name = |e: &Engine| {
+        e.group_tree()
+            .expect("groups")
+            .into_iter()
+            .find(|g| g.uuid == shared)
+            .expect("shared group present")
+            .name
+    };
+    assert_eq!(
+        group_name(&engine_a),
+        group_name(&engine_b),
+        "both replicas agree on the group's name",
+    );
+    assert_eq!(
+        engine_a.content_digest().expect("a digest"),
+        engine_b.content_digest().expect("b digest"),
+        "replicas converge after the rename exchange",
     );
 }

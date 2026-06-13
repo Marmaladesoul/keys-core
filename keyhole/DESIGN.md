@@ -388,13 +388,28 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   keys-engine `two_engine_adopts_peer_only_group`;
   `fuzz-convergence.sh` gains a `create-group` op (peer-only groups
   adopted under churn) — 30/30 soak.
+- **Done (2026-06-13, 5d group metadata LWW):** `adopt_peer_groups`
+  grew into `reconcile_peer_groups` — an *existing* group's name /
+  notes / icon now reconcile by LWW on the group's `modified_at`
+  (bumped by every `update_group`), with a same-second tiebreak over
+  `(floored modified_at, name, notes, icon, custom_icon)` and the
+  peer's `modified_at` adopted verbatim. Includes the ROOT group: its
+  name is in the digest, so a root rename must propagate too — the
+  fuzzer caught it diverging when reconciliation only walked root's
+  children (`reconcile_peer_groups` now reconciles `peer.root`'s own
+  metadata before descending). New keyhole verb `rename-group`; pinned
+  by [group-rename-lww.sh](scenarios/group-rename-lww.sh) (one-sided +
+  both-sided LWW) + keys-engine
+  `two_engine_group_rename_reconciles_and_converges`;
+  `fuzz-convergence.sh` gains a `rename-group` op — 30/30 soak. Group
+  *move* (re-parent) and tombstone-driven deletion remain.
 - **Next:** icon pool union (the last 5c sliver); then the rest of
-  **5d group structure** — group rename / move / recycle (metadata
-  LWW + tree reconciliation for *existing* groups), consuming group
-  tombstones (recorded since 5b, never consumed), and the deferred
-  previous-parent merge rules; then group rename/recycle join the
-  fuzzer mix. `empty-bin` verb; value-hash-based adoption matching
-  (timestamp-free) as hardening when resolution records grow fields.
+  **5d group structure** — group MOVE (re-parent LWW on group
+  `location_changed`) + consuming group tombstones (recorded since 5b,
+  never consumed) for cross-peer group deletion, and the deferred
+  previous-parent merge rules; then those join the fuzzer mix.
+  `empty-bin` verb; value-hash-based adoption matching (timestamp-free)
+  as hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old

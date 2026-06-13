@@ -877,6 +877,11 @@ pub struct IngestPeerOutcome {
     /// locally so entries can be placed into them (Phase 5d group adoption).
     /// The local side changed → the caller must persist.
     pub groups_added: Vec<Uuid>,
+    /// Existing groups whose metadata (name / notes / icon) the peer changed
+    /// more recently than us — adopted by LWW on the group's
+    /// `modified_at` (Phase 5d group metadata). The local side changed →
+    /// the caller must persist.
+    pub groups_updated: Vec<Uuid>,
     /// Count of entries the peer agreed on outright — nothing written.
     pub in_sync: usize,
 }
@@ -928,12 +933,13 @@ pub(crate) fn ingest_peer(
     let mut outcome = IngestPeerOutcome::default();
     let tx = conn.transaction()?;
 
-    // Phase 5d: adopt peer-only GROUPS before the entry passes, so an
-    // entry moved/added into a group the peer just created lands there
-    // instead of falling back to root. Top-down so a parent is inserted
-    // before its children; only groups we lack are touched (group
-    // rename/move LWW + tombstones are later 5d slices).
-    adopt_peer_groups(&tx, peer, &mut outcome)?;
+    // Phase 5d: reconcile the peer's GROUP tree before the entry passes —
+    // adopt peer-only groups (so an entry moved/added into a group the peer
+    // just created lands there instead of falling back to root) and apply
+    // metadata LWW (rename / notes / icon) to groups we already hold.
+    // Top-down so a parent is handled before its children. Group move
+    // (re-parent) + tombstone deletion are later 5d slices.
+    reconcile_peer_groups(&tx, peer, &mut outcome)?;
 
     for (peer_entry, peer_parent) in collect_entries_with_parent(&peer.root) {
         let uuid = peer_entry.id.0;
@@ -1266,20 +1272,25 @@ fn resolution_times(
     out
 }
 
-/// Adopt every group the peer holds that the local mirror lacks (Phase 5d
-/// group adoption). Walks the peer tree top-down (pre-order), so a parent
-/// is always inserted before its children; a group already present locally
-/// is left untouched (rename / move / metadata LWW for existing groups, and
-/// tombstone-driven deletion, are later 5d slices). New ids land in
-/// `outcome.groups_added`.
+/// Reconcile the peer's group tree into the local mirror (Phase 5d group
+/// structure). Walks top-down (pre-order), so a parent is handled before
+/// its children. Per group:
 ///
-/// Adopted groups are inserted as ORDINARY groups (`is_recycle_bin = 0`):
-/// recycle-bin / `<Meta>` reconciliation is its own deferred slice, and
-/// minting a second bin from a peer's would corrupt the single-bin
-/// invariant. A peer's bin therefore adopts as a plain group until that
-/// slice lands — acceptable because the bin is part of the shared base in
-/// every real 2-device flow.
-fn adopt_peer_groups(
+/// - **absent locally** → adopt it (insert), id → `outcome.groups_added`.
+///   Adopted as an ORDINARY group (`is_recycle_bin = 0`): recycle-bin /
+///   `<Meta>` reconciliation is its own deferred slice, and minting a
+///   second bin from a peer's would corrupt the single-bin invariant.
+/// - **present locally** → metadata LWW: if the peer's group changed more
+///   recently, adopt its name / notes / icon, id → `outcome.groups_updated`.
+///
+/// Group *re-parenting* (move) and tombstone-driven *deletion* are the next
+/// 5d slice — this pass never changes a group's `parent_uuid` or removes a
+/// group. Metadata LWW keys on the group's `modified_at` (bumped by
+/// `update_group` on every metadata edit), with a deterministic,
+/// replica-symmetric tiebreak for same-second edits, and adopts the peer's
+/// `modified_at` VERBATIM (Finding #8: the same generation must not diverge
+/// in time across replicas).
+fn reconcile_peer_groups(
     tx: &Connection,
     peer: &Vault,
     outcome: &mut IngestPeerOutcome,
@@ -1291,7 +1302,9 @@ fn adopt_peer_groups(
         sort_order: u32,
         outcome: &mut IngestPeerOutcome,
     ) -> Result<(), EngineError> {
-        if !group_exists(tx, group.id)? {
+        if group_exists(tx, group.id)? {
+            reconcile_group_metadata(tx, group, outcome)?;
+        } else {
             tx.execute(
                 "INSERT INTO \"group\" (\
                     uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
@@ -1324,8 +1337,12 @@ fn adopt_peer_groups(
         Ok(())
     }
 
-    // The peer's root maps onto the local root (same vault) — never inserted;
-    // descend straight into its children.
+    // The peer's root maps 1:1 onto the local root (same uuid — both forked
+    // from one base), so it's never inserted, but its OWN metadata (name /
+    // notes / icon) still reconciles by LWW: the root group's name is in the
+    // convergence digest, so a root rename must propagate like any other.
+    reconcile_group_metadata(tx, &peer.root, outcome)?;
+    // Then descend into its children.
     for (idx, child) in peer.root.groups.iter().enumerate() {
         walk(
             tx,
@@ -1335,6 +1352,82 @@ fn adopt_peer_groups(
             outcome,
         )?;
     }
+    Ok(())
+}
+
+/// Metadata LWW for one group present on both sides (Phase 5d). Adopts the
+/// peer's name / notes / icon iff the peer's metadata generation wins a
+/// **total order** over `(floored modified_at, name, notes, icon_id,
+/// custom_icon)` — `modified_at` is the LWW signal (bumped by every
+/// `update_group`); the rest are a deterministic, replica-symmetric tiebreak
+/// for same-second edits (without it concurrent same-second renames would
+/// each keep their own name forever — the group twin of the entry
+/// same-second race). The peer's `modified_at` is adopted VERBATIM so the
+/// same generation can't carry different stamps across replicas. Never
+/// touches `parent_uuid` (group move is the next slice) or `is_recycle_bin`.
+fn reconcile_group_metadata(
+    tx: &Connection,
+    peer_group: &Group,
+    outcome: &mut IngestPeerOutcome,
+) -> Result<(), EngineError> {
+    let uuid_str = peer_group.id.0.to_string();
+    // No-op if the group isn't local (the root-metadata call passes
+    // `peer.root` unconditionally; in real sync both replicas share the
+    // root uuid, but a peer whose root id differs — or any absent group —
+    // simply has nothing to reconcile here).
+    let Some((local_name, local_notes, local_icon, local_custom, local_mod)): Option<(
+        String,
+        String,
+        i64,
+        Option<String>,
+        i64,
+    )> = tx
+        .query_row(
+            "SELECT name, notes, icon_index, icon_custom_uuid, modified_at \
+             FROM \"group\" WHERE uuid = ?1",
+            params![uuid_str],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
+
+    let peer_mod = dt_to_ms(peer_group.times.last_modification_time);
+    let peer_mod_floored = peer_mod - peer_mod.rem_euclid(1000);
+    let local_mod_floored = local_mod - local_mod.rem_euclid(1000);
+    let peer_custom = peer_group.custom_icon_uuid.map(|u| u.to_string());
+    let local_tuple = (
+        local_mod_floored,
+        local_name,
+        local_notes,
+        local_icon,
+        local_custom,
+    );
+    let peer_tuple = (
+        peer_mod_floored,
+        peer_group.name.clone(),
+        peer_group.notes.clone(),
+        i64::from(peer_group.icon_id),
+        peer_custom.clone(),
+    );
+    if peer_tuple <= local_tuple {
+        return Ok(());
+    }
+
+    tx.execute(
+        "UPDATE \"group\" SET name = ?1, notes = ?2, icon_index = ?3, \
+         icon_custom_uuid = ?4, modified_at = ?5 WHERE uuid = ?6",
+        params![
+            peer_group.name,
+            peer_group.notes,
+            i64::from(peer_group.icon_id),
+            peer_custom,
+            peer_mod,
+            uuid_str
+        ],
+    )?;
+    outcome.groups_updated.push(peer_group.id.0);
     Ok(())
 }
 

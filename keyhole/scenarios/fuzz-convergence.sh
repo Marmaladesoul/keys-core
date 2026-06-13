@@ -102,9 +102,16 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
     # sync-multipeer-store.md.
     # NB: if/fi rather than `[ -n ] &&` — under `set -e` a final failing
     # && would silently kill the whole run when a pick comes up empty.
-    op=$((RANDOM % 8))
+    op=$((RANDOM % 9))
     case $op in
         7) "$KEYHOLE" create-group "$v" "g-$n" >/dev/null ;;
+        8) g="$(random_group "$v")"
+           # Rename a random group (5d group metadata LWW). Every group
+           # uuid is shared once adopted, so a rename either propagates
+           # one-sided or races + resolves LWW; a just-created g-* not yet
+           # on the peer converges next round (adoption + rename both
+           # propagate). Renames on the same shared group race.
+           if [ -n "$g" ]; then "$KEYHOLE" rename-group "$v" "$g" "r-$n" >/dev/null 2>&1 || true; fi ;;
         0) "$KEYHOLE" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
         1) e="$(random_entry "$v")"
            if [ -n "$e" ]; then "$KEYHOLE" update-entry "$v" "$e" --username "edit-$n" >/dev/null; fi ;;
