@@ -387,12 +387,13 @@ pub(crate) fn held_conflict_payload(
         let Some(owner) = owners.first() else {
             continue;
         };
-        let Some(peer_entry) =
+        let Some(reconstructed) =
             conflict_rows::reconstruct_peer_entry(engine.conn(), owner, uuid, &session_key)?
         else {
             continue;
         };
         let mut theirs_vault = local_vault.clone();
+        let peer_entry = bind_attachments_into_pool(reconstructed, &mut theirs_vault.binaries);
         swap_entry_in_tree(&mut theirs_vault.root, peer_entry);
 
         let outcome = keepass_merge::merge(&local_vault, &theirs_vault)
@@ -422,6 +423,40 @@ pub(crate) fn held_conflict_payload(
         return Ok(Some(payload));
     }
     Ok(None)
+}
+
+/// Bind a reconstructed peer entry's attachment bytes into `pool` and return
+/// the entry with its `Attachment` refs set (Finding #7).
+///
+/// `pool` is the synthetic "theirs" vault's binary pool — a clone of the
+/// local projection's, which is content-deduplicated — so the common case
+/// (peer and local agree on the bytes) reuses an existing binary and adds
+/// nothing; only genuinely divergent peer bytes grow the pool.
+fn bind_attachments_into_pool(
+    reconstructed: crate::conflict_rows::ReconstructedPeerEntry,
+    pool: &mut Vec<keepass_core::model::Binary>,
+) -> keepass_core::model::Entry {
+    let crate::conflict_rows::ReconstructedPeerEntry {
+        mut entry,
+        attachments,
+    } = reconstructed;
+    for (name, bytes) in attachments {
+        let ref_id = pool
+            .iter()
+            .position(|b| b.data == bytes)
+            .unwrap_or_else(|| {
+                pool.push(keepass_core::model::Binary::new(bytes, false));
+                pool.len() - 1
+            });
+        // Pools are tiny relative to u32; saturate rather than panic on a
+        // pathological vault (a wrong ref is a skipped attachment, caught
+        // by the digest oracle, not corruption).
+        let ref_id = u32::try_from(ref_id).unwrap_or(u32::MAX);
+        entry
+            .attachments
+            .push(keepass_core::model::Attachment::new(name, ref_id));
+    }
+    entry
 }
 
 /// Replace the entry with `replacement.id` in the group tree with

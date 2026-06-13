@@ -69,11 +69,31 @@ struct ConflictEntryRow {
     expires_at: Option<i64>,
 }
 
+/// A peer's ("theirs") entry rebuilt from its conflict rows, plus its
+/// attachment bytes.
+///
+/// [`Entry::attachments`] is a `(name, ref_id)` reference into a vault's
+/// binary pool, and reconstruction has no vault — so `entry` carries no
+/// attachments; they ride alongside as named bytes for the caller to bind
+/// into whatever pool backs the synthetic "theirs" vault
+/// (`reconcile::held_conflict_payload`).
+pub(crate) struct ReconstructedPeerEntry {
+    pub(crate) entry: Entry,
+    /// `(attachment name, bytes)`, name-sorted; resolved from the shared
+    /// `attachment_blob` pool at read time.
+    pub(crate) attachments: Vec<(String, Vec<u8>)>,
+}
+
 /// Reconstruct one peer's ("theirs") [`Entry`] from its conflict rows — the
 /// inverse of `ingest::insert_conflict_entry`. Protected fields are unsealed
 /// with `session_key`, so the result carries plaintext in `password` /
 /// `custom_fields[].value`, matching the post-unwrap shape the resolver's
 /// reveal path expects.
+///
+/// Attachments come back as named bytes (Finding #7 — without them the
+/// rebuilt "theirs" read as "remote removed every attachment" and a
+/// choose-remote resolution wiped the local links). A sha with no pool blob
+/// (a future GC) skips, matching the history-snapshot posture.
 ///
 /// `<History>` is not stored, so the reconstructed entry carries none: a held
 /// conflict re-derives through the no-shared-ancestor path, where every
@@ -85,7 +105,7 @@ pub(crate) fn reconstruct_peer_entry(
     owner: &str,
     uuid: Uuid,
     session_key: &SessionKey,
-) -> Result<Option<Entry>, EngineError> {
+) -> Result<Option<ReconstructedPeerEntry>, EngineError> {
     let uuid_str = uuid.to_string();
     let base = conn
         .query_row(
@@ -171,7 +191,24 @@ pub(crate) fn reconstruct_peer_entry(
             .push(CustomField::new(field_name, value, false));
     }
 
-    Ok(Some(entry))
+    // Attachments: resolve each row's sha through the shared blob pool.
+    // The INNER JOIN drops a sha whose blob is gone (a future GC) — skip,
+    // don't fail the rebuild.
+    let mut stmt = conn.prepare(
+        "SELECT a.attachment_name, b.bytes \
+         FROM conflict_entry_attachment a \
+         JOIN attachment_blob b ON b.sha256 = a.blob_sha256 \
+         WHERE a.owner = ?1 AND a.entry_uuid = ?2 ORDER BY a.attachment_name",
+    )?;
+    let att_rows = stmt.query_map(params![owner, uuid_str], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut attachments = Vec::new();
+    for row in att_rows {
+        attachments.push(row?);
+    }
+
+    Ok(Some(ReconstructedPeerEntry { entry, attachments }))
 }
 
 /// Drop every owner's conflict rows for one `entry_uuid` (across all peers),
@@ -191,6 +228,10 @@ pub(crate) fn drop_conflict_rows(conn: &Connection, entry_uuid: Uuid) -> Result<
     )?;
     conn.execute(
         "DELETE FROM conflict_entry_custom_field WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    conn.execute(
+        "DELETE FROM conflict_entry_attachment WHERE entry_uuid = ?1",
         params![uuid_str],
     )?;
     let removed = conn.execute(
@@ -312,9 +353,14 @@ mod tests {
             "s3cret",
             &[("TOTP", "seed", true), ("note", "hello", false)],
         );
-        let entry = reconstruct_peer_entry(&conn, "peerB", id, &sk())
+        let reconstructed = reconstruct_peer_entry(&conn, "peerB", id, &sk())
             .expect("reconstruct")
             .expect("entry present");
+        let entry = reconstructed.entry;
+        assert!(
+            reconstructed.attachments.is_empty(),
+            "no attachment rows stored, none reconstructed"
+        );
         assert_eq!(entry.id.0, id);
         assert_eq!(entry.title, "Acme");
         assert_eq!(entry.password, "s3cret", "password unsealed");
@@ -332,6 +378,82 @@ mod tests {
             .expect("note");
         assert_eq!(note.value, "hello");
         assert!(!note.protected);
+    }
+
+    #[test]
+    fn reconstruct_returns_attachment_bytes_from_pool() {
+        let conn = mem_conn();
+        let id = Uuid::new_v4();
+        insert_peer(&conn, "peerB", id, "Acme", "pw", &[]);
+        // Pool blob + conflict link, the shape `insert_conflict_entry`
+        // writes (sha content-addresses the bytes).
+        let bytes = b"attachment-bytes".to_vec();
+        let sha: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            h.finalize().into()
+        };
+        conn.execute(
+            "INSERT INTO attachment_blob (sha256, bytes, size) VALUES (?1, ?2, ?3)",
+            params![
+                sha.as_slice(),
+                bytes,
+                i64::try_from(bytes.len()).expect("test bytes fit")
+            ],
+        )
+        .expect("insert blob");
+        conn.execute(
+            "INSERT INTO conflict_entry_attachment \
+                 (owner, entry_uuid, attachment_name, blob_sha256) \
+             VALUES (?1, ?2, 'doc.txt', ?3)",
+            params!["peerB", id.to_string(), sha.as_slice()],
+        )
+        .expect("insert conflict attachment");
+        // A second link whose blob is absent (GC'd) must skip, not fail.
+        conn.execute(
+            "INSERT INTO conflict_entry_attachment \
+                 (owner, entry_uuid, attachment_name, blob_sha256) \
+             VALUES (?1, ?2, 'gone.txt', x'00')",
+            params!["peerB", id.to_string()],
+        )
+        .expect("insert dangling conflict attachment");
+
+        let reconstructed = reconstruct_peer_entry(&conn, "peerB", id, &sk())
+            .expect("reconstruct")
+            .expect("entry present");
+        assert_eq!(
+            reconstructed.attachments,
+            vec![("doc.txt".to_string(), b"attachment-bytes".to_vec())],
+            "stored attachment comes back; dangling sha skips"
+        );
+        assert!(
+            reconstructed.entry.attachments.is_empty(),
+            "ref binding is the caller's job — the entry itself carries none"
+        );
+    }
+
+    #[test]
+    fn drop_clears_attachment_rows_too() {
+        let conn = mem_conn();
+        let id = Uuid::new_v4();
+        insert_peer(&conn, "peerB", id, "Acme", "pw", &[]);
+        conn.execute(
+            "INSERT INTO conflict_entry_attachment \
+                 (owner, entry_uuid, attachment_name, blob_sha256) \
+             VALUES ('peerB', ?1, 'doc.txt', x'aa')",
+            params![id.to_string()],
+        )
+        .expect("insert conflict attachment");
+        drop_conflict_rows(&conn, id).expect("drop");
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conflict_entry_attachment WHERE entry_uuid = ?1",
+                params![id.to_string()],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(left, 0, "attachment rows dropped with the conflict");
     }
 
     #[test]
