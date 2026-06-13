@@ -485,9 +485,10 @@ pub(crate) fn create_entry(
     group_uuid: Uuid,
     fields: NewEntryFields,
     now: i64,
+    new_uuid: Uuid,
 ) -> Result<Uuid, EngineError> {
     let session = session_key(protector)?;
-    let entry_uuid = Uuid::new_v4();
+    let entry_uuid = new_uuid;
     let group_uuid_str = group_uuid.to_string();
     let entry_uuid_str = entry_uuid.to_string();
 
@@ -1005,6 +1006,7 @@ pub(crate) fn recycle_entry(
     conn: &mut Connection,
     uuid: Uuid,
     now: i64,
+    bin_uuid: Uuid,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -1039,7 +1041,7 @@ pub(crate) fn recycle_entry(
     let bin = match recycle_bin_uuid(&tx)? {
         Some(bin) => Some(bin),
         None if crate::meta::read_recycle_bin_enabled(&tx)? => {
-            Some(create_recycle_bin_group(&tx, now)?)
+            Some(create_recycle_bin_group(&tx, now, bin_uuid)?)
         }
         None => None,
     };
@@ -1074,13 +1076,17 @@ pub(crate) fn recycle_entry(
 /// group UUID. Mirrors keepass-core's `find_or_create_recycle_bin` — same
 /// name and icon (43) — so a bin created here is indistinguishable from one
 /// the model layer would mint, and projects/syncs identically.
-fn create_recycle_bin_group(tx: &Transaction<'_>, now: i64) -> Result<String, EngineError> {
+fn create_recycle_bin_group(
+    tx: &Transaction<'_>,
+    now: i64,
+    bin_uuid: Uuid,
+) -> Result<String, EngineError> {
     let root_uuid: String = tx.query_row(
         "SELECT uuid FROM \"group\" WHERE parent_uuid IS NULL LIMIT 1",
         [],
         |r| r.get(0),
     )?;
-    let new_uuid = Uuid::new_v4().to_string();
+    let new_uuid = bin_uuid.to_string();
     let next_sort_order: i64 = tx.query_row(
         "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM \"group\" WHERE parent_uuid = ?1",
         params![root_uuid],
@@ -1111,12 +1117,13 @@ fn create_recycle_bin_group(tx: &Transaction<'_>, now: i64) -> Result<String, En
 pub(crate) fn ensure_recycle_bin(
     conn: &mut Connection,
     now: i64,
+    bin_uuid: Uuid,
 ) -> Result<Option<String>, EngineError> {
     let tx = conn.transaction()?;
     let bin = match recycle_bin_uuid(&tx)? {
         Some(bin) => Some(bin),
         None if crate::meta::read_recycle_bin_enabled(&tx)? => {
-            Some(create_recycle_bin_group(&tx, now)?)
+            Some(create_recycle_bin_group(&tx, now, bin_uuid)?)
         }
         None => None,
     };
@@ -2208,9 +2215,9 @@ pub(crate) fn create_group(
     parent_uuid: Uuid,
     fields: NewGroupFields,
     now: i64,
+    new_uuid: Uuid,
 ) -> Result<Uuid, EngineError> {
     let parent_str = parent_uuid.to_string();
-    let new_uuid = Uuid::new_v4();
     let new_uuid_str = new_uuid.to_string();
     let (icon_index, icon_custom_uuid) = icon_parts(&fields.icon);
 

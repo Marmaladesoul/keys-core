@@ -53,6 +53,7 @@ impl Engine {
         fields: NewEntryFields,
     ) -> Result<Uuid, EngineError> {
         let now = self.now_ms();
+        let new_uuid = self.next_uuid();
         let result = mutations::create_entry(
             &mut self.conn,
             &self.fingerprint_key,
@@ -60,6 +61,7 @@ impl Engine {
             group_uuid,
             fields,
             now,
+            new_uuid,
         )?;
         self.emit(ChangeEvent::EntriesAdded(vec![result]));
         Ok(result)
@@ -135,6 +137,7 @@ impl Engine {
         target_group_uuid: Uuid,
     ) -> Result<Uuid, EngineError> {
         let now = self.now_ms();
+        let entry_uuid = self.next_uuid();
         let (new_uuid, icon_inserted) = crate::portable::import_entry(
             &mut self.conn,
             &self.fingerprint_key,
@@ -142,6 +145,7 @@ impl Engine {
             target_group_uuid,
             portable,
             now,
+            entry_uuid,
         )?;
         self.emit(ChangeEvent::EntriesAdded(vec![new_uuid]));
         if icon_inserted {
@@ -228,7 +232,8 @@ impl Engine {
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn recycle_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
         let now = self.now_ms();
-        mutations::recycle_entry(&mut self.conn, uuid, now)?;
+        let bin_uuid = self.next_uuid();
+        mutations::recycle_entry(&mut self.conn, uuid, now, bin_uuid)?;
         self.emit(ChangeEvent::EntriesRecycled(vec![uuid]));
         Ok(())
     }
@@ -245,7 +250,8 @@ impl Engine {
     pub fn ensure_recycle_bin(&mut self) -> Result<Option<String>, EngineError> {
         let before = self.recycle_bin_uuid()?;
         let now = self.now_ms();
-        let bin = mutations::ensure_recycle_bin(&mut self.conn, now)?;
+        let bin_uuid = self.next_uuid();
+        let bin = mutations::ensure_recycle_bin(&mut self.conn, now, bin_uuid)?;
         // Emit only when we actually created the group (it was absent before).
         if before.is_none() {
             if let Some(uuid) = bin.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
@@ -468,7 +474,8 @@ impl Engine {
         fields: NewGroupFields,
     ) -> Result<Uuid, EngineError> {
         let now = self.now_ms();
-        let uuid = mutations::create_group(&mut self.conn, parent_uuid, fields, now)?;
+        let new_uuid = self.next_uuid();
+        let uuid = mutations::create_group(&mut self.conn, parent_uuid, fields, now, new_uuid)?;
         self.emit(ChangeEvent::GroupsAdded(vec![uuid]));
         Ok(uuid)
     }

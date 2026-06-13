@@ -257,6 +257,7 @@ pub(crate) fn import_entry(
     target_group_uuid: Uuid,
     portable: PortableEntry,
     now: i64,
+    entry_uuid: Uuid,
 ) -> Result<(Uuid, bool), EngineError> {
     // Custom-icon rehoming runs *before* the create-entry transaction
     // so the resulting UUID is available to thread through
@@ -318,6 +319,7 @@ pub(crate) fn import_entry(
         target_group_uuid,
         fields,
         now,
+        entry_uuid,
     )?;
 
     // Preserve `expires_at` if the carrier had one. `create_entry`

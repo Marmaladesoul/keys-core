@@ -100,6 +100,28 @@ different concern and keep their sleeps. Remaining `sleep`s in the
 scenario set are either file-signature waits or not-yet-retrofitted
 LWW cases; converting the rest is a mechanical follow-up.
 
+### Deterministic entity ids (`--uuid-seed <n>`)
+
+The third non-determinism source (after the seeded op stream and the
+`--at` clock) is entity ids. `Engine::open_with_clock` also injects a
+`keys_engine::uuid_source::UuidSource`: production uses `RandomUuids`
+(`Uuid::new_v4`); tests/fuzz use `SeededUuids`
+(`Uuid::from_u64_pair(seed, counter)`). Surfaced via keys-ffi
+`Engine::open_deterministic(clock_ms, uuid_seed)` and `keyhole
+--uuid-seed`. The fuzzer passes a DISTINCT per-command seed (the global
+op counter `n`; seed-time creates use a high range) so every entity id
+is unique AND reproducible across runs — `FUZZ_SEED=777` went from
+intermittent to 3/3 consistent.
+
+**Caveat — not byte-definitive.** The root group + default recycle bin
+are minted by `Vault::create_empty` (keys-ffi→keepass-core), *outside*
+the engine's `UuidSource`, so they stay random per vault. Within a run
+both devices share them (via `cp`) and they never participate in the
+entry conflicts under test, so convergence/replay of a *finding* is
+unaffected — but two runs' *content digests* still differ by those two
+ids. Pinning them too (a keepass-core `Vault::create_empty` seed) is the
+follow-up for byte-identical cross-run replay.
+
 ## The persistent mirror
 
 The SQLCipher mirror lives at **`<vault>.mirror/`**, keyed to the vault
@@ -502,10 +524,31 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   This is the badge/payload-disagreement class the 2026-06-12 work
   touched one face of; the parity oracle proves a residual path. Repro:
   the fuzzer at seed 777 (artefacts auto-preserved on failure).
-  **Next:** isolate which `ingest_peer` arm leaves a `conflict_entry`
-  row behind when the conflict no longer reconstructs (likely a missing
-  `clear_conflict_rows` on an InSync/AutoMerged transition for an entry
-  that previously parked), and make the badge query + payload agree.
+  **Mechanism (code-grounded):** `held_conflict_payload`
+  (`reconcile.rs:402`) self-heals — when a parked entry's stored peer
+  value no longer conflicts with local (`outcome.entry_conflicts`
+  empty) it `drop_conflict_rows` and skips. So a conflict row that has
+  *dissolved* (local converged to the stored peer value in a later
+  round, with no ingest arm clearing it) lingers until a resolver-open
+  triggers that lazy heal. But the badge —
+  `parked_conflict_uuids` (`SELECT DISTINCT entry_uuid FROM
+  conflict_entry`) — counts it immediately. Net: a phantom badge /
+  dead resolver entry until someone opens it, and a one-sided
+  `list-conflicts` divergence in the meantime. (Diagnosing with
+  `show-conflict` *hides* the bug — that call is the lazy heal.)
+  **Fix direction:** clear a conflict row eagerly when it dissolves —
+  at the `ingest_peer` arm where local converges to the stored peer
+  value (InSync/AutoMerged for an entry that still has a
+  `conflict_entry` row) — so the badge is accurate without a
+  resolver-open. Alternatively make the badge query merge-aware, but
+  that defeats its cheapness; eager-clear-on-converge is the right
+  shape. Validate with a deterministic red scenario + the seed-777
+  fuzzer path. **NB intermittent:** the fuzzer's UUIDs are random (not
+  seeded), so `FUZZ_SEED=777` does not replay the failure byte-for-byte
+  — recapture needs a higher-volume soak (or the deterministic-UUID
+  fuzzer follow-up) to land a live pre-heal artefact. Inspect a
+  preserved artefact with `list-conflicts` + `digest` only —
+  `show-conflict` triggers the lazy heal and erases the evidence.
 
 - **[FIXED] Finding #9 — `resolved_at` was stamped from the system
   clock, not the injected engine clock, so under a pinned clock every

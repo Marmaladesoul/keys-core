@@ -61,13 +61,22 @@ fail() {
 # right after `create` (the only group then) so the move/delete target
 # picker can exclude it — root has no parent and deleting it would wipe
 # the vault.
+# Determinism: seed-time entity ids are pinned via --uuid-seed (distinct
+# high values, well clear of the loop's per-op ids below) so the shared
+# world replays byte-for-byte across runs. (The root group + default
+# recycle bin are minted by Vault::create_empty, OUTSIDE the engine's
+# UuidSource, so they stay random — but both devices share them via the
+# cp below, and they never participate in the entry conflicts under
+# test, so they don't affect convergence/replay of a finding.)
+SEED_AT=1799999000000
+us=9000000000
 "$KEYHOLE" create "$A" >/dev/null
 ROOT="$("$KEYHOLE" list-groups "$A" | awk '$1 ~ /^[0-9a-f-]{36}$/ {print $1; exit}')"
 for f in Folder Folder-2 Folder-3; do
-    "$KEYHOLE" create-group "$A" "$f" >/dev/null
+    us=$((us + 1)); "$KEYHOLE" --at "$SEED_AT" --uuid-seed "$us" create-group "$A" "$f" >/dev/null
 done
 for t in alpha beta gamma; do
-    "$KEYHOLE" create-entry "$A" "$t" --username "u-$t" >/dev/null
+    us=$((us + 1)); "$KEYHOLE" --at "$SEED_AT" --uuid-seed "$us" create-entry "$A" "$t" --username "u-$t" >/dev/null
 done
 # A dedicated "battleground" entry that BOTH devices edit (same field,
 # distinct values) every round, guaranteeing a genuine same-field clash
@@ -75,7 +84,7 @@ done
 # only ~1 round in 10, leaving the park/resolve/parity paths barely
 # exercised. Excluded from random_entry so a random delete/move can't
 # remove it out from under the contention step.
-"$KEYHOLE" create-entry "$A" "Contested" --username u-contested >/dev/null
+us=$((us + 1)); "$KEYHOLE" --at "$SEED_AT" --uuid-seed "$us" create-entry "$A" "Contested" --username u-contested >/dev/null
 CONTESTED="$("$KEYHOLE" list "$A" | awk '/Contested/ {print $1; exit}')"
 cp "$A" "$B"
 
@@ -143,7 +152,7 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
     # contended edit every round).
     op=$((RANDOM % 11))
     case $op in
-        7) "$KEYHOLE" --at "$AT" create-group "$v" "g-$n" >/dev/null ;;
+        7) "$KEYHOLE" --at "$AT" --uuid-seed "$n" create-group "$v" "g-$n" >/dev/null ;;
         8) g="$(random_group "$v")"
            # Rename a random group (5d group metadata LWW). Every group
            # uuid is shared once adopted, so a rename either propagates
@@ -158,7 +167,7 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
         10) g="$(random_movable_group "$v")"
            # Delete a group (5d cross-peer group delete via tombstone).
            if [ -n "$g" ]; then "$KEYHOLE" --at "$AT" delete-group "$v" "$g" >/dev/null 2>&1 || true; fi ;;
-        0) "$KEYHOLE" --at "$AT" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
+        0) "$KEYHOLE" --at "$AT" --uuid-seed "$n" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
         1) e="$(random_entry "$v")"
            if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" update-entry "$v" "$e" --username "edit-$n" >/dev/null; fi ;;
         2) e="$(random_entry "$v")"

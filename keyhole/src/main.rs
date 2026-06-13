@@ -60,6 +60,17 @@ struct Cli {
     /// (production behaviour).
     #[arg(long = "at", global = true)]
     clock_ms: Option<i64>,
+
+    /// Make entity ids deterministic: new entries / groups draw from a
+    /// seeded UUID source rooted at this value instead of random v4. The
+    /// last piece (with `--at`) that makes a run byte-reproducible, so a
+    /// fuzz failure replays instead of merely preserving artefacts. Use
+    /// a DISTINCT seed per device — two devices sharing a seed would
+    /// mint the same id for different entities. Requires `--at`. Ignored
+    /// by `create` (the root group + recycle bin are minted in
+    /// keepass-core, outside the engine's seeded id source).
+    #[arg(long = "uuid-seed", global = true)]
+    uuid_seed: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -362,6 +373,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let password = read_password(&cli.password_env)?;
     let clock_ms = cli.clock_ms;
+    let uuid_seed = cli.uuid_seed;
 
     match cli.command {
         Command::Create { vault } => {
@@ -374,7 +386,7 @@ async fn main() -> Result<()> {
             entry_password,
             group,
         } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session
                 .create_entry(title, username, entry_password, group)
                 .await?;
@@ -405,11 +417,11 @@ async fn main() -> Result<()> {
                 icon: None,
                 expires_at: None,
             };
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.update_entry(uuid, update).await?;
         }
         Command::EnsureBin { vault } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.ensure_bin().await?;
         }
         Command::SetBin {
@@ -421,15 +433,15 @@ async fn main() -> Result<()> {
                 !(state == "on" && delete_bin_contents),
                 "--delete-bin-contents only applies with `off`"
             );
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.set_bin(state == "on", delete_bin_contents).await?;
         }
         Command::Inspect { vault } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.inspect()?;
         }
         Command::List { vault, group } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.list(group)?;
         }
         Command::Recycle {
@@ -437,7 +449,7 @@ async fn main() -> Result<()> {
             uuid,
             no_save,
         } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.recycle(uuid, !no_save).await?;
         }
         Command::IngestPeer {
@@ -445,19 +457,19 @@ async fn main() -> Result<()> {
             peer_kdbx,
             owner,
         } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.ingest_peer(owner, &peer_kdbx).await?;
         }
         Command::ListConflicts { vault } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.list_conflicts()?;
         }
         Command::ShowConflict { vault, entry } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.show_conflict(entry).await?;
         }
         Command::Digest { vault } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.digest()?;
         }
         Command::CreateGroup {
@@ -465,35 +477,35 @@ async fn main() -> Result<()> {
             name,
             parent,
         } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.create_group(name, parent).await?;
         }
         Command::RenameGroup { vault, uuid, name } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.rename_group(uuid, name).await?;
         }
         Command::MoveGroup { vault, uuid, to } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.move_group(uuid, to).await?;
         }
         Command::DeleteGroup { vault, uuid } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.delete_group(uuid).await?;
         }
         Command::ListGroups { vault } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.list_groups()?;
         }
         Command::MoveEntry { vault, uuid, to } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.move_entry(uuid, to).await?;
         }
         Command::Restore { vault, uuid } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.restore(uuid).await?;
         }
         Command::DeleteEntry { vault, uuid } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.delete_entry(uuid).await?;
         }
         Command::SetAttachment {
@@ -502,17 +514,17 @@ async fn main() -> Result<()> {
             name,
             text,
         } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session
                 .set_attachment(uuid, name, text.into_bytes())
                 .await?;
         }
         Command::CatAttachment { vault, uuid, name } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.cat_attachment(uuid, name)?;
         }
         Command::RemoveAttachment { vault, uuid, name } => {
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.remove_attachment(uuid, name).await?;
         }
         Command::Resolve {
@@ -531,7 +543,7 @@ async fn main() -> Result<()> {
                     Ok((key.to_owned(), parse_side(side_str)?))
                 })
                 .collect::<Result<Vec<(String, ConflictSideFfi)>>>()?;
-            let session = Session::open(&vault, &password, clock_ms).await?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.resolve(entry, side, &overrides).await?;
         }
     }
@@ -561,7 +573,12 @@ impl Session {
     /// - signature differs → the KDBX changed under us →
     ///   `reconcile_with_disk_park_conflicts` (the disk-watcher path:
     ///   merges, parks divergences, never blocks).
-    async fn open(vault: &Path, password: &str, clock_ms: Option<i64>) -> Result<Self> {
+    async fn open(
+        vault: &Path,
+        password: &str,
+        clock_ms: Option<i64>,
+        uuid_seed: Option<u64>,
+    ) -> Result<Self> {
         anyhow::ensure!(vault.exists(), "vault not found: {}", vault.display());
 
         let mirror_dir = mirror_dir_for(vault);
@@ -569,20 +586,33 @@ impl Session {
             .with_context(|| format!("create mirror dir {}", mirror_dir.display()))?;
         let mirror_db = mirror_dir.join("mirror.sqlite");
 
-        // `--at` pins the engine clock so the LWW stamps a mutation
-        // writes are deterministic; without it we use the system clock
-        // (production behaviour). The mirror path / key / protector wiring
-        // is identical either way.
+        // `--at` pins the engine clock and `--uuid-seed` pins entity ids,
+        // so the LWW stamps and ids a mutation writes are deterministic;
+        // without them we use the system clock + random v4 (production
+        // behaviour). The mirror path / key / protector wiring is
+        // identical across all three. `--uuid-seed` needs a pinned clock
+        // to be meaningfully reproducible, so it requires `--at`.
         let db_path = mirror_db.to_string_lossy().into_owned();
-        let engine = match clock_ms {
-            Some(ms) => Engine::open_with_fixed_clock(
+        let engine = match (clock_ms, uuid_seed) {
+            (Some(ms), Some(seed)) => Engine::open_deterministic(
+                db_path,
+                Arc::new(FixedDbKey),
+                Arc::new(FixedProtector),
+                None,
+                ms,
+                seed,
+            ),
+            (Some(ms), None) => Engine::open_with_fixed_clock(
                 db_path,
                 Arc::new(FixedDbKey),
                 Arc::new(FixedProtector),
                 None,
                 ms,
             ),
-            None => Engine::open(
+            (None, Some(_)) => {
+                anyhow::bail!("--uuid-seed requires --at (a pinned clock) to be reproducible");
+            }
+            (None, None) => Engine::open(
                 db_path,
                 Arc::new(FixedDbKey),
                 Arc::new(FixedProtector),

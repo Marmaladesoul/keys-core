@@ -29,6 +29,7 @@ use crate::projection;
 use crate::reconcile::{self, MergeResult, ParkConflictsResult};
 use crate::save::{self, SelfWriteSignature};
 use crate::strength::{self, Strength};
+use crate::uuid_source::{RandomUuids, UuidSource};
 
 // `impl Engine { ... }` blocks split across files by concern; each
 // submodule contributes its slice of the engine's public method
@@ -136,6 +137,15 @@ pub struct Engine {
     /// an explicit `now` into the `mutations` layer — peer-adopted
     /// stamps still come verbatim from the peer, never re-derived here.
     clock: Arc<dyn Clock>,
+    /// Source of fresh entity ids for entry / group / recycle-bin
+    /// creation. Defaults to [`RandomUuids`] via [`Engine::open`];
+    /// [`Engine::open_with_clock`] injects it alongside the clock so the
+    /// keyhole fuzzer can mint *deterministic* ids ([`SeededUuids`]) and
+    /// thereby replay a failing run rather than merely preserve it.
+    /// Resolved via [`Engine::next_uuid`] and threaded as an explicit
+    /// `new_uuid` into the `mutations` layer — peer-adopted ids still
+    /// come verbatim from the peer.
+    uuid_src: Arc<dyn UuidSource>,
     /// Shared lifecycle / signature state that the optional
     /// [`FileWatcher`] observer needs read/write access to from another
     /// thread. The engine reads through this on every call; the file-
@@ -327,21 +337,26 @@ impl Engine {
             field_protector,
             file_watcher,
             Arc::new(SystemClock),
+            Arc::new(RandomUuids),
         )
     }
 
-    /// Like [`Engine::open`] but with an injected [`Clock`].
+    /// Like [`Engine::open`] but with an injected [`Clock`] and
+    /// [`UuidSource`].
     ///
     /// Production callers use [`Engine::open`] (which supplies
-    /// [`SystemClock`]). Tests and the keyhole fuzzer pass a fixed or
-    /// scripted clock so the timestamps that drive LWW reconciliation
-    /// (`modified_at`, `location_changed_at`, tombstone `deleted_at`)
-    /// are deterministic — forcing same-second ties or pinning an exact
-    /// winner without `sleep` between mutations.
+    /// [`SystemClock`] + [`RandomUuids`]). Tests and the keyhole fuzzer
+    /// pass a fixed/scripted clock so the timestamps that drive LWW
+    /// reconciliation (`modified_at`, `location_changed_at`, tombstone
+    /// `deleted_at`) are deterministic, and a [`SeededUuids`] source so
+    /// entity ids replay too — together that makes a fuzz run
+    /// byte-reproducible (replay, not just preserve-on-failure).
     ///
-    /// The clock is stamped only on *local* mutations through this
-    /// engine; peer stamps adopted during `ingest_peer` come verbatim
-    /// from the peer and are never re-derived from this clock.
+    /// [`SeededUuids`]: crate::uuid_source::SeededUuids
+    ///
+    /// The clock and id source apply only to *local* mutations through
+    /// this engine; peer stamps and ids adopted during `ingest_peer`
+    /// come verbatim from the peer and are never re-derived here.
     ///
     /// # Errors
     ///
@@ -352,6 +367,7 @@ impl Engine {
         field_protector: Arc<dyn FieldProtector>,
         file_watcher: Option<Arc<dyn FileWatcher>>,
         clock: Arc<dyn Clock>,
+        uuid_src: Arc<dyn UuidSource>,
     ) -> Result<Self, EngineError> {
         let key = key_provider.acquire_db_key()?;
 
@@ -428,6 +444,7 @@ impl Engine {
             fingerprint_key,
             field_protector,
             clock,
+            uuid_src,
             shared,
             observer: None,
             file_watcher,
@@ -1030,6 +1047,14 @@ impl Engine {
     /// resolved-since gate in `ingest_peer` is deterministic.
     pub(crate) fn now(&self) -> chrono::DateTime<chrono::Utc> {
         self.clock.now()
+    }
+
+    /// A fresh entity id from this engine's injected [`UuidSource`].
+    /// Called once at the top of each creating mutation and threaded as
+    /// an explicit `new_uuid` into the `mutations` layer, so a seeded
+    /// source makes entity ids replay deterministically.
+    pub(crate) fn next_uuid(&self) -> uuid::Uuid {
+        self.uuid_src.next_uuid()
     }
 
     /// Close the underlying connection, finalising any pending work.

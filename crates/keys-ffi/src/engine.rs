@@ -157,7 +157,63 @@ impl Engine {
         let watcher = engine_file_watcher::bridge(file_watcher);
         let clock: Arc<dyn keepass_core::model::Clock> =
             Arc::new(keepass_core::model::FixedClock(fixed));
-        let inner = eng::Engine::open_with_clock(&path_buf, &kp, fp, watcher, clock)?;
+        let inner = eng::Engine::open_with_clock(
+            &path_buf,
+            &kp,
+            fp,
+            watcher,
+            clock,
+            Arc::new(eng::uuid_source::RandomUuids),
+        )?;
+        Ok(Arc::new(Self {
+            inner: Mutex::new(Some(inner)),
+        }))
+    }
+
+    /// Like [`Engine::open_with_fixed_clock`] but *also* makes entity
+    /// ids deterministic: new entries / groups draw from a
+    /// [`SeededUuids`](keys_engine::uuid_source::SeededUuids) rooted at
+    /// `uuid_seed` instead of random v4. With the clock pinned and ids
+    /// seeded, a run is byte-reproducible — the keyhole fuzzer uses this
+    /// (distinct `uuid_seed` per device) so a failing run replays
+    /// instead of merely preserving its artefacts.
+    ///
+    /// **Test / fuzz scaffolding only.** Production uses [`Engine::open`].
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Internal`] if `clock_ms` is not a representable
+    ///   UTC instant.
+    /// - Otherwise as [`Engine::open`].
+    #[uniffi::constructor]
+    pub fn open_deterministic(
+        path: String,
+        key_provider: Arc<dyn VaultDbKeyProvider>,
+        field_protector: Arc<dyn VaultFieldProtector>,
+        file_watcher: Option<Arc<dyn VaultFileWatcher>>,
+        clock_ms: i64,
+        uuid_seed: u64,
+    ) -> Result<Arc<Self>, EngineError> {
+        let fixed = chrono::DateTime::from_timestamp_millis(clock_ms).ok_or_else(|| {
+            EngineError::Internal(format!(
+                "clock_ms {clock_ms} is not a representable UTC instant"
+            ))
+        })?;
+        let path_buf = PathBuf::from(path);
+        let kp = BridgeDbKeyProvider::new(key_provider);
+        let fp: Arc<dyn keepass_core::protector::FieldProtector> =
+            Arc::new(BridgeProtector::new(field_protector));
+        let watcher = engine_file_watcher::bridge(file_watcher);
+        let clock: Arc<dyn keepass_core::model::Clock> =
+            Arc::new(keepass_core::model::FixedClock(fixed));
+        let inner = eng::Engine::open_with_clock(
+            &path_buf,
+            &kp,
+            fp,
+            watcher,
+            clock,
+            Arc::new(eng::uuid_source::SeededUuids::new(uuid_seed)),
+        )?;
         Ok(Arc::new(Self {
             inner: Mutex::new(Some(inner)),
         }))

@@ -26,6 +26,7 @@ pub mod strength;
 pub mod syllable_generator;
 pub mod totp;
 pub mod url_matcher;
+pub mod uuid_source;
 
 pub use engine::{DisconnectReason, Engine, ReconcileTrigger, VaultState};
 pub use error::{EngineError, IngestError, ProjectionError, RevealError};
