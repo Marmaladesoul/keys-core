@@ -21,16 +21,12 @@ failed_names=()
 for s in "$DIR"/*.sh; do
     name="$(basename "$s")"
     [ "$name" = "run-all.sh" ] && continue
-    # fuzz-attachments is manual/diagnostic until DESIGN.md Finding #8
-    # (LCA generation-aliasing resurrects removed attachments) is
-    # fixed — it reliably reproduces that open bug, so in CI it would
-    # flake on known-broken behaviour.
-    [ "$name" = "fuzz-attachments.sh" ] && continue
-    # fuzz-convergence is a full CI gate since Findings #4 + #5 were
-    # fixed (timestamp flooring + dissolved-conflict badge clearing) —
-    # 30/30 soak runs green. Its interleaving varies run-to-run (fresh
-    # uuids), so a red here is a real convergence bug: the failure
-    # preserves both vaults + mirrors for post-mortem.
+    # Both fuzzers are full CI gates: fuzz-convergence since Findings
+    # #4 + #5 (timestamp flooring + dissolved-conflict badge clearing),
+    # fuzz-attachments since Finding #8 (LCA generation disambiguation)
+    # — each soaked green at re-gate time. Interleaving varies
+    # run-to-run (fresh uuids), so a red here is a real convergence
+    # bug: the failure preserves both vaults + mirrors for post-mortem.
     printf '\n── %s ─────────────────────────\n' "$name"
     if bash "$s"; then
         pass=$((pass + 1))

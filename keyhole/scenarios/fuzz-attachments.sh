@@ -2,23 +2,16 @@
 #
 # Scenario: the attachment-propagation fuzzer — seeded random one-sided
 # attachment set/replace/remove across two replicas, digest-asserted
-# every round. The attachment twin of fuzz-convergence.sh, kept
-# SEPARATE on purpose: no field edits happen here, so no conflicts
-# ever park, which keeps the run inside the shipped 5c surface.
-# Mixing attachment ops with field edits reaches the unshipped
-# facets-alongside-held-conflict slice (resolving a parked conflict
-# drops attachments added since the fork — DESIGN.md Finding #7);
-# merge the two mixes when that slice lands.
+# every round. The attachment-focused twin of fuzz-convergence.sh
+# (whose mix now also carries attachment ops alongside field edits);
+# this one hammers attachment churn alone at a higher density, which
+# is what surfaced Finding #8 (content-hash LCA aliasing) — it
+# reproduced ~1-in-7 runs until the matcher learnt generation
+# disambiguation, and has been a CI gate since.
 #
 # Names are device-prefixed: same-name both-sided attachment edits
-# stay on the conservative no-auto-pick path by design.
-#
-# STATUS: manual/diagnostic, excluded from run-all.sh — it reliably
-# (~1-in-7 runs) reproduces DESIGN.md Finding #8 (OPEN): removing an
-# attachment returns the entry to a content-state identical to an
-# older shared snapshot, the content-hash LCA matcher aliases to that
-# ancient generation, and the peer's not-yet-removed copy then reads
-# as a fresh add → the removal resurrects. Re-gate when #8 is fixed.
+# stay on the conservative no-auto-pick path until the remaining 5c
+# slice (both-sided attachment park/resolve) lands.
 
 set -euo pipefail
 

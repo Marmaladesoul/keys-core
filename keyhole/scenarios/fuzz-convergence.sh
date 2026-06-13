@@ -3,8 +3,9 @@
 # Scenario: the two-device convergence fuzzer — the thing keyhole was
 # built for (DESIGN.md payoff #1). Two replicas of one vault take
 # seeded-random concurrent edits (entry create / field edits / hard
-# delete — exactly the supported 5b cross-peer surface; see mutate()
-# for why location ops are excluded), then sync each round:
+# delete / attachment set+remove — the supported 5b+5c cross-peer
+# surface; see mutate() for why location ops are excluded), then sync
+# each round:
 #
 #   A ingests B  →  A resolves every parked conflict (random side)
 #   B ingests A  →  B must adopt A's resolutions (no re-park)
@@ -71,22 +72,23 @@ random_entry() { # $1=vault → uuid of a random live entry, "" if none
 }
 
 n=0  # monotonic counter so generated values never collide
-mutate() { # $1=vault $2=device-prefix (reserved for the attachment mix)
-    local v="$1" op e
-    : "$2"
+mutate() { # $1=vault $2=device-prefix (namespaces attachment names)
+    local v="$1" p="$2" op e
     n=$((n + 1))
     # Op mix = exactly the cross-peer surface the multipeer store
     # supports today: entry create, field edits, hard delete (5b
-    # tombstones). LOCATION ops (move/recycle/restore/create-group) are
-    # ABSENT — the deferred 5d slice. ATTACHMENT ops are ALSO absent
-    # here, in fuzz-attachments.sh instead: mixing them with field
-    # edits reaches the unshipped facets-alongside-held-conflict slice
-    # (resolving a parked conflict drops attachments added since the
-    # fork — DESIGN.md Finding #7), which this gate must not flake on.
-    # The scope ledger lives in sync-multipeer-store.md.
+    # tombstones), and attachment set/remove (5c — merged into this
+    # gate once Findings #7 + #8 were fixed: conflict rows carry
+    # attachment state, and the LCA matcher disambiguates generations).
+    # Attachment names stay DEVICE-PREFIXED: both-sided same-name
+    # divergence has no park/resolve path yet (the remaining 5c
+    # slice), so same-name clashes would stall on the deliberate
+    # no-auto-pick posture rather than reveal merge bugs. LOCATION ops
+    # (move/recycle/restore/create-group) are ABSENT — the deferred 5d
+    # slice. The scope ledger lives in sync-multipeer-store.md.
     # NB: if/fi rather than `[ -n ] &&` — under `set -e` a final failing
     # && would silently kill the whole run when a pick comes up empty.
-    op=$((RANDOM % 4))
+    op=$((RANDOM % 6))
     case $op in
         0) "$KEYHOLE" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
         1) e="$(random_entry "$v")"
@@ -95,6 +97,10 @@ mutate() { # $1=vault $2=device-prefix (reserved for the attachment mix)
            if [ -n "$e" ]; then "$KEYHOLE" update-entry "$v" "$e" --url "https://fz$n.example" --notes "note-$n" >/dev/null; fi ;;
         3) e="$(random_entry "$v")"
            if [ -n "$e" ]; then "$KEYHOLE" delete-entry "$v" "$e" >/dev/null; fi ;;
+        4) e="$(random_entry "$v")"
+           if [ -n "$e" ]; then "$KEYHOLE" set-attachment "$v" "$e" "${p}-att-$((RANDOM % 2))" --text "payload-$n" >/dev/null; fi ;;
+        5) e="$(random_entry "$v")"
+           if [ -n "$e" ]; then "$KEYHOLE" remove-attachment "$v" "$e" "${p}-att-$((RANDOM % 2))" >/dev/null 2>&1 || true; fi ;;
     esac
 }
 
