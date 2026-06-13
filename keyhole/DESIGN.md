@@ -421,13 +421,25 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   A) leaves the two replicas disagreeing on that one edge (the guard
   skips both sides) until a deterministic cycle-breaking pass lands —
   that pass + fuzzer group-move are the final-final 5d item.
-- **Next:** icon pool union (the last 5c sliver); then the last 5d
-  pieces — consuming group tombstones (recorded since 5b, never
-  consumed) for cross-peer group deletion, plus deterministic
-  cycle-breaking for mutual group moves (then group move/delete join
-  the fuzzer); the deferred previous-parent merge rules. `empty-bin`
-  verb; value-hash-based adoption matching (timestamp-free) as
-  hardening when resolution records grow fields.
+- **Done (2026-06-13, 5d cross-peer group delete):** `ingest_peer` now
+  CONSUMES peer group tombstones (recorded since 5b, never consumed) —
+  `reconcile_peer_group_deletes` removes a live local group the peer
+  tombstoned, **empty-only** (a group still holding a live child group
+  or entry is kept — never silently drop concurrently-added content)
+  and **edit-wins** (a local rename/move strictly after the deletion
+  keeps it). Ordered after the entry-delete pass (so a cascade-deleted
+  group reads empty) and before the tombstone-union (extracted into
+  `union_peer_tombstones`, run last so a just-removed object correctly
+  carries its tombstone — else a third peer would resurrect it). New
+  keyhole verb `delete-group`; pinned by
+  [group-delete.sh](scenarios/group-delete.sh) (empty + cascade) +
+  keys-engine `two_engine_group_delete_propagates_and_converges`.
+- **Next:** icon pool union (the last 5c sliver); then the final-final
+  5d item — deterministic cycle-breaking for concurrent mutual group
+  moves, after which group move + delete join the fuzzer mix; the
+  deferred previous-parent merge rules. `empty-bin` verb;
+  value-hash-based adoption matching (timestamp-free) as hardening when
+  resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old

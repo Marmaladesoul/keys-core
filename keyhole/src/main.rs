@@ -212,6 +212,15 @@ enum Command {
         /// New group name.
         name: String,
     },
+    /// Delete a group (cascading its entries + subgroups, recording
+    /// `<DeletedObjects>` tombstones), then persist. The divergence-maker
+    /// for 5d cross-peer group deletion.
+    DeleteGroup {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the group to delete (see `list-groups`).
+        uuid: String,
+    },
     /// Re-parent a group under another group, then persist. The
     /// divergence-maker for 5d group move (re-parent LWW).
     MoveGroup {
@@ -455,6 +464,10 @@ async fn main() -> Result<()> {
         Command::MoveGroup { vault, uuid, to } => {
             let session = Session::open(&vault, &password).await?;
             session.move_group(uuid, to).await?;
+        }
+        Command::DeleteGroup { vault, uuid } => {
+            let session = Session::open(&vault, &password).await?;
+            session.delete_group(uuid).await?;
         }
         Command::ListGroups { vault } => {
             let session = Session::open(&vault, &password).await?;
@@ -937,6 +950,16 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("move_group: {e:?}"))?;
         self.save().await?;
         println!("moved group {uuid} under {to} and saved to disk");
+        Ok(())
+    }
+
+    /// Delete a group (cascading), then persist.
+    async fn delete_group(&self, uuid: String) -> Result<()> {
+        self.engine
+            .delete_group(uuid.clone())
+            .map_err(|e| anyhow::anyhow!("delete_group: {e:?}"))?;
+        self.save().await?;
+        println!("deleted group {uuid} and saved to disk");
         Ok(())
     }
 
