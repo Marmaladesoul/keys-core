@@ -43,7 +43,7 @@ cp "$VAULT" "$PEER"
 "$KEYHOLE" ingest-peer "$VAULT" "$PEER" --owner device-b >/dev/null
 
 # --- the fork-A assertion: a SEPARATE process sees the held conflict -
-"$KEYHOLE" list-conflicts "$VAULT" | grep -q "$uuid" \
+"$KEYHOLE" list-conflicts "$VAULT" | grep "$uuid" >/dev/null \
     || { echo "FAIL: conflict not held across invocations (persistent mirror broken?)"; exit 1; }
 
 # --- the payload names the diverged field, both sides intact ---------
@@ -58,12 +58,12 @@ echo "$payload" | grep -q 'username="bob"' \
 # --- resolve choosing the peer side, again in a fresh process --------
 "$KEYHOLE" resolve "$VAULT" --entry "$uuid" --choose remote >/dev/null
 
-"$KEYHOLE" list-conflicts "$VAULT" | grep -q '(no held conflicts)' \
+"$KEYHOLE" list-conflicts "$VAULT" | grep '(no held conflicts)' >/dev/null \
     || { echo "FAIL: conflict still held after resolve"; exit 1; }
 
 # --- convergence must be ON DISK: nuke the mirror, re-ingest, check --
 rm -rf "$VAULT.mirror"
-"$KEYHOLE" list "$VAULT" | grep -q '<bob>' \
+"$KEYHOLE" list "$VAULT" | grep '<bob>' >/dev/null \
     || { echo "FAIL: resolved username (bob) did not persist to the KDBX"; exit 1; }
 
 # --- the convergence oracle: sync the resolution back to device B ----
@@ -71,7 +71,7 @@ rm -rf "$VAULT.mirror"
 # adopted (no re-park on B), and both replicas must digest identically
 # — the exact assertion the fuzz harness loops on.
 "$KEYHOLE" ingest-peer "$PEER" "$VAULT" --owner device-a >/dev/null
-"$KEYHOLE" list-conflicts "$PEER" | grep -q '(no held conflicts)' \
+"$KEYHOLE" list-conflicts "$PEER" | grep '(no held conflicts)' >/dev/null \
     || { echo "FAIL: device B re-parked a conflict the peer already resolved"; exit 1; }
 da="$("$KEYHOLE" digest "$VAULT")"
 db="$("$KEYHOLE" digest "$PEER")"

@@ -42,7 +42,7 @@ converged() { [ "$("$KEYHOLE" digest "$A")" = "$("$KEYHOLE" digest "$B")" ]; }
 "$KEYHOLE" update-entry "$A" "$uuid" --username a-user >/dev/null
 "$KEYHOLE" update-entry "$B" "$uuid" --username b-user >/dev/null
 "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
-"$KEYHOLE" list-conflicts "$A" | grep -q "$uuid" \
+"$KEYHOLE" list-conflicts "$A" | grep "$uuid" >/dev/null \
     || { echo "FAIL(precondition): expected a held conflict on A"; exit 1; }
 
 # --- THE BUG: resolve choosing remote must keep the attachment --------
@@ -51,7 +51,7 @@ converged() { [ "$("$KEYHOLE" digest "$A")" = "$("$KEYHOLE" digest "$B")" ]; }
 got="$("$KEYHOLE" cat-attachment "$A" "$uuid" doc.txt 2>/dev/null || echo MISSING)"
 [ "$got" = "precious" ] \
     || { echo "FAIL: choose-remote resolve dropped the attachment (got: $got)"; exit 1; }
-"$KEYHOLE" list "$A" | grep -q '<b-user>' \
+"$KEYHOLE" list "$A" | grep '<b-user>' >/dev/null \
     || { echo "FAIL: choose-remote resolve did not take the remote field"; exit 1; }
 
 # The resolution converges: B adopts, replicas agree, attachment intact.

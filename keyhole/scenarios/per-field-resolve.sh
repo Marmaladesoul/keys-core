@@ -32,7 +32,7 @@ cp "$A" "$B"
 "$KEYHOLE" update-entry "$B" "$uuid" --username b-user --notes b-notes >/dev/null
 
 "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
-"$KEYHOLE" show-conflict "$A" --entry "$uuid" | grep -q "field Notes" \
+"$KEYHOLE" show-conflict "$A" --entry "$uuid" | grep "field Notes" >/dev/null \
     || { echo "FAIL: expected a Notes delta alongside UserName"; exit 1; }
 
 # Mixed resolution: keep A's username, take B's notes.
@@ -40,7 +40,7 @@ cp "$A" "$B"
 
 # The mixed result, read from disk in a fresh mirror.
 rm -rf "$A.mirror"
-"$KEYHOLE" list "$A" | grep -q '<a-user>' \
+"$KEYHOLE" list "$A" | grep '<a-user>' >/dev/null \
     || { echo "FAIL: local-side username (a-user) lost in mixed resolution"; exit 1; }
 
 # Notes aren't in list output; prove the remote notes landed via the
@@ -57,7 +57,7 @@ de="$("$KEYHOLE" digest "$EXPECT")"
 
 # And the mixed outcome converges: B adopts A's resolution.
 "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
-"$KEYHOLE" list-conflicts "$B" | grep -q '(no held conflicts)' \
+"$KEYHOLE" list-conflicts "$B" | grep '(no held conflicts)' >/dev/null \
     || { echo "FAIL: B re-parked the mixed resolution"; exit 1; }
 db="$("$KEYHOLE" digest "$B")"
 [ "$da" = "$db" ] \

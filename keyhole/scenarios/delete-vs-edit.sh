@@ -40,11 +40,11 @@ sleep 1.1   # cross a whole-second boundary: the edit is genuinely later
 "$KEYHOLE" update-entry "$A" "$uuid" --username rescued >/dev/null
 
 "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
-"$KEYHOLE" list "$A" | grep -q '<rescued>' \
+"$KEYHOLE" list "$A" | grep '<rescued>' >/dev/null \
     || { echo "FAIL: post-delete edit was eaten by the peer's tombstone"; exit 1; }
 
 "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
-"$KEYHOLE" list "$B" | grep -q '<rescued>' \
+"$KEYHOLE" list "$B" | grep '<rescued>' >/dev/null \
     || { echo "FAIL: edited entry did not resurrect on the deleting side"; exit 1; }
 da="$("$KEYHOLE" digest "$A")"; db="$("$KEYHOLE" digest "$B")"
 [ "$da" = "$db" ] || { echo "FAIL: case-1 replicas did not converge"; exit 1; }
@@ -53,7 +53,7 @@ da="$("$KEYHOLE" digest "$A")"; db="$("$KEYHOLE" digest "$B")"
 "$KEYHOLE" create-entry "$A" "Doomed" --username brief >/dev/null
 duuid="$("$KEYHOLE" list "$A" | awk '/Doomed/ {print $1; exit}')"
 "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null   # share it first
-"$KEYHOLE" list "$B" | grep -q "$duuid" || { echo "FAIL: setup — Doomed did not sync to B"; exit 1; }
+"$KEYHOLE" list "$B" | grep "$duuid" || { echo "FAIL: setup — Doomed did not sync to B"; exit 1; } >/dev/null
 
 # Same second: no sleep between the two ops (each invocation is well
 # under a second; both mtimes floor to the same instant in practice).
@@ -64,14 +64,14 @@ duuid="$("$KEYHOLE" list "$A" | awk '/Doomed/ {print $1; exit}')"
 "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
 da="$("$KEYHOLE" digest "$A")"; db="$("$KEYHOLE" digest "$B")"
 [ "$da" = "$db" ] || { echo "FAIL: case-2 replicas did not converge after tie"; exit 1; }
-if "$KEYHOLE" list "$A" | grep -q "$duuid"; then
+if "$KEYHOLE" list "$A" | grep "$duuid"; then >/dev/null
     # The edit may legitimately land in the NEXT second on a slow run —
     # then edit-wins is correct. Accept either converged outcome, but
     # call out which one ran so a flaky tie isn't silently untested.
     echo "note: ops straddled a second boundary — edit-wins path exercised instead of the tie"
-    "$KEYHOLE" list "$B" | grep -q "$duuid" || { echo "FAIL: straddle case diverged"; exit 1; }
+    "$KEYHOLE" list "$B" | grep "$duuid" || { echo "FAIL: straddle case diverged"; exit 1; } >/dev/null
 else
-    "$KEYHOLE" list "$B" | grep -q "$duuid" && { echo "FAIL: tie outcome asymmetric"; exit 1; }
+    "$KEYHOLE" list "$B" | grep "$duuid" && { echo "FAIL: tie outcome asymmetric"; exit 1; } >/dev/null
 fi
 
 echo "PASS: post-delete edit wins and resurrects; same-second tie converges identically on both replicas"

@@ -263,24 +263,45 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   (both resolution sides, across reopen + cross-replica convergence)
   and keys-engine `parked_resolution_preserves_attachments` +
   `held_divergent_attachment_survives_resolving_another_entry`.
-- **[OPEN] LCA generation-aliasing resurrects removed attachments —
-  found by `fuzz-attachments.sh` on its first soak (keyhole finding
-  #8).** `find_common_ancestor` matches by content hash alone; when an
+- **[FIXED] LCA generation-aliasing silently diverged replicas under
+  attachment churn — found by `fuzz-attachments.sh` on its first soak
+  (keyhole finding #8).** `find_common_ancestor` matched by content
+  hash alone, walking local candidates newest-mtime-first; when an
   edit returns an entry to a content-state identical to an OLDER
-  shared snapshot (removing an attachment ⇒ back to the pre-add
-  state), the matcher can alias to that ancient generation. Against
-  the wrong ancestor, the peer's not-yet-synced copy reads as a fresh
-  one-sided *add* → auto re-adopt → the removal silently undoes
-  itself and replicas diverge. Mechanism confirmed by replaying
-  preserved artefacts with `KEYS_DEBUG_ADOPTION=1` (entry classified
-  in-sync per-entry while mirror and file disagreed). Any
-  return-to-prior-state edit can alias, not just attachments —
-  attachments just made it easy to reach. Fix direction: disambiguate
-  LCA candidates by generation (prefer the candidate implying the
-  fewest changes, or reinstate an (mtime, hash) compound key now that
-  Finding #4's flooring makes mtimes sync-safe).
-  `fuzz-attachments.sh` reproduces it ~1-in-7 runs and stays
-  manual/diagnostic until fixed.
+  shared snapshot (removing an attachment ⇒ back to the pre-add state;
+  restoring any old field value), the matcher aliased to that ancient
+  generation — the dominant live shape being same-second bursts, where
+  the stable mtime sort left history OLDEST-first inside the tie.
+  Against the wrong ancestor a one-sided change reads as both-sided
+  (swallowed by classify's no-park attachment posture → silent
+  divergence: `branch=in-sync` while the replicas disagreed) or a
+  stale peer copy reads as a fresh one-sided add (silent revert).
+  **Fix (keepass-merge): min-rank pair selection** — the ancestor is
+  the content-matching pair maximising `min(local generation rank,
+  remote generation rank)` (oldest snapshot = 0, current = highest):
+  the version sitting latest in BOTH lineages, which is what "fork
+  point" means. Two candidate fixes were empirically eliminated first,
+  worth remembering: a *(floored mtime, hash) compound match gate*
+  made the fuzzer WORSE (7/30 vs 19/30 baseline) because **the same
+  logical generation does not carry the same mtime on both replicas**
+  — classify's auto-merge builds the advanced entry from a clone of
+  the LOCAL side, so adopted changes keep the adopter's mtime
+  (observed live via `KEYS_DEBUG_LCA=1`: identical hashes one second
+  apart); and *generation-ordered walking alone* can't help when the
+  aliasing candidate IS the local current (always walked first).
+  Soak: 30/30 seeds green (was ~1-in-7 red). The env-gated
+  `KEYS_DEBUG_LCA=1` candidate dump in `find_common_ancestor` stays,
+  kin to `KEYS_DEBUG_ADOPTION` (uuid + ranks + floored mtimes + 4-byte
+  hash prefixes + attachment counts only — no names, no values).
+  Pinned by keepass-merge `lca_same_second_tie_prefers_newest_generation`
+  + `lca_replace_back_to_old_value_does_not_alias` and keyhole
+  [attachment-remove-no-resurrect.sh](scenarios/attachment-remove-no-resurrect.sh)
+  (the deterministic cross-second remove case — NB it passed even
+  pre-fix thanks to attachment tombstones; the fuzzer remains the
+  authoritative gate). `fuzz-attachments.sh` is re-gated into
+  `run-all.sh`, and `fuzz-convergence.sh`'s mix now carries attachment
+  ops (the 5b+5c surface, device-prefixed names until both-sided
+  park/resolve lands).
 - **Done (2026-06-13):** `set-bin <vault> on|off [--delete-bin-contents]`
   — the behaviour behind Keys-Mac's Vault Info recycle-bin toggle
   (agreed design from the KeysCore #136 review: respect the per-vault
@@ -294,12 +315,18 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   peer's attachment state (migration 0009) and the resolver's rebuilt
   "theirs" carries it — resolving a parked conflict no longer drops
   attachments added since the fork. See Findings.
-- **Next:** the remaining 5c slice — fix Finding #8 (LCA generation
-  disambiguation), then both-sided attachment park/resolve and
-  blob-pool GC (GC must treat `conflict_entry_attachment` as a
-  reference root), then merge + re-gate the fuzz mixes; `empty-bin`
-  verb; value-hash-based adoption matching (timestamp-free) as
-  hardening when resolution records grow fields.
+- **Done (2026-06-13, Finding #8 fix):** `find_common_ancestor` is
+  generation-aware (min-rank pair selection, keepass-merge); both
+  fuzzers are CI gates and the main fuzz mix carries attachment ops.
+  See Findings.
+- **Next:** the remaining 5c slice — both-sided attachment
+  park/resolve and blob-pool GC (GC must treat
+  `conflict_entry_attachment` as a reference root; same-name
+  both-sided divergence currently neither parks nor auto-picks, and
+  with #7's conflict rows storing attachments the park path is now
+  buildable), then 5d (groups/location — re-enable the fuzzer's
+  location ops); `empty-bin` verb; value-hash-based adoption matching
+  (timestamp-free) as hardening when resolution records grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old
