@@ -124,20 +124,22 @@ and `keyhole --uuid-seed --at create` uses it — root = `from_u64_pair(seed,
 an 8e9 band (clear of the per-op `mix()` 0–4e9 band and the 9e9+ seed-time
 band), so create replays. Proven by `scenarios/deterministic-vault-uuids.sh`.
 
-**Subshell `$RANDOM` is a replay trap (partly fixed).** While wiring the
-above into the fuzzer, a double-run harness exposed that the target-pickers
-(`random_entry`/`random_group`/…) read `$RANDOM` *inside* `$(...)` command
-substitutions — and bash reseeds a subshell's `$RANDOM` with run-varying
-entropy, so `$(...)`-based selection is NOT reproducible across runs (it
-silently desynced the whole op stream). Pickers now select via a
-deterministic `pick_idx(n, salt, SEED)` against a UUID-sorted list (never
-subshell `$RANDOM`), and `resolve_all` chooses its side by a cksum of
-`(uuid, $AT)`. This removed a real class of desync but did NOT make the
-fuzzer fully replayable — two same-seed runs still diverge intermittently,
-even at one round (see Findings → "Fuzzer cross-run replay residual").
-`scenarios/fuzz-replay-determinism.sh` is the forcing function for that
-open work (excluded from `run-all.sh` until it's a true gate); create-uuid
-determinism itself is solid and gated by `deterministic-vault-uuids.sh`.
+**Subshell `$RANDOM` is a replay trap (fixed in two places).** While wiring
+the above into the fuzzer, a double-run harness exposed that `$RANDOM` read
+*inside* a `$(...)` command substitution is NOT reproducible across runs —
+bash reseeds a subshell's `$RANDOM` with run-varying entropy, silently
+desyncing the whole op stream. Two instances, both now fixed: (1) the
+target-pickers (`random_entry`/`random_group`/…) selected with `awk -v
+r=$RANDOM` inside `$(...)` — now select via a deterministic `pick_idx(n,
+salt, SEED)` against a UUID-sorted list (`resolve_all` likewise chooses its
+side by a cksum of `(uuid, $AT)`); and (2) the per-device op **count** was
+drawn as `$(seq 1 $((RANDOM % 3 + 1)))`, evaluating `$RANDOM` in the `seq`
+subshell — the cross-run replay residual (task #33), now drawn in the main
+shell first. With both fixed the fuzzer replays byte-for-byte:
+`scenarios/fuzz-replay-determinism.sh` is a full multi-round, multi-seed gate
+(seeds 42/43/777 × 6 rounds) and is **part of `run-all.sh`**; create-uuid
+determinism is separately gated by `deterministic-vault-uuids.sh`. General
+trap write-up: `reference_bash_subshell_random`.
 
 ## The persistent mirror
 
@@ -540,27 +542,39 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   `pick_idx(n, salt, SEED)` (main-shell op counter, never subshell
   `$RANDOM`) against a UUID-sorted list, with a per-call salt so two picks
   in one mutate (op 9's source+dest) don't collapse; `resolve_all` chooses
-  its side by a cksum of `(uuid, $AT)`. This removes a whole class of
-  desync, but does NOT by itself make the fuzzer replayable — a deeper
-  residual remains (next finding). (It's the class of bug task #28's "audit
-  HashMap order" was meant to catch but didn't — the headline source was in
-  bash, not the engine.)
+  its side by a cksum of `(uuid, $AT)`. This removed a whole class of desync
+  but did NOT by itself make the fuzzer replayable — one more instance of
+  the *same* trap survived (the per-device op count, also a `$(…)` subshell
+  draw); see the cross-run replay residual finding below, now [FIXED]. (It's
+  the class of bug task #28's "audit HashMap order" was meant to catch but
+  didn't — the headline source was in bash, not the engine.)
 
-- **[OPEN] Fuzzer cross-run replay residual.** After create-uuid pinning
-  (task #29) + the subshell-`$RANDOM` picker fix above, two same-seed runs
-  STILL diverge intermittently — flaky even at one round (e.g. 2 fails + 1
-  pass over three back-to-back `fuzz-replay-determinism.sh` runs: an extra
-  group, or `alpha` left at `u-alpha` vs `edit-6`). The op stream itself
-  desyncs (a mutate count / op-target differs), so a `$RANDOM`-stream or
-  selection draw is still run-varying somewhere — NOT yet fully isolated.
-  Within each run both peers converge (the convergence oracle is 30/30
-  green), so this is a reproducibility gap, not a convergence bug. The
-  remaining source is either another subshell/run-varying draw in a
-  sometimes-taken op path, or a process-stable-but-run-varying engine
-  ordering. Tracked as a follow-up; `fuzz-replay-determinism.sh` is kept as
-  the forcing function but **excluded from `run-all.sh`** (it's not a green
-  gate yet). `deterministic-vault-uuids.sh` (create-uuid determinism) is
-  rock-solid (5/5) and IS gated.
+- **[FIXED] Fuzzer cross-run replay residual (task #33) — the per-device op
+  count was drawn in a `$(seq …)` subshell.** After create-uuid pinning
+  (task #29) + the subshell-`$RANDOM` *picker* fix above, two same-seed runs
+  STILL diverged intermittently — flaky even at one round (2 fails + 1 pass
+  over three back-to-back `fuzz-replay-determinism.sh` runs; symptom: an extra
+  `g-$n` group, i.e. an op-7 `create-group` that fired in one run but not the
+  other, plus trailing op-target drift). **Mechanism:** the same
+  subshell-`$RANDOM` trap as the pickers, one rung up. Each round drew the
+  number of "offline" edits per device as `for _ in $(seq 1 $((RANDOM %
+  3 + 1)))` — and `$((RANDOM % 3 + 1))` is evaluated *inside* the `$(seq …)`
+  command-substitution subshell, which bash reseeds with run-varying entropy.
+  So the **count** of mutations per device per round varied run-to-run (an
+  extra op → an extra `g-$n` group → cascading op-target drift), and the draw
+  didn't even advance the deterministic main-shell stream. Reproduced
+  byte-for-byte: a 5-process `bash -c` harness showed the subshell draw
+  yielding `x`/`xx`/`xxx` across runs while a main-shell assignment yielded a
+  constant. **Fix:** draw the count in the **main shell** first
+  (`na=$((RANDOM % 3 + 1)); for _ in $(seq 1 "$na"); …`), a pure function of
+  the seeded stream. Within each run both peers always converged (the
+  convergence oracle was 30/30 green throughout), so this was purely a
+  reproducibility gap, never a convergence bug. **Now solid:**
+  `fuzz-replay-determinism.sh` was promoted to a full multi-round, multi-seed
+  gate (seeds 42/43/777 × 6 rounds, byte-for-byte) and **re-included in
+  `run-all.sh`**; soaked 18/18 across seeds {42,43,777,115,179,7} × rounds
+  {1,6,20} and 12/12 at one round, with convergence still 240/240 green over
+  the new op stream. The general trap is in `reference_bash_subshell_random`.
 
 - **[FIXED] Finding #10 — a dissolved conflict left a ghost badge
   (`parked_conflict_uuids` reported a conflict `held_conflict_payload`

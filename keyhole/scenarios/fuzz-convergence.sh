@@ -262,8 +262,17 @@ for round in $(seq 1 "$ROUNDS"); do
     AT=$((CLOCK_BASE + round * 60000))   # edits this round: +60s per round
 
     # Concurrent edits while "offline": 1–3 per device, all at $AT.
-    for _ in $(seq 1 $((RANDOM % 3 + 1))); do mutate "$A" a; done
-    for _ in $(seq 1 $((RANDOM % 3 + 1))); do mutate "$B" b; done
+    # CRUCIAL: draw the per-device op count in the MAIN shell first. Reading
+    # $RANDOM directly inside `$(seq 1 $((RANDOM % 3 + 1)))` evaluates it in
+    # the command-substitution SUBSHELL, which bash reseeds with run-varying
+    # entropy — so the count (hence the whole op stream) desynced across two
+    # runs of one seed, even at a single round. THIS was the cross-run replay
+    # residual: a varying count produced an extra/absent `g-$n` group (op 7)
+    # and trailing op-target drift. Same subshell-$RANDOM trap the pickers hit
+    # (see reference_bash_subshell_random + DESIGN.md Findings); a main-shell
+    # assignment is a pure function of the seeded stream, so it replays.
+    na=$((RANDOM % 3 + 1)); for _ in $(seq 1 "$na"); do mutate "$A" a; done
+    nb=$((RANDOM % 3 + 1)); for _ in $(seq 1 "$nb"); do mutate "$B" b; done
 
     # Guaranteed contention: both devices edit the battleground entry's
     # same field to distinct values, so a genuine clash parks this round

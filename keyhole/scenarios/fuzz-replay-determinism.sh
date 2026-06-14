@@ -1,30 +1,32 @@
 #!/usr/bin/env bash
 #
-# Task #29 end-to-end: prove the convergence fuzzer REPLAYS byte-for-byte.
-# With the op-stream seeded (bash $RANDOM), entity ids seeded (engine
-# UuidSource) and timestamps pinned (--at), the last gap was the create
-# itself — the root group + eager recycle bin were minted from random v4
-# (kdbx.rs), so two runs of the same FUZZ_SEED produced vaults that
-# differed in those ids and a failure could be preserved but never
-# re-derived. Now `create` draws them from a seeded keepass-core
-# UuidSource too (Vault::create_empty_deterministic), so a whole run is a
-# pure function of its seed.
+# Prove the convergence fuzzer REPLAYS byte-for-byte across two runs of one
+# seed. Four non-determinism sources had to be pinned to get here:
+#   1. the op stream            — bash $RANDOM seeded from FUZZ_SEED;
+#   2. entity ids               — engine UuidSource (--uuid-seed);
+#   3. timestamps               — injected clock (--at);
+#   4. create-time root/bin ids — Vault::create_empty_deterministic (task #29);
+# plus two bash subshell-$RANDOM traps that silently desynced the op stream
+# across runs (a subshell's $RANDOM is reseeded with run-varying entropy):
+#   - the target pickers read $RANDOM inside $(...) — fixed by pick_idx
+#     (deterministic main-shell counter); and
+#   - the per-device op COUNT was drawn as `$(seq 1 $((RANDOM % 3 + 1)))`,
+#     evaluating $RANDOM in the seq subshell — THE cross-run replay residual,
+#     fixed by drawing the count in the main shell first.
+# With all six pinned, a whole run (create included) is a pure function of
+# its seed. (See keyhole DESIGN.md → Findings and reference_bash_subshell_random.)
 #
-# This runs the fuzzer twice with one seed (via the FUZZ_KEEP hook, which
-# dumps each device's final entries + groups-with-uuids + content digest)
-# and asserts the two captures are identical. The groups capture includes
-# the create-time root/bin uuids, so this fails the instant create
-# determinism regresses — not just engine-side determinism.
+# Each (seed) is run twice via the fuzzer's FUZZ_KEEP hook — which dumps each
+# device's final entries + groups-with-uuids + content digest — and the two
+# captures are asserted byte-identical. The groups capture includes the
+# create-time root/bin uuids, so this fails the instant create determinism
+# regresses, not just engine-side determinism.
 #
-# SCOPE (current): defaults to ONE round, which replays byte-for-byte and
-# guards the create-uuid + deterministic-picker + deterministic-resolve
-# work. Cranking FUZZ_ROUNDS past ~1 currently surfaces an OPEN residual:
-# a rare, compounding cross-run divergence over many rounds (see keyhole
-# DESIGN.md → "Fuzzer multi-round replay residual"). Round 1 is proven
-# deterministic (draws, picks, content all identical across runs); the
-# multi-round residual is a separate, deeper investigation. Until it's
-# closed, this scenario is a single-round regression guard, not a full
-# multi-round replay proof.
+# SCOPE: a full multi-round, multi-seed replay gate. Sweeps a few seeds at a
+# soak round count (the residual compounded over rounds, so >1 round is the
+# sensitive case) and proves each replays byte-for-byte. Overridable:
+#   FUZZ_SEEDS="42 43 777"   the seeds to sweep
+#   FUZZ_ROUNDS=6            rounds per seed (per the two internal runs)
 
 set -euo pipefail
 
@@ -32,27 +34,42 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 FUZZER="$HERE/fuzz-convergence.sh"
 export KEYHOLE_PASSWORD="keyhole-scenario-pw"
 
+# Default sweep: the headline seed plus a few that historically surfaced
+# convergence/parity findings (43, 777). Each is replay-checked independently.
+SEEDS="${FUZZ_SEEDS:-42 43 777}"
+ROUNDS="${FUZZ_ROUNDS:-6}"
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-SEED="${FUZZ_SEED:-42}"
-ROUNDS="${FUZZ_ROUNDS:-1}"
-
-run() {
-    FUZZ_SEED="$SEED" FUZZ_ROUNDS="$ROUNDS" FUZZ_KEEP="$1" bash "$FUZZER" >/dev/null
+run() { # $1=seed $2=capture-dir
+    FUZZ_SEED="$1" FUZZ_ROUNDS="$ROUNDS" FUZZ_KEEP="$2" bash "$FUZZER" >/dev/null
 }
 
-run "$TMP/run1"
-run "$TMP/run2"
+fails=0
+for seed in $SEEDS; do
+    d1="$TMP/$seed/run1"
+    d2="$TMP/$seed/run2"
+    run "$seed" "$d1"
+    run "$seed" "$d2"
 
-if ! diff -r "$TMP/run1" "$TMP/run2" >"$TMP/delta" 2>&1; then
-    echo "FAIL: same-seed runs diverged — the fuzzer is not byte-reproducible:"
-    cat "$TMP/delta"
+    if ! diff -r "$d1" "$d2" >"$TMP/$seed.delta" 2>&1; then
+        echo "FAIL: seed=$seed ($ROUNDS rounds) — runs diverged, fuzzer is not byte-reproducible:"
+        cat "$TMP/$seed.delta"
+        fails=$((fails + 1))
+        continue
+    fi
+    # Guard against a vacuous pass if the FUZZ_KEEP hook broke.
+    if [ ! -s "$d1/device-a.kdbx.groups" ]; then
+        echo "FAIL: seed=$seed — replay capture is empty (FUZZ_KEEP hook produced nothing)"
+        fails=$((fails + 1))
+        continue
+    fi
+    echo "ok: seed=$seed ($ROUNDS rounds) — two runs byte-identical (create incl. root/bin uuids replays)"
+done
+
+if [ "$fails" -ne 0 ]; then
+    echo "FAIL: $fails seed(s) did not replay"
     exit 1
 fi
-
-# Guard against the capture being empty (a vacuous pass if the hook broke).
-[ -s "$TMP/run1/device-a.kdbx.groups" ] \
-    || { echo "FAIL: replay capture is empty (FUZZ_KEEP hook produced nothing)"; exit 1; }
-
-echo "PASS: two runs of seed=$SEED ($ROUNDS rounds) are byte-identical (create incl. root/bin uuids replays)"
+echo "PASS: every seed [$SEEDS] replays byte-for-byte at $ROUNDS rounds"

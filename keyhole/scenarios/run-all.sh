@@ -21,17 +21,15 @@ failed_names=()
 for s in "$DIR"/*.sh; do
     name="$(basename "$s")"
     [ "$name" = "run-all.sh" ] && continue
-    # fuzz-replay-determinism.sh is a WIP replay-hardening harness, not yet a
-    # gate: single-round replay is still flaky pending the open multi-round
-    # residual (keyhole DESIGN.md → Findings; task: fuzzer replay residual).
-    # Run it manually (`bash scenarios/fuzz-replay-determinism.sh`) while
-    # chasing that finding; excluded here so the suite stays a true gate.
-    [ "$name" = "fuzz-replay-determinism.sh" ] && continue
-    # Both fuzzers are full CI gates: fuzz-convergence since Findings
-    # #4 + #5 (timestamp flooring + dissolved-conflict badge clearing),
-    # fuzz-attachments since Finding #8 (LCA generation disambiguation)
-    # — each soaked green at re-gate time. Interleaving varies
-    # run-to-run (fresh uuids), so a red here is a real convergence
+    # fuzz-replay-determinism.sh is now a full CI gate: the cross-run replay
+    # residual (the per-device op count drawn in a $(seq …) subshell) is fixed,
+    # and it sweeps seeds 42/43/777 × 6 rounds proving byte-for-byte replay
+    # (keyhole DESIGN.md → Findings → "Fuzzer cross-run replay residual" FIXED).
+    # Both convergence fuzzers are full CI gates too: fuzz-convergence since
+    # Findings #4 + #5 (timestamp flooring + dissolved-conflict badge
+    # clearing), fuzz-attachments since Finding #8 (LCA generation
+    # disambiguation) — each soaked green at re-gate time. Interleaving varies
+    # run-to-run (fresh uuids), so a red there is a real convergence
     # bug: the failure preserves both vaults + mirrors for post-mortem.
     printf '\n── %s ─────────────────────────\n' "$name"
     if bash "$s"; then
