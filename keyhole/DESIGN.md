@@ -612,6 +612,20 @@ GUI) instead of one — short-term effort bought for compounding payoff.
     badge stays a trivial `SELECT` — reconciliation is on the write side
     and is a cheap "any rows?" no-op for non-conflicted entries; only an
     entry actually in conflict pays the projection + per-owner merge.
+  - **e2e-pinned (task #31, the post-ingest site):**
+    `scenarios/conflict-postingest-sweep-different-owner.sh` drives the
+    different-owner case end-to-end through keyhole — hub parks vs p1/p2/p3,
+    then adopts p1's propagated resolution (hub → p1's value), which the
+    owner-scoped ingest arm only clears for p1; the sweep must additionally
+    dissolve p2 (which held the same value) while keeping the genuinely
+    divergent p3. A fourth peer keeps the entry badged throughout, so the
+    owner-agnostic badge is blind to whether p2 was swept — the assertion
+    needs the new `conflict-owners <vault> <entry>` verb (a pure `SELECT`,
+    so reading it doesn't trigger the lazy heal and the eager drop is what's
+    proven). Surfaced `keys-engine::Engine::conflict_owners` →
+    `keys-ffi::Engine::conflict_owners` (the per-owner companion to
+    `entries_with_parked_conflict`). Teeth verified: with the sweep removed
+    the scenario goes red (`owners=[p2, p3]`, same badge).
   - **NB the fuzzer catch was never replayable** (the root group +
     recycle-bin uuids are minted in `Vault::create_empty`, *outside* the
     engine's seeded `UuidSource`, so they stay random per run; seeds

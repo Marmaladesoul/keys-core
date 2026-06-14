@@ -1136,6 +1136,20 @@ impl Engine {
         })
     }
 
+    /// Return the distinct peer owner ids currently holding a parked conflict
+    /// row for `entry_uuid`, sorted — empty if the entry carries no parked
+    /// conflict. The per-owner companion to
+    /// [`Self::entries_with_parked_conflict`] (which only answers "is this
+    /// entry badged?"): this answers "which peers does it still diverge
+    /// from?", letting a caller distinguish states that share one badge count
+    /// — e.g. confirming the post-ingest dissolve sweep dropped exactly the
+    /// converged owner's row. See
+    /// [`keys_engine::Engine::conflict_owners`].
+    pub fn conflict_owners(&self, entry_uuid: String) -> Result<Vec<String>, EngineError> {
+        let u = parse_uuid(&entry_uuid, "entry")?;
+        self.with_engine(|e| Ok(e.conflict_owners(u)?))
+    }
+
     /// Dismiss the held-conflict badge on `entry_uuid` locally (drop it from
     /// the derived held set) and clean up any legacy `keys.field_conflict.v1`
     /// history markers from older builds. Cross-peer convergence is driven by

@@ -206,6 +206,19 @@ enum Command {
         #[arg(long)]
         entry: Option<String>,
     },
+    /// Print the distinct peer owner ids that still hold a parked conflict
+    /// row for one entry — one per line, sorted, machine-greppable. The
+    /// per-owner companion to `list-conflicts` (which only says *whether* an
+    /// entry is badged): this says *which peers* it still diverges from, so a
+    /// test can prove the post-ingest dissolve sweep dropped exactly the
+    /// converged owner's row while leaving a still-divergent peer parked.
+    /// Reads the persistent mirror (owner rows survive across processes).
+    ConflictOwners {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry whose conflict owners to list.
+        entry: String,
+    },
     /// Print the hex SHA-256 digest of the vault's user-visible
     /// content (fields, locations, icons, group tree, recycle-bin
     /// state). Equal digests ⇔ converged replicas — the convergence
@@ -469,6 +482,10 @@ async fn main() -> Result<()> {
         Command::ShowConflict { vault, entry } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.show_conflict(entry).await?;
+        }
+        Command::ConflictOwners { vault, entry } => {
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.conflict_owners(entry)?;
         }
         Command::Digest { vault } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
@@ -938,6 +955,25 @@ impl Session {
             println!("{u}");
         }
         println!("\n{} held conflict(s)", held.len());
+        Ok(())
+    }
+
+    /// Print the distinct peer owner ids holding a parked conflict row for
+    /// `entry` — one per line, sorted, greppable. Empty set prints a single
+    /// `(no parked conflict)` marker (matching `list_conflicts`' style) so a
+    /// scenario can assert "this entry diverges from exactly these peers".
+    fn conflict_owners(&self, entry: String) -> Result<()> {
+        let owners = self
+            .engine
+            .conflict_owners(entry)
+            .map_err(|e| anyhow::anyhow!("conflict_owners: {e:?}"))?;
+        if owners.is_empty() {
+            println!("(no parked conflict)");
+            return Ok(());
+        }
+        for o in &owners {
+            println!("{o}");
+        }
         Ok(())
     }
 

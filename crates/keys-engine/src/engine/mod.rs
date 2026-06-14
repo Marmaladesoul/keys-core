@@ -955,6 +955,25 @@ impl Engine {
         reconcile::entries_with_parked_conflict(self)
     }
 
+    /// The distinct peer owner ids currently holding a parked conflict row
+    /// for `entry_uuid`, sorted ascending — empty if the entry carries no
+    /// parked conflict.
+    ///
+    /// The per-owner companion to [`Self::entries_with_parked_conflict`],
+    /// which only answers "is this entry badged?". This answers "which peers
+    /// does it still diverge from?", so a caller can tell apart two states
+    /// that share one badge count: e.g. that the post-ingest dissolve sweep
+    /// (`reconcile_all_conflict_rows`) dropped exactly the now-converged
+    /// owner's row while leaving a genuinely-divergent peer parked.
+    /// Read-only; the trivial badge `SELECT` is unaffected.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Sqlite`] on storage failure.
+    pub fn conflict_owners(&self, entry_uuid: uuid::Uuid) -> Result<Vec<String>, EngineError> {
+        crate::conflict_rows::conflict_owners_for(self.conn(), entry_uuid)
+    }
+
     /// Dismiss the held-conflict badge on `entry_uuid` by dropping its owner
     /// (`conflict_*`) rows across every peer.
     ///
