@@ -113,14 +113,31 @@ op counter `n`; seed-time creates use a high range) so every entity id
 is unique AND reproducible across runs — `FUZZ_SEED=777` went from
 intermittent to 3/3 consistent.
 
-**Caveat — not byte-definitive.** The root group + default recycle bin
-are minted by `Vault::create_empty` (keys-ffi→keepass-core), *outside*
-the engine's `UuidSource`, so they stay random per vault. Within a run
-both devices share them (via `cp`) and they never participate in the
-entry conflicts under test, so convergence/replay of a *finding* is
-unaffected — but two runs' *content digests* still differ by those two
-ids. Pinning them too (a keepass-core `Vault::create_empty` seed) is the
-follow-up for byte-identical cross-run replay.
+**Create-time ids are pinned too (task #29).** The root group + default
+recycle bin used to be minted by `Vault::create_empty` *outside* the
+engine's `UuidSource`, so they stayed random per vault. keepass-core now
+has its own `model::UuidSource` (mirroring the engine's) and a
+`Kdbx::create_empty_v4_deterministic(clock, uuids)` entry point; keys-ffi
+surfaces it as `Vault::create_empty_deterministic(uuid_seed, clock_ms)`,
+and `keyhole --uuid-seed --at create` uses it — root = `from_u64_pair(seed,
+0)`, eager bin = `from_u64_pair(seed, 1)`. The fuzzer seeds `create` from
+an 8e9 band (clear of the per-op `mix()` 0–4e9 band and the 9e9+ seed-time
+band), so create replays. Proven by `scenarios/deterministic-vault-uuids.sh`.
+
+**Subshell `$RANDOM` is a replay trap (partly fixed).** While wiring the
+above into the fuzzer, a double-run harness exposed that the target-pickers
+(`random_entry`/`random_group`/…) read `$RANDOM` *inside* `$(...)` command
+substitutions — and bash reseeds a subshell's `$RANDOM` with run-varying
+entropy, so `$(...)`-based selection is NOT reproducible across runs (it
+silently desynced the whole op stream). Pickers now select via a
+deterministic `pick_idx(n, salt, SEED)` against a UUID-sorted list (never
+subshell `$RANDOM`), and `resolve_all` chooses its side by a cksum of
+`(uuid, $AT)`. This removed a real class of desync but did NOT make the
+fuzzer fully replayable — two same-seed runs still diverge intermittently,
+even at one round (see Findings → "Fuzzer cross-run replay residual").
+`scenarios/fuzz-replay-determinism.sh` is the forcing function for that
+open work (excluded from `run-all.sh` until it's a true gate); create-uuid
+determinism itself is solid and gated by `deterministic-vault-uuids.sh`.
 
 ## The persistent mirror
 
@@ -509,6 +526,41 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   — worth a look when `restore` is wired.
 
 ## Findings (surfaced by keyhole)
+
+- **[FIXED] Fuzzer pickers read `$RANDOM` inside `$(...)` — not
+  replayable.** Surfaced by the new double-run replay harness
+  (`fuzz-replay-determinism.sh`) during task #29. The target pickers
+  (`random_entry` / `random_group` / `random_movable_group`) selected with
+  `awk -v r=$((RANDOM))` *inside* a `$(...)` command substitution. bash
+  reseeds a **subshell's** `$RANDOM` with run-varying entropy (verified:
+  main-shell draws identical across runs, subshell draws differ), so
+  `$(...)`-based selection was never reproducible — it silently desynced
+  the whole op stream, which is why a hand-reproducible bug could go
+  unhit across a 60×40 soak. **Fix:** pickers select via a deterministic
+  `pick_idx(n, salt, SEED)` (main-shell op counter, never subshell
+  `$RANDOM`) against a UUID-sorted list, with a per-call salt so two picks
+  in one mutate (op 9's source+dest) don't collapse; `resolve_all` chooses
+  its side by a cksum of `(uuid, $AT)`. This removes a whole class of
+  desync, but does NOT by itself make the fuzzer replayable — a deeper
+  residual remains (next finding). (It's the class of bug task #28's "audit
+  HashMap order" was meant to catch but didn't — the headline source was in
+  bash, not the engine.)
+
+- **[OPEN] Fuzzer cross-run replay residual.** After create-uuid pinning
+  (task #29) + the subshell-`$RANDOM` picker fix above, two same-seed runs
+  STILL diverge intermittently — flaky even at one round (e.g. 2 fails + 1
+  pass over three back-to-back `fuzz-replay-determinism.sh` runs: an extra
+  group, or `alpha` left at `u-alpha` vs `edit-6`). The op stream itself
+  desyncs (a mutate count / op-target differs), so a `$RANDOM`-stream or
+  selection draw is still run-varying somewhere — NOT yet fully isolated.
+  Within each run both peers converge (the convergence oracle is 30/30
+  green), so this is a reproducibility gap, not a convergence bug. The
+  remaining source is either another subshell/run-varying draw in a
+  sometimes-taken op path, or a process-stable-but-run-varying engine
+  ordering. Tracked as a follow-up; `fuzz-replay-determinism.sh` is kept as
+  the forcing function but **excluded from `run-all.sh`** (it's not a green
+  gate yet). `deterministic-vault-uuids.sh` (create-uuid determinism) is
+  rock-solid (5/5) and IS gated.
 
 - **[FIXED] Finding #10 — a dissolved conflict left a ghost badge
   (`parked_conflict_uuids` reported a conflict `held_conflict_payload`

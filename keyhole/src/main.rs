@@ -66,9 +66,11 @@ struct Cli {
     /// last piece (with `--at`) that makes a run byte-reproducible, so a
     /// fuzz failure replays instead of merely preserving artefacts. Use
     /// a DISTINCT seed per device — two devices sharing a seed would
-    /// mint the same id for different entities. Requires `--at`. Ignored
-    /// by `create` (the root group + recycle bin are minted in
-    /// keepass-core, outside the engine's seeded id source).
+    /// mint the same id for different entities. Requires `--at`. Honoured
+    /// by `create` too: the root group (`from_u64_pair(seed, 0)`) and the
+    /// eager recycle bin (`from_u64_pair(seed, 1)`) are drawn from a
+    /// keepass-core seeded source, so the whole vault — create included —
+    /// is replayable.
     #[arg(long = "uuid-seed", global = true)]
     uuid_seed: Option<u64>,
 }
@@ -377,7 +379,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Create { vault } => {
-            create_vault(&vault, &password)?;
+            create_vault(&vault, &password, clock_ms, uuid_seed)?;
         }
         Command::CreateEntry {
             vault,
@@ -1335,20 +1337,49 @@ fn resolution_choosing(
 }
 
 /// Create a fresh empty vault via the same FFI entry point the GUI uses.
-fn create_vault(vault: &Path, password: &str) -> Result<()> {
+///
+/// With `--uuid-seed` + `--at` the root group + recycle-bin ids and
+/// creation timestamps are pinned (via `Vault::create_empty_deterministic`)
+/// so a fuzz run replays byte-for-byte; without them the production path
+/// mints random ids under the system clock. `--uuid-seed` requires `--at`,
+/// matching the engine-open contract.
+fn create_vault(
+    vault: &Path,
+    password: &str,
+    clock_ms: Option<i64>,
+    uuid_seed: Option<u64>,
+) -> Result<()> {
     anyhow::ensure!(
         !vault.exists(),
         "refusing to overwrite existing file: {}",
         vault.display()
     );
-    Vault::create_empty(
-        vault.to_string_lossy().into_owned(),
-        password.to_owned(),
-        "keyhole".to_owned(),
-        Some(Arc::new(FixedProtector)),
-        None,
-    )
-    .map_err(|e| anyhow::anyhow!("create_empty: {e:?}"))?;
+    let path = vault.to_string_lossy().into_owned();
+    match (clock_ms, uuid_seed) {
+        (Some(ms), Some(seed)) => {
+            Vault::create_empty_deterministic(
+                path,
+                password.to_owned(),
+                "keyhole".to_owned(),
+                Some(Arc::new(FixedProtector)),
+                None,
+                seed,
+                ms,
+            )
+            .map_err(|e| anyhow::anyhow!("create_empty_deterministic: {e:?}"))?;
+        }
+        (None, Some(_)) => anyhow::bail!("--uuid-seed requires --at on create"),
+        (_, None) => {
+            Vault::create_empty(
+                path,
+                password.to_owned(),
+                "keyhole".to_owned(),
+                Some(Arc::new(FixedProtector)),
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("create_empty: {e:?}"))?;
+        }
+    }
     println!("created {}", vault.display());
     Ok(())
 }

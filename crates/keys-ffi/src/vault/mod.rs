@@ -17,7 +17,10 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, TimeZone, Utc};
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
-use keepass_core::model::{Entry as KcEntry, EntryId, Group as KcGroup, GroupId};
+use keepass_core::model::{
+    Clock, Entry as KcEntry, EntryId, FixedClock, Group as KcGroup, GroupId, NewGroup, SeededUuids,
+    UuidSource,
+};
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
 
@@ -152,60 +155,53 @@ impl Vault {
         field_protector: Option<Arc<dyn VaultFieldProtector>>,
         temp_dir: Option<String>,
     ) -> Result<Arc<Self>, VaultError> {
-        let path_buf = PathBuf::from(&path);
-        let secret = SecretString::from(password);
-        let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
-        let bridged = bridge_protector(field_protector);
-
-        // Build the unlocked vault, derive the transformed key against
-        // the freshly-generated KDF params.
-        let mut kdbx = Kdbx::<keepass_core::kdbx::Unlocked>::create_empty_v4_with_protector(
-            &composite,
+        Self::create_empty_inner(
+            path,
+            password,
             database_name,
-            bridged,
-        )?;
+            field_protector,
+            temp_dir,
+            None,
+        )
+    }
 
-        // Keys policy: new vaults ship with the recycle bin enabled AND the
-        // bin group already created, so the first "Move to Trash" is
-        // recoverable — and so the bin's UUID is fixed before the vault is
-        // ever synced (no "two peers each mint their own bin" race). The group
-        // matches keepass-core's `find_or_create_recycle_bin` (name + icon 43,
-        // auto-type / search off); we just create it eagerly here instead of
-        // lazily on first recycle.
-        let root = kdbx.vault().root.id;
-        let bin = kdbx
-            .add_group(
-                root,
-                keepass_core::model::NewGroup::new("Recycle Bin")
-                    .icon_id(43)
-                    .enable_auto_type(Some(false))
-                    .enable_searching(Some(false)),
-            )
-            .map_err(crate::error::model_err_to_vault_err)?;
-        kdbx.set_recycle_bin(true, Some(bin));
-
-        // Initial save via the same atomic-write pattern as `Self::save`.
-        let bytes = kdbx.save_to_bytes()?;
-        let parent = path_buf.parent().ok_or_else(|| {
-            VaultError::Io("create_empty path has no parent directory".to_owned())
-        })?;
-        let tmp_in = temp_dir.as_deref().map_or(parent, std::path::Path::new);
-        let mut tmp =
-            tempfile::NamedTempFile::new_in(tmp_in).map_err(|e| VaultError::Io(e.to_string()))?;
-        tmp.write_all(&bytes)
-            .map_err(|e| VaultError::Io(e.to_string()))?;
-        tmp.flush().map_err(|e| VaultError::Io(e.to_string()))?;
-        tmp.as_file_mut()
-            .sync_all()
-            .map_err(|e| VaultError::Io(e.to_string()))?;
-        tmp.persist(&path_buf)
-            .map_err(|e| VaultError::Io(e.error.to_string()))?;
-
-        Ok(Arc::new(Self {
-            inner: Mutex::new(Some(kdbx)),
-            path: path_buf,
-            observer: Mutex::new(None),
-        }))
+    /// Like [`Self::create_empty`] but with the root group + recycle-bin
+    /// UUIDs and creation timestamps pinned, so a fresh vault is
+    /// byte-reproducible for fuzzing / replay.
+    ///
+    /// `uuid_seed` drives a [`SeededUuids`] source: the root id is
+    /// `from_u64_pair(uuid_seed, 0)`, the eager recycle bin is
+    /// `from_u64_pair(uuid_seed, 1)` — one coherent sequence, matching the
+    /// engine's seeded source so a vault created with seed `S` and then
+    /// mutated by an `Engine` seeded with `S` shares one id space.
+    /// `clock_ms` (epoch-milliseconds) pins every creation timestamp via a
+    /// [`FixedClock`]. The KDBX *bytes* still vary run-to-run (master seed
+    /// / IV / KDF salt are fresh OS randomness), but the entity ids and
+    /// timestamps that drive sync are deterministic. Use one distinct
+    /// `uuid_seed` per simulated device.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_empty`], plus [`VaultError::Io`] if `clock_ms` is
+    /// not a representable UTC instant.
+    #[uniffi::constructor]
+    pub fn create_empty_deterministic(
+        path: String,
+        password: String,
+        database_name: String,
+        field_protector: Option<Arc<dyn VaultFieldProtector>>,
+        temp_dir: Option<String>,
+        uuid_seed: u64,
+        clock_ms: i64,
+    ) -> Result<Arc<Self>, VaultError> {
+        Self::create_empty_inner(
+            path,
+            password,
+            database_name,
+            field_protector,
+            temp_dir,
+            Some((uuid_seed, clock_ms)),
+        )
     }
 
     /// Drop the unlocked vault state. Idempotent — locking an
@@ -288,6 +284,104 @@ impl std::fmt::Debug for Vault {
 }
 
 impl Vault {
+    /// Shared core of [`Self::create_empty`] /
+    /// [`Self::create_empty_deterministic`]. `deterministic` carries
+    /// `(uuid_seed, clock_ms)` when the caller wants pinned ids/timestamps,
+    /// or `None` for the production path (random ids, system clock).
+    ///
+    /// Lives outside the `#[uniffi::export]` impl block — uniffi only
+    /// supports exported methods/constructors there, not plain private
+    /// associated fns.
+    fn create_empty_inner(
+        path: String,
+        password: String,
+        database_name: String,
+        field_protector: Option<Arc<dyn VaultFieldProtector>>,
+        temp_dir: Option<String>,
+        deterministic: Option<(u64, i64)>,
+    ) -> Result<Arc<Self>, VaultError> {
+        let path_buf = PathBuf::from(&path);
+        let secret = SecretString::from(password);
+        let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
+        let bridged = bridge_protector(field_protector);
+
+        // Build the unlocked vault, derive the transformed key against the
+        // freshly-generated KDF params. The deterministic path injects a
+        // FixedClock + SeededUuids and draws the eager bin's id from the
+        // SAME source (second draw → from_u64_pair(seed, 1)) so root + bin
+        // share one coherent seeded sequence.
+        let (mut kdbx, bin_uuid) = if let Some((uuid_seed, clock_ms)) = deterministic {
+            let fixed = DateTime::from_timestamp_millis(clock_ms).ok_or_else(|| {
+                VaultError::Io(format!(
+                    "clock_ms {clock_ms} is not a representable UTC instant"
+                ))
+            })?;
+            let clock: Box<dyn Clock> = Box::new(FixedClock(fixed));
+            let uuids = SeededUuids::new(uuid_seed);
+            let kdbx = Kdbx::<keepass_core::kdbx::Unlocked>::create_empty_v4_deterministic(
+                &composite,
+                database_name,
+                bridged,
+                clock,
+                &uuids,
+            )?;
+            // Draw the eager bin's id from the SAME source (second draw →
+            // from_u64_pair(seed, 1)) so root + bin share one sequence.
+            let bin_uuid = uuids.next_uuid();
+            (kdbx, Some(bin_uuid))
+        } else {
+            let kdbx = Kdbx::<keepass_core::kdbx::Unlocked>::create_empty_v4_with_protector(
+                &composite,
+                database_name,
+                bridged,
+            )?;
+            (kdbx, None)
+        };
+
+        // Keys policy: new vaults ship with the recycle bin enabled AND the
+        // bin group already created, so the first "Move to Trash" is
+        // recoverable — and so the bin's UUID is fixed before the vault is
+        // ever synced (no "two peers each mint their own bin" race). The group
+        // matches keepass-core's `find_or_create_recycle_bin` (name + icon 43,
+        // auto-type / search off); we just create it eagerly here instead of
+        // lazily on first recycle.
+        let root = kdbx.vault().root.id;
+        let mut bin_template = NewGroup::new("Recycle Bin")
+            .icon_id(43)
+            .enable_auto_type(Some(false))
+            .enable_searching(Some(false));
+        if let Some(u) = bin_uuid {
+            bin_template = bin_template.with_uuid(u);
+        }
+        let bin = kdbx
+            .add_group(root, bin_template)
+            .map_err(crate::error::model_err_to_vault_err)?;
+        kdbx.set_recycle_bin(true, Some(bin));
+
+        // Initial save via the same atomic-write pattern as `Self::save`.
+        let bytes = kdbx.save_to_bytes()?;
+        let parent = path_buf.parent().ok_or_else(|| {
+            VaultError::Io("create_empty path has no parent directory".to_owned())
+        })?;
+        let tmp_in = temp_dir.as_deref().map_or(parent, std::path::Path::new);
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(tmp_in).map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.write_all(&bytes)
+            .map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.flush().map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.as_file_mut()
+            .sync_all()
+            .map_err(|e| VaultError::Io(e.to_string()))?;
+        tmp.persist(&path_buf)
+            .map_err(|e| VaultError::Io(e.error.to_string()))?;
+
+        Ok(Arc::new(Self {
+            inner: Mutex::new(Some(kdbx)),
+            path: path_buf,
+            observer: Mutex::new(None),
+        }))
+    }
+
     /// Fire `change` to the current observer (if any) **outside**
     /// the inner mutex. Snapshots the observer `Arc` under the brief
     /// observer lock, drops the lock, then dispatches — so an

@@ -75,16 +75,18 @@ fail() {
 # right after `create` (the only group then) so the move/delete target
 # picker can exclude it — root has no parent and deleting it would wipe
 # the vault.
-# Determinism: seed-time entity ids are pinned via --uuid-seed (distinct
-# high values, well clear of the loop's per-op ids below) so the shared
-# world replays byte-for-byte across runs. (The root group + default
-# recycle bin are minted by Vault::create_empty, OUTSIDE the engine's
-# UuidSource, so they stay random — but both devices share them via the
-# cp below, and they never participate in the entry conflicts under
-# test, so they don't affect convergence/replay of a finding.)
+# Determinism: every seed-time id is pinned via --uuid-seed so the shared
+# world replays byte-for-byte across runs. Three disjoint seed bands keep
+# the sequences collision-free (ids only clash when both seed-half AND
+# counter match): the per-op loop ids use mix() in [0, 4e9); the seed-time
+# create-group/create-entry ids use the 9e9+ band (`us` below); and the
+# create itself (root group + eager recycle bin, minted in keepass-core
+# via Vault::create_empty_deterministic — task #29) uses 8e9, in the gap
+# between the two. Both devices share the create ids via the cp below.
 SEED_AT=1799999000000
+CREATE_SEED=8000000000
 us=9000000000
-"$KEYHOLE" create "$A" >/dev/null
+"$KEYHOLE" --at "$SEED_AT" --uuid-seed "$CREATE_SEED" create "$A" >/dev/null
 ROOT="$("$KEYHOLE" list-groups "$A" | awk '$1 ~ /^[0-9a-f-]{36}$/ {print $1; exit}')"
 for f in Folder Folder-2 Folder-3; do
     us=$((us + 1)); "$KEYHOLE" --at "$SEED_AT" --uuid-seed "$us" create-group "$A" "$f" >/dev/null
@@ -102,28 +104,43 @@ us=$((us + 1)); "$KEYHOLE" --at "$SEED_AT" --uuid-seed "$us" create-entry "$A" "
 CONTESTED="$("$KEYHOLE" list "$A" | awk '/Contested/ {print $1; exit}')"
 cp "$A" "$B"
 
+# Deterministic pick index from the main-shell op counter $n, a per-call
+# salt, and the fuzz SEED. CRUCIAL: pickers must NOT read $RANDOM, because
+# they run inside $(...) command substitutions and bash reseeds a
+# subshell's $RANDOM with run-varying entropy — so $RANDOM-based selection
+# is NOT reproducible across runs (the subshell draws differ every run,
+# desyncing the whole op stream). $n is a main-shell counter (a pure
+# function of the run), so an index derived from it replays byte-for-byte.
+# The salt distinguishes two picks within ONE mutate (e.g. op 9 picks two
+# distinct movable groups) so they don't collapse to the same target.
+pick_idx() { # $1=op counter, $2=salt → a large deterministic non-negative int
+    echo $(( ($1 * 48271 + $2 * 40503 + SEED * 2654435761) % 1000000000 ))
+}
+
 # A random group uuid (any of the shared seed groups or root), for moves.
-random_group() { # $1=vault → uuid of a random group
+# Selects idx % NR into a UUID-sorted list so the index→target mapping is
+# stable within AND across runs, regardless of the order the engine returns
+# groups in (that order differs between an incrementally-built mirror and
+# one re-ingested from the KDBX).
+random_group() { # $1=vault [$2=salt] → uuid of a random group
     "$KEYHOLE" list-groups "$1" 2>/dev/null | awk '$1 ~ /^[0-9a-f-]{36}$/ {print $1}' \
-        | awk -v r=$((RANDOM)) 'BEGIN{srand(r)} {a[NR]=$0} END{if (NR) print a[int(rand()*NR)+1]}'
+        | sort \
+        | awk -v idx="$(pick_idx "$n" "${2:-0}")" '{a[NR]=$0} END{if (NR) print a[(idx % NR)+1]}'
 }
 
 # A random NON-root, non-bin group — a safe move/delete target. Root has no
 # parent and the bin is structural; list-groups marks the bin "[bin]" and
-# root is the first row (the only one create made before the seed folders),
-# but rather than rely on position we exclude by the fields list-groups
-# prints: skip the row whose name is the bin's and skip root by its known
-# uuid (captured at seed time as $ROOT).
-random_movable_group() { # $1=vault → uuid of a random non-root, non-bin group
+# root is excluded by its known uuid (captured at seed time as $ROOT).
+random_movable_group() { # $1=vault [$2=salt] → uuid of a random non-root, non-bin group
     "$KEYHOLE" list-groups "$1" 2>/dev/null \
         | awk -v root="$ROOT" '$1 ~ /^[0-9a-f-]{36}$/ && $1 != root && $0 !~ /\[bin\]/ {print $1}' \
-        | awk -v r=$((RANDOM)) 'BEGIN{srand(r)} {a[NR]=$0} END{if (NR) print a[int(rand()*NR)+1]}'
+        | sort \
+        | awk -v idx="$(pick_idx "$n" "${2:-0}")" '{a[NR]=$0} END{if (NR) print a[(idx % NR)+1]}'
 }
 
-# Pick a random live entry, indexing into a TITLE-sorted list so the
-# index→target mapping is stable within a run regardless of the order
-# the engine happens to return rows in.
-random_entry() { # $1=vault → uuid of a random live entry, "" if none
+# Pick a random live entry, idx % NR into a TITLE-sorted list so the mapping
+# is stable within and across runs regardless of engine row order.
+random_entry() { # $1=vault [$2=salt] → uuid of a random live entry, "" if none
     # Excludes $CONTESTED — that entry is driven only by the per-round
     # contention step, so random ops must never delete/move/edit it. The
     # exclusion is an awk guard (not `grep -v`): grep exits 1 when it
@@ -132,7 +149,7 @@ random_entry() { # $1=vault → uuid of a random live entry, "" if none
     "$KEYHOLE" list "$1" 2>/dev/null \
         | awk -v c="$CONTESTED" 'NF>1 && $1 ~ /^[0-9a-f-]{36}$/ && $1 != c {print $2, $1}' \
         | sort | awk '{print $2}' \
-        | awk -v r=$((RANDOM)) 'BEGIN{srand(r)} {a[NR]=$0} END{if (NR) print a[int(rand()*NR)+1]}'
+        | awk -v idx="$(pick_idx "$n" "${2:-0}")" '{a[NR]=$0} END{if (NR) print a[(idx % NR)+1]}'
 }
 
 n=0  # monotonic counter so generated values never collide
@@ -174,11 +191,13 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
            # on the peer converges next round (adoption + rename both
            # propagate). Renames on the same shared group race.
            if [ -n "$g" ]; then "$KEYHOLE" --at "$AT" rename-group "$v" "$g" "r-$n" >/dev/null 2>&1 || true; fi ;;
-        9) g="$(random_movable_group "$v")"; dst="$(random_movable_group "$v")"
-           # Re-parent a group under another (5d group move). Concurrent
+        9) g="$(random_movable_group "$v" 1)"; dst="$(random_movable_group "$v" 2)"
+           # Re-parent a group under another (5d group move). Distinct salts
+           # (1, 2) so the source and destination picks don't collapse to the
+           # same group (a self-move the engine would just reject). Concurrent
            # mutual moves resolve via the deterministic cycle-break.
            if [ -n "$g" ] && [ -n "$dst" ]; then "$KEYHOLE" --at "$AT" move-group "$v" "$g" --to "$dst" >/dev/null 2>&1 || true; fi ;;
-        10) g="$(random_movable_group "$v")"
+        10) g="$(random_movable_group "$v" 1)"
            # Delete a group (5d cross-peer group delete via tombstone).
            if [ -n "$g" ]; then "$KEYHOLE" --at "$AT" delete-group "$v" "$g" >/dev/null 2>&1 || true; fi ;;
         0) "$KEYHOLE" --at "$AT" --uuid-seed "$(mix "$n")" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
@@ -192,7 +211,7 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
            if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" set-attachment "$v" "$e" "att-$((RANDOM % 2))" --text "payload-$n" >/dev/null; fi ;;
         5) e="$(random_entry "$v")"
            if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" remove-attachment "$v" "$e" "att-$((RANDOM % 2))" >/dev/null 2>&1 || true; fi ;;
-        6) e="$(random_entry "$v")"; g="$(random_group "$v")"
+        6) e="$(random_entry "$v")"; g="$(random_group "$v" 1)"
            if [ -n "$e" ] && [ -n "$g" ]; then "$KEYHOLE" --at "$AT" move-entry "$v" "$e" --to "$g" >/dev/null 2>&1 || true; fi ;;
     esac
 }
@@ -205,9 +224,22 @@ conflicts_on() { # $1=vault — sorted parked-conflict uuid set ('' if none)
 
 resolve_all() { # $1=vault — resolve every held conflict, random side; stamps $AT
     local v="$1" u side
-    "$KEYHOLE" list-conflicts "$v" | awk '$1 ~ /^[0-9a-f-]{36}$/ {print $1}' \
+    # Sort the conflict uuids before the read loop: each iteration draws a
+    # $RANDOM to pick local/remote, so an unsorted (engine-order) list would
+    # assign sides by incidental order and desync replay across runs.
+    "$KEYHOLE" list-conflicts "$v" | awk '$1 ~ /^[0-9a-f-]{36}$/ {print $1}' | sort \
     | while read -r u; do
-        if [ $((RANDOM % 2)) -eq 0 ]; then side=local; else side=remote; fi
+        # Side is a deterministic function of (uuid, round clock), NOT a
+        # $RANDOM draw: it still varies per-entry and per-round (so both
+        # resolution directions get exercised), but a $RANDOM draw inside
+        # this read loop would consume a stream-position that depends on
+        # the conflict COUNT — desyncing replay across runs whenever the
+        # parked set size differs by a single entry.
+        if [ $(($(printf '%s' "$u-$AT" | cksum | cut -d' ' -f1) % 2)) -eq 0 ]; then
+            side=local
+        else
+            side=remote
+        fi
         # "no held conflict" here is benign: resolving one entry can
         # legitimately settle a sibling listed in the same sweep. The
         # real invariant is the caller's post-loop "no held conflicts"
@@ -274,5 +306,26 @@ for round in $(seq 1 "$ROUNDS"); do
     db="$("$KEYHOLE" digest "$B")"
     [ "$da" = "$db" ] || fail "digest divergence after sync: A=$da B=$db"
 done
+
+# Replay hook: with FUZZ_KEEP set, dump each device's final logical state
+# (entries + groups WITH uuids — including the create-time root/bin — and
+# the content digest) to that dir before the trap cleans up. The
+# replay-determinism harness runs this twice with one seed and diffs the
+# two dirs, proving the whole run (create included) is byte-reproducible.
+if [ -n "${FUZZ_KEEP:-}" ]; then
+    mkdir -p "$FUZZ_KEEP"
+    for side in "$A" "$B"; do
+        b="$(basename "$side")"
+        # Sort the listings: the engine's row order is legitimately
+        # unspecified (a client sorts in its own view layer) and differs
+        # between an incrementally-built mirror and a re-ingested one, so we
+        # compare canonical CONTENT, not incidental row order. A real
+        # divergence (different uuids / counts) still shows; pure reordering
+        # doesn't masquerade as one.
+        "$KEYHOLE" list "$side" | sort >"$FUZZ_KEEP/$b.entries"
+        "$KEYHOLE" list-groups "$side" | sort >"$FUZZ_KEEP/$b.groups"
+        "$KEYHOLE" digest "$side" >"$FUZZ_KEEP/$b.digest"
+    done
+fi
 
 echo "PASS: $ROUNDS rounds of seeded concurrent edits (seed=$SEED) converged every round"

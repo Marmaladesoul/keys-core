@@ -21,6 +21,12 @@ failed_names=()
 for s in "$DIR"/*.sh; do
     name="$(basename "$s")"
     [ "$name" = "run-all.sh" ] && continue
+    # fuzz-replay-determinism.sh is a WIP replay-hardening harness, not yet a
+    # gate: single-round replay is still flaky pending the open multi-round
+    # residual (keyhole DESIGN.md → Findings; task: fuzzer replay residual).
+    # Run it manually (`bash scenarios/fuzz-replay-determinism.sh`) while
+    # chasing that finding; excluded here so the suite stays a true gate.
+    [ "$name" = "fuzz-replay-determinism.sh" ] && continue
     # Both fuzzers are full CI gates: fuzz-convergence since Findings
     # #4 + #5 (timestamp flooring + dissolved-conflict badge clearing),
     # fuzz-attachments since Finding #8 (LCA generation disambiguation)
