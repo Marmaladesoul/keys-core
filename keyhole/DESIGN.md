@@ -562,21 +562,32 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   #10 dissolve-reconciliation: "entry gone locally → drop all its rows."
   Proven by `scenarios/conflict-delete-clears-badge.sh`.
 
-- **[OPEN] Finding #12 — attachment classify asymmetry → cross-peer
+- **[FIXED] Finding #12 — attachment classify asymmetry → cross-peer
   conflict-set divergence** (pre-existing; surfaced by the parity oracle
   during the #10/#11 soak, fuzz seed 43, intermittent). An attachment
-  divergence (`att-1` RemoteOnly) classifies as a CONFLICT from peer A's
-  side but is NOT parked on peer B, so the two peers' conflict sets
-  differ — one badges it, the other doesn't (Bug-D class). It's a
-  *genuine live* conflict (`show-conflict` returns a payload), not a
-  dissolved ghost, so it's **outside** the #10/#11 reconcile fix (which
-  correctly leaves live conflicts parked). Root cause is in
-  `keepass_merge::classify`: asymmetric verdicts on the attachment facet
-  depending on which side is "local" (per-side `<History>`/LCA differs) —
-  the same family as Finding #8's LCA work, on attachments. Intermittent
-  (random root/bin ids; passes ~6/6 on isolated rerun). Only bites
-  multi-peer attachment add/remove interleavings. Fix is a
-  classify-symmetry change in keepass-merge — a separate slice.
+  divergence (`att-1` RemoteOnly) classified as a CONFLICT from peer A's
+  side but was NOT parked on peer B, so the two peers' conflict sets
+  differed — one badged it, the other didn't (Bug-D class). It was a
+  *genuine live* conflict (`show-conflict` returned a payload), not a
+  dissolved ghost, so it sat **outside** the #10/#11 reconcile fix (which
+  correctly leaves live conflicts parked). Root cause was in
+  `keepass_merge::find_common_ancestor` (the LCA selection that feeds
+  `classify`): the pair-selection tiebreak was
+  `(min(local,remote) rank, local_mtime, local_rank)` — its `local_*`
+  tail flipped under argument swap, so two same-second shared generations
+  on opposite sides resolved to different ancestors depending on which
+  peer ran `classify` first, and the attachment facet then classified
+  asymmetrically. Same family as Finding #8's LCA work, on attachments.
+  **Fix** (keepass-core PR #227, keepass-merge): made the key symmetric —
+  `(min rank, max rank, matched content hash)`, every component
+  order-independent (the pair only scores when the two sides' content
+  hashes are equal). mtime dropped from selection entirely (it was only
+  ever the now-removed tiebreak); the floored-mtime `KEYS_DEBUG_LCA` dump
+  computes it on the fly. Guarded by `lca_is_symmetric_under_argument_swap`
+  (asserts the matched content hash, the real selection key, is identical
+  under swap) plus the convergence fuzzer. Verified: 480 fuzz rounds
+  (12 seeds × 40), including the original seed 43, converge; keepass-merge's
+  203 tests pass.
 
 - **[FIXED] Finding #9 — `resolved_at` was stamped from the system
   clock, not the injected engine clock, so under a pinned clock every
