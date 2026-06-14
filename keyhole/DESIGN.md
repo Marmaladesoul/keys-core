@@ -514,9 +514,15 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   surface** (create/rename/move/delete groups, all entry CRUD,
   attachments, conflicts) — 60/60 soak. 5d's core reconciliation is
   complete.
-- **Next:** icon pool union (the last 5c sliver); previous-parent merge
-  rules; `empty-bin` verb; value-hash-based adoption matching
-  (timestamp-free) as hardening when resolution records grow fields.
+- **Done (2026-06-14, 5c custom-icon pool union):** `ingest_peer` now unions
+  the peer's `meta_custom_icon` pool (grow-only, content-addressed) so an
+  adopted icon ref isn't left dangling — the last 5c sliver. New verbs
+  `add-custom-icon` / `custom-icon-bytes`; proven by
+  `custom-icon-cross-peer.sh` + engine `two_engine_custom_icon_pool_unions`.
+  See Findings.
+- **Next:** previous-parent merge rules; `empty-bin` verb; value-hash-based
+  adoption matching (timestamp-free) as hardening when resolution records
+  grow fields.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old
@@ -528,6 +534,26 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   — worth a look when `restore` is wired.
 
 ## Findings (surfaced by keyhole)
+
+- **[FIXED] custom-icon pool not unioned on `ingest_peer` → dangling icon
+  reference (digest-blind).** The last 5c sliver. When a peer adds a custom
+  icon to a shared entry, the entry's content-addressed `custom_icon_uuid`
+  rides the normal content merge and propagates — but the icon BYTES live in
+  a separate vault-level pool (`meta_custom_icon`), and `ingest_peer` never
+  unioned it. So the adopting replica was left with a reference to an icon
+  whose bytes it didn't have. The convergence digest covers the icon *ref*
+  but not the pool bytes, so both replicas' digests matched the instant the
+  ref propagated — the oracle was blind to the dangling blob (the same class
+  of gap the attachment-pool union closed for 5c attachments). Surfaced by a
+  new keyhole scenario reading the pool directly across a fresh disk read.
+  **Fix:** `ingest::union_peer_custom_icons` — a grow-only `INSERT OR IGNORE`
+  of the peer's `meta.custom_icons` into the local pool at the ingest tail
+  (alongside `union_peer_tombstones`); keyed by the content-addressed uuid, so
+  a present uuid carries identical bytes and only genuinely-new icons land. New
+  keyhole verbs `add-custom-icon` / `custom-icon-bytes`; proven by
+  `scenarios/custom-icon-cross-peer.sh` (RED before the fix) + engine
+  `two_engine_custom_icon_pool_unions` (teeth-checked: both go red with the
+  union removed).
 
 - **[FIXED] Fuzzer pickers read `$RANDOM` inside `$(...)` — not
   replayable.** Surfaced by the new double-run replay harness

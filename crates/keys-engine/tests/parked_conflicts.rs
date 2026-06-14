@@ -973,6 +973,87 @@ fn two_engine_move_reconciles_and_converges() {
     assert_eq!(a_in_folder, b_in_folder, "both agree on the entry's group");
 }
 
+/// Phase 5c custom-icon pool union: a one-sided custom-icon add on B must
+/// carry its BYTES to A on `ingest_peer`, not just the entry's
+/// content-addressed `custom_icon_uuid` ref. The ref rides the normal
+/// content merge, but the bytes live in the separate vault-level
+/// `meta_custom_icon` pool — without `union_peer_custom_icons` A adopts the
+/// ref while its pool stays empty (a dangling reference the convergence
+/// digest, which covers the ref but not the pool bytes, cannot see).
+#[test]
+fn two_engine_custom_icon_pool_unions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Shared base: one entry both replicas hold.
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let seed = kdbx
+        .add_entry(root, NewEntry::new("Iconned"))
+        .expect("seed")
+        .0;
+
+    let kdbx_a = dir.path().join("a.kdbx");
+    let kdbx_b = dir.path().join("b.kdbx");
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save");
+
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut handle_b = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut handle_b, None)
+        .expect("b save");
+
+    // B adds a custom icon to the shared entry (one-sided).
+    let icon_bytes = vec![0x89, 0x50, 0x4e, 0x47, 5, 6, 7, 8];
+    let icon_str = engine_b.add_custom_icon(&icon_bytes).expect("b add icon");
+    let icon = uuid::Uuid::parse_str(&icon_str).expect("icon uuid");
+    engine_b
+        .link_entry_custom_icon(seed, icon)
+        .expect("b link icon");
+    let mut hb = reopen_kdbx(&kdbx_b);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb, None)
+        .expect("b save 2");
+
+    // Teeth: A has no idea about this icon before the sync.
+    assert!(
+        engine_a
+            .custom_icon_bytes(icon)
+            .expect("a icon pre")
+            .is_none(),
+        "A must not hold B's custom icon before any sync",
+    );
+
+    // A ingests B: it adopts the ref AND must union the bytes.
+    engine_a
+        .ingest_peer_from_kdbx(&kdbx_b, &composite(), "device-b")
+        .expect("a ingest b");
+
+    assert_eq!(
+        engine_a.custom_icon_bytes(icon).expect("a icon post"),
+        Some(icon_bytes),
+        "A unioned B's custom-icon bytes on ingest (no dangling reference)",
+    );
+    // The ref rode across too — digests converge (and would converge even if
+    // the bytes were missing, which is exactly why the pool assertion above
+    // is the one with teeth).
+    assert_eq!(
+        engine_a.content_digest().expect("a digest"),
+        engine_b.content_digest().expect("b digest"),
+        "replicas converged after the icon add",
+    );
+}
+
 /// Phase 5d group adoption: a peer-only GROUP (one B has never seen)
 /// is adopted on ingest, and an entry the peer moved into it lands
 /// there rather than at root. Group adoption is unconditional (not

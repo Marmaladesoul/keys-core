@@ -219,6 +219,31 @@ enum Command {
         /// UUID of the entry whose conflict owners to list.
         entry: String,
     },
+    /// Add a custom-icon blob to the vault's pool and link it to `entry`,
+    /// then persist. `data` is the raw icon bytes (any bytes — the pool
+    /// stores blobs verbatim, content-addressed; no PNG validation). Prints
+    /// the icon's content-addressed UUID, which is a pure function of the
+    /// bytes (so two devices that add the same icon mint the same UUID — see
+    /// `add_custom_icon_dedup`). Drives the 5c custom-icon-pool surface.
+    AddCustomIcon {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry to link the icon to.
+        entry: String,
+        /// Raw icon bytes (their UTF-8 encoding) — deterministic per string.
+        data: String,
+    },
+    /// Print whether a custom-icon UUID's bytes are present in the vault's
+    /// pool: `present <len>` or `(none)`. The honest "did the icon's BYTES
+    /// arrive?" check (the convergence digest covers an entry's icon *ref*
+    /// but not the pool bytes, so a dangling ref it can't see). Reads the
+    /// persistent mirror.
+    CustomIconBytes {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// Content-addressed UUID of the custom icon (see `add-custom-icon`).
+        icon: String,
+    },
     /// Print the hex SHA-256 digest of the vault's user-visible
     /// content (fields, locations, icons, group tree, recycle-bin
     /// state). Equal digests ⇔ converged replicas — the convergence
@@ -486,6 +511,14 @@ async fn main() -> Result<()> {
         Command::ConflictOwners { vault, entry } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.conflict_owners(entry)?;
+        }
+        Command::AddCustomIcon { vault, entry, data } => {
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.add_custom_icon(entry, data).await?;
+        }
+        Command::CustomIconBytes { vault, icon } => {
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.custom_icon_bytes(icon)?;
         }
         Command::Digest { vault } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
@@ -973,6 +1006,38 @@ impl Session {
         }
         for o in &owners {
             println!("{o}");
+        }
+        Ok(())
+    }
+
+    /// Add `data`'s bytes as a custom icon, link it to `entry`, persist, and
+    /// print the content-addressed icon UUID. The link itself doesn't bump
+    /// `modified_at` (favicon semantics), so this is a one-sided cosmetic
+    /// change for the cross-peer pool-union scenario.
+    async fn add_custom_icon(&self, entry: String, data: String) -> Result<()> {
+        let uuid = self
+            .engine
+            .add_custom_icon(data.into_bytes())
+            .map_err(|e| anyhow::anyhow!("add_custom_icon: {e:?}"))?;
+        self.engine
+            .link_entry_custom_icon(entry, uuid.clone())
+            .map_err(|e| anyhow::anyhow!("link_entry_custom_icon: {e:?}"))?;
+        self.save().await?;
+        println!("{uuid}");
+        Ok(())
+    }
+
+    /// Print `present <len>` if the custom icon's bytes are in the pool, else
+    /// `(none)` — the honest "did the icon BYTES arrive?" check (a pure read,
+    /// like the digest, so it never perturbs state).
+    fn custom_icon_bytes(&self, icon: String) -> Result<()> {
+        match self
+            .engine
+            .custom_icon_bytes(icon)
+            .map_err(|e| anyhow::anyhow!("custom_icon_bytes: {e:?}"))?
+        {
+            Some(bytes) => println!("present {}", bytes.len()),
+            None => println!("(none)"),
         }
         Ok(())
     }

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use keepass_core::kdbx::{Kdbx, Unlocked};
-use keepass_core::model::{Entry, Group, GroupId, Vault};
+use keepass_core::model::{CustomIcon, Entry, Group, GroupId, Vault};
 use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
 use keepass_merge::{Classification, Granularity, classify, parse_conflict_resolutions};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -1178,6 +1178,7 @@ pub(crate) fn ingest_peer(
     //      emptiness — is what makes cross-peer group delete converge.
     reconcile_peer_deletes(&tx, &local_by_uuid, &peer_uuids, &peer_tomb, &mut outcome)?;
     union_peer_tombstones(&tx, &peer_tomb)?;
+    union_peer_custom_icons(&tx, &peer.meta.custom_icons)?;
     materialize_group_tombstones(&tx, &mut outcome)?;
 
     tx.commit()?;
@@ -1239,6 +1240,41 @@ fn union_peer_tombstones(
             continue;
         }
         union_tombstone(tx, &uuid_str, *deleted_at)?;
+    }
+    Ok(())
+}
+
+/// Grow-only union of the peer's custom-icon pool into the local
+/// `meta_custom_icon` (Phase 5c — the icon analogue of the attachment-pool
+/// union).
+///
+/// An entry or group adopts a peer's `custom_icon_uuid` through the normal
+/// content merge, but the icon BYTES live in this separate vault-level pool.
+/// Without this union the adopting replica is left with a dangling reference
+/// — an icon ref with no blob — which the convergence digest can't see (it
+/// covers the ref, not the pool bytes), and which a save would write back as
+/// a `<CustomIconUUID>` with no matching `<CustomIcons>` entry. Mirrors how
+/// one-sided attachment changes carry their bytes across.
+///
+/// Keyed by `uuid`, the table's primary key, which is **content-addressed**
+/// (a pure function of the icon bytes — see `meta::add_custom_icon_dedup`).
+/// So `INSERT OR IGNORE` is exactly right: a uuid already present carries
+/// identical bytes, so the local row (and its metadata) is kept untouched —
+/// matching the pool's preserve-existing-metadata semantics — and only
+/// genuinely-new icons are added. Grow-only by design: ingest only ever adds
+/// to the pool (mirroring `<CustomIcons>`, which KDBX writers carry verbatim).
+fn union_peer_custom_icons(tx: &Connection, peer_icons: &[CustomIcon]) -> Result<(), EngineError> {
+    for icon in peer_icons {
+        tx.execute(
+            "INSERT OR IGNORE INTO meta_custom_icon (uuid, name, bytes, last_modified_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                icon.uuid.to_string(),
+                icon.name,
+                icon.data,
+                icon.last_modified.map(|t| t.timestamp_millis()),
+            ],
+        )?;
     }
     Ok(())
 }
