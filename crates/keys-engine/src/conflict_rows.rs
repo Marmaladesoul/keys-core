@@ -241,6 +241,39 @@ pub(crate) fn drop_conflict_rows(conn: &Connection, entry_uuid: Uuid) -> Result<
     Ok(u32::try_from(removed).unwrap_or(u32::MAX))
 }
 
+/// Drop ONE owner's conflict rows for `entry_uuid`, leaving any other
+/// owners' rows intact. The owner-scoped counterpart to
+/// [`drop_conflict_rows`], for dissolve-reconciliation: when a local
+/// edit / sync converges the entry to *one* peer's value, only that
+/// peer's parked row has dissolved — other peers may still genuinely
+/// diverge and must stay badged (the multi-peer over-clear the
+/// Finding #10 review caught). Mirrors `ingest::clear_conflict_rows`'s
+/// `WHERE owner = ?1 AND entry_uuid = ?2` shape.
+pub(crate) fn drop_conflict_rows_for_owner(
+    conn: &Connection,
+    owner: &str,
+    entry_uuid: Uuid,
+) -> Result<(), EngineError> {
+    let uuid_str = entry_uuid.to_string();
+    conn.execute(
+        "DELETE FROM conflict_entry_protected WHERE owner = ?1 AND entry_uuid = ?2",
+        params![owner, uuid_str],
+    )?;
+    conn.execute(
+        "DELETE FROM conflict_entry_custom_field WHERE owner = ?1 AND entry_uuid = ?2",
+        params![owner, uuid_str],
+    )?;
+    conn.execute(
+        "DELETE FROM conflict_entry_attachment WHERE owner = ?1 AND entry_uuid = ?2",
+        params![owner, uuid_str],
+    )?;
+    conn.execute(
+        "DELETE FROM conflict_entry WHERE owner = ?1 AND entry_uuid = ?2",
+        params![owner, uuid_str],
+    )?;
+    Ok(())
+}
+
 fn reconstruct_times(row: &ConflictEntryRow) -> Timestamps {
     let ms = |o: Option<i64>| o.and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis);
     let mut t = Timestamps::default();
@@ -339,6 +372,51 @@ mod tests {
         insert_peer(&conn, "peerC", id, "A", "y", &[]);
         let owners = conflict_owners_for(&conn, id).expect("owners");
         assert_eq!(owners, vec!["peerB".to_string(), "peerC".to_string()]);
+    }
+
+    #[test]
+    fn drop_for_owner_is_owner_scoped() {
+        // Two peers conflict on the same entry; dropping one owner's rows
+        // must leave the other owner's rows (and badge) intact — the
+        // owner-granular clear that prevents the multi-peer over-clear
+        // (Finding #10 review). A custom field + protected pw per owner
+        // exercises the child-table deletes too.
+        let conn = mem_conn();
+        let id = Uuid::new_v4();
+        insert_peer(&conn, "peerB", id, "A", "pwB", &[("cf", "vB", false)]);
+        insert_peer(&conn, "peerC", id, "A", "pwC", &[("cf", "vC", true)]);
+        assert_eq!(conflict_owners_for(&conn, id).unwrap().len(), 2);
+
+        drop_conflict_rows_for_owner(&conn, "peerB", id).expect("drop peerB");
+
+        // peerB gone from every table; peerC fully intact.
+        assert_eq!(
+            conflict_owners_for(&conn, id).unwrap(),
+            vec!["peerC".to_string()],
+            "only the dropped owner is removed"
+        );
+        let n_prot: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM conflict_entry_protected WHERE owner = 'peerB' AND entry_uuid = ?1",
+                params![id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_prot, 0, "peerB protected rows gone");
+        let n_cf_c: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM conflict_entry_protected WHERE owner = 'peerC' AND entry_uuid = ?1",
+                params![id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_cf_c, 2, "peerC pw + protected cf intact");
+        // The entry is still badged (peerC still conflicts).
+        assert_eq!(parked_conflict_uuids(&conn).unwrap(), vec![id]);
+
+        // Owner-agnostic drop then clears the remainder.
+        drop_conflict_rows(&conn, id).expect("drop all");
+        assert!(parked_conflict_uuids(&conn).unwrap().is_empty());
     }
 
     #[test]

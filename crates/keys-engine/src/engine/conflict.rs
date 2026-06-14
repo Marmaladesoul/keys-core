@@ -418,14 +418,22 @@ impl Engine {
         peer: &keepass_core::model::Vault,
     ) -> Result<crate::ingest::IngestPeerOutcome, EngineError> {
         let local = self.project_to_vault()?;
-        crate::ingest::ingest_peer(
+        let outcome = crate::ingest::ingest_peer(
             &mut self.conn,
             &self.fingerprint_key,
             &*self.field_protector,
             owner,
             &local,
             peer,
-        )
+        )?;
+        // Post-ingest sweep (Finding #10): a sync can dissolve a parked
+        // conflict with a DIFFERENT owner as a side effect of adopting
+        // this peer's value — the ingest arms only clear the ingested
+        // owner (owner-scoped). Reconcile the whole parked set so the
+        // badge is accurate after every sync, without waiting for a
+        // resolver-open to lazily heal it.
+        crate::reconcile::reconcile_all_conflict_rows(self)?;
+        Ok(outcome)
     }
 
     /// Owner-rows badge query: every entry UUID that carries at least one

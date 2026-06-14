@@ -180,6 +180,7 @@ impl Engine {
             update,
             now,
         )?;
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
     }
@@ -219,6 +220,7 @@ impl Engine {
             save,
             now,
         )?;
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
     }
@@ -234,6 +236,7 @@ impl Engine {
         let now = self.now_ms();
         let bin_uuid = self.next_uuid();
         mutations::recycle_entry(&mut self.conn, uuid, now, bin_uuid)?;
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::EntriesRecycled(vec![uuid]));
         Ok(())
     }
@@ -292,6 +295,9 @@ impl Engine {
     pub fn delete_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
         let now = self.now_ms();
         let outcome = mutations::delete_entry(&mut self.conn, uuid, now)?;
+        // Entry gone → its parked conflict rows are orphans (Finding #11);
+        // reconcile drops them so the badge doesn't haunt a deleted entry.
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::EntriesDeleted(vec![EntryDeletionInfo {
             uuid,
             previous_group: outcome.previous_group,
@@ -341,6 +347,7 @@ impl Engine {
             plaintext,
             now,
         )?;
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::ProtectedFieldChanged {
             entry_uuid: uuid,
             field_name: field_name.to_owned(),
@@ -363,6 +370,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let now = self.now_ms();
         mutations::set_non_protected_custom_field(&mut self.conn, uuid, field_name, value, now)?;
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
     }
@@ -382,6 +390,7 @@ impl Engine {
     pub fn remove_custom_field(&mut self, uuid: Uuid, field_name: &str) -> Result<(), EngineError> {
         let now = self.now_ms();
         mutations::remove_custom_field(&mut self.conn, uuid, field_name, now)?;
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
     }
@@ -396,6 +405,7 @@ impl Engine {
     pub fn set_tags(&mut self, uuid: Uuid, tags: Vec<String>) -> Result<(), EngineError> {
         let now = self.now_ms();
         mutations::set_tags(&mut self.conn, uuid, tags, now)?;
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         // Two events: the tag set changed (`TagsChanged`), and the
         // entry's `modified_at` was bumped (`EntriesUpdated`). Frontends
         // that only care about tag indices subscribe to the first;
@@ -422,6 +432,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let now = self.now_ms();
         mutations::attach_file(&mut self.conn, uuid, name, bytes, now)?;
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())
     }
@@ -443,6 +454,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let now = self.now_ms();
         mutations::set_attachment(&mut self.conn, uuid, name, bytes, now)?;
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())
     }
@@ -457,6 +469,7 @@ impl Engine {
     pub fn remove_attachment(&mut self, uuid: Uuid, name: &str) -> Result<(), EngineError> {
         let now = self.now_ms();
         mutations::remove_attachment(&mut self.conn, uuid, name, now)?;
+        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())
     }
@@ -725,6 +738,7 @@ impl Engine {
             max_items,
             now,
         )?;
+        crate::reconcile::reconcile_conflict_rows(self, entry_uuid)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
         Ok(())
     }

@@ -380,12 +380,23 @@ pub(crate) fn held_conflict_payload(
         .map_err(|e| EngineError::Serialise(format!("acquire session key: {e}")))?;
 
     for uuid in parked {
-        // Build "theirs": a clone of local with this parked entry swapped for
-        // its reconstructed peer value. If local doesn't hold the entry, skip
-        // it (a peer-only entry has no local side to conflict against here).
+        // First reconcile this entry's rows owner-by-owner: drop any whose
+        // divergence has dissolved (or all, if the entry is gone), leaving
+        // only genuinely-live owners. Using the same machinery as the
+        // write-side reconcile keeps badge and resolver in agreement and
+        // avoids the multi-owner over-clear an owner-agnostic drop here
+        // would cause (drop owner B's dissolved row, NOT peer C's live one).
         let owners = conflict_rows::conflict_owners_for(engine.conn(), uuid)?;
-        let Some(owner) = owners.first() else {
+        if owners.is_empty() {
             continue;
+        }
+        let decision = dissolve_decision(engine, &local_vault, &session_key, uuid, &owners)?;
+        apply_dissolve(engine, uuid, decision)?;
+
+        // Build "theirs" from the first still-live owner, if any remain.
+        let live_owners = conflict_rows::conflict_owners_for(engine.conn(), uuid)?;
+        let Some(owner) = live_owners.first() else {
+            continue; // fully dissolved — nothing to resolve.
         };
         let Some(reconstructed) =
             conflict_rows::reconstruct_peer_entry(engine.conn(), owner, uuid, &session_key)?
@@ -400,10 +411,8 @@ pub(crate) fn held_conflict_payload(
             .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
 
         if outcome.entry_conflicts.is_empty() && outcome.delete_edit_conflicts.is_empty() {
-            // Dissolved: the stored peer value no longer conflicts with
-            // local. Drop the stale rows so the badge clears, and keep
-            // walking — a later candidate may still hold a real conflict.
-            conflict_rows::drop_conflict_rows(engine.conn(), uuid)?;
+            // A live owner that nonetheless merges clean is a belt-and-
+            // braces case (reconcile above should have dropped it); skip.
             continue;
         }
 
@@ -423,6 +432,149 @@ pub(crate) fn held_conflict_payload(
         return Ok(Some(payload));
     }
     Ok(None)
+}
+
+/// Per-owner decision for one entry's parked conflict rows.
+enum DissolveDecision {
+    /// The entry is gone locally (deleted) — drop every owner's rows.
+    DropAll,
+    /// Drop only these owners' rows (their divergence dissolved); any
+    /// owner not listed still genuinely conflicts and stays parked.
+    DropOwners(Vec<String>),
+}
+
+/// Read-only: decide which of `uuid`'s parked conflict rows have
+/// dissolved against the current local state. No DB writes — the caller
+/// applies the decision in a transaction. `owners` is `uuid`'s current
+/// owner set (already known non-empty by the caller).
+fn dissolve_decision(
+    engine: &Engine,
+    local_vault: &keepass_core::model::Vault,
+    session_key: &keepass_core::protector::SessionKey,
+    uuid: uuid::Uuid,
+    owners: &[String],
+) -> Result<DissolveDecision, EngineError> {
+    // Entry deleted locally → no live side to conflict against; the
+    // rows are orphans (Finding #11). Drop them all.
+    if !child_contains_entry(&local_vault.root, keepass_core::model::EntryId(uuid)) {
+        return Ok(DissolveDecision::DropAll);
+    }
+    let mut dissolved = Vec::new();
+    for owner in owners {
+        // A row that no longer reconstructs is itself stale → drop it.
+        let Some(reconstructed) =
+            conflict_rows::reconstruct_peer_entry(engine.conn(), owner, uuid, session_key)?
+        else {
+            dissolved.push(owner.clone());
+            continue;
+        };
+        // "Theirs" = local with this entry swapped for the owner's parked
+        // value; if a merge against local finds no conflict, this owner's
+        // divergence has dissolved. Same check the resolver
+        // (`held_conflict_payload`) runs — kept identical so badge and
+        // resolver always agree.
+        let mut theirs = local_vault.clone();
+        let peer_entry = bind_attachments_into_pool(reconstructed, &mut theirs.binaries);
+        swap_entry_in_tree(&mut theirs.root, peer_entry);
+        let outcome = keepass_merge::merge(local_vault, &theirs)
+            .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
+        if outcome.entry_conflicts.is_empty() && outcome.delete_edit_conflicts.is_empty() {
+            dissolved.push(owner.clone());
+        }
+    }
+    Ok(DissolveDecision::DropOwners(dissolved))
+}
+
+/// Apply a [`DissolveDecision`] in a single transaction.
+fn apply_dissolve(
+    engine: &mut Engine,
+    uuid: uuid::Uuid,
+    decision: DissolveDecision,
+) -> Result<(), EngineError> {
+    let owners = match decision {
+        DissolveDecision::DropAll => {
+            let tx = engine.conn_mut().transaction()?;
+            conflict_rows::drop_conflict_rows(&tx, uuid)?;
+            tx.commit()?;
+            return Ok(());
+        }
+        DissolveDecision::DropOwners(o) => o,
+    };
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let tx = engine.conn_mut().transaction()?;
+    for owner in &owners {
+        conflict_rows::drop_conflict_rows_for_owner(&tx, owner, uuid)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Reconcile ONE entry's parked conflict rows against the current local
+/// state, dropping rows whose divergence has dissolved (Finding #10).
+///
+/// The badge query ([`conflict_rows::parked_conflict_uuids`]) is a cheap
+/// `SELECT` that can't tell a live conflict from a dissolved one; the
+/// merge-backed resolver ([`held_conflict_payload`]) only healed stale
+/// rows lazily on open, so the badge could show a conflict the resolver
+/// considered gone (a ghost badge). This restores the invariant "a
+/// `conflict_entry(owner, E)` row exists iff E exists locally AND still
+/// genuinely diverges from that owner's stored value" eagerly, on the
+/// write side — so badge reads stay a trivial `SELECT`.
+///
+/// Cheap when `entry_uuid` has no parked rows (the overwhelmingly common
+/// case): one indexed `SELECT` and return, no projection. Only an entry
+/// that is *actually* in conflict pays the projection + per-owner merge —
+/// rare, and exactly when the caller is already touching that conflict.
+/// Call it after any local content edit or delete of an entry.
+///
+/// Best-effort, not part of the edit's atomic unit: callers run this in
+/// its own transaction *after* the mutation has committed, so a crash in
+/// the window leaves a transiently over-reported badge (never lost vault
+/// data). The next ingest sweep ([`reconcile_all_conflict_rows`]) or
+/// resolver-open ([`held_conflict_payload`]) is the backstop.
+pub(crate) fn reconcile_conflict_rows(
+    engine: &mut Engine,
+    entry_uuid: uuid::Uuid,
+) -> Result<(), EngineError> {
+    let owners = conflict_rows::conflict_owners_for(engine.conn(), entry_uuid)?;
+    if owners.is_empty() {
+        return Ok(());
+    }
+    let local_vault = engine.project_to_vault()?;
+    let session_key = engine
+        .field_protector_arc()
+        .acquire_session_key()
+        .map_err(|e| EngineError::Serialise(format!("acquire session key: {e}")))?;
+    let decision = dissolve_decision(engine, &local_vault, &session_key, entry_uuid, &owners)?;
+    apply_dissolve(engine, entry_uuid, decision)
+}
+
+/// Reconcile EVERY parked entry's conflict rows in one pass — the
+/// post-ingest sweep. A sync can dissolve a conflict with peer C as a
+/// side effect of adopting peer B's value (the ingest arms only clear
+/// the ingested owner, owner-scoped), so after ingest we sweep the whole
+/// parked set to drop any rows that dissolved. Projects the vault once.
+pub(crate) fn reconcile_all_conflict_rows(engine: &mut Engine) -> Result<(), EngineError> {
+    let parked = conflict_rows::parked_conflict_uuids(engine.conn())?;
+    if parked.is_empty() {
+        return Ok(());
+    }
+    let local_vault = engine.project_to_vault()?;
+    let session_key = engine
+        .field_protector_arc()
+        .acquire_session_key()
+        .map_err(|e| EngineError::Serialise(format!("acquire session key: {e}")))?;
+    for uuid in parked {
+        let owners = conflict_rows::conflict_owners_for(engine.conn(), uuid)?;
+        if owners.is_empty() {
+            continue;
+        }
+        let decision = dissolve_decision(engine, &local_vault, &session_key, uuid, &owners)?;
+        apply_dissolve(engine, uuid, decision)?;
+    }
+    Ok(())
 }
 
 /// Bind a reconstructed peer entry's attachment bytes into `pool` and return

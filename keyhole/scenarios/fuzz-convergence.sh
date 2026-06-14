@@ -31,6 +31,20 @@ SEED="${FUZZ_SEED:-42}"
 ROUNDS="${FUZZ_ROUNDS:-6}"
 RANDOM=$SEED
 
+# Per-create entity-id seed. MUST vary with FUZZ_SEED so different seeds
+# explore different entity-id ORDERINGS — that ordering is what several
+# tiebreaks (same-second LWW, group cycle-break, parked-conflict order)
+# turn on, so it's a first-class fuzzing dimension, not noise. Folding
+# SEED in (a) decorrelates id-order from creation-order (a bare counter
+# made "older == smaller" an invariant, so orderings that contradict
+# creation order — where real bugs hide — were UNREACHABLE), while
+# (b) staying a pure function of (SEED, command index) so a given
+# FUZZ_SEED still replays byte-for-byte. The multiplicative mix is
+# injective in $1 for a fixed SEED over the command counts we hit (so no
+# id collisions) and scatters across the 0..4e9 block (kept clear of the
+# 9e9+ seed-time block below).
+mix() { echo $(( (($1 * 48271) + (SEED * 2654435761)) % 4000000000 )); }
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 A="$TMP/device-a.kdbx"
@@ -152,7 +166,7 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
     # contended edit every round).
     op=$((RANDOM % 11))
     case $op in
-        7) "$KEYHOLE" --at "$AT" --uuid-seed "$n" create-group "$v" "g-$n" >/dev/null ;;
+        7) "$KEYHOLE" --at "$AT" --uuid-seed "$(mix "$n")" create-group "$v" "g-$n" >/dev/null ;;
         8) g="$(random_group "$v")"
            # Rename a random group (5d group metadata LWW). Every group
            # uuid is shared once adopted, so a rename either propagates
@@ -167,7 +181,7 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
         10) g="$(random_movable_group "$v")"
            # Delete a group (5d cross-peer group delete via tombstone).
            if [ -n "$g" ]; then "$KEYHOLE" --at "$AT" delete-group "$v" "$g" >/dev/null 2>&1 || true; fi ;;
-        0) "$KEYHOLE" --at "$AT" --uuid-seed "$n" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
+        0) "$KEYHOLE" --at "$AT" --uuid-seed "$(mix "$n")" create-entry "$v" "fz-$n" --username "fu-$n" >/dev/null ;;
         1) e="$(random_entry "$v")"
            if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" update-entry "$v" "$e" --username "edit-$n" >/dev/null; fi ;;
         2) e="$(random_entry "$v")"

@@ -510,45 +510,73 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 
 ## Findings (surfaced by keyhole)
 
-- **[OPEN] Finding #10 — stale `conflict_entry` row: badge present,
-  payload absent (ghost badge), asymmetric across peers.** Surfaced by
-  the hardened fuzzer once Finding #9 was fixed (`fuzz-convergence.sh`,
-  `FUZZ_SEED=777` round 30, parity oracle): peer A's
-  `entries_with_parked_conflict` returns an entry uuid for which
-  `held_conflict_payload` returns `None` ("(no held conflict)"), while
-  peer B holds no conflict for it at all — the conflict-set differs
-  across peers. The entry itself is present and live on both sides. So
-  a `conflict_entry` row outlived the divergence it recorded (the
-  values converged out-of-band) but was never cleared, leaving a badge
-  the resolver can't open and that never clears — and it's one-sided.
-  This is the badge/payload-disagreement class the 2026-06-12 work
-  touched one face of; the parity oracle proves a residual path. Repro:
-  the fuzzer at seed 777 (artefacts auto-preserved on failure).
-  **Mechanism (code-grounded):** `held_conflict_payload`
-  (`reconcile.rs:402`) self-heals — when a parked entry's stored peer
-  value no longer conflicts with local (`outcome.entry_conflicts`
-  empty) it `drop_conflict_rows` and skips. So a conflict row that has
-  *dissolved* (local converged to the stored peer value in a later
-  round, with no ingest arm clearing it) lingers until a resolver-open
-  triggers that lazy heal. But the badge —
-  `parked_conflict_uuids` (`SELECT DISTINCT entry_uuid FROM
-  conflict_entry`) — counts it immediately. Net: a phantom badge /
-  dead resolver entry until someone opens it, and a one-sided
-  `list-conflicts` divergence in the meantime. (Diagnosing with
-  `show-conflict` *hides* the bug — that call is the lazy heal.)
-  **Fix direction:** clear a conflict row eagerly when it dissolves —
-  at the `ingest_peer` arm where local converges to the stored peer
-  value (InSync/AutoMerged for an entry that still has a
-  `conflict_entry` row) — so the badge is accurate without a
-  resolver-open. Alternatively make the badge query merge-aware, but
-  that defeats its cheapness; eager-clear-on-converge is the right
-  shape. Validate with a deterministic red scenario + the seed-777
-  fuzzer path. **NB intermittent:** the fuzzer's UUIDs are random (not
-  seeded), so `FUZZ_SEED=777` does not replay the failure byte-for-byte
-  — recapture needs a higher-volume soak (or the deterministic-UUID
-  fuzzer follow-up) to land a live pre-heal artefact. Inspect a
-  preserved artefact with `list-conflicts` + `digest` only —
-  `show-conflict` triggers the lazy heal and erases the evidence.
+- **[FIXED] Finding #10 — a dissolved conflict left a ghost badge
+  (`parked_conflict_uuids` reported a conflict `held_conflict_payload`
+  considered gone).** Surfaced by the hardened fuzzer (parity oracle;
+  intermittent — seeds 777, 115, 179 across sweeps). **Mechanism:**
+  `held_conflict_payload` (`reconcile.rs:402`) self-heals — when a
+  parked entry's stored peer value no longer conflicts with local it
+  `drop_conflict_rows` and skips. So a conflict row that *dissolved*
+  (local converged to the stored peer value with no ingest arm clearing
+  it) lingered until a resolver-open ran that lazy heal, while the cheap
+  badge query (`SELECT DISTINCT entry_uuid FROM conflict_entry`) counted
+  it immediately → a phantom badge / dead resolver entry. **Isolated
+  deterministically by hand** (the fuzzer catch is non-replayable — see
+  below): park a clash, then *locally edit* the entry to match the
+  parked peer value (no resolve, no re-ingest) → badge stays, resolver
+  says gone (`scenarios/conflict-stale-badge-on-local-edit.sh`; read the
+  badge with `list-conflicts` ONLY — `show-conflict` triggers the heal
+  and erases the evidence).
+  - **First fix attempt was wrong** (caught by the pre-land review): a
+    blanket `drop_conflict_rows` in `bump_modified` is owner-AGNOSTIC, so
+    a local edit toward peer B also wiped peer C's still-unresolved row
+    (multi-peer over-clear; guard: `conflict-multipeer-no-overclear.sh`).
+  - **Fix (shipped — dissolve-reconciliation):**
+    `reconcile::reconcile_conflict_rows(engine, entry)` restores the
+    invariant "a `conflict_entry(owner,E)` row exists iff E is present
+    locally AND still genuinely diverges from that owner's stored value":
+    E gone → drop all of E's rows (covers Finding #11); else per owner,
+    re-run the same merge-check the resolver uses and drop only the
+    *dissolved* owners (owner-scoped `drop_conflict_rows_for_owner`),
+    leaving still-divergent peers parked. Called at three sites:
+    post-edit (every content-mutation `Engine` wrapper), post-delete
+    (`delete_entry`/`recycle_entry`), and post-ingest
+    (`reconcile_all_conflict_rows` sweep at the tail of `Engine::ingest_peer`,
+    catching a sync that dissolves a *different* owner's conflict). The
+    badge stays a trivial `SELECT` — reconciliation is on the write side
+    and is a cheap "any rows?" no-op for non-conflicted entries; only an
+    entry actually in conflict pays the projection + per-owner merge.
+  - **NB the fuzzer catch was never replayable** (the root group +
+    recycle-bin uuids are minted in `Vault::create_empty`, *outside* the
+    engine's seeded `UuidSource`, so they stay random per run; seeds
+    777/115/179 each failed once and passed ≥13× on isolated rerun). The
+    fix is validated by the deterministic hand-repros + full suite +
+    fuzz soak, not by re-catching it in the fuzzer. Truly replayable
+    fuzzing still needs the `Vault::create_empty` ids pinned (keepass-core
+    follow-up) — the last non-determinism source.
+
+- **[FIXED] Finding #11 — `delete_entry`/`recycle_entry` orphaned
+  `conflict_entry` rows → ghost badge for a deleted entry** (pre-existing;
+  surfaced by the Finding #10 review). No FK cascade onto `conflict_entry`,
+  so removing an entry left its parked rows behind. Fixed for free by the
+  #10 dissolve-reconciliation: "entry gone locally → drop all its rows."
+  Proven by `scenarios/conflict-delete-clears-badge.sh`.
+
+- **[OPEN] Finding #12 — attachment classify asymmetry → cross-peer
+  conflict-set divergence** (pre-existing; surfaced by the parity oracle
+  during the #10/#11 soak, fuzz seed 43, intermittent). An attachment
+  divergence (`att-1` RemoteOnly) classifies as a CONFLICT from peer A's
+  side but is NOT parked on peer B, so the two peers' conflict sets
+  differ — one badges it, the other doesn't (Bug-D class). It's a
+  *genuine live* conflict (`show-conflict` returns a payload), not a
+  dissolved ghost, so it's **outside** the #10/#11 reconcile fix (which
+  correctly leaves live conflicts parked). Root cause is in
+  `keepass_merge::classify`: asymmetric verdicts on the attachment facet
+  depending on which side is "local" (per-side `<History>`/LCA differs) —
+  the same family as Finding #8's LCA work, on attachments. Intermittent
+  (random root/bin ids; passes ~6/6 on isolated rerun). Only bites
+  multi-peer attachment add/remove interleavings. Fix is a
+  classify-symmetry change in keepass-merge — a separate slice.
 
 - **[FIXED] Finding #9 — `resolved_at` was stamped from the system
   clock, not the injected engine clock, so under a pinned clock every
