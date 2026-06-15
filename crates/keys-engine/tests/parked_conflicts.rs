@@ -1054,6 +1054,66 @@ fn two_engine_custom_icon_pool_unions() {
     );
 }
 
+/// Phase 5 vault-meta convergence: a recycle-bin toggle on one peer must
+/// converge on the other via `ingest_peer`. Before `reconcile_peer_meta`,
+/// `ingest_peer` ignored Meta entirely, so B kept its own recycle-bin state
+/// and the content digest (which covers `recycle_bin_enabled` + the bin
+/// pointer) diverged permanently.
+#[test]
+fn two_engine_recycle_bin_meta_converges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut kdbx = fresh_kdbx();
+    kdbx.add_entry(kdbx.vault().root.id, NewEntry::new("E"))
+        .expect("seed");
+
+    let kdbx_a = dir.path().join("a.kdbx");
+    let kdbx_b = dir.path().join("b.kdbx");
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save");
+
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut handle_b = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut handle_b, None)
+        .expect("b save");
+
+    // A toggles the recycle bin on (a Meta change, stamping recycle_bin_changed).
+    engine_a.set_recycle_bin(true, None).expect("a enable bin");
+    let mut ha = reopen_kdbx(&kdbx_a);
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut ha, None)
+        .expect("a save 2");
+
+    // Teeth: the two diverge before any sync (A enabled, B still default).
+    assert_ne!(
+        engine_a.content_digest().expect("a digest pre"),
+        engine_b.content_digest().expect("b digest pre"),
+        "A's bin toggle should diverge the replicas before sync",
+    );
+
+    // B ingests A: it must adopt A's recycle-bin state, re-converging.
+    engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest a");
+
+    assert_eq!(
+        engine_a.content_digest().expect("a digest"),
+        engine_b.content_digest().expect("b digest"),
+        "replicas re-converged after B adopted A's recycle-bin toggle",
+    );
+}
+
 /// Phase 5d group adoption: a peer-only GROUP (one B has never seen)
 /// is adopted on ingest, and an entry the peer moved into it lands
 /// there rather than at root. Group adoption is unconditional (not

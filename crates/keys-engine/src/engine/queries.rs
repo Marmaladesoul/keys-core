@@ -234,7 +234,8 @@ impl Engine {
         enabled: bool,
         group_uuid: Option<Uuid>,
     ) -> Result<(), EngineError> {
-        mutations::set_recycle_bin(&mut self.conn, enabled, group_uuid)?;
+        let now = self.now_ms();
+        mutations::set_recycle_bin(&mut self.conn, enabled, group_uuid, now)?;
         self.emit(ChangeEvent::MetaUpdated {
             keys: vec![
                 crate::meta::KEY_RECYCLE_BIN_ENABLED.to_string(),

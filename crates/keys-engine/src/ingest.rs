@@ -14,9 +14,11 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use keepass_core::kdbx::{Kdbx, Unlocked};
-use keepass_core::model::{CustomIcon, Entry, Group, GroupId, Vault};
+use keepass_core::model::{CustomIcon, Entry, Group, GroupId, Meta, Vault};
 use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
-use keepass_merge::{Classification, Granularity, classify, parse_conflict_resolutions};
+use keepass_merge::{
+    Classification, Granularity, classify, merge_meta_scalars, parse_conflict_resolutions,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -1180,9 +1182,73 @@ pub(crate) fn ingest_peer(
     union_peer_tombstones(&tx, &peer_tomb)?;
     union_peer_custom_icons(&tx, &peer.meta.custom_icons)?;
     materialize_group_tombstones(&tx, &mut outcome)?;
+    // Vault-meta convergence: LWW the scalar Meta facets (recycle-bin config,
+    // db name/description, history caps, …). Runs last so the recycle-bin
+    // group pointer is resolved against the final, post-tombstone group tree.
+    reconcile_peer_meta(&tx, &local.meta, &peer.meta)?;
 
     tx.commit()?;
     Ok(outcome)
+}
+
+/// Reconcile the peer's vault Meta into the local mirror by LWW (Phase 5 —
+/// meta convergence).
+///
+/// `ingest_peer` reconciles entries, groups, resolution records and the
+/// custom-icon pool, but the **scalar** Meta facets were never reconciled — so
+/// a recycle-bin toggle (or a db-name / history-quota edit) on one peer left
+/// the other untouched and the replicas diverged. The convergence digest
+/// covers the recycle-bin pair, so that one is a genuine, permanent digest
+/// split until this runs.
+///
+/// Shares the canonical LWW rules with the disk-reconcile path via
+/// [`merge_meta_scalars`] (one implementation, so the two ingest paths can't
+/// drift on the rules). Only the scalar subset runs here: the icon pool is
+/// unioned content-addressed by [`union_peer_custom_icons`] and resolution
+/// records ride the custom-data path, both above — so this deliberately does
+/// NOT touch them.
+fn reconcile_peer_meta(
+    tx: &Connection,
+    local_meta: &Meta,
+    peer_meta: &Meta,
+) -> Result<(), EngineError> {
+    let mut merged = local_meta.clone();
+    merge_meta_scalars(&mut merged, peer_meta);
+
+    // Scalar setting rows (name/description/default-username + their
+    // `*_changed`, `recycle_bin_changed`, `settings_changed`, history caps,
+    // colour, …). The scalar-only writer upserts these and never touches the
+    // icon or custom-data list tables — `write_meta`'s list writes are plain
+    // inserts that would duplicate the resolution-record rows mid-ingest.
+    meta::write_meta_scalars(tx, &merged)?;
+
+    // Recycle bin: the enabled flag (a 1-byte setting) plus the bin pointer,
+    // which is the `is_recycle_bin` flag on a group row (derived, not a
+    // setting) — moved together as `merge_meta_scalars` decided.
+    meta::write_recycle_bin_enabled(tx, merged.recycle_bin_enabled)?;
+    match merged.recycle_bin_uuid {
+        // The winner names a bin group we actually hold → flag it.
+        Some(g) if group_row_exists(tx, &g.0.to_string())? => {
+            meta::write_recycle_bin_group(tx, &g.0.to_string())?;
+        }
+        // Disabled, or the winner's bin group isn't present locally yet (a
+        // group not adopted on this ingest) → clear the flag; projection
+        // derives `recycle_bin_uuid = None` until the group arrives.
+        _ => meta::clear_recycle_bin_group(tx)?,
+    }
+    Ok(())
+}
+
+/// True if a group row with `uuid` exists in the mirror.
+fn group_row_exists(conn: &Connection, uuid: &str) -> Result<bool, EngineError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM \"group\" WHERE uuid = ?1",
+            params![uuid],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// Phase 5b direction-1: reconcile local entries the peer no longer holds

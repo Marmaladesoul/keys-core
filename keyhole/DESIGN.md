@@ -535,6 +535,28 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 
 ## Findings (surfaced by keyhole)
 
+- **[FIXED] `ingest_peer` ignored vault Meta → a recycle-bin toggle diverged
+  replicas permanently (digest-visible).** The owner-rows peer-sync path
+  reconciled entries, groups, resolution records and (since the icon finding
+  below) the custom-icon pool, but never the scalar `Meta` facets. So toggling
+  the recycle bin on one peer left the other untouched, and since the
+  convergence digest covers `recycle_bin_enabled` + the bin pointer, the two
+  replicas' digests split and never re-converged — a "stuck out of sync" a
+  2-Mac soak would otherwise chase for an afternoon (the fuzzer never toggles
+  the bin, so it was a blind spot). Two sub-causes: (1) `set_recycle_bin` never
+  stamped `recycle_bin_changed`, so there was no LWW arbiter; (2) `ingest_peer`
+  had no meta reconcile at all. **Fix:** stamp `recycle_bin_changed` on every
+  toggle, and add `ingest::reconcile_peer_meta` — LWW the scalar facets via
+  the shared `keepass_merge::merge_meta_scalars` (one rule-set for the
+  peer-sync and disk-reconcile paths), persisting via a new scalar-only
+  `meta::write_meta_scalars` (the full `write_meta` plain-inserts the
+  custom-data/icon list tables and would duplicate resolution rows mid-ingest —
+  a regression the fuzzer caught). Proven by
+  `scenarios/meta-recycle-bin-converges.sh` (one-sided adopt + LWW, across a
+  fresh disk read) + engine `two_engine_recycle_bin_meta_converges`. Needs
+  keepass-core (the `merge_meta_scalars` export) to land first. The other
+  scalar facets (db name/description, history caps) ride the same reconcile.
+
 - **[FIXED] custom-icon pool not unioned on `ingest_peer` → dangling icon
   reference (digest-blind).** The last 5c sliver. When a peer adds a custom
   icon to a shared entry, the entry's content-addressed `custom_icon_uuid`

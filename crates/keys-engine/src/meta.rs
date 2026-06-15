@@ -86,6 +86,19 @@ pub(crate) const KEY_KDBX_TRANSFORM_ROUNDS: &str = "meta.kdbx_transform_rounds";
 /// The caller is responsible for clearing pre-existing Meta rows before
 /// invoking this — see [`clear_meta_tables`].
 pub(crate) fn write_meta(conn: &Connection, meta: &Meta) -> Result<(), rusqlite::Error> {
+    write_meta_scalars(conn, meta)?;
+    write_meta_lists(conn, meta)
+}
+
+/// Write only the SCALAR Meta facets — the `setting`-table rows: strings,
+/// timestamps, integers, the packed memory-protection byte, unknown-XML.
+/// Every write is an `INSERT OR REPLACE`, so this is safe to call WITHOUT
+/// first clearing the meta tables, unlike the list-table writes in
+/// [`write_meta_lists`] (plain inserts). The owner-rows `ingest_peer` meta
+/// reconcile uses this to LWW the scalars into a live mirror without touching
+/// the content-addressed icon pool or the resolution-record custom-data rows
+/// it reconciles on their own paths.
+pub(crate) fn write_meta_scalars(conn: &Connection, meta: &Meta) -> Result<(), rusqlite::Error> {
     // Strings — always set, even if empty, so a default-empty value
     // round-trips cleanly rather than disappearing.
     set_text(conn, KEY_GENERATOR, &meta.generator)?;
@@ -138,7 +151,14 @@ pub(crate) fn write_meta(conn: &Connection, meta: &Meta) -> Result<(), rusqlite:
     let unknown_json = serialise_unknown_xml(&meta.unknown_xml)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     set_text(conn, KEY_UNKNOWN_XML, &unknown_json)?;
+    Ok(())
+}
 
+/// Write the list-shaped Meta tables (custom-icon pool, vault-level
+/// custom-data) via plain INSERT. The caller MUST have cleared these rows
+/// first (see [`clear_meta_tables`]); used only on the full-vault ingest path,
+/// never on the live `ingest_peer` reconcile (which would duplicate rows).
+fn write_meta_lists(conn: &Connection, meta: &Meta) -> Result<(), rusqlite::Error> {
     // List-shaped tables.
     for icon in &meta.custom_icons {
         conn.execute(
@@ -258,6 +278,18 @@ pub(crate) fn write_recycle_bin_enabled(
 ) -> Result<(), rusqlite::Error> {
     let blob: [u8; 1] = [u8::from(enabled)];
     set_blob(conn, KEY_RECYCLE_BIN_ENABLED, &blob)
+}
+
+/// Stamp `meta.recycle_bin_changed` (epoch-ms) — the LWW arbiter for the
+/// recycle-bin facet (the enabled flag and bin-group pointer move together
+/// under it). Written on every toggle so cross-peer sync can pick a winner;
+/// without it both peers carry a `None` timestamp and a divergent toggle never
+/// converges.
+pub(crate) fn write_recycle_bin_changed(
+    conn: &Connection,
+    ts_ms: i64,
+) -> Result<(), rusqlite::Error> {
+    set_i64(conn, KEY_RECYCLE_BIN_CHANGED, ts_ms)
 }
 
 /// Designate the group with `uuid` as the vault's recycle bin. Sets

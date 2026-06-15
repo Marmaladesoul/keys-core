@@ -986,6 +986,7 @@ pub(crate) fn set_recycle_bin(
     conn: &mut Connection,
     enabled: bool,
     group_uuid: Option<Uuid>,
+    now_ms: i64,
 ) -> Result<(), EngineError> {
     let tx = conn.transaction()?;
     if let Some(uuid) = group_uuid {
@@ -998,6 +999,9 @@ pub(crate) fn set_recycle_bin(
         crate::meta::clear_recycle_bin_group(&tx)?;
     }
     crate::meta::write_recycle_bin_enabled(&tx, enabled)?;
+    // Stamp the LWW arbiter so a divergent toggle converges cross-peer
+    // (reconciled in `ingest::reconcile_peer_meta`).
+    crate::meta::write_recycle_bin_changed(&tx, now_ms)?;
     tx.commit()?;
     Ok(())
 }
