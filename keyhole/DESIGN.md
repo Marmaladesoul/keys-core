@@ -520,9 +520,25 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   `add-custom-icon` / `custom-icon-bytes`; proven by
   `custom-icon-cross-peer.sh` + engine `two_engine_custom_icon_pool_unions`.
   See Findings.
+- **Done (2026-06-15, vault-meta convergence):** `ingest_peer` now LWW-
+  reconciles the scalar `Meta` facets (recycle-bin config, db name/desc,
+  history caps) via the shared `keepass_merge::merge_meta_scalars` — a
+  recycle-bin toggle was a proven permanent digest split. keepass-core #229 +
+  KeysCore #167; proven by `meta-recycle-bin-converges.sh` + engine
+  `two_engine_recycle_bin_meta_converges`. See Findings.
+- **Done (2026-06-15, adversarial save-fidelity gate):** the engine projects
+  the mirror → vault → KDBX on every save, so a lossy projection silently
+  drops data (Finding #6 class). A self-round-trip can pass vacuously, so
+  `save-fidelity-adversarial.sh` builds a deliberately-rich vault via keyhole
+  and verifies the engine-saved file with an INDEPENDENT reader (`keepassxc-cli`)
+  — fields/history/attachment-bytes/custom-icon all survive; the checks are
+  teeth-verified (a sabotaged copy goes red) and the scenario SKIPs where the
+  cli is absent. Came back clean for this facet set; breadth (KDBX 3.1,
+  custom fields, unknown-XML, a fidelity fuzzer) is a later escalation.
 - **Next:** previous-parent merge rules; `empty-bin` verb; value-hash-based
   adoption matching (timestamp-free) as hardening when resolution records
-  grow fields.
+  grow fields; vault-level `<Meta><CustomData>` (plugin keys) peer-path
+  convergence; the save-fidelity breadth pass above.
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old
