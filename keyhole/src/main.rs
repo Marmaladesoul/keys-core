@@ -244,6 +244,20 @@ enum Command {
         /// Content-addressed UUID of the custom icon (see `add-custom-icon`).
         icon: String,
     },
+    /// Set a non-protected custom (string) field on an entry, then persist —
+    /// the `entry_custom_field` surface that clients show as extra
+    /// attributes. Lets scenarios cover custom-field save-fidelity and
+    /// cross-peer convergence (a facet `create-entry` can't author).
+    SetField {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry to set the field on.
+        entry: String,
+        /// Custom field name (the attribute key).
+        name: String,
+        /// Custom field value.
+        value: String,
+    },
     /// Print the hex SHA-256 digest of the vault's user-visible
     /// content (fields, locations, icons, group tree, recycle-bin
     /// state). Equal digests ⇔ converged replicas — the convergence
@@ -519,6 +533,15 @@ async fn main() -> Result<()> {
         Command::CustomIconBytes { vault, icon } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.custom_icon_bytes(icon)?;
+        }
+        Command::SetField {
+            vault,
+            entry,
+            name,
+            value,
+        } => {
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.set_field(entry, name, value).await?;
         }
         Command::Digest { vault } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
@@ -1007,6 +1030,16 @@ impl Session {
         for o in &owners {
             println!("{o}");
         }
+        Ok(())
+    }
+
+    /// Set a non-protected custom (string) field on `entry`, then persist.
+    async fn set_field(&self, entry: String, name: String, value: String) -> Result<()> {
+        self.engine
+            .set_non_protected_custom_field(entry, name.clone(), value)
+            .map_err(|e| anyhow::anyhow!("set_non_protected_custom_field: {e:?}"))?;
+        self.save().await?;
+        println!("set field {name:?} and saved to disk");
         Ok(())
     }
 

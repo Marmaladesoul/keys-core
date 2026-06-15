@@ -526,15 +526,19 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   recycle-bin toggle was a proven permanent digest split. keepass-core #229 +
   KeysCore #167; proven by `meta-recycle-bin-converges.sh` + engine
   `two_engine_recycle_bin_meta_converges`. See Findings.
-- **Done (2026-06-15, adversarial save-fidelity gate):** the engine projects
-  the mirror → vault → KDBX on every save, so a lossy projection silently
-  drops data (Finding #6 class). A self-round-trip can pass vacuously, so
-  `save-fidelity-adversarial.sh` builds a deliberately-rich vault via keyhole
-  and verifies the engine-saved file with an INDEPENDENT reader (`keepassxc-cli`)
-  — fields/history/attachment-bytes/custom-icon all survive; the checks are
-  teeth-verified (a sabotaged copy goes red) and the scenario SKIPs where the
-  cli is absent. Came back clean for this facet set; breadth (KDBX 3.1,
-  custom fields, unknown-XML, a fidelity fuzzer) is a later escalation.
+- **Done (2026-06-15, adversarial save-fidelity gate + format/field breadth):**
+  the engine projects the mirror → vault → KDBX on every save, so a lossy
+  projection silently drops data (Finding #6 class). A self-round-trip can pass
+  vacuously, so the gate verifies the engine-saved file with an INDEPENDENT
+  reader (`keepassxc-cli`) that shares none of our assumptions; checks are
+  teeth-verified (a sabotaged copy goes red) and **fail loudly** if the cli is
+  absent (a skipped gate is no gate — CI installs it). `keyhole set-field`
+  added so a custom field is authorable. Two scenarios:
+  `save-fidelity-adversarial.sh` (KDBX4: fields/history/attachment/custom-icon/
+  custom-field) and `save-fidelity-kdbx3.sh` (opens a vendored KDBX3 fixture,
+  builds it rich, asserts the engine keeps it KDBX3 — no silent v3→v4 upgrade —
+  with every facet intact). Both came back clean. Remaining breadth: unknown-XML
+  and a full round-trip fidelity fuzzer.
 - **Next:** previous-parent merge rules; `empty-bin` verb; value-hash-based
   adoption matching (timestamp-free) as hardening when resolution records
   grow fields; vault-level `<Meta><CustomData>` (plugin keys) peer-path

@@ -16,13 +16,14 @@
 # here: it deliberately excludes history / timestamps / unknown-XML, exactly
 # the round-trip facets at risk.
 #
-# Facets covered (bounded first cut): standard entry fields, per-entry history,
-# an attachment (name + exact bytes), a custom icon (pool + entry ref). Custom
-# fields / unknown-XML / KDBX-3.1 are a later breadth pass.
+# Facets covered: standard entry fields, per-entry history, an attachment
+# (name + exact bytes), a custom icon (pool + entry ref), a non-protected
+# custom field. KDBX-3.1 fidelity is a sibling scenario
+# (save-fidelity-kdbx3.sh); unknown-XML and a fidelity fuzzer are later.
 #
-# Needs an independent KDBX reader; SKIPs cleanly where keepassxc-cli is
-# absent (e.g. a bare CI runner), so it's a real local gate without breaking
-# the suite elsewhere.
+# Needs an independent KDBX reader and FAILS LOUDLY if it's absent — a skipped
+# gate is no gate. CI installs keepassxc-cli for exactly this; locally, install
+# KeePassXC.
 
 set -euo pipefail
 
@@ -36,8 +37,10 @@ if [ -z "$XC" ] && [ -x "/Applications/KeePassXC.app/Contents/MacOS/keepassxc-cl
     XC="/Applications/KeePassXC.app/Contents/MacOS/keepassxc-cli"
 fi
 if [ -z "$XC" ]; then
-    echo "SKIP: keepassxc-cli not found — adversarial save-fidelity needs an independent KDBX reader"
-    exit 0
+    echo "FAIL: keepassxc-cli not found — the adversarial save-fidelity gate REQUIRES an"
+    echo "      independent KDBX reader; it must never silently skip (a skipped gate is no"
+    echo "      gate). Install it — CI: 'apt-get install -y keepassxc'; macOS: KeePassXC.app."
+    exit 1
 fi
 
 TMP="$(mktemp -d)"
@@ -59,6 +62,9 @@ uuid="$("$KEYHOLE" list "$V" | awk '/Secret/ {print $1; exit}')"
 "$KEYHOLE" --at 3000000 update-entry "$V" "$uuid" --username bravo >/dev/null
 "$KEYHOLE" --at 4000000 set-attachment "$V" "$uuid" "file.bin" --text "PAYLOAD-7f3a-attach" >/dev/null
 icon="$("$KEYHOLE" --at 5000000 add-custom-icon "$V" "$uuid" "ICON-IMAGE-BYTES-001")"
+# A non-protected custom field (extra attribute) — a distinct facet from the
+# standard fields, stored in entry_custom_field.
+"$KEYHOLE" --at 6000000 set-field "$V" "$uuid" "API-Token" "tok-7f3a-field" >/dev/null
 # Sanity: the input is sound — keyhole's own mirror holds the icon it added
 # (so a later miss is the SAVE projection, not a broken input).
 [ "$("$KEYHOLE" custom-icon-bytes "$V" "$icon")" != "(none)" ] \
@@ -70,6 +76,11 @@ grep -q "UserName: bravo"            <<<"$show" || { echo "FAIL: username lost/m
 grep -q "Password: s3cret"           <<<"$show" || { echo "FAIL: password lost/mangled on save"; exit 1; }
 grep -q "URL: https://example.test"  <<<"$show" || { echo "FAIL: url lost/mangled on save"; exit 1; }
 grep -q "Notes: hello notes"         <<<"$show" || { echo "FAIL: notes lost/mangled on save"; exit 1; }
+
+# Custom field: keepassxc surfaces non-protected custom fields as attributes.
+field="$(xc show -a "API-Token" "$V" "Secret")"
+[ "$field" = "tok-7f3a-field" ] \
+    || { echo "FAIL: custom field lost/mangled on save (got: '$field')"; exit 1; }
 
 # Attachment: export to a real file (not /dev/stdout, which the cli mixes with
 # its success message) and compare exact bytes.
