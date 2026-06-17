@@ -207,6 +207,9 @@ pub(crate) fn apply_conflict_resolution(
         groups_updated: 0,
         groups_deleted: 0,
         groups_moved: 0,
+        // History-tombstone reconciliation rides the eager `apply_merge` on this
+        // path, so there's no separate count to surface.
+        history_pruned: 0,
     };
     engine.emit(ChangeEvent::ExternalChangeMerged { applied });
 

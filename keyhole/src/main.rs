@@ -1457,7 +1457,7 @@ fn print_park_result(label: &str, r: &ParkConflictsResultFfi) {
         ParkConflictsResultFfi::NoChange => println!("{label}: no change"),
         ParkConflictsResultFfi::Applied { applied, parked } => {
             println!(
-                "{label}: entries +{} ~{} -{} moved {}; groups +{} ~{} -{} moved {}",
+                "{label}: entries +{} ~{} -{} moved {}; groups +{} ~{} -{} moved {}; history pruned {}",
                 applied.entries_added,
                 applied.entries_updated,
                 applied.entries_deleted,
@@ -1466,6 +1466,7 @@ fn print_park_result(label: &str, r: &ParkConflictsResultFfi) {
                 applied.groups_updated,
                 applied.groups_deleted,
                 applied.groups_moved,
+                applied.history_pruned,
             );
             for u in &parked.entries_with_parked_conflict {
                 println!("parked conflict: {u}");

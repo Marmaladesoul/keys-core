@@ -21,14 +21,6 @@ failed_names=()
 for s in "$DIR"/*.sh; do
     name="$(basename "$s")"
     [ "$name" = "run-all.sh" ] && continue
-    # history-delete-propagates.sh is a RED forcing-function, not yet a gate:
-    # it pins an OPEN bug — a deleted history snapshot doesn't propagate
-    # cross-peer (no tombstone union/prune on the InSync ingest path). The
-    # local half (delete_history_at writes the tombstone) has landed; the
-    # ingest-side reconcile is the pending fix (keyhole DESIGN.md → Findings →
-    # "History-snapshot deletion doesn't propagate"). Run it manually while
-    # chasing that; excluded here so the suite stays a true gate.
-    [ "$name" = "history-delete-propagates.sh" ] && continue
     # fuzz-replay-determinism.sh is now a full CI gate: the cross-run replay
     # residual (the per-device op count drawn in a $(seq …) subshell) is fixed,
     # and it sweeps seeds 42/43/777 × 6 rounds proving byte-for-byte replay

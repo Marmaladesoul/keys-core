@@ -121,6 +121,12 @@ pub struct MergeStats {
     pub groups_deleted: usize,
     /// Groups that changed parent. Always `0` in v0.1.
     pub groups_moved: usize,
+    /// Entries whose history was pruned because a peer's
+    /// `keys.history_tombstones.v1` record propagated a history-snapshot
+    /// deletion (the privacy fix, part 2). Distinct bucket because the live
+    /// entry is typically `InSync` — only its history changed — so it would
+    /// otherwise be an invisible `Applied`-with-zero-counts.
+    pub history_pruned: usize,
 }
 
 /// Outcome of a successful
@@ -280,6 +286,9 @@ pub(crate) fn reconcile_with_disk(
         groups_updated: 0,
         groups_deleted: count_groups_tombstoned(&local_vault, &remote_vault),
         groups_moved: 0,
+        // The disk-reconcile path folds history-tombstone reconciliation into
+        // its eager merge (`apply_merge`), so it has no separate count.
+        history_pruned: 0,
     };
 
     // 9. Apply the merge to a clone of the local vault.
@@ -714,14 +723,16 @@ fn ingest_kdbx_as_owner(
     let outcome = engine.ingest_peer(owner, &remote_vault)?;
 
     // Loop-safety discriminator: only an advanced local side (a non-empty
-    // `auto_merged`, `added`, `deleted`, or `moved`) is something to save. A
-    // held conflict advanced nothing → NoChange → no save → no re-push → the
-    // loop never starts. The badge reads the owner rows directly, so
-    // `conflicted` does NOT make this `Applied`. A propagated cross-peer delete
-    // (Phase 5b) or location move (Phase 5d) is a real local change, so it does
-    // (mirrors the `added` bucket). Loop-safe: an adopted move takes the peer's
-    // verbatim `location_changed`, so the re-saved value equals what the peer
-    // sent → the peer's next pull sees no newer stamp → no re-move.
+    // `auto_merged`, `added`, `deleted`, `moved`, or `history_pruned`) is
+    // something to save. A held conflict advanced nothing → NoChange → no save
+    // → no re-push → the loop never starts. The badge reads the owner rows
+    // directly, so `conflicted` does NOT make this `Applied`. A propagated
+    // cross-peer delete (Phase 5b), location move (Phase 5d), or history-
+    // snapshot deletion (the privacy fix, part 2) is a real local change, so it
+    // does (mirrors the `added` bucket). Loop-safe: an adopted move takes the
+    // peer's verbatim `location_changed`, and a history-tombstone reconcile is
+    // idempotent once both sides agree, so the re-saved value matches what the
+    // peer holds → the peer's next pull sees nothing newer → the loop settles.
     if outcome.auto_merged.is_empty()
         && outcome.added.is_empty()
         && outcome.deleted.is_empty()
@@ -730,6 +741,7 @@ fn ingest_kdbx_as_owner(
         && outcome.groups_updated.is_empty()
         && outcome.groups_moved.is_empty()
         && outcome.groups_deleted.is_empty()
+        && outcome.history_pruned.is_empty()
     {
         return Ok(ParkConflictsResult::NoChange);
     }
@@ -743,7 +755,7 @@ fn ingest_kdbx_as_owner(
         groups_updated: outcome.groups_updated.len(),
         groups_moved: outcome.groups_moved.len(),
         groups_deleted: outcome.groups_deleted.len(),
-        ..Default::default()
+        history_pruned: outcome.history_pruned.len(),
     };
     let parked = ParkedConflictsSummary {
         entries_with_parked_conflict: outcome

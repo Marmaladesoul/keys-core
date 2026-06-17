@@ -989,6 +989,10 @@ pub struct MergeStats {
     pub groups_updated: u64,
     pub groups_deleted: u64,
     pub groups_moved: u64,
+    /// Entries whose history was pruned by a propagated history-snapshot
+    /// deletion (`keys.history_tombstones.v1`). Typically the live entry is
+    /// `InSync`, so this is the only non-zero count for a history scrub.
+    pub history_pruned: u64,
 }
 
 impl From<eng::MergeStats> for MergeStats {
@@ -1002,6 +1006,7 @@ impl From<eng::MergeStats> for MergeStats {
             groups_updated: s.groups_updated as u64,
             groups_deleted: s.groups_deleted as u64,
             groups_moved: s.groups_moved as u64,
+            history_pruned: s.history_pruned as u64,
         }
     }
 }

@@ -894,6 +894,14 @@ pub struct IngestPeerOutcome {
     /// empty locally, and we hadn't changed them since (cross-peer group
     /// delete, Phase 5d). The local side changed → the caller must persist.
     pub groups_deleted: Vec<Uuid>,
+    /// Shared entries whose history was pruned (and/or whose history-tombstone
+    /// list grew) because the peer carried a `keys.history_tombstones.v1`
+    /// record this side hadn't applied — a "scrub this old version" deletion
+    /// propagating cross-peer (the history-deletion privacy fix, part 2). The
+    /// classify verdict for these is typically `InSync` (the live entry is
+    /// identical; only the history differs), so this is reconciled out-of-band
+    /// like the location pass. The local side changed → the caller must persist.
+    pub history_pruned: Vec<Uuid>,
     /// Count of entries the peer agreed on outright — nothing written.
     pub in_sync: usize,
 }
@@ -996,6 +1004,13 @@ pub(crate) fn ingest_peer(
             outcome.added.push(uuid);
             continue;
         };
+        // Did the verdict arm rebuild the live entry (history and all) from the
+        // PEER's copy? Only the conflict adopt-peer arm does (via
+        // `advance_local_entry(peer, &conflict.remote)`); every other arm leaves
+        // the persisted history equal to local's. The history-tombstone pass
+        // below must reconcile against whichever side is now on disk, or it
+        // would clobber the just-adopted peer history with a stale local one.
+        let mut adopted_peer_history = false;
         match classify(
             local_entry,
             peer_entry,
@@ -1115,6 +1130,10 @@ pub(crate) fn ingest_peer(
                         &session_key,
                         &peer_bin_refs,
                     )?;
+                    // The live entry — history included — now holds the peer's
+                    // copy, so the history-tombstone pass must reconcile the
+                    // PEER's history, not our stale local one.
+                    adopted_peer_history = true;
                     outcome.auto_merged.push(uuid);
                 } else {
                     // Genuine unresolved conflict (or our edit superseded the
@@ -1163,6 +1182,43 @@ pub(crate) fn ingest_peer(
         // clash being resolved.
         if reconcile_entry_location(&tx, uuid, peer_entry, peer_parent)? {
             outcome.moved.push(uuid);
+        }
+
+        // History-tombstone propagation (the privacy fix, part 2), also
+        // orthogonal to the content verdict: deleting a history snapshot (the
+        // "scrub this old/leaked version" action) leaves the LIVE entry
+        // unchanged, so classify verdicts the entry InSync and the deletion
+        // would never reach this peer. Reconcile both sides' history tombstones
+        // for every shared entry — union the OR-sets, prune the persisted
+        // entry's matching history records, persist. Runs after the verdict arm
+        // so it survives `advance_local_entry`'s drop+reinsert; touches only
+        // history rows + the tombstone custom_data item, never the live entry,
+        // so it's safe for held conflicts too. Loop-safe: idempotent once both
+        // agree. The base is whichever side's history the arm just persisted:
+        // the peer's when we adopted its resolved value, else local's.
+        let history_changed = if adopted_peer_history {
+            reconcile_entry_history_tombstones(
+                &tx,
+                uuid,
+                peer_entry,
+                local_entry,
+                &peer.binaries,
+                &session_key,
+                &peer_bin_refs,
+            )?
+        } else {
+            reconcile_entry_history_tombstones(
+                &tx,
+                uuid,
+                local_entry,
+                peer_entry,
+                &local.binaries,
+                &session_key,
+                &local_bin_refs,
+            )?
+        };
+        if history_changed {
+            outcome.history_pruned.push(uuid);
         }
     }
 
@@ -1943,6 +1999,134 @@ fn reconcile_entry_location(
         ],
     )?;
     Ok(true)
+}
+
+/// Does `entry` carry a history-tombstone `custom_data` record? The cheap
+/// pre-check that lets the per-entry history reconcile skip the clone +
+/// rewrite for the overwhelmingly common no-tombstone entry.
+fn has_history_tombstone(entry: &Entry) -> bool {
+    entry
+        .custom_data
+        .iter()
+        .any(|c| c.key == keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY)
+}
+
+/// Reconcile history-snapshot deletions for a shared entry (the history-deletion
+/// privacy fix, part 2).
+///
+/// `base` is the entry whose history the verdict arm just persisted to the
+/// mirror — local for the `InSync` / auto-merge / held-conflict arms, but the
+/// **peer** for the conflict adopt-peer arm (where `advance_local_entry`
+/// rebuilt the entry, history and all, from the peer's resolved copy). `other`
+/// is the opposite side; it contributes only its tombstone list to the union.
+/// Basing on the wrong side would clobber the just-persisted history with a
+/// stale one — so the caller picks `base`/`other`/`base_binaries`/`base_bin_refs`
+/// to match the arm that ran.
+///
+/// Delegates the CRDT to [`keepass_merge::reconcile_history_tombstones`] (the
+/// same OR-set the disk-reconcile path uses): it unions both sides'
+/// `keys.history_tombstones.v1` lists onto a clone of `base`, prunes the history
+/// records the union tombstones, and reports whether anything changed. On change
+/// we persist by rewriting the entry's `entry_history` rows and its tombstone
+/// `entry_custom_data` item — the live `entry` row is never touched (only history
+/// snapshots), so this is safe regardless of the surrounding classify verdict.
+///
+/// `base_binaries` is the pool `base.history` references (for the content hash);
+/// `base_bin_refs` is that same pool as byte slices (to re-seal the rewritten
+/// snapshots), matching whatever pool the verdict arm wrote with.
+///
+/// Returns `true` iff the local side changed (so the caller records it and the
+/// reconcile drives a save). A `false` return is the converged steady state.
+///
+/// Known limitation (eventually-consistent): the prune matches a record by its
+/// content hash, which for an attachment-bearing history snapshot includes the
+/// attachment bytes. A peer that doesn't hold those bytes hashes the same record
+/// *without* the attachment, so the prune no-ops there until the bytes arrive.
+/// The tombstone `custom_data` still propagates, so any peer that later resolves
+/// the bytes prunes on its next reconcile — the scrub is delayed, never lost.
+fn reconcile_entry_history_tombstones(
+    tx: &Connection,
+    uuid: Uuid,
+    base: &Entry,
+    other: &Entry,
+    base_binaries: &[keepass_core::model::Binary],
+    session_key: &SessionKey,
+    base_bin_refs: &[&[u8]],
+) -> Result<bool, EngineError> {
+    // Cheap pre-check: neither side has a tombstone → nothing to do, and no
+    // need to clone the entry's history.
+    if !has_history_tombstone(base) && !has_history_tombstone(other) {
+        return Ok(false);
+    }
+    let mut merged = base.clone();
+    let changed = keepass_merge::reconcile_history_tombstones(&mut merged, other, base_binaries)
+        .map_err(|e| EngineError::Serialise(format!("reconcile_history_tombstones: {e}")))?;
+    if !changed {
+        return Ok(false);
+    }
+    let uuid_str = uuid.to_string();
+    rewrite_entry_history(tx, &uuid_str, &merged.history, session_key, base_bin_refs)?;
+    let tombstone_item = merged
+        .custom_data
+        .iter()
+        .find(|c| c.key == keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY);
+    write_entry_tombstone_custom_data(tx, &uuid_str, tombstone_item)?;
+    Ok(true)
+}
+
+/// Replace an entry's `entry_history` rows with `history` (oldest-first),
+/// re-sealing each snapshot exactly as [`insert_entry`] does. The per-entry
+/// twin of the full clear+reinsert ingest does — there was no per-entry
+/// history-rewrite helper before the history-tombstone reconcile needed one.
+fn rewrite_entry_history(
+    tx: &Connection,
+    uuid_str: &str,
+    history: &[Entry],
+    session_key: &SessionKey,
+    binaries: &[&[u8]],
+) -> Result<(), EngineError> {
+    tx.execute(
+        "DELETE FROM entry_history WHERE entry_uuid = ?1",
+        params![uuid_str],
+    )?;
+    for (idx, hist) in history.iter().enumerate() {
+        let snapshot = HistorySnapshot::from_entry(hist, session_key, binaries)?;
+        let json = serde_json::to_string(&snapshot)
+            .map_err(|e| EngineError::Ingest(IngestError::Json(e)))?;
+        tx.execute(
+            "INSERT INTO entry_history (entry_uuid, history_index, snapshot_json) \
+             VALUES (?1, ?2, ?3)",
+            params![uuid_str, i64::try_from(idx).unwrap_or(i64::MAX), json],
+        )?;
+    }
+    Ok(())
+}
+
+/// Upsert (or, when `tombstone_item` is `None`, clear) an entry's
+/// `keys.history_tombstones.v1` row in `entry_custom_data`. Only the
+/// tombstone key is touched — other `custom_data` rows are left alone.
+fn write_entry_tombstone_custom_data(
+    tx: &Connection,
+    uuid_str: &str,
+    tombstone_item: Option<&keepass_core::model::CustomDataItem>,
+) -> Result<(), EngineError> {
+    tx.execute(
+        "DELETE FROM entry_custom_data WHERE entry_uuid = ?1 AND key = ?2",
+        params![uuid_str, keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY],
+    )?;
+    if let Some(item) = tombstone_item {
+        tx.execute(
+            "INSERT INTO entry_custom_data (entry_uuid, key, value, last_modified_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                uuid_str,
+                item.key,
+                item.value,
+                item.last_modified.map(|d| d.timestamp_millis()),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 /// Truncate sub-second precision (toward negative infinity, so pre-1970

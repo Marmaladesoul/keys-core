@@ -159,8 +159,9 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
     n=$((n + 1))
     # Op mix = the cross-peer surface the multipeer store supports today:
     # entry create, field edits, hard delete (5b tombstones), attachment
-    # set/remove (5c), tag replace (3-way set merge), entry MOVE (5d location
-    # LWW), and group CREATE
+    # set/remove (5c), tag replace (3-way set merge), history-snapshot delete
+    # (the privacy fix part 2 — history-tombstone union/prune on ingest), entry
+    # MOVE (5d location LWW), and group CREATE
     # (5d peer-only group adoption — a device-local new group the peer
     # adopts on ingest, into which subsequent moves can land). Merged in
     # as each finding/slice landed (#7 conflict-row attachments, #8 LCA
@@ -182,7 +183,7 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
     # second as a resolution (the sub-second hazard that silently
     # auto-merges a real clash — caught when this fuzzer first ran a
     # contended edit every round).
-    op=$((RANDOM % 12))
+    op=$((RANDOM % 13))
     case $op in
         7) "$KEYHOLE" --at "$AT" --uuid-seed "$(mix "$n")" create-group "$v" "g-$n" >/dev/null ;;
         8) g="$(random_group "$v")"
@@ -222,6 +223,18 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
            # order-independent and the digest covers them, so a real divergence
            # still fails the oracle. Proven path: tags-cross-peer.sh.
            if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" set-tags "$v" "$e" "t-$((n % 3)),t-$((n % 5))" >/dev/null; fi ;;
+        12) e="$(random_entry "$v")"
+           # Delete a history snapshot (the privacy fix, part 2): writes a
+           # keys.history_tombstones.v1 record that the peer's ingest unions +
+           # prunes against, so the deletion propagates cross-peer even though
+           # the live entry stays InSync. Index 0 (oldest) always exists when
+           # history is non-empty; an empty-history entry just no-ops (|| true).
+           # Deterministic: target via random_entry, fixed index 0, tombstone
+           # `at` stamped from the pinned $AT — no $RANDOM, so replay holds.
+           # The digest excludes history + tombstones, so this can't perturb
+           # the convergence oracle; it exercises the ingest history-reconcile
+           # path under churn. Proven path: history-delete-propagates.sh.
+           if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" delete-history "$v" "$e" 0 >/dev/null 2>&1 || true; fi ;;
     esac
 }
 

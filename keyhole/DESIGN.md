@@ -547,11 +547,13 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   by `tags-cross-peer.sh` and now fuzzed (op 11 in `fuzz-convergence.sh`,
   200/200 soak + replay-deterministic). Tags already converged — this closed
   the test gap, not a bug.
-- **Next (the headline):** **part 2 of the history-deletion fix** — an
-  `ingest_peer` pass that unions + prunes history tombstones for shared
-  entries even when classify says InSync (see Findings → "History-snapshot
-  deletion doesn't propagate"). That flips `history-delete-propagates.sh` from
-  forcing-function to gate. Then the rest of the history-surgery cluster
+- **Done (2026-06-17, part 2 of the history-deletion fix):** an `ingest_peer`
+  pass unions + prunes history tombstones for shared entries even when classify
+  says InSync (see Findings → "History-snapshot deletion didn't propagate"),
+  via the new `keepass_merge::reconcile_history_tombstones`. That flipped
+  `history-delete-propagates.sh` from forcing-function to a `run-all.sh` gate;
+  `fuzz-convergence.sh`'s mix gained a deterministic `delete-history` op.
+- **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the
   covered `set-attachment`). Then: previous-parent merge rules; `empty-bin`
@@ -569,29 +571,55 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 
 ## Findings (surfaced by keyhole)
 
-- **[OPEN, part-fixed] History-snapshot deletion doesn't propagate cross-peer
-  — a privacy gap.** Deleting one history snapshot (the "scrub this old
-  version" action — e.g. removing a leaked password from an entry's history)
-  does NOT propagate: after a sync the two replicas diverge on history depth
-  forever (A=2 snapshots, B=3), so the deleted secret lives on every other
-  device. Surfaced by the new `history` / `delete-history` verbs +
+- **[FIXED] History-snapshot deletion didn't propagate cross-peer — a privacy
+  gap.** Deleting one history snapshot (the "scrub this old version" action —
+  e.g. removing a leaked password from an entry's history) did NOT propagate:
+  after a sync the two replicas diverged on history depth forever (A=2
+  snapshots, B=3), so the deleted secret lived on every other device. Surfaced
+  by the `history` / `delete-history` verbs +
   `scenarios/history-delete-propagates.sh`. **Why:** the cross-peer history
   merge is *lossless* (it unions histories), so a bare local `DELETE` can't
   survive — only a `keys.history_tombstones.v1` record (which the merge prunes
-  against) makes a deletion stick. Two sub-causes: **(1)** `delete_history_at`
-  wrote no tombstone — **FIXED**: the engine wrapper now writes one via
-  `keepass_merge::add_history_tombstone` (keyed by the record's content-hash +
-  mtime) before dropping the row. **(2, OPEN)** even with the tombstone in A's
-  custom_data, A's live entry equals B's, so `ingest_peer` classifies the
-  entry **InSync and skips it entirely** — the tombstone custom_data never
-  reaches B (diagnosed: B receives 0 tombstones, keeps all 3 snapshots). The
-  pending fix is an `ingest_peer` pass that unions + prunes history tombstones
-  for *shared* entries regardless of the content verdict (mirroring how
-  `reconcile_entry_location` runs for every shared entry) — a core-sync-loop
-  change needing a full fuzz re-soak, so it's its own slice. The convergence
-  digest is no oracle here (it deliberately excludes history), which is why
-  this stayed invisible. `history-delete-propagates.sh` is the forcing
-  function, **excluded from `run-all.sh`** until part 2 lands.
+  against) makes a deletion stick. Two sub-causes, both now fixed:
+  - **(1, part 1)** `delete_history_at` wrote no tombstone. **Fixed**: the
+    engine wrapper writes one via `keepass_merge::add_history_tombstone` (keyed
+    by the record's content-hash + mtime) before dropping the row.
+  - **(2, part 2)** even with the tombstone in A's custom_data, A's live entry
+    equalled B's, so `ingest_peer` classified the entry **InSync and skipped it
+    entirely** — the tombstone never reached B (diagnosed: B received 0
+    tombstones, kept all 3 snapshots). **Fixed**: a per-shared-entry pass in
+    `ingest_peer` (after `reconcile_entry_location`, orthogonal to the content
+    verdict — the same "runs for every shared entry" shape) reconciles history
+    tombstones via the new `keepass_merge::reconcile_history_tombstones`: it
+    unions both sides' OR-sets, prunes the local entry's matching history
+    records, and persists by rewriting that entry's `entry_history` rows + the
+    tombstone custom_data item (a new per-entry history-rewrite helper — ingest
+    only ever did a full clear+reinsert before). It reuses the canonical
+    `union_history_tombstones` the disk-reconcile path uses, so the two ingest
+    paths can't drift on the CRDT. Loop-safe: idempotent once both sides agree,
+    and it only touches history snapshots (never a live record). The new
+    `IngestPeerOutcome.history_pruned` bucket drives the save decision.
+  The convergence digest is no oracle here (it deliberately excludes history),
+  which is why this stayed invisible — `history-delete-propagates.sh` compares
+  the snapshot sets directly across a fresh disk read and is now a full
+  `run-all.sh` gate. Engine-pinned by `two_engine_history_delete_propagates`;
+  `fuzz-convergence.sh`'s mix gained a deterministic `delete-history` op.
+  - **Pre-commit review catch — the post-pass must reconcile the side the
+    verdict arm actually persisted.** The reconcile bases on a clone of the
+    pre-ingest local entry, which is right for InSync / auto-merge / held
+    conflicts (the mirror still holds local's history) but WRONG for the
+    conflict adopt-peer arm: there `advance_local_entry` rebuilds the entry
+    from the peer's resolved copy, so basing on stale local history clobbered
+    the just-adopted peer snapshots (silent cross-peer history loss + permanent
+    depth divergence; privacy still held — the scrub stuck either way). Fixed by
+    selecting the base per arm: the peer entry + its pool when we adopted the
+    peer's value, else local. Reaching that arm needs a re-edit-after-park (a
+    bare resolve snapshots the loser into history, making the next pull an
+    AutoMerge, not an adopt) — pinned by
+    [history-delete-conflict-adopt.sh](scenarios/history-delete-conflict-adopt.sh)
+    (teeth-verified: red when the post-pass bases on local). A history-only
+    propagation also now surfaces in `MergeStats.history_pruned` instead of
+    reading as an all-zero `Applied`.
 
 - **[FIXED] `ingest_peer` ignored vault Meta → a recycle-bin toggle diverged
   replicas permanently (digest-visible).** The owner-rows peer-sync path

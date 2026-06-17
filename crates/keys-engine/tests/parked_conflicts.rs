@@ -973,6 +973,147 @@ fn two_engine_move_reconciles_and_converges() {
     assert_eq!(a_in_folder, b_in_folder, "both agree on the entry's group");
 }
 
+/// History-deletion privacy fix (part 2): deleting one history snapshot
+/// (the "scrub this old/leaked version" action) must PROPAGATE cross-peer.
+/// The deletion leaves the LIVE entry untouched, so classify verdicts the
+/// entry `InSync` and the per-entry history-tombstone reconcile is what
+/// carries it — `delete_history_at` writes a `keys.history_tombstones.v1`
+/// record (part 1), and `ingest_peer` unions + prunes against it (part 2).
+///
+/// A builds history [v0, v1, v2] (live v3); B forks with the full history;
+/// A scrubs v1. After a both-ways sync the replicas must AGREE on the
+/// surviving history {v0, v2} — not diverge, not resurrect v1 — and the
+/// deletion must survive a fresh disk read on the receiving side.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn two_engine_history_delete_propagates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Base: one entry, username v0. A builds the history via engine edits.
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    kdbx.add_entry(root, NewEntry::new("E").username("v0"))
+        .expect("seed entry");
+
+    let kdbx_a = dir.path().join("a.kdbx");
+    let kdbx_b = dir.path().join("b.kdbx");
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+
+    let seed = engine_a
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list")[0]
+        .uuid;
+
+    // Three edits → history snapshots v0, v1, v2 (live entry is v3).
+    for u in ["v1", "v2", "v3"] {
+        engine_a
+            .update_entry(
+                seed,
+                keys_engine::EntryUpdate {
+                    username: Some(u.to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("a edit");
+    }
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save");
+
+    let hist_usernames = |e: &Engine, uuid| -> Vec<String> {
+        let mut us: Vec<String> = e
+            .history(uuid)
+            .expect("history")
+            .into_iter()
+            .map(|h| h.username)
+            .collect();
+        us.sort();
+        us
+    };
+    assert_eq!(
+        hist_usernames(&engine_a, seed),
+        vec!["v0", "v1", "v2"],
+        "base history before the scrub",
+    );
+
+    // B forks from A's on-disk base with the full history, keeps its own file.
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut handle_b = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut handle_b, None)
+        .expect("b save");
+    assert_eq!(
+        hist_usernames(&engine_b, seed),
+        vec!["v0", "v1", "v2"],
+        "B forked with the full history",
+    );
+
+    // A scrubs the middle snapshot (v1, index 1 in oldest-first [v0, v1, v2]).
+    engine_a
+        .delete_history_at(seed, 1)
+        .expect("a delete history");
+    assert_eq!(
+        hist_usernames(&engine_a, seed),
+        vec!["v0", "v2"],
+        "A's local delete dropped v1",
+    );
+    let mut handle_a = reopen_kdbx(&kdbx_a);
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut handle_a, None)
+        .expect("a save 2");
+
+    // Exchange both ways (re-saving so the next pull reads reconciled state).
+    let applied = engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest a");
+    assert!(
+        matches!(applied, ParkConflictsResult::Applied { .. }),
+        "B must apply the history-deletion (not NoChange), got {applied:?}",
+    );
+    let mut hb = reopen_kdbx(&kdbx_b);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb, None)
+        .expect("b save 2");
+    engine_a
+        .ingest_peer_from_kdbx(&kdbx_b, &composite(), "device-b")
+        .expect("a ingest b");
+
+    // Converged: both agree on {v0, v2}; v1 did not resurrect or survive.
+    assert_eq!(
+        hist_usernames(&engine_a, seed),
+        vec!["v0", "v2"],
+        "A still {{v0, v2}} after the round trip",
+    );
+    assert_eq!(
+        hist_usernames(&engine_b, seed),
+        vec!["v0", "v2"],
+        "the deletion propagated to B (v1 scrubbed)",
+    );
+
+    // Honest disk read: a fresh engine opening B's saved KDBX must see the
+    // pruned history — i.e. the tombstone really hit the file, not just B's
+    // warm mirror.
+    let db_b2 = dir.path().join("b2.db");
+    let mut engine_b2 =
+        Engine::open(&db_b2, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b2");
+    engine_b2
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_b))
+        .expect("b2 ingest");
+    assert_eq!(
+        hist_usernames(&engine_b2, seed),
+        vec!["v0", "v2"],
+        "deletion survives a fresh disk read of B's KDBX",
+    );
+}
+
 /// Phase 5c custom-icon pool union: a one-sided custom-icon add on B must
 /// carry its BYTES to A on `ingest_peer`, not just the entry's
 /// content-addressed `custom_icon_uuid` ref. The ref rides the normal
