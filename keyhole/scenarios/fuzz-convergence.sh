@@ -159,7 +159,8 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
     n=$((n + 1))
     # Op mix = the cross-peer surface the multipeer store supports today:
     # entry create, field edits, hard delete (5b tombstones), attachment
-    # set/remove (5c), entry MOVE (5d location LWW), and group CREATE
+    # set/remove (5c), tag replace (3-way set merge), entry MOVE (5d location
+    # LWW), and group CREATE
     # (5d peer-only group adoption — a device-local new group the peer
     # adopts on ingest, into which subsequent moves can land). Merged in
     # as each finding/slice landed (#7 conflict-row attachments, #8 LCA
@@ -181,7 +182,7 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
     # second as a resolution (the sub-second hazard that silently
     # auto-merges a real clash — caught when this fuzzer first ran a
     # contended edit every round).
-    op=$((RANDOM % 11))
+    op=$((RANDOM % 12))
     case $op in
         7) "$KEYHOLE" --at "$AT" --uuid-seed "$(mix "$n")" create-group "$v" "g-$n" >/dev/null ;;
         8) g="$(random_group "$v")"
@@ -213,6 +214,14 @@ mutate() { # $1=vault $2=device-prefix (unused since attachment names went share
            if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" remove-attachment "$v" "$e" "att-$((RANDOM % 2))" >/dev/null 2>&1 || true; fi ;;
         6) e="$(random_entry "$v")"; g="$(random_group "$v" 1)"
            if [ -n "$e" ] && [ -n "$g" ]; then "$KEYHOLE" --at "$AT" move-entry "$v" "$e" --to "$g" >/dev/null 2>&1 || true; fi ;;
+        11) e="$(random_entry "$v")"
+           # Replace an entry's tag set (tags reconcile by 3-way SET semantics,
+           # not LWW). The set is a deterministic function of $n — replace-all,
+           # so it both adds and removes tags as $n varies, exercising the
+           # union-of-adds + removal-vs-LCA merge under concurrency. Tags are
+           # order-independent and the digest covers them, so a real divergence
+           # still fails the oracle. Proven path: tags-cross-peer.sh.
+           if [ -n "$e" ]; then "$KEYHOLE" --at "$AT" set-tags "$v" "$e" "t-$((n % 3)),t-$((n % 5))" >/dev/null; fi ;;
     esac
 }
 

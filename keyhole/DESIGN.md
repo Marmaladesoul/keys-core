@@ -539,10 +539,21 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   builds it rich, asserts the engine keeps it KDBX3 — no silent v3→v4 upgrade —
   with every facet intact). Both came back clean. Remaining breadth: unknown-XML
   and a full round-trip fidelity fuzzer.
-- **Next:** previous-parent merge rules; `empty-bin` verb; value-hash-based
-  adoption matching (timestamp-free) as hardening when resolution records
-  grow fields; vault-level `<Meta><CustomData>` (plugin keys) peer-path
-  convergence; the save-fidelity breadth pass above.
+- **Done (2026-06-16, tags coverage):** a keys-ffi-seam audit found tags were
+  the last sync-relevant facet keyhole couldn't author (`create-entry`/
+  `update-entry` hardcode an empty tag set) — the same coverage hole class as
+  custom-fields and recycle-bin/meta. New verbs `set-tags` / `tags`; tags
+  converge by 3-way SET semantics (union of adds, removal-vs-LCA wins), proven
+  by `tags-cross-peer.sh` and now fuzzed (op 11 in `fuzz-convergence.sh`,
+  200/200 soak + replay-deterministic). Tags already converged — this closed
+  the test gap, not a bug.
+- **Next (keyhole coverage — from the seam audit):** the *history-surgery*
+  cluster keyhole still can't drive — `restore_entry_from_history`,
+  `delete_history_at`, `save_entry` (atomic full-entry snapshot), `attach_file`
+  (history-archiving attachment add, distinct from `set_attachment`),
+  `clear_entry_custom_icon`. Then: previous-parent merge rules; `empty-bin`
+  verb; vault-level `<Meta><CustomData>` peer-path convergence; the
+  save-fidelity breadth pass (unknown-XML + fidelity fuzzer).
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old

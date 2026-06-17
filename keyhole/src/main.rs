@@ -258,6 +258,27 @@ enum Command {
         /// Custom field value.
         value: String,
     },
+    /// Replace an entry's tag set, then persist. Tags reconcile cross-peer by
+    /// 3-way SET semantics (union of adds, removals relative to the LCA win) —
+    /// distinct from per-field LWW — so this lets scenarios + the fuzzer
+    /// exercise tag convergence (a facet `create-entry`/`update-entry` can't
+    /// author; they hardcode an empty tag set).
+    SetTags {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry to set tags on.
+        entry: String,
+        /// Comma-separated tag set (replace-all); empty string clears tags.
+        tags: String,
+    },
+    /// Print an entry's tags, one per line, sorted — the read side for tag
+    /// convergence assertions. `(no tags)` when the set is empty.
+    Tags {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry whose tags to print.
+        entry: String,
+    },
     /// Print the hex SHA-256 digest of the vault's user-visible
     /// content (fields, locations, icons, group tree, recycle-bin
     /// state). Equal digests ⇔ converged replicas — the convergence
@@ -542,6 +563,14 @@ async fn main() -> Result<()> {
         } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.set_field(entry, name, value).await?;
+        }
+        Command::SetTags { vault, entry, tags } => {
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.set_tags(entry, tags).await?;
+        }
+        Command::Tags { vault, entry } => {
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.tags(entry)?;
         }
         Command::Digest { vault } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
@@ -1040,6 +1069,42 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("set_non_protected_custom_field: {e:?}"))?;
         self.save().await?;
         println!("set field {name:?} and saved to disk");
+        Ok(())
+    }
+
+    /// Replace `entry`'s tag set (comma-separated; empty string clears), then
+    /// persist. Whitespace around each tag is trimmed; empty items dropped.
+    async fn set_tags(&self, entry: String, tags: String) -> Result<()> {
+        let parsed: Vec<String> = tags
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        self.engine
+            .set_tags(entry, parsed)
+            .map_err(|e| anyhow::anyhow!("set_tags: {e:?}"))?;
+        self.save().await?;
+        println!("set tags and saved to disk");
+        Ok(())
+    }
+
+    /// Print `entry`'s tags one per line, sorted (`(no tags)` if empty) — the
+    /// read side for tag-convergence assertions. A pure read.
+    fn tags(&self, entry: String) -> Result<()> {
+        let full = self
+            .engine
+            .entry(entry)
+            .map_err(|e| anyhow::anyhow!("entry: {e:?}"))?
+            .ok_or_else(|| anyhow::anyhow!("entry not found"))?;
+        let mut tags = full.tags;
+        tags.sort();
+        if tags.is_empty() {
+            println!("(no tags)");
+            return Ok(());
+        }
+        for t in &tags {
+            println!("{t}");
+        }
         Ok(())
     }
 
