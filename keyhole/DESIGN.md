@@ -547,11 +547,14 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   by `tags-cross-peer.sh` and now fuzzed (op 11 in `fuzz-convergence.sh`,
   200/200 soak + replay-deterministic). Tags already converged — this closed
   the test gap, not a bug.
-- **Next (keyhole coverage — from the seam audit):** the *history-surgery*
-  cluster keyhole still can't drive — `restore_entry_from_history`,
-  `delete_history_at`, `save_entry` (atomic full-entry snapshot), `attach_file`
-  (history-archiving attachment add, distinct from `set_attachment`),
-  `clear_entry_custom_icon`. Then: previous-parent merge rules; `empty-bin`
+- **Next (the headline):** **part 2 of the history-deletion fix** — an
+  `ingest_peer` pass that unions + prunes history tombstones for shared
+  entries even when classify says InSync (see Findings → "History-snapshot
+  deletion doesn't propagate"). That flips `history-delete-propagates.sh` from
+  forcing-function to gate. Then the rest of the history-surgery cluster
+  (`restore_entry_from_history`, `clear_entry_custom_icon`,
+  `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the
+  covered `set-attachment`). Then: previous-parent merge rules; `empty-bin`
   verb; vault-level `<Meta><CustomData>` peer-path convergence; the
   save-fidelity breadth pass (unknown-XML + fidelity fuzzer).
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
@@ -565,6 +568,30 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   — worth a look when `restore` is wired.
 
 ## Findings (surfaced by keyhole)
+
+- **[OPEN, part-fixed] History-snapshot deletion doesn't propagate cross-peer
+  — a privacy gap.** Deleting one history snapshot (the "scrub this old
+  version" action — e.g. removing a leaked password from an entry's history)
+  does NOT propagate: after a sync the two replicas diverge on history depth
+  forever (A=2 snapshots, B=3), so the deleted secret lives on every other
+  device. Surfaced by the new `history` / `delete-history` verbs +
+  `scenarios/history-delete-propagates.sh`. **Why:** the cross-peer history
+  merge is *lossless* (it unions histories), so a bare local `DELETE` can't
+  survive — only a `keys.history_tombstones.v1` record (which the merge prunes
+  against) makes a deletion stick. Two sub-causes: **(1)** `delete_history_at`
+  wrote no tombstone — **FIXED**: the engine wrapper now writes one via
+  `keepass_merge::add_history_tombstone` (keyed by the record's content-hash +
+  mtime) before dropping the row. **(2, OPEN)** even with the tombstone in A's
+  custom_data, A's live entry equals B's, so `ingest_peer` classifies the
+  entry **InSync and skips it entirely** — the tombstone custom_data never
+  reaches B (diagnosed: B receives 0 tombstones, keeps all 3 snapshots). The
+  pending fix is an `ingest_peer` pass that unions + prunes history tombstones
+  for *shared* entries regardless of the content verdict (mirroring how
+  `reconcile_entry_location` runs for every shared entry) — a core-sync-loop
+  change needing a full fuzz re-soak, so it's its own slice. The convergence
+  digest is no oracle here (it deliberately excludes history), which is why
+  this stayed invisible. `history-delete-propagates.sh` is the forcing
+  function, **excluded from `run-all.sh`** until part 2 lands.
 
 - **[FIXED] `ingest_peer` ignored vault Meta → a recycle-bin toggle diverged
   replicas permanently (digest-visible).** The owner-rows peer-sync path

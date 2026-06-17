@@ -279,6 +279,30 @@ enum Command {
         /// UUID of the entry whose tags to print.
         entry: String,
     },
+    /// Print an entry's history snapshots — one line per snapshot
+    /// (`<index>  <username>`), newest-index last, then a count. The read
+    /// oracle for history convergence: the content digest deliberately
+    /// EXCLUDES history (replicas can legitimately differ in depth), so a
+    /// history scenario must compare the snapshots directly, not the digest.
+    History {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry whose history to print.
+        entry: String,
+    },
+    /// Delete one history snapshot by index, then persist — the user
+    /// "remove this old version" action (e.g. scrubbing a leaked password
+    /// from history). For the deletion to PROPAGATE cross-peer it must write
+    /// a history tombstone, or the lossless history merge resurrects it from
+    /// the peer; this verb drives exactly that path.
+    DeleteHistory {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry.
+        entry: String,
+        /// Zero-based history index to delete (see `history`).
+        index: u32,
+    },
     /// Print the hex SHA-256 digest of the vault's user-visible
     /// content (fields, locations, icons, group tree, recycle-bin
     /// state). Equal digests ⇔ converged replicas — the convergence
@@ -571,6 +595,18 @@ async fn main() -> Result<()> {
         Command::Tags { vault, entry } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.tags(entry)?;
+        }
+        Command::History { vault, entry } => {
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.history(entry)?;
+        }
+        Command::DeleteHistory {
+            vault,
+            entry,
+            index,
+        } => {
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.delete_history(entry, index).await?;
         }
         Command::Digest { vault } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
@@ -1105,6 +1141,35 @@ impl Session {
         for t in &tags {
             println!("{t}");
         }
+        Ok(())
+    }
+
+    /// Print `entry`'s history snapshots — `<index>  <username>` per line in
+    /// index order, then a count. The history-convergence read oracle (the
+    /// digest excludes history). A pure read.
+    fn history(&self, entry: String) -> Result<()> {
+        let hist = self
+            .engine
+            .history(entry)
+            .map_err(|e| anyhow::anyhow!("history: {e:?}"))?;
+        if hist.is_empty() {
+            println!("(no history)");
+            return Ok(());
+        }
+        for h in &hist {
+            println!("{}  {}", h.history_index, h.username);
+        }
+        println!("\n{} snapshot(s)", hist.len());
+        Ok(())
+    }
+
+    /// Delete history snapshot `index` from `entry`, then persist.
+    async fn delete_history(&self, entry: String, index: u32) -> Result<()> {
+        self.engine
+            .delete_history_at(entry, index)
+            .map_err(|e| anyhow::anyhow!("delete_history_at: {e:?}"))?;
+        self.save().await?;
+        println!("deleted history snapshot {index} and saved to disk");
         Ok(())
     }
 

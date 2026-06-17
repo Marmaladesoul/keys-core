@@ -677,6 +677,56 @@ impl Engine {
         entry_uuid: Uuid,
         history_index: u32,
     ) -> Result<(), EngineError> {
+        // Write a history tombstone BEFORE dropping the row, so the deletion
+        // PROPAGATES cross-peer. The cross-peer history merge is lossless (it
+        // unions histories), so a bare local DELETE either resurrects from the
+        // peer or diverges forever — only a `keys.history_tombstones.v1` record
+        // (which the merge prunes against) makes a "remove this old version"
+        // stick on every device (a privacy obligation). Reuses keepass-merge's
+        // canonical tombstone construction — keyed by the record's
+        // content-hash + mtime — via a one-entry projection.
+        let vault = self.project_to_vault()?;
+        let entry = vault
+            .iter_entries()
+            .find(|e| e.id == keepass_core::model::EntryId(entry_uuid))
+            .ok_or(EngineError::NotFound { entity: "entry" })?;
+        let record = entry
+            .history
+            .get(history_index as usize)
+            .ok_or(EngineError::NotFound {
+                entity: "history_snapshot",
+            })?;
+        let now =
+            chrono::DateTime::from_timestamp_millis(self.now_ms()).unwrap_or_else(chrono::Utc::now);
+        let mut tomb_entry = entry.clone();
+        keepass_merge::add_history_tombstone(
+            &mut tomb_entry,
+            record,
+            &vault.binaries,
+            keepass_merge::TombstoneReason::UserDelete,
+            None,
+            now,
+        )
+        .map_err(|e| EngineError::Serialise(format!("add_history_tombstone: {e}")))?;
+        // Persist the merged tombstone list onto the entry's custom_data so it
+        // survives reconcile→project→save and is unioned on the peer's ingest.
+        if let Some(item) = tomb_entry
+            .custom_data
+            .iter()
+            .find(|c| c.key == keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY)
+        {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO entry_custom_data \
+                 (entry_uuid, key, value, last_modified_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    entry_uuid.to_string(),
+                    item.key,
+                    item.value,
+                    item.last_modified.map(|d| d.timestamp_millis()),
+                ],
+            )?;
+        }
+        // Drop the local row + repack indices (the pre-existing behaviour).
         mutations::delete_history_at(&mut self.conn, entry_uuid, history_index)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
         Ok(())
