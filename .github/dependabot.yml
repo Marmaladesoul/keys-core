@@ -1,4 +1,7 @@
 # Automated dependency updates for the keys-core workspace.
+#
+# Grouped so each ecosystem opens at most ONE pull request per week, rather
+# than one branch per dependency — keeps the branch list quiet.
 
 version: 2
 updates:
@@ -8,6 +11,13 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    groups:
+      cargo-dependencies:
+        patterns: ["*"]
+    ignore:
+      # uniffi is intentionally held at 0.28 (the generated FFI bindings target
+      # it); moving to 0.29+ is a deliberate manual migration, not an auto-bump.
+      - dependency-name: "uniffi*"
 
   - package-ecosystem: github-actions
     directory: "/"
@@ -15,3 +25,6 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        patterns: ["*"]
