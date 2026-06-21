@@ -1,4 +1,4 @@
-# Rust
+ # Rust
 /target/
 **/target/
 Cargo.lock.bak
@@ -40,6 +40,9 @@ Cargo.lock.bak
 *.swo
 *~
 .claude/
+
+# Local dev: cargo paths overrides pointing at sibling checkouts (co-dev).
+/.cargo/
 
 # Private workspace docs — never commit to this public repo (defence in
 # depth; the secret-scan workflow also denies references to these).
