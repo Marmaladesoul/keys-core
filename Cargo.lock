@@ -1003,7 +1003,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.118",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2567,7 +2567,7 @@ dependencies = [
 [[package]]
 name = "keepass-core"
 version = "0.0.0"
-source = "git+https://github.com/Marmaladesoul/keepass-core#bf68488caeeeefa01fbf18ac3ee7384d31ba2e36"
+source = "git+https://github.com/Marmaladesoul/keepass-core#47d3330fc78f9178291c67201f59b4399cda503e"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm",
@@ -2593,7 +2593,7 @@ dependencies = [
 [[package]]
 name = "keepass-merge"
 version = "0.0.0"
-source = "git+https://github.com/Marmaladesoul/keepass-core#bf68488caeeeefa01fbf18ac3ee7384d31ba2e36"
+source = "git+https://github.com/Marmaladesoul/keepass-core#47d3330fc78f9178291c67201f59b4399cda503e"
 dependencies = [
  "chrono",
  "keepass-core",
