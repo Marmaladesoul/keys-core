@@ -36,7 +36,7 @@ secrecy = "0.10"
 # (`SessionKey`, `DbKey`) already zeroize; this covers the intermediate
 # Rust-side allocations the bridge holds across the FFI boundary.
 zeroize = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 uuid = "1"
