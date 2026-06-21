@@ -72,10 +72,11 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
-# Workspace crates set `license = "UNLICENSED"` and `publish = false`
-# — this isn't a redistribution risk, it's a "we don't intend to
-# license this for public reuse" signal. The `private` table tells
-# cargo-deny to skip license-checking these.
+# Workspace crates are GPL-3.0-only with `publish = false` (consumed via
+# git deps, not the registry). The allow-list above governs DEPENDENCIES,
+# which must stay permissive — our own GPL crates are excluded from that
+# check via the `private` table below (do NOT add GPL to the allow-list,
+# or GPL *dependencies* would slip through).
 private = { ignore = true }
 
 # ---------------------------------------------------------------------------

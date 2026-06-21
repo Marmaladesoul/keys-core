@@ -55,3 +55,12 @@ privately — see **[SECURITY.md](SECURITY.md)**.
 
 External code contributions are not accepted, but security reports are
 welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)**.
+
+## Licence
+
+keys-core is licensed under the **GNU General Public License v3.0 only**
+— see [LICENSE](LICENSE).
+
+It builds on
+[`keepass-core`](https://github.com/Marmaladesoul/keepass-core), which is
+separately available under `MIT OR Apache-2.0`.

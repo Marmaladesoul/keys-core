@@ -14,7 +14,9 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Marmaladesoul"]
-license = "UNLICENSED"
+license = "GPL-3.0-only"
+# Not published to crates.io — consumed by the Keys client apps (and via
+# git deps). GPL-3.0 still applies to the source regardless.
 publish = false
 
 [workspace.lints.rust]
