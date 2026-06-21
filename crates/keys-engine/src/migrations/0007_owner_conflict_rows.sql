@@ -1,7 +1,6 @@
 -- Migration 0007: owner-tagged conflict rows (multi-peer sync store).
 --
--- Phase 2 of the multi-peer owner-rows rearchitecture
--- (_project-management/sync-multipeer-store.md §9). The model keeps each
+-- Phase 2 of the multi-peer owner-rows rearchitecture. The model keeps each
 -- peer's divergent value as an extra OWNER-keyed row and derives conflicts
 -- lazily, instead of eagerly merging every peer into one canonical vault.
 --

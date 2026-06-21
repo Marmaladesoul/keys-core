@@ -39,5 +39,10 @@ Cargo.lock.bak
 *.swp
 *.swo
 *~
-_localdocs/
 .claude/
+
+# Private workspace docs — never commit to this public repo (defence in
+# depth; the secret-scan workflow also denies references to these).
+_localdocs/
+_project-management/
+_design/
