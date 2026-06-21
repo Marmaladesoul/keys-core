@@ -50,8 +50,7 @@ use crate::events::{ChangeEvent, ConflictPayload};
 /// TODO(multi-peer): true N-peer differentiation threads a real peer id from
 /// the sync layer through to [`Engine::ingest_peer`] instead of this single
 /// sentinel, so divergent values from peers B and C don't share one owner row.
-/// Out of scope for the Phase-4 switch; see
-/// `_project-management/sync-multipeer-store.md` §9.
+/// Out of scope for the Phase-4 switch.
 const FILE_OWNER: &str = "file";
 
 /// Legacy `<CustomData>` key of the pre-redesign parked-conflict history
@@ -363,8 +362,7 @@ pub(crate) fn reconcile_with_disk(
 ///
 /// Multi-peer note: when an entry carries rows from several peers this picks
 /// the first owner ([`conflict_rows::conflict_owners_for`] returns them sorted)
-/// — surfacing the full N-value picker is deferred (see
-/// `_project-management/sync-multipeer-store.md` §3).
+/// — surfacing the full N-value picker is deferred.
 pub(crate) fn held_conflict_payload(
     engine: &mut Engine,
     _kdbx_path: &Path,

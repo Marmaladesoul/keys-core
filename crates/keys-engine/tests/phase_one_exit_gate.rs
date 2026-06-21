@@ -4,8 +4,7 @@
 //! holds end-to-end against an SQLCipher-encrypted file on disk, with a
 //! random 32-byte key, before Phase 2 starts wiring real ingest paths.
 //!
-//! See `_localdocs/SQLITE_MIGRATION.md` task 1.6 and the Phase 1 exit
-//! gate description.
+//! This is the Phase 1 exit-gate check.
 
 use std::fmt::Write as _;
 

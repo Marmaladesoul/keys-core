@@ -1,13 +1,8 @@
 //! keys-iroh-sync — iroh transport library for the Keys password manager.
 //!
 //! This crate wraps [`iroh`], [`iroh_docs`], and [`iroh_blobs`] into a
-//! stable, FFI-friendly library that Keys clients (Mac, iOS, eventually
-//! Windows) embed for device sync, fleet sync, and friendship sync.
-//!
-//! See `_project-management/sync-transport-decision.md` for the
-//! decision record that picked iroh as the transport, and
-//! `_project-management/iroh-ios-spike-results.md` for the spike that
-//! validated the iOS cold-start cost.
+//! stable, FFI-friendly library that the Keys client applications embed
+//! for device sync, fleet sync, and friendship sync.
 //!
 //! Library, not application:
 //!
@@ -25,7 +20,7 @@
 //! - The Rust API on this crate follows semver. Breaking changes bump
 //!   the minor while pre-1.0 and the major after 1.0.
 //! - The FFI surface (uniffi-generated bindings) is part of the public
-//!   API — bindings consumed by Keys-iOS and Keys-Mac must regenerate
+//!   API — bindings consumed by the client apps must regenerate
 //!   on every minor bump.
 //! - iroh itself is pre-1.0; we track its rc.x releases in lockstep
 //!   and call out the iroh version in every CHANGELOG entry.

@@ -55,10 +55,9 @@ algorithmic-complexity denial-of-service with a concrete proof-of-concept.
 
 Out of scope:
 
-- **The Keys GUI applications** (Keys-Mac, Keys-iOS, and any Windows
-  client) — these live in separate repositories with their own channels.
-  Platform secret-store handling (Keychain, Credential Manager) and
-  app-level key handling belong there, not here.
+- **The Keys client applications** — these live in separate repositories
+  with their own channels. Platform secure-storage handling and app-level
+  key handling belong there, not here.
 - **Third-party dependencies** (e.g. `iroh`, `keepass-core`, `rusqlite`) —
   report these upstream. If a dependency flaw is reachable *specifically
   because of how `keys-core` uses it*, we do want to hear about that.

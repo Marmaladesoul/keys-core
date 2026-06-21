@@ -1,6 +1,6 @@
 [package]
 name = "keys-ffi"
-description = "Private FFI facade for the Keys password manager. Consumes keepass-core and exposes a uniffi-generated API for SwiftUI and WinUI 3 frontends."
+description = "FFI facade for the Keys password manager. Consumes keepass-core and exposes a uniffi-generated API consumed by the Keys client applications."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,9 +15,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 workspace = true
 
 [dependencies]
-# Path deps during Phase 2 — flip to crates.io once keepass-core v0.1 ships.
-keepass-core = { path = "../../../KeepassCore/crates/keepass-core" }
-keepass-merge = { path = "../../../KeepassCore/crates/keepass-merge" }
+# Git deps on the public keepass-core repo so a clean clone builds without a
+# side-by-side checkout. Flip to crates.io version deps once keepass-core ships there.
+keepass-core = { git = "https://github.com/Marmaladesoul/keepass-core" }
+keepass-merge = { git = "https://github.com/Marmaladesoul/keepass-core" }
 keys-engine = { path = "../keys-engine" }
 
 # uniffi 0.28, proc-macro path. No build.rs needed — `setup_scaffolding!()`

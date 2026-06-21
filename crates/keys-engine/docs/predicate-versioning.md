@@ -5,10 +5,9 @@ Four rules govern the on-the-wire shape; together they let any device safely
 ignore variants and fields it doesn't recognise without dropping data or
 corrupting a peer.
 
-These rules are normative. They are duplicated verbatim from the project
-tracker (`_localdocs/SQLITE_MIGRATION.md` → "Predicate versioning rules")
-so that anyone adding a predicate variant or persisting a folder can read
-the discipline next to the code it constrains.
+These rules are normative, kept next to the code they constrain so that
+anyone adding a predicate variant or persisting a folder can read the
+discipline in one place.
 
 ## The four rules
 

@@ -6,13 +6,8 @@ This crate is the **transport library**, not the Keys app. It wraps
 [`iroh`](https://crates.io/crates/iroh),
 [`iroh-docs`](https://crates.io/crates/iroh-docs), and
 [`iroh-blobs`](https://crates.io/crates/iroh-blobs) into a stable,
-FFI-friendly Rust library that Keys clients (Mac, iOS, eventually
-Windows) embed for device sync, fleet sync, and friendship sync.
-
-For the decision record that picked iroh as the transport, see
-`_project-management/sync-transport-decision.md` in the parent
-workspace. For the iOS spike results that validated the choice, see
-`_project-management/iroh-ios-spike-results.md`.
+FFI-friendly Rust library that the Keys client applications embed for
+device sync, fleet sync, and friendship sync.
 
 ## What's in scope
 
@@ -37,15 +32,14 @@ workspace. For the iOS spike results that validated the choice, see
 - **Identity storage.** Callers own the secret bytes and keep them
   in their platform keychain.
 - **Platform binary builds.** xcframework / Windows DLL builds live
-  in the consuming app's repo (Keys-iOS owns its own xcframework
-  pipeline; Keys-Mac links the rlib directly).
+  in the consuming app's repo.
 
 ## Stability promise
 
 - The Rust API on this crate follows semver. Breaking changes bump
   the minor while pre-1.0 and the major after 1.0.
 - The FFI surface (uniffi-generated bindings) is part of the public
-  API — bindings consumed by Keys-iOS and Keys-Mac must regenerate
+  API — bindings consumed by the client apps must regenerate
   on every minor bump.
 - iroh itself is pre-1.0; we track its `rc.x` releases in lockstep
   and call out the iroh version in every changelog entry.

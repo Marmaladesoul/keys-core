@@ -87,9 +87,9 @@ private = { ignore = true }
 # noise stays visible without blocking CI; revisit at iroh 1.0.
 multiple-versions = "warn"
 wildcards = "deny"
-# Workspace path deps (KeepassCore + keys-engine + keys-ffi cross-refs)
-# appear to cargo-deny as wildcard versions. They're not real wildcards
-# — they're path-relative deps. Allow them explicitly.
+# Workspace path deps (keys-engine + keys-ffi cross-refs) appear to
+# cargo-deny as wildcard versions. They're not real wildcards — they're
+# path-relative deps. Allow them explicitly.
 allow-wildcard-paths = true
 highlight = "all"
 # Note on TLS: we DO NOT ban openssl / openssl-sys here, even though
@@ -106,10 +106,12 @@ deny = [
 skip = []
 
 # ---------------------------------------------------------------------------
-# Sources — only crates.io
+# Sources — crates.io + the public keepass-core git repo
 # ---------------------------------------------------------------------------
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# keepass-core / keepass-merge are consumed as git deps on the public repo
+# until they publish to crates.io. Everything else must come from crates.io.
+allow-git = ["https://github.com/Marmaladesoul/keepass-core"]

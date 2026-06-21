@@ -1,6 +1,5 @@
-//! Read-side primitives for the owner-tagged conflict rows (Phase 3 of the
-//! multi-peer owner-rows store, `_project-management/sync-multipeer-store.md`
-//! §9).
+//! Read-side primitives for the owner-tagged conflict rows of the
+//! multi-peer owner-rows store.
 //!
 //! Phase 2 ([`crate::ingest::ingest_peer`]) WRITES the `conflict_*` rows;
 //! this module READS them back — the badge query (which entries have a peer

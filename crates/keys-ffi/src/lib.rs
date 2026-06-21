@@ -1,13 +1,11 @@
 //! # keys-ffi
 //!
-//! Private FFI facade for the Keys password manager. Consumes the public
+//! FFI facade for the Keys password manager. Consumes the public
 //! `keepass-core` and `keepass-merge` crates and exposes a uniffi-generated
-//! API for consumption by the native Swift/SwiftUI and C#/WinUI 3
-//! frontends.
+//! API consumed by the Keys client applications.
 //!
 //! API shape is driven by Keys' UI needs and carries no stability
-//! guarantee for external consumers — hence this crate remains
-//! closed-source and is deliberately not published to crates.io.
+//! guarantee for external consumers; it is not published to crates.io.
 
 mod db_key_provider;
 mod dto;

@@ -8,8 +8,6 @@ The shapes here are the **stable public API** of `keys-engine` for the
 duration of the SQLite migration project. Adding fields and methods is
 non-breaking; renaming, removing, or changing semantics is breaking.
 
-Cross-reference: `_localdocs/SQLITE_MIGRATION.md` Phase 3 tasks 3.1–3.9.
-
 ## Methods
 
 All methods live on `impl Engine`. Stubs panic with

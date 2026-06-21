@@ -1,19 +1,8 @@
-# CI for the private keys-core (keys-ffi) workspace.
+# CI for the keys-core workspace.
 #
-# Wrinkle: keys-ffi currently depends on keepass-core and keepass-merge via
-# *path* dependencies (`../../../KeepassCore/crates/keepass-core`). That path
-# doesn't exist inside a single-repo checkout, so CI must check out both
-# repos side-by-side to match the local developer layout.
-#
-# keepass-core is public so no authentication is required to check it out.
-#
-# Once keepass-core publishes to crates.io (v0.1+), flip the dependencies in
-# crates/keys-ffi/Cargo.toml from path to version deps — at that point the
-# side-by-side checkout step goes away entirely.
-#
-# Linux-only on this private repo to conserve the 2,000 minute/month
-# free-plan Actions budget (which applies to private repos only; the
-# public keepass-core repo has unlimited minutes).
+# keys-core depends on keepass-core and keepass-merge as git dependencies on
+# the public repo, so a plain checkout builds with no side-by-side checkout.
+# (Flip to crates.io version deps once keepass-core publishes there.)
 
 name: CI
 
@@ -38,97 +27,55 @@ jobs:
     name: build + test
     runs-on: ubuntu-latest
     steps:
-      # 1. Check out keys-core into KeysCore/
-      - name: Checkout keys-core
-        uses: actions/checkout@v6
-        with:
-          path: KeysCore
-
-      # 2. Check out keepass-core into KeepassCore/ (sibling directory).
-      #    No token needed — the repo is public.
-      - name: Checkout keepass-core
-        uses: actions/checkout@v6
-        with:
-          repository: Marmaladesoul/keepass-core
-          path: KeepassCore
-
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: KeysCore
 
       - name: fmt check
-        working-directory: KeysCore
         run: cargo fmt --all -- --check
 
       - name: clippy
-        working-directory: KeysCore
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: test
-        working-directory: KeysCore
         run: cargo test --workspace --all-features --no-fail-fast
 
       - name: doc
-        working-directory: KeysCore
         run: cargo doc --workspace --no-deps --all-features
 
-      # keyhole scenarios: end-to-end behaviour proofs one rung below
-      # the GUI (see keyhole/DESIGN.md). keepassxc-cli seeds the
-      # cross-implementation honesty scenarios — kept on purpose so we
-      # test real-world KDBX files, not just our own.
+      # keyhole scenarios: end-to-end behaviour proofs one rung below the GUI
+      # (see keyhole/DESIGN.md). keepassxc-cli seeds the cross-implementation
+      # honesty scenarios — kept on purpose so we test real-world KDBX files,
+      # not just our own.
       - name: Install keepassxc-cli
         run: sudo apt-get update && sudo apt-get install -y keepassxc
 
       - name: keyhole scenarios
-        working-directory: KeysCore
         run: ./keyhole/scenarios/run-all.sh
 
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
-    # Checks Cargo.lock against the RustSec Advisory Database for known
-    # CVEs in any transitive dependency. Fast (~5 s) and a no-brainer
-    # for a workspace that handles credentials and now owns the iroh
-    # transport layer. Side-by-side checkout because the workspace's
-    # path deps refer to ../KeepassCore.
+    # Checks Cargo.lock against the RustSec Advisory Database for known CVEs
+    # in any transitive dependency. Fast, and a no-brainer for a workspace
+    # that handles credentials and owns the iroh transport layer.
     steps:
-      - name: Checkout keys-core
-        uses: actions/checkout@v6
-        with:
-          path: KeysCore
-      - name: Checkout keepass-core
-        uses: actions/checkout@v6
-        with:
-          repository: Marmaladesoul/keepass-core
-          path: KeepassCore
+      - uses: actions/checkout@v6
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: KeysCore
 
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
-    # Stricter than cargo audit: enforces a license allowlist (no GPL
-    # / unknown licenses), a source allowlist (deps must come from
-    # crates.io — blocks attacker-supplied path/git overrides), a
-    # banned-crates list (openssl/native-tls), and surfaces duplicate
-    # versions. Config lives in `deny.toml` at the workspace root.
+    # Stricter than cargo audit: enforces a licence allowlist, a source
+    # allowlist (crates.io + the keepass-core git repo), a banned-crates list
+    # (native-tls), and surfaces duplicate versions. Config in deny.toml.
     steps:
-      - name: Checkout keys-core
-        uses: actions/checkout@v6
-        with:
-          path: KeysCore
-      - name: Checkout keepass-core
-        uses: actions/checkout@v6
-        with:
-          repository: Marmaladesoul/keepass-core
-          path: KeepassCore
+      - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
           arguments: --all-features
-          manifest-path: KeysCore/Cargo.toml

@@ -20,9 +20,8 @@
 //! Two surfaces live in this module:
 //!
 //! 1. **Presence detection** (`is_totp_field`, `url_is_otpauth`) for the
-//!    precomputed `entry.has_totp` column. The Swift side mirrors these
-//!    checks in `Keys-Mac/Keys/Services/TOTPGenerator.swift::hasTOTP` and
-//!    `Keys-Mac/Keys/Services/QuickTypeService.swift::hasTOTP`. The set
+//!    precomputed `entry.has_totp` column. The client mirrors these
+//!    checks on the Swift side. The set
 //!    of recognised field names and the URL-prefix rule must stay in
 //!    lock-step on both sides — drift means the engine's precomputed
 //!    flag disagrees with what the rest of the app considers a TOTP
@@ -30,8 +29,7 @@
 //!    see `crates/keys-engine/src/migrations/0005_entry_has_totp.sql`.
 //!
 //! 2. **Code generation** (`generate_code`, `parse_uri`, `base32_decode`,
-//!    …) implementing RFC 6238 on top of RFC 4226. Ported from
-//!    `Keys-Mac/Keys/Services/TOTPGenerator.swift` and validated against
+//!    …) implementing RFC 6238 on top of RFC 4226, validated against
 //!    the RFC 6238 Appendix B test vectors.
 
 use hmac::{Hmac, Mac};

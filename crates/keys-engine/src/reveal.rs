@@ -17,9 +17,8 @@
 //! [`SessionKey`](keepass_core::protector::SessionKey) via the
 //! [`FieldProtector`] and drops it as soon as the unwrap returns. We
 //! deliberately do **not** cache the key on the engine — every reveal
-//! is one Keychain hit + one AES-GCM open, matching the trust model
-//! described in `_localdocs/SQLITE_MIGRATION.md` (and the Swift side's
-//! reveal-on-select behaviour).
+//! is one Keychain hit + one AES-GCM open, matching the client's
+//! reveal-on-select behaviour.
 
 use std::collections::HashMap;
 

@@ -1,10 +1,8 @@
 # Swift harness CI for keys-ffi.
 #
-# Runs on macOS, paid for private repos at 10x the Linux rate. Triggered
-# only on demand and by a weekly heartbeat to stay inside the 2,000
-# minute/month free-tier budget — Phase 5 of the Keys-Mac integration
-# exhausted that budget in a single day with the previous per-push +
-# per-PR triggers. Linux Rust-only checks (clippy, fmt, cargo test) live
+# Runs on macOS, triggered on demand (and an optional weekly heartbeat)
+# rather than per-push — macOS runners are slow, and the per-commit
+# Linux Rust-only checks (clippy, fmt, cargo test) live
 # in `ci.yml` and continue to gate every push and PR — that's the
 # per-commit signal. This workflow is the deliberate "macOS-side
 # binding generation still works" check, hit before merging an
@@ -24,11 +22,9 @@ name: Swift harness
 
 on:
   workflow_dispatch:
-  # Weekly macOS heartbeat DISABLED 2026-06-16 to conserve the private-repo
-  # Actions budget (macOS bills at 10x). Manual `workflow_dispatch` still
-  # works — fire it before merging an FFI-shape PR. Re-enable the cron once
-  # the minute budget is comfortable again (or if keys-core goes public,
-  # where Actions are free).
+  # Weekly macOS heartbeat currently disabled — run it manually via
+  # `workflow_dispatch` before merging an FFI-shape PR. Re-enable the cron
+  # below if you want scheduled macOS coverage.
   # schedule:
   #   # 04:07 UTC Monday — off-peak, off-:00 to spread fleet load.
   #   - cron: '7 4 * * 1'

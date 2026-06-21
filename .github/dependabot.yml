@@ -1,5 +1,4 @@
-# Automated dependency updates for the private keys-core workspace.
-# Same cadence as the public repo for consistency.
+# Automated dependency updates for the keys-core workspace.
 
 version: 2
 updates:

@@ -387,8 +387,7 @@ impl Engine {
     }
 
     /// Ingest one peer's vault as owner-tagged conflict rows — the
-    /// multi-peer owner-rows store (Phase 2,
-    /// `_project-management/sync-multipeer-store.md` §9).
+    /// multi-peer owner-rows store.
     ///
     /// For each entry the peer holds that we also hold, runs the
     /// keepass-merge `classify` brain (item granularity) and either advances
