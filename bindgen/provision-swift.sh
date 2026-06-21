@@ -8,15 +8,18 @@
 #
 # Behaviour (env-driven):
 #   KEYS_CORE_VERSION   release tag to fetch a prebuilt artifact for (e.g.
-#                       v0.1.0). Unset/empty  ->  build locally.
-#   KEYS_CORE_LOCAL=1   force a local build even if a version is pinned —
-#                       use this while iterating on keys-core itself.
+#                       v0.1.0). Unset/empty  ->  deliberate local build.
+#   KEYS_CORE_LOCAL=1   build locally even if a version is pinned. This is the
+#                       EXPLICIT way to opt into a local build — e.g. while
+#                       iterating on keys-core, or if a release is unavailable.
 #
-# Prebuilt path: download <FW>-bindings.tar.gz + checksums.txt from the
-# release, verify the SHA-256, verify the SLSA build-provenance attestation
-# (if `gh` is available), then extract the xcframework + generated Sources
-# into the harness dir. Any failure falls back to a local build. Already
-# provisioned for the pinned version => fast no-op (safe to call every build).
+# A local build only ever happens when explicitly asked for (no pin, or
+# KEYS_CORE_LOCAL=1) — never silently. With a pin set, the prebuilt path is
+# REQUIRED: download <FW>-bindings.tar.gz + checksums.txt, verify the SHA-256
+# and the SLSA build-provenance attestation (if `gh` is present), then extract
+# the xcframework + generated Sources. If any step fails it exits non-zero
+# (loud) and tells you to rerun with KEYS_CORE_LOCAL=1 to build locally instead.
+# Already provisioned for the pinned version => fast no-op (call every build).
 
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,9 +37,9 @@ VERSION="${KEYS_CORE_VERSION:-}"
 ASSET="$FW-bindings.tar.gz"
 MARKER="$HARNESS/.provisioned-version"
 
-build_local() { echo "provision-swift[$FW]: building locally"; exec "$BUILD"; }
+build_local() { echo "provision-swift[$FW]: deliberate local build"; exec "$BUILD"; }
 
-# --- decide: local build, or fetch a pinned prebuilt? ---
+# --- decide: local build (only when explicitly asked), or fetch a pinned prebuilt? ---
 [ "${KEYS_CORE_LOCAL:-0}" = "1" ] && build_local
 [ -z "$VERSION" ] && build_local
 
@@ -58,8 +61,10 @@ fetch() {
 }
 
 if ! fetch "$ASSET" || ! fetch "checksums.txt"; then
-  echo "provision-swift[$FW]: download failed — falling back to local build" >&2
-  build_local
+  echo "provision-swift[$FW]: ERROR — could not download prebuilt $VERSION from $REPO_SLUG." >&2
+  echo "  Does the tag exist with its release assets? To build keys-core locally" >&2
+  echo "  instead, rerun with KEYS_CORE_LOCAL=1." >&2
+  exit 1
 fi
 
 # Integrity: SHA-256 must match the published checksum.
