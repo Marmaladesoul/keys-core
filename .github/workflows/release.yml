@@ -1,0 +1,87 @@
+name: release
+
+# Builds the Swift xcframeworks on a version tag, publishes them as GitHub
+# Release assets, and attaches a SLSA build-provenance attestation to each.
+#
+# Why this exists:
+#   1. Offload the build — apps download a prebuilt xcframework instead of
+#      compiling keys-core locally (no multi-hundred-MB local build dirs).
+#   2. Provenance / trust — the attestation cryptographically ties each
+#      published binary to THIS public repo, the exact commit, and the
+#      workflow run that produced it. Anyone can verify the artifact they
+#      bundle was built from the audited open-source code, untampered:
+#        gh attestation verify KeysCoreFFI.xcframework.zip \
+#          --repo Marmaladesoul/keys-core
+#      Combined with the published SHA-256 checksums and the deterministic
+#      (byte-identical) build scripts, that's a verifiable source->binary chain.
+#
+# Release flow: push a tag like `v0.1.0` (or run manually against an existing
+# tag via workflow_dispatch). Hardening TODO: pin the third-party actions to
+# commit SHAs rather than version tags.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build a release for (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write       # create the release + upload assets
+  id-token: write       # OIDC for keyless Sigstore signing
+  attestations: write   # write the build-provenance attestation
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  xcframeworks:
+    name: build + attest xcframeworks (macOS)
+    runs-on: macos-14
+    steps:
+      - name: Checkout the tagged commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+
+      # keepass-core is a git dependency, so cargo fetches it during the build
+      # — no side-by-side checkout needed.
+      - name: Build xcframeworks (release profile)
+        env:
+          PROFILE: release
+        run: |
+          bindgen/build-swift.sh
+          bindgen/build-swift-iroh-sync.sh
+
+      - name: Package + checksum
+        run: |
+          mkdir -p dist
+          # ditto preserves the xcframework's symlinks/structure (unlike zip).
+          ditto -c -k --keepParent swift-harness/KeysCoreFFI.xcframework dist/KeysCoreFFI.xcframework.zip
+          ditto -c -k --keepParent swift-harness-iroh-sync/KeysIrohSyncFFI.xcframework dist/KeysIrohSyncFFI.xcframework.zip
+          ( cd dist && shasum -a 256 *.zip | tee checksums.txt )
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/*.zip'
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            dist/KeysCoreFFI.xcframework.zip
+            dist/KeysIrohSyncFFI.xcframework.zip
+            dist/checksums.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
