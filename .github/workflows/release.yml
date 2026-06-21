@@ -66,23 +66,25 @@ jobs:
       - name: Package + checksum
         run: |
           mkdir -p dist
-          # ditto preserves the xcframework's symlinks/structure (unlike zip).
-          ditto -c -k --keepParent swift-harness/KeysCoreFFI.xcframework dist/KeysCoreFFI.xcframework.zip
-          ditto -c -k --keepParent swift-harness-iroh-sync/KeysIrohSyncFFI.xcframework dist/KeysIrohSyncFFI.xcframework.zip
-          ( cd dist && shasum -a 256 *.zip | tee checksums.txt )
+          # Each consumable bundles BOTH the xcframework and the generated
+          # Swift wrapper sources — together they are what the SwiftPM package
+          # needs. Static-lib xcframeworks carry no symlinks, so tar is fine.
+          tar -czf dist/KeysCoreFFI-bindings.tar.gz -C swift-harness KeysCoreFFI.xcframework Sources/KeysCoreFFI
+          tar -czf dist/KeysIrohSyncFFI-bindings.tar.gz -C swift-harness-iroh-sync KeysIrohSyncFFI.xcframework Sources/KeysIrohSyncFFI
+          ( cd dist && shasum -a 256 *.tar.gz | tee checksums.txt )
 
       - name: Attest build provenance (SLSA)
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
-          subject-path: 'dist/*.zip'
+          subject-path: 'dist/*.tar.gz'
 
       - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
-            dist/KeysCoreFFI.xcframework.zip
-            dist/KeysIrohSyncFFI.xcframework.zip
+            dist/KeysCoreFFI-bindings.tar.gz
+            dist/KeysIrohSyncFFI-bindings.tar.gz
             dist/checksums.txt
           generate_release_notes: true
           fail_on_unmatched_files: true
