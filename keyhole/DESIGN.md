@@ -571,6 +571,83 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 
 ## Findings (surfaced by keyhole)
 
+- **[CHARACTERISED — seam is data-safe; gap guarded one rung up] Skip-ingest
+  unlock does not verify the master password — but `save_to_kdbx` fails closed,
+  so a wrong password cannot re-key the vault.** Investigating a Keys-Mac
+  data-loss report (a WRONG password typed into the unlock modal appeared to
+  silently re-key a live vault, locking the user out), keyhole reproduced the
+  *mechanism* at this seam: `Session::open` skips ingest when the mirror's
+  recorded `(mtime,size)` signature matches the kdbx on disk (the steady-state
+  perf win — no Argon2), and that skip path never reads the kdbx, so the open
+  **succeeds for ANY password** without verifying it.
+  `scenarios/wrong-password-no-rekey.sh` arms that skip path (create + a
+  correct-password mutation → signature matches disk), then opens+mutates+saves
+  under a deliberately-wrong password. **The decisive result:** the open is
+  accepted (skip, no verify) and the mutation lands in the mirror, but the
+  trailing `save_to_kdbx(wrong)` **fails closed** —
+  `Internal("open kdbx: decryption failed (wrong key or corrupt data)")` —
+  because it must `open_unlocked(path, wrong)` the on-disk file FIRST (as the
+  crypto-envelope template) and a wrong password is rejected there. So the
+  on-disk kdbx is left untouched: it still opens under the correct password,
+  rejects the wrong one, and the wrong-password write never reaches disk.
+  - **What this means.** `save_to_kdbx` **cannot re-key an existing kdbx to a
+    different password** — it is open-then-reuse, not derive-from-password. So
+    the `aaaa` re-key observed in the Keys-Mac app did **not** come from the
+    save path on the existing vault. The actual re-key vector is therefore
+    elsewhere — most likely a *fresh-create / first-save* on a sync peer with no
+    existing file to open (the report was against a `sync-test` vault), or the
+    `reconcile_with_disk*` path (which builds a `CompositeKey` from the password
+    directly). The same corrupted-cached-password state also explains the
+    "PR-2 iroh-sync wrong-key / decryption-failed merge failure": once the app
+    caches the wrong password, the next signature-mismatch open takes the
+    reconcile path and fails to open the disk kdbx.
+  - **Re-key-vector hunt — RESOLVED: there is no re-key of an existing vault,
+    anywhere.** `scenarios/sync-wrong-password-no-rekey.sh` drives the three
+    remaining candidates under a wrong password — `ingest-peer` (per-device-key
+    transport merge), `reconcile_with_disk_park_conflicts` (the disk-watcher
+    path a sync write to the file triggers), and `create` on a fresh path — and
+    pins that the first two **fail closed** (`unlock disk kdbx: decryption
+    failed`) leaving both replicas openable only under the correct password,
+    while only `create` on a *non-existent* path keys a vault from a raw,
+    caller-supplied password. The structural reason: every disk-touching FFI op
+    (`save_to_kdbx`, `ingest_from_kdbx`, `reconcile_*`, `ingest_peer_*`)
+    `open_unlocked`s the existing file FIRST, so a wrong key is rejected before
+    any write; `save_to_kdbx` is open-then-reuse and so cannot even *create* a
+    file (its `Kdbx::open` of a missing path is an IO error). A Keys-Mac code
+    trace confirms the app honours this: the only `Vault::create_empty` call is
+    the user-driven WelcomeView create (password typed + confirmed there), and
+    the "rebuild missing vault" path (`MissingVaultRecovery.runRebuild`) routes
+    through `save_to_kdbx`, so it too fails closed rather than minting a
+    wrong-keyed file. **Conclusion:** the `sync-test` vault was almost certainly
+    NOT cryptographically re-keyed — the on-disk kdbx is still keyed with its
+    original password. The actual damage is the **Keychain overwrite** (the app
+    caches the wrong typed password), which locks the app out (every open now
+    tries the wrong password) and breaks sync reconcile with "wrong key" — both
+    symptoms of a poisoned cache, not a destroyed vault. That makes Guard 1+2
+    (never cache an unverified password — Keys-Mac `DatabaseDocument` /
+    `DatabaseManager`) the load-bearing fix; the re-key fear the report opened
+    with does not have a code path behind it.
+  - **Altitude.** The skip-path open accepting a wrong password is real but
+    *not* fixable at this seam without a verify primitive: there is no cheap
+    header-auth check (KDBX4 header HMAC needs the Argon2-derived composite key,
+    so any real verify pays the KDF the skip exists to avoid). Keys-Mac patches
+    it one rung up — `DatabaseDocument` constant-time-compares the typed
+    password against the cached **Keychain** password before trusting the skip,
+    falling through to a full ingest on mismatch (zero Argon2 on the happy
+    path). keyhole has no Keychain, so it can't exercise that specific remedy —
+    hence this finding is characterised, not "fixed", here. If we ever want the
+    seam itself to reject a wrong password on the skip path (so every client —
+    Mac, AutoFill, a future Windows app — inherits it), that's a `keys-ffi`
+    `verify_password` / header-auth primitive, and this scenario is where it'd
+    be gated.
+  - **Also pinned:** `scenarios/wrong-password-ingest-rejected.sh` — the slow
+    path (fresh ingest) DOES reject a wrong password, and its error string
+    carries a marker Keys-Mac's `VaultUnlockError.isWrongPassword(_:)` classifier
+    matches (so the UI shows "Incorrect Password"). That scenario is the canary
+    for keepass-core rewording its wrong-key message out from under the Swift
+    classifier — keep the marker list in sync with
+    `DatabaseManager.swift` → `enum VaultUnlockError.wrongPasswordMarkers`.
+
 - **[FIXED] History-snapshot deletion didn't propagate cross-peer — a privacy
   gap.** Deleting one history snapshot (the "scrub this old version" action —
   e.g. removing a leaked password from an entry's history) did NOT propagate:
