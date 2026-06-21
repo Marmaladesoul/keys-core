@@ -18,6 +18,21 @@ updates:
       # uniffi is intentionally held at 0.28 (the generated FFI bindings target
       # it); moving to 0.29+ is a deliberate manual migration, not an auto-bump.
       - dependency-name: "uniffi*"
+      # The crypto / RNG / storage cohort is held at its current line. The next
+      # release of each is a breaking API change — RustCrypto digest 0.11
+      # (hmac/sha1/sha2), rand 0.9, getrandom 0.3, rusqlite 0.40, notify 8 —
+      # that needs one deliberate, reviewed migration across keys-engine, not a
+      # weekly auto-bump. These are 0.x crates, so the breaking jump is a
+      # *minor* version bump; a semver-major ignore would miss it. Hold the
+      # whole line (as with uniffi) and bump them by hand. cargo-audit still
+      # gates every PR, so a CVE in any of these is surfaced regardless.
+      - dependency-name: "rand"
+      - dependency-name: "getrandom"
+      - dependency-name: "hmac"
+      - dependency-name: "sha1"
+      - dependency-name: "sha2"
+      - dependency-name: "rusqlite"
+      - dependency-name: "notify"
 
   - package-ecosystem: github-actions
     directory: "/"
