@@ -1,26 +1,13 @@
 //! Integration tests for slice 2 — `Vault::open` + `lock`.
 //!
-//! Drives the public FFI surface against the `keepass-core` fixture corpus
-//! at `KeepassCore/tests/fixtures/`. Path resolution relies on the path-dep
-//! relationship between the two repos (CI's side-by-side checkout puts
-//! `KeepassCore` next to `KeysCore`).
-
-use std::path::PathBuf;
+//! Drives the public FFI surface against the `keepass-core` fixture corpus.
+//! Fixture paths resolve through the shared `common::fixture` helper — see
+//! its module docs for the `KEYS_TEST_FIXTURES_DIR` contract.
 
 use keys_ffi::{Vault, VaultError};
 
-/// Resolve a fixture path from the `KeepassCore` repo's workspace-level
-/// fixture corpus. The two repos are sibling directories on disk
-/// (`Keys/KeysCore` and `Keys/KeepassCore`), with the relationship
-/// already enforced by `crates/keys-ffi/Cargo.toml`'s path deps.
-fn fixture(rel: &str) -> String {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .join("../../../KeepassCore/tests/fixtures")
-        .join(rel)
-        .to_string_lossy()
-        .into_owned()
-}
+mod common;
+use common::fixture;
 
 #[test]
 fn opens_kdbx3_basic_fixture() {

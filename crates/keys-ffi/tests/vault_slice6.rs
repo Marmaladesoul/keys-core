@@ -3,20 +3,13 @@
 //! share fixtures and helpers; logically split by `mod` blocks.
 
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use keys_ffi::{EntryCreate, GroupPatch, Vault, VaultError};
 use tempfile::NamedTempFile;
 
-fn fixture(rel: &str) -> String {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .join("../../../KeepassCore/tests/fixtures")
-        .join(rel)
-        .to_string_lossy()
-        .into_owned()
-}
+mod common;
+use common::fixture;
 
 fn open_basic() -> Arc<Vault> {
     Vault::new(

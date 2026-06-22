@@ -5,19 +5,11 @@
 //! Slice 8I-E adds `all_entries`, `recycle_bin_enabled`, and
 //! `move_group_to_position` — exercised by the additional tests below.
 
-use std::path::PathBuf;
-
 use keys_ffi::{Vault, VaultError};
 use tempfile::TempDir;
 
-fn fixture(rel: &str) -> String {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .join("../../../KeepassCore/tests/fixtures")
-        .join(rel)
-        .to_string_lossy()
-        .into_owned()
-}
+mod common;
+use common::fixture;
 
 fn open_custom_icons() -> std::sync::Arc<Vault> {
     Vault::new(

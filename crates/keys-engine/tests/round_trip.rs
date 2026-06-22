@@ -41,7 +41,7 @@
 //!   respectively. The helper compares both flavours.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use keepass_core::CompositeKey;
@@ -901,13 +901,16 @@ fn round_trip_with_empty_strings() {
 
 #[test]
 fn round_trip_keepass_core_fixture() {
-    // Optional: round-trip a real KDBX3 fixture if the keepass-core
-    // checkout is co-located with this repo. The repo layout (Keys/
-    // → KeysCore + KeepassCore as sibling directories) is assumed; if
-    // the relative path doesn't resolve we skip gracefully so this
-    // test doesn't fail in unfamiliar checkouts.
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../KeepassCore/tests/fixtures/keepassxc/kdbx3-basic.kdbx");
+    // Optional: round-trip a real KDBX3 fixture. The corpus dir comes from
+    // `KEYS_TEST_FIXTURES_DIR` when set (the fixtures-path contract shared
+    // with the keys-ffi integration tests; see their `tests/common/mod.rs`),
+    // else a sibling keepass-core checkout. If neither resolves we skip
+    // gracefully so this test doesn't fail in unfamiliar checkouts.
+    let fixtures_dir = match std::env::var_os("KEYS_TEST_FIXTURES_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../KeepassCore/tests/fixtures"),
+    };
+    let fixture = fixtures_dir.join("keepassxc/kdbx3-basic.kdbx");
     if !fixture.exists() {
         eprintln!(
             "skipping round_trip_keepass_core_fixture: {} not found",

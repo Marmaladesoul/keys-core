@@ -7,7 +7,6 @@
 //! committing new fixtures.
 
 use std::fs;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use keys_ffi::{
@@ -20,14 +19,8 @@ use tempfile::TempDir;
 
 const PASSWORD: &str = "tëst pässwörd 🔑/\\";
 
-fn fixture(rel: &str) -> String {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .join("../../../KeepassCore/tests/fixtures")
-        .join(rel)
-        .to_string_lossy()
-        .into_owned()
-}
+mod common;
+use common::fixture;
 
 /// Copy `kdbx3-basic.kdbx` into a fresh temp directory and return the
 /// `Vault` opened against the copy plus the temp dir for cleanup.

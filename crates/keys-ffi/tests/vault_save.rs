@@ -3,20 +3,13 @@
 //! upstream `Kdbx::save_to_path`.
 
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use keys_ffi::{Vault, VaultError};
 use tempfile::TempDir;
 
-fn fixture(rel: &str) -> String {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .join("../../../KeepassCore/tests/fixtures")
-        .join(rel)
-        .to_string_lossy()
-        .into_owned()
-}
+mod common;
+use common::fixture;
 
 /// Copy a fixture into a writable temp directory and open the copy
 /// — `save()` writes back to its constructor path, so we must not

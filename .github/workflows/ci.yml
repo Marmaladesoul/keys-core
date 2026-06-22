@@ -2,10 +2,12 @@
 #
 # keys-core depends on keepass-core and keepass-merge as git dependencies on
 # the public repo, so a plain checkout *builds* with no side-by-side checkout.
-# The vault integration tests, however, read KDBX fixtures from a sibling
-# keepass-core checkout (resolved relative to each crate as
-# ../../../KeepassCore/tests/fixtures), so the build+test job checks that repo
-# out alongside this one before running `cargo test`.
+# The vault integration tests, however, read KDBX fixtures from a keepass-core
+# checkout. The build+test job checks that repo out and points the tests at it
+# via KEYS_TEST_FIXTURES_DIR — the fixtures-path contract documented in
+# crates/keys-ffi/tests/common/mod.rs. (With the env var unset, the tests fall
+# back to a sibling keepass-core checkout, which is how a local side-by-side
+# layout works with zero configuration.)
 # (Flip to crates.io version deps once keepass-core publishes there.)
 
 name: CI
@@ -33,14 +35,14 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # The vault integration tests resolve KDBX fixtures from a sibling
-      # keepass-core checkout (../../../KeepassCore/tests/fixtures, relative to
-      # the crate). actions/checkout only places a repo under $GITHUB_WORKSPACE,
-      # so check it out into a subdir, then move it up to the sibling path the
-      # tests expect. Pinned to a keepass-core commit that carries the fixtures;
-      # bump this SHA when the fixtures the tests need change. (Deliberately a
-      # real branch commit, decoupled from the Cargo.lock library rev — that rev
-      # can point at a rewritten/orphaned commit that won't stay fetchable.)
+      # The vault integration tests read KDBX fixtures from a keepass-core
+      # checkout, located at runtime via KEYS_TEST_FIXTURES_DIR (set on the
+      # test step below). Check that repo out under $GITHUB_WORKSPACE and point
+      # the env var at its fixtures dir — no sibling-path juggling needed.
+      # Pinned to a keepass-core commit that carries the fixtures; bump this SHA
+      # when the fixtures the tests need change. (Deliberately a real branch
+      # commit, decoupled from the Cargo.lock library rev — that rev can point
+      # at a rewritten/orphaned commit that won't stay fetchable.)
       - name: Check out keepass-core test fixtures
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -48,8 +50,6 @@ jobs:
           ref: 44aa5d9b15edbac84e451f89e465c3907da6db14
           path: _keepass-core
           persist-credentials: false
-      - name: Stage keepass-core at the sibling path the tests resolve
-        run: mv "$GITHUB_WORKSPACE/_keepass-core" "$(dirname "$GITHUB_WORKSPACE")/KeepassCore"
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -64,6 +64,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: test
+        env:
+          # Point the vault integration tests (and the optional engine
+          # round-trip) at the fixtures checked out above — the fixtures-path
+          # contract; see crates/keys-ffi/tests/common/mod.rs.
+          KEYS_TEST_FIXTURES_DIR: ${{ github.workspace }}/_keepass-core/tests/fixtures
         run: cargo test --workspace --all-features --no-fail-fast
 
       - name: doc
