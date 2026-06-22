@@ -571,6 +571,70 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 
 ## Findings (surfaced by keyhole)
 
+- **[CHARACTERISED — seam is data-safe] No `keys-ffi` path re-keys an existing
+  vault under a wrong password; the skip-ingest fast path is not a password
+  check.** The seam invariant, pinned by the three `scenarios/wrong-password-*.sh`
+  / `scenarios/sync-wrong-password-no-rekey.sh` scenarios: every disk-touching
+  FFI op (`save_to_kdbx`, `ingest_from_kdbx`, `reconcile_*`, `ingest_peer_*`)
+  `open_unlocked`s the existing file FIRST and fails closed on a wrong key,
+  before any write — so a wrong password can never re-key a file that already
+  exists. The mechanism keyhole characterised:
+  - **The skip-ingest fast path does not verify the password.** `Session::open`
+    skips ingest when the mirror's recorded `(mtime,size)` signature matches the
+    kdbx on disk (the steady-state perf win — no Argon2), and that skip path
+    never reads the kdbx, so the open **succeeds for ANY password** without
+    verifying it. `scenarios/wrong-password-no-rekey.sh` arms that skip path
+    (create + a correct-password mutation → signature matches disk), then
+    opens+mutates+saves under a deliberately-wrong password. **The decisive
+    result:** the open is accepted (skip, no verify) and the mutation lands in
+    the mirror, but the trailing `save_to_kdbx(wrong)` **fails closed** —
+    `Internal("open kdbx: decryption failed (wrong key or corrupt data)")` —
+    because it must `open_unlocked(path, wrong)` the on-disk file FIRST (as the
+    crypto-envelope template) and a wrong password is rejected there. The
+    on-disk kdbx is left untouched: it still opens under the correct password,
+    rejects the wrong one, and the wrong-password write never reaches disk.
+  - **`save_to_kdbx` cannot re-key an existing kdbx.** It is open-then-reuse,
+    not derive-from-password, so it cannot change a vault's password — and
+    cannot even *create* a file (its `Kdbx::open` of a missing path is an IO
+    error).
+  - **No re-key vector for an existing vault, anywhere.**
+    `scenarios/sync-wrong-password-no-rekey.sh` drives the three remaining
+    disk-touching candidates under a wrong password — `ingest-peer`
+    (per-device-key transport merge), `reconcile_with_disk_park_conflicts` (the
+    disk-watcher path a sync write to the file triggers), and `create` on a
+    fresh path — and pins that the first two **fail closed** (`unlock disk kdbx:
+    decryption failed`), leaving both replicas openable only under the correct
+    password, while only `create` on a *non-existent* path keys a vault from a
+    raw, caller-supplied password. The structural reason is the open-first
+    invariant above: `create_empty` is the sole entry point that keys a vault
+    from a raw password, and only when there is no file to open.
+  - **Consumer contract: the skip path is not a password check.** A consumer
+    that relies on the signature-match skip-ingest fast path to avoid
+    re-deriving the KDF does NOT thereby verify the typed password. It must
+    verify the password by other means before trusting or caching it —
+    otherwise it can cache an unverified (wrong) password, which then locks
+    subsequent opens out and breaks any signature-mismatch path that rebuilds a
+    `CompositeKey` from the cached value. Data-safety lives at the seam (the
+    file is never re-keyed); the cache-correctness obligation lives in the
+    consumer.
+  - **Altitude.** The skip-path open accepting a wrong password is real but
+    *not* fixable at this seam without a verify primitive: there is no cheap
+    header-auth check (KDBX4 header HMAC needs the Argon2-derived composite key,
+    so any real verify pays the KDF the skip exists to avoid). If the seam
+    itself should reject a wrong password on the skip path (so every client
+    inherits it), that's a `keys-ffi` `verify_password` / header-auth primitive,
+    and this scenario is where it'd be gated. keyhole's adapters carry no OS
+    keychain, so the consumer-side cache-verification remedy is exercised by a
+    consumer's own harness, not here — hence this finding is characterised, not
+    "fixed", at this seam.
+  - **Also pinned:** `scenarios/wrong-password-ingest-rejected.sh` — the slow
+    path (fresh ingest) DOES reject a wrong password, and its error string
+    carries a stable marker a consumer's wrong-password classifier can match (so
+    the UI can show "Incorrect Password"). That scenario is the canary for
+    keepass-core rewording its wrong-key message out from under any consumer's
+    classifier — keep the consumer's marker list in sync with the message this
+    scenario asserts.
+
 - **[FIXED] History-snapshot deletion didn't propagate cross-peer — a privacy
   gap.** Deleting one history snapshot (the "scrub this old version" action —
   e.g. removing a leaked password from an entry's history) did NOT propagate:
@@ -844,8 +908,8 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   *enabled* (`keys-ffi Vault::create_empty`). Proven by
   `scenarios/recycle-persists.sh` + `scenarios/default-recycle-bin.sh`
   and keys-engine `recycle_entry_enabled_without_bin_lazy_creates…` /
-  `…_disabled_without_bin_hard_deletes…`. The Mac/iOS apps inherit it on
-  their next FFI rebuild — no Swift change needed. Original diagnosis
+  `…_disabled_without_bin_hard_deletes…`. Every client inherits it on its
+  next FFI rebuild — no consumer-side change needed. Original diagnosis
   below for the record:
   - `keepass-core::Kdbx::recycle_entry` (the canonical KDBX model,
     `KeepassCore/.../kdbx.rs:1805`) hard-deletes **only when
@@ -861,9 +925,10 @@ GUI) instead of one — short-term effort bought for compounding payoff.
     **the first "Move to Trash" is a permanent, tombstoned delete** with
     no recoverable copy. Not an edge case: every new vault until a bin
     exists.
-  - The Mac app ([`DatabaseManager.moveToRecycleBin`]) calls `recycleEntry`
-    directly under a "trash" label, trusting core — so the UI promises
-    recoverability it doesn't get.
+  - **Consumer impact:** any consumer that surfaces `recycle_entry` under a
+    "trash"/recoverable label trusts the seam to soft-delete — so this
+    divergence silently breaks a recoverability contract the consumer can't
+    see, on every vault until a bin exists.
   - **Fix (preferred):** port keepass-core's logic into keys-engine
     `recycle_entry` — when no bin group exists and the bin is enabled,
     lazy-create the "Recycle Bin" group (icon 43, auto-type/search off,
