@@ -4,20 +4,13 @@
 //! Save+reopen round-trips use the production `save_to_bytes` introduced in slice 7.
 
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use keys_ffi::{Vault, VaultError};
 use tempfile::NamedTempFile;
 
-fn fixture(rel: &str) -> String {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .join("../../../KeepassCore/tests/fixtures")
-        .join(rel)
-        .to_string_lossy()
-        .into_owned()
-}
+mod common;
+use common::fixture;
 
 /// Open the custom-fields fixture (one entry, two protected custom
 /// fields plus the structural Password).

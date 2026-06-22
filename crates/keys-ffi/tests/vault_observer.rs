@@ -1,18 +1,11 @@
 //! Integration tests for slice 9 — observer callbacks.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use keys_ffi::{EntryCreate, EntryPatch, GroupPatch, Vault, VaultChange, VaultObserver};
 
-fn fixture(rel: &str) -> String {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .join("../../../KeepassCore/tests/fixtures")
-        .join(rel)
-        .to_string_lossy()
-        .into_owned()
-}
+mod common;
+use common::fixture;
 
 fn open_basic() -> Arc<Vault> {
     Vault::new(
