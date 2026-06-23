@@ -303,6 +303,20 @@ enum Command {
         /// Zero-based history index to delete (see `history`).
         index: u32,
     },
+    /// Set the vault-wide history retention cap (`<HistoryMaxItems>`), then
+    /// persist. A negative value means unlimited (the upstream convention). When a
+    /// subsequent edit pushes an entry's history past this cap the oldest
+    /// snapshots are trimmed — and on the Engine path that trim must leave a
+    /// `quota_trim` history tombstone, or a peer still holding the trimmed
+    /// snapshot resurrects it on the next sync; this verb arms exactly that
+    /// path for a scenario.
+    SetHistoryMax {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// Max number of history snapshots to retain per entry
+        /// (`<HistoryMaxItems>`); negative = unlimited.
+        items: i32,
+    },
     /// Print the hex SHA-256 digest of the vault's user-visible
     /// content (fields, locations, icons, group tree, recycle-bin
     /// state). Equal digests ⇔ converged replicas — the convergence
@@ -607,6 +621,10 @@ async fn main() -> Result<()> {
         } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.delete_history(entry, index).await?;
+        }
+        Command::SetHistoryMax { vault, items } => {
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.set_history_max(items).await?;
         }
         Command::Digest { vault } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
@@ -1170,6 +1188,18 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("delete_history_at: {e:?}"))?;
         self.save().await?;
         println!("deleted history snapshot {index} and saved to disk");
+        Ok(())
+    }
+
+    /// Set the vault-wide `<HistoryMaxItems>` cap, then persist. Subsequent
+    /// edits trim each entry's history to this cap (oldest first); the Engine
+    /// path must tombstone what it trims so a peer can't resurrect it.
+    async fn set_history_max(&self, items: i32) -> Result<()> {
+        self.engine
+            .set_history_max_items(items)
+            .map_err(|e| anyhow::anyhow!("set_history_max_items: {e:?}"))?;
+        self.save().await?;
+        println!("set history_max_items = {items} and saved to disk");
         Ok(())
     }
 

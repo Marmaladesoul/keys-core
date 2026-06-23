@@ -706,6 +706,35 @@ struct HistoryCustomDataItem {
     last_modified_at: Option<i64>,
 }
 
+/// Reconstruct a single history snapshot from its stored
+/// `entry_history.snapshot_json` into the same [`Entry`] shape
+/// [`project`] produces — protected fields unwrapped, attachments
+/// resolved into `binary_pool`. Used by [`crate::mutations`] to compute
+/// a quota-trimmed snapshot's content hash for its history tombstone via
+/// the canonical [`snapshot_to_entry`], so the tombstone's `(mtime, hash)`
+/// matches the one any peer derives for the same record (no second source
+/// of truth for the hash). Pass a per-entry-shared `binary_pool` /
+/// `sha_to_ref` so attachment `ref_id`s stay self-consistent.
+pub(crate) fn snapshot_json_to_entry(
+    conn: &Connection,
+    session_key: &SessionKey,
+    entry_uuid: Uuid,
+    snapshot_json: &str,
+    binary_pool: &mut Vec<Binary>,
+    sha_to_ref: &mut HashMap<[u8; 32], u32>,
+) -> Result<Entry, EngineError> {
+    let snap: HistorySnapshot = serde_json::from_str(snapshot_json)
+        .map_err(|e| EngineError::Projection(ProjectionError::Json(e)))?;
+    snapshot_to_entry(
+        entry_uuid,
+        &snap,
+        session_key,
+        conn,
+        binary_pool,
+        sha_to_ref,
+    )
+}
+
 fn snapshot_to_entry(
     entry_uuid: Uuid,
     snap: &HistorySnapshot,

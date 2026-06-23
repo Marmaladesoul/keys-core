@@ -16,7 +16,10 @@ use std::collections::HashSet;
 
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
+use keepass_core::model::{Binary, CustomDataItem, Entry, EntryId};
 use keepass_core::protector::{FieldProtector, SessionKey, open_with_key, seal_with_key};
+use keepass_merge::{TombstoneReason, add_history_tombstone};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -290,8 +293,14 @@ fn upsert_tag(tx: &Transaction<'_>, name: &str) -> Result<i64, EngineError> {
 /// evicting them would recreate the original "lost ancestor" bug class.
 /// Concretely: with 11 marker-tagged snapshots and `history_max_items =
 /// 10`, all 11 markers stay and zero unmarked records remain.
-fn push_history_snapshot(tx: &Transaction<'_>, uuid_str: &str) -> Result<(), EngineError> {
-    let snap = build_live_snapshot(tx, uuid_str)?;
+fn push_history_snapshot(
+    tx: &Transaction<'_>,
+    uuid: Uuid,
+    now: i64,
+    protector: &dyn FieldProtector,
+) -> Result<(), EngineError> {
+    let uuid_str = uuid.to_string();
+    let snap = build_live_snapshot(tx, &uuid_str)?;
     let json =
         serde_json::to_string(&snap).map_err(|e| EngineError::Reveal(RevealError::Json(e)))?;
     let max_idx: Option<i64> = tx
@@ -308,36 +317,52 @@ fn push_history_snapshot(tx: &Transaction<'_>, uuid_str: &str) -> Result<(), Eng
          VALUES (?1, ?2, ?3)",
         params![uuid_str, next_idx, json],
     )?;
-    prune_history(tx, uuid_str)?;
+    prune_history(tx, uuid, now, protector)?;
     Ok(())
 }
 
-/// Prune `entry_history` for `uuid_str` to honour
-/// `meta.history_max_items` and `meta.history_max_size`. Records carrying
-/// the *legacy* parked-conflict marker
+/// Prune `entry_history` for `uuid` to honour `meta.history_max_items`
+/// and `meta.history_max_size`. Records carrying the *legacy*
+/// parked-conflict marker
 /// ([`crate::reconcile::FIELD_CONFLICT_CUSTOM_DATA_KEY`]) are always
 /// retained so a cleanup pass can still find and tombstone them — the
 /// hold-open redesign no longer writes the marker, but old vaults may
 /// still hold one. See [`crate::reconcile::clear_parked_conflict_marker`].
 ///
+/// Every snapshot this drops for quota is first tombstoned
+/// ([`tombstone_quota_trimmed_snapshots`], reason `quota_trim`) so the
+/// drop PROPAGATES cross-peer as a deletion — without it a replica still
+/// holding the trimmed snapshot keeps a quota-trimmed old secret forever.
+/// This mirrors `Engine::delete_history_at`'s tombstone for the
+/// user-delete seam and the FFI `Vault::trim_entry_history` path, all via
+/// the same canonical `keepass_merge::add_history_tombstone`.
+///
 /// Re-packs `history_index` into a dense `0..N` afterwards.
 #[allow(clippy::too_many_lines)]
-fn prune_history(tx: &Transaction<'_>, uuid_str: &str) -> Result<(), EngineError> {
+fn prune_history(
+    tx: &Transaction<'_>,
+    uuid: Uuid,
+    now: i64,
+    protector: &dyn FieldProtector,
+) -> Result<(), EngineError> {
     /// Large offset used by the dense `0..N` re-pack to avoid
     /// transient PK collisions while shifting indices.
     const SHIFT: i64 = 1_000_000_000;
 
-    #[derive(Clone)]
     struct Row {
         history_index: i64,
         size_bytes: i64,
         is_marker: bool,
+        json: String,
     }
 
+    let uuid_str = uuid.to_string();
     let max_items = crate::meta::read_history_max_items(tx)?;
     let max_size = crate::meta::read_history_max_size(tx)?;
 
-    // Load all rows oldest-first with their byte size and marker flag.
+    // Load all rows oldest-first with their byte size, marker flag, and the
+    // snapshot JSON (kept so a quota-dropped row can be reconstructed for its
+    // tombstone before we delete it).
     let rows: Vec<Row> = {
         let mut stmt = tx.prepare(
             "SELECT history_index, length(snapshot_json), snapshot_json \
@@ -365,6 +390,7 @@ fn prune_history(tx: &Transaction<'_>, uuid_str: &str) -> Result<(), EngineError
                 history_index: idx,
                 size_bytes: size,
                 is_marker,
+                json,
             });
         }
         out
@@ -430,6 +456,16 @@ fn prune_history(tx: &Transaction<'_>, uuid_str: &str) -> Result<(), EngineError
     if to_delete.is_empty() {
         return Ok(());
     }
+    // Tombstone every snapshot being dropped for quota BEFORE deleting it, so
+    // the drop survives a merge with a peer that hasn't trimmed yet (it would
+    // otherwise keep the trimmed snapshot — a quota-trimmed old secret living
+    // on another device).
+    let dropped_jsons: Vec<&str> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| (!survive_marker[i]).then_some(r.json.as_str()))
+        .collect();
+    tombstone_quota_trimmed_snapshots(tx, uuid, protector, &dropped_jsons, now)?;
     for idx in &to_delete {
         tx.execute(
             "DELETE FROM entry_history WHERE entry_uuid = ?1 AND history_index = ?2",
@@ -456,6 +492,111 @@ fn prune_history(tx: &Transaction<'_>, uuid_str: &str) -> Result<(), EngineError
             "UPDATE entry_history SET history_index = ?1 \
              WHERE entry_uuid = ?2 AND history_index = ?3",
             params![new_idx_i64, uuid_str, old_shifted],
+        )?;
+    }
+    Ok(())
+}
+
+/// Tombstone the history snapshots a quota trim is about to drop, mirroring
+/// `Engine::delete_history_at`'s tombstone write for the user-delete seam.
+///
+/// Each dropped snapshot's JSON is reconstructed into the canonical [`Entry`]
+/// shape via [`crate::projection::snapshot_json_to_entry`] (so its content hash
+/// matches the one any peer derives for the same record — no second source of
+/// truth for the hash), then folded into the entry's
+/// `keys.history_tombstones.v1` `custom_data` via the shared
+/// `keepass_merge::add_history_tombstone` with reason `quota_trim`. The merged
+/// list is persisted onto `entry_custom_data`; `ingest_peer`'s existing
+/// per-entry history-tombstone reconcile then prunes the record on any peer
+/// that still holds it.
+///
+/// Acquires the session key (needed to unwrap each snapshot's protected fields
+/// for the content hash) lazily — only on the rare edit that actually evicts a
+/// record — so the steady-state (under-quota) edit pays nothing here.
+fn tombstone_quota_trimmed_snapshots(
+    tx: &Transaction<'_>,
+    uuid: Uuid,
+    protector: &dyn FieldProtector,
+    dropped_jsons: &[&str],
+    now: i64,
+) -> Result<(), EngineError> {
+    if dropped_jsons.is_empty() {
+        return Ok(());
+    }
+    let uuid_str = uuid.to_string();
+    let session = session_key(protector)?;
+    let now_dt = DateTime::from_timestamp_millis(now).unwrap_or_else(Utc::now);
+
+    // Carry the entry's existing tombstone list so the union FOLDS the new
+    // drops in rather than replacing. Only the JSON value is read back (by
+    // `add_history_tombstone`'s `parse_tombstones`), so a `None` last-modified
+    // on the seed is fine — the persist below re-stamps it.
+    let mut carrier = Entry::empty(EntryId(uuid));
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT value FROM entry_custom_data WHERE entry_uuid = ?1 AND key = ?2",
+            params![uuid_str, keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(value) = existing {
+        carrier.custom_data.push(CustomDataItem::new(
+            keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY.to_string(),
+            value,
+            None,
+        ));
+    }
+
+    // Reconstruct each dropped snapshot into a shared per-entry binary pool so
+    // attachment `ref_id`s stay self-consistent across the entry's history,
+    // then tombstone it by `(mtime, content-hash)`.
+    let mut pool: Vec<Binary> = Vec::new();
+    let mut sha_to_ref: HashMap<[u8; 32], u32> = HashMap::new();
+    for &json in dropped_jsons {
+        // A snapshot we can't reconstruct into a hashable Entry — a pre-shape
+        // or corrupt row, never a live engine-written one — has no stable
+        // cross-peer content hash, so it can't carry a tombstone; skip it (the
+        // eviction still proceeds). Blocking the edit over an un-hashable
+        // history row would be worse than a missed tombstone, and this mirrors
+        // both `prune_history`'s defensive marker-parse posture and
+        // `reconcile_entry_history_tombstones`'s "can't hash → no-op".
+        let Ok(record) = crate::projection::snapshot_json_to_entry(
+            tx,
+            &session,
+            uuid,
+            json,
+            &mut pool,
+            &mut sha_to_ref,
+        ) else {
+            continue;
+        };
+        add_history_tombstone(
+            &mut carrier,
+            &record,
+            &pool,
+            TombstoneReason::QuotaTrim,
+            None,
+            now_dt,
+        )
+        .map_err(|e| EngineError::Serialise(format!("add_history_tombstone: {e}")))?;
+    }
+
+    // Persist the merged tombstone list back onto the entry's custom_data —
+    // the same `INSERT OR REPLACE` upsert `Engine::delete_history_at` uses.
+    if let Some(item) = carrier
+        .custom_data
+        .iter()
+        .find(|c| c.key == keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY)
+    {
+        tx.execute(
+            "INSERT OR REPLACE INTO entry_custom_data \
+             (entry_uuid, key, value, last_modified_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                uuid_str,
+                item.key,
+                item.value,
+                item.last_modified.map(|d| d.timestamp_millis()),
+            ],
         )?;
     }
     Ok(())
@@ -611,7 +752,7 @@ pub(crate) fn update_entry(
     // One history snapshot per logical edit — capture pre-edit state
     // before any field mutates. See [`push_history_snapshot`] for the
     // invariant.
-    push_history_snapshot(&tx, &uuid_str)?;
+    push_history_snapshot(&tx, uuid, now, protector)?;
 
     if let Some(title) = update.title {
         tx.execute(
@@ -736,7 +877,7 @@ pub(crate) fn save_entry(
 
     // One snapshot of the pre-save state, captured before any field
     // mutates — see [`push_history_snapshot`] for the invariant.
-    push_history_snapshot(&tx, &uuid_str)?;
+    push_history_snapshot(&tx, uuid, now, protector)?;
 
     // ── Standard columns + derived password columns ──
     let url_host = parse_host(&save.url);
@@ -884,6 +1025,7 @@ fn recompute_has_totp(tx: &Transaction<'_>, uuid: &str) -> Result<(), EngineErro
 /// match.
 pub(crate) fn clear_entry_custom_icon(
     conn: &mut Connection,
+    protector: &dyn FieldProtector,
     uuid: Uuid,
     now: i64,
 ) -> Result<(), EngineError> {
@@ -892,7 +1034,7 @@ pub(crate) fn clear_entry_custom_icon(
     if !entry_exists(&tx, &uuid_str)? {
         return Err(EngineError::NotFound { entity: "entry" });
     }
-    push_history_snapshot(&tx, &uuid_str)?;
+    push_history_snapshot(&tx, uuid, now, protector)?;
     tx.execute(
         "UPDATE entry SET icon_custom_uuid = NULL WHERE uuid = ?1",
         params![uuid_str],
@@ -1318,7 +1460,7 @@ pub(crate) fn set_protected_field(
     if !entry_exists(&tx, &uuid_str)? {
         return Err(EngineError::NotFound { entity: "entry" });
     }
-    push_history_snapshot(&tx, &uuid_str)?;
+    push_history_snapshot(&tx, uuid, now, protector)?;
     tx.execute(
         "INSERT INTO entry_protected (entry_uuid, field_name, wrapped_blob) \
          VALUES (?1, ?2, ?3) \
@@ -1352,6 +1494,7 @@ pub(crate) fn set_protected_field(
 
 pub(crate) fn set_non_protected_custom_field(
     conn: &mut Connection,
+    protector: &dyn FieldProtector,
     uuid: Uuid,
     field_name: &str,
     value: &str,
@@ -1362,7 +1505,7 @@ pub(crate) fn set_non_protected_custom_field(
     if !entry_exists(&tx, &uuid_str)? {
         return Err(EngineError::NotFound { entity: "entry" });
     }
-    push_history_snapshot(&tx, &uuid_str)?;
+    push_history_snapshot(&tx, uuid, now, protector)?;
     tx.execute(
         "INSERT INTO entry_custom_field (entry_uuid, field_name, value) \
          VALUES (?1, ?2, ?3) \
@@ -1379,6 +1522,7 @@ pub(crate) fn set_non_protected_custom_field(
 
 pub(crate) fn remove_custom_field(
     conn: &mut Connection,
+    protector: &dyn FieldProtector,
     uuid: Uuid,
     field_name: &str,
     now: i64,
@@ -1397,7 +1541,7 @@ pub(crate) fn remove_custom_field(
             entity: "custom_field",
         });
     }
-    push_history_snapshot(&tx, &uuid_str)?;
+    push_history_snapshot(&tx, uuid, now, protector)?;
     tx.execute(
         "DELETE FROM entry_protected WHERE entry_uuid = ?1 AND field_name = ?2",
         params![uuid_str, field_name],
@@ -1417,6 +1561,7 @@ pub(crate) fn remove_custom_field(
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn set_tags(
     conn: &mut Connection,
+    protector: &dyn FieldProtector,
     uuid: Uuid,
     tags: Vec<String>,
     now: i64,
@@ -1449,7 +1594,7 @@ pub(crate) fn set_tags(
     normalised_new.dedup();
     let changed = current != normalised_new;
     if changed {
-        push_history_snapshot(&tx, &uuid_str)?;
+        push_history_snapshot(&tx, uuid, now, protector)?;
     }
     tx.execute(
         "DELETE FROM entry_tag WHERE entry_uuid = ?1",
@@ -1467,6 +1612,7 @@ pub(crate) fn set_tags(
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn attach_file(
     conn: &mut Connection,
+    protector: &dyn FieldProtector,
     uuid: Uuid,
     name: &str,
     bytes: Vec<u8>,
@@ -1483,7 +1629,7 @@ pub(crate) fn attach_file(
     if !entry_exists(&tx, &uuid_str)? {
         return Err(EngineError::NotFound { entity: "entry" });
     }
-    push_history_snapshot(&tx, &uuid_str)?;
+    push_history_snapshot(&tx, uuid, now, protector)?;
     tx.execute(
         "INSERT OR IGNORE INTO attachment_blob (sha256, bytes, size) VALUES (?1, ?2, ?3)",
         params![sha_bytes, bytes, size_i64],
@@ -1799,6 +1945,22 @@ pub(crate) fn restore_entry_from_history(
         )?;
         if count > cap {
             let to_drop = count - cap;
+            // Tombstone the snapshots about to be dropped for quota — same
+            // `quota_trim` reason + canonical content hash as the edit-path
+            // trim in `prune_history` — so the drop propagates cross-peer as a
+            // deletion instead of being silently re-added from an un-trimmed
+            // peer.
+            let dropped: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT snapshot_json FROM entry_history \
+                     WHERE entry_uuid = ?1 ORDER BY history_index ASC LIMIT ?2",
+                )?;
+                let mapped =
+                    stmt.query_map(params![uuid_str, to_drop], |r| r.get::<_, String>(0))?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            let dropped_refs: Vec<&str> = dropped.iter().map(String::as_str).collect();
+            tombstone_quota_trimmed_snapshots(&tx, uuid, protector, &dropped_refs, now)?;
             // Drop the `to_drop` rows with the lowest history_index,
             // then renumber survivors to a dense `0..N`.
             tx.execute(
@@ -2154,6 +2316,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 /// [`remove_attachment`].
 pub(crate) fn set_attachment(
     conn: &mut Connection,
+    protector: &dyn FieldProtector,
     uuid: Uuid,
     name: &str,
     bytes: &[u8],
@@ -2164,7 +2327,7 @@ pub(crate) fn set_attachment(
     if !entry_exists(&tx, &uuid_str)? {
         return Err(EngineError::NotFound { entity: "entry" });
     }
-    push_history_snapshot(&tx, &uuid_str)?;
+    push_history_snapshot(&tx, uuid, now, protector)?;
 
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -2190,6 +2353,7 @@ pub(crate) fn set_attachment(
 
 pub(crate) fn remove_attachment(
     conn: &mut Connection,
+    protector: &dyn FieldProtector,
     uuid: Uuid,
     name: &str,
     now: i64,
@@ -2199,7 +2363,7 @@ pub(crate) fn remove_attachment(
     if !entry_exists(&tx, &uuid_str)? {
         return Err(EngineError::NotFound { entity: "entry" });
     }
-    push_history_snapshot(&tx, &uuid_str)?;
+    push_history_snapshot(&tx, uuid, now, protector)?;
     // Don't GC `attachment_blob` rows here; blobs are shared by SHA and
     // GC is a separate concern.
     tx.execute(
@@ -2639,6 +2803,28 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    /// Minimal fixed-key protector for the low-level prune tests. The quota
+    /// tombstone path acquires a session key to unwrap a dropped snapshot's
+    /// protected fields; these tests' hand-crafted rows aren't reconstructable
+    /// (so they skip tombstoning), but the acquire must still succeed.
+    #[derive(Debug)]
+    struct FixedProtector([u8; 32]);
+
+    impl FieldProtector for FixedProtector {
+        fn acquire_session_key(
+            &self,
+        ) -> Result<SessionKey, keepass_core::protector::ProtectorError> {
+            Ok(SessionKey::from_bytes(self.0))
+        }
+    }
+
+    /// A `prune_history` call for the structural tests: parse the entry uuid,
+    /// pin `now` to 0, and hand it a fixed-key protector.
+    fn prune(tx: &Transaction<'_>, entry: &str) {
+        let uuid = Uuid::parse_str(entry).expect("valid uuid");
+        prune_history(tx, uuid, 0, &FixedProtector([0x9c; 32])).unwrap();
+    }
+
     /// Spin up a minimal `SQLite` DB with the engine's schema and a single
     /// group + entry row so we can hand-craft history rows for prune
     /// tests without going through the full Engine wiring.
@@ -2710,7 +2896,7 @@ mod tests {
             insert_history_row(&conn, &entry, i, false);
         }
         let tx = conn.transaction().unwrap();
-        prune_history(&tx, &entry).unwrap();
+        prune(&tx, &entry);
         tx.commit().unwrap();
 
         let count: i64 = conn
@@ -2752,7 +2938,7 @@ mod tests {
             insert_history_row(&conn, &entry, i, false);
         }
         let tx = conn.transaction().unwrap();
-        prune_history(&tx, &entry).unwrap();
+        prune(&tx, &entry);
         tx.commit().unwrap();
 
         let mut stmt = conn

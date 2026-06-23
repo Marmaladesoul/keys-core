@@ -327,7 +327,12 @@ impl Engine {
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn clear_entry_custom_icon(&mut self, entry_uuid: Uuid) -> Result<(), EngineError> {
         let now = self.now_ms();
-        mutations::clear_entry_custom_icon(&mut self.conn, entry_uuid, now)?;
+        mutations::clear_entry_custom_icon(
+            &mut self.conn,
+            &*self.field_protector,
+            entry_uuid,
+            now,
+        )?;
         crate::reconcile::reconcile_conflict_rows(self, entry_uuid)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![entry_uuid]));
         Ok(())

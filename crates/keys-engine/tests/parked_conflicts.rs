@@ -1114,6 +1114,161 @@ fn two_engine_history_delete_propagates() {
     );
 }
 
+/// Engine twin of the keyhole `history-quota-trim-propagates.sh` scenario:
+/// a history snapshot dropped to satisfy the `HistoryMaxItems` quota must
+/// PROPAGATE cross-peer as a deletion (the `quota_trim` tombstone half of the
+/// history-tombstone story), exactly like the user-delete half above.
+///
+/// With a cap of 2: A builds history [v0, v1] (live v2); B forks holding that
+/// at-cap history; A edits to v3, which pushes v2 onto history → [v0, v1, v2],
+/// over the cap, so the oldest (v0) is quota-trimmed and tombstoned. After a
+/// both-ways sync the trimmed v0 must live on NEITHER replica — the owner-rows
+/// ingest path PRUNES local history against the unioned tombstone set (it does
+/// not union the peer's history in, so depth may differ; the convergence digest
+/// excludes history for that reason). The guarantee under test is privacy:
+/// the quota-trimmed old secret is gone everywhere, and survives a fresh disk
+/// read on the receiving side.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn two_engine_history_quota_trim_propagates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Base: one entry, username v0. A builds the history via engine edits.
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    kdbx.add_entry(root, NewEntry::new("E").username("v0"))
+        .expect("seed entry");
+
+    let kdbx_a = dir.path().join("a.kdbx");
+    let kdbx_b = dir.path().join("b.kdbx");
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    // Cap history at 2 snapshots so a single extra edit trips the quota trim.
+    engine_a.set_history_max_items(2).expect("set cap");
+
+    let seed = engine_a
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list")[0]
+        .uuid;
+
+    let hist_usernames = |e: &Engine, uuid| -> Vec<String> {
+        let mut us: Vec<String> = e
+            .history(uuid)
+            .expect("history")
+            .into_iter()
+            .map(|h| h.username)
+            .collect();
+        us.sort();
+        us
+    };
+
+    // Two edits → history [v0, v1] (live v2); still at the cap, nothing trimmed.
+    for u in ["v1", "v2"] {
+        engine_a
+            .update_entry(
+                seed,
+                keys_engine::EntryUpdate {
+                    username: Some(u.to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("a edit");
+    }
+    assert_eq!(
+        hist_usernames(&engine_a, seed),
+        vec!["v0", "v1"],
+        "base history is at the cap before the trimming edit",
+    );
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save");
+
+    // B forks from A's on-disk base holding the at-cap history {v0, v1}.
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut handle_b = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut handle_b, None)
+        .expect("b save");
+    assert_eq!(
+        hist_usernames(&engine_b, seed),
+        vec!["v0", "v1"],
+        "B forked with the at-cap history",
+    );
+
+    // One more edit on A pushes v2 onto history → [v0, v1, v2], over the cap of
+    // 2, so the oldest (v0) is quota-trimmed AND tombstoned.
+    engine_a
+        .update_entry(
+            seed,
+            keys_engine::EntryUpdate {
+                username: Some("v3".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("a trimming edit");
+    assert_eq!(
+        hist_usernames(&engine_a, seed),
+        vec!["v1", "v2"],
+        "A quota-trimmed the oldest snapshot (v0)",
+    );
+    let mut handle_a = reopen_kdbx(&kdbx_a);
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut handle_a, None)
+        .expect("a save 2");
+
+    // Exchange both ways (re-saving so the next pull reads reconciled state).
+    let applied = engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest a");
+    assert!(
+        matches!(applied, ParkConflictsResult::Applied { .. }),
+        "B must apply the quota trim (not NoChange), got {applied:?}",
+    );
+    let mut hb = reopen_kdbx(&kdbx_b);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb, None)
+        .expect("b save 2");
+    engine_a
+        .ingest_peer_from_kdbx(&kdbx_b, &composite(), "device-b")
+        .expect("a ingest b");
+
+    // Privacy guarantee: the quota-trimmed v0 lives on NEITHER replica, and the
+    // trimmer A did not have it resurrected.
+    let a_hist = hist_usernames(&engine_a, seed);
+    let b_hist = hist_usernames(&engine_b, seed);
+    assert!(
+        !a_hist.contains(&"v0".to_string()),
+        "v0 must not resurrect on the trimmer A (got {a_hist:?})",
+    );
+    assert!(
+        !b_hist.contains(&"v0".to_string()),
+        "the quota-trimmed v0 must be purged from peer B (got {b_hist:?})",
+    );
+    assert_eq!(a_hist, vec!["v1", "v2"], "A keeps its post-trim set");
+    assert_eq!(b_hist, vec!["v1"], "B pruned the trimmed v0");
+
+    // Honest disk read: a fresh engine opening B's saved KDBX must see v0 gone —
+    // the tombstone really hit the file, not just B's warm mirror.
+    let db_b2 = dir.path().join("b2.db");
+    let mut engine_b2 =
+        Engine::open(&db_b2, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b2");
+    engine_b2
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_b))
+        .expect("b2 ingest");
+    assert_eq!(
+        hist_usernames(&engine_b2, seed),
+        vec!["v1"],
+        "the quota trim survives a fresh disk read of B's KDBX",
+    );
+}
+
 /// Phase 5c custom-icon pool union: a one-sided custom-icon add on B must
 /// carry its BYTES to A on `ingest_peer`, not just the entry's
 /// content-addressed `custom_icon_uuid` ref. The ref rides the normal
