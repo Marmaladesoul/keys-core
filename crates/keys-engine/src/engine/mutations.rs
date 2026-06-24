@@ -369,7 +369,14 @@ impl Engine {
         value: &str,
     ) -> Result<(), EngineError> {
         let now = self.now_ms();
-        mutations::set_non_protected_custom_field(&mut self.conn, uuid, field_name, value, now)?;
+        mutations::set_non_protected_custom_field(
+            &mut self.conn,
+            &*self.field_protector,
+            uuid,
+            field_name,
+            value,
+            now,
+        )?;
         crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
@@ -389,7 +396,13 @@ impl Engine {
     /// - [`EngineError::Sqlite`].
     pub fn remove_custom_field(&mut self, uuid: Uuid, field_name: &str) -> Result<(), EngineError> {
         let now = self.now_ms();
-        mutations::remove_custom_field(&mut self.conn, uuid, field_name, now)?;
+        mutations::remove_custom_field(
+            &mut self.conn,
+            &*self.field_protector,
+            uuid,
+            field_name,
+            now,
+        )?;
         crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
         Ok(())
@@ -404,7 +417,7 @@ impl Engine {
     /// - [`EngineError::Sqlite`].
     pub fn set_tags(&mut self, uuid: Uuid, tags: Vec<String>) -> Result<(), EngineError> {
         let now = self.now_ms();
-        mutations::set_tags(&mut self.conn, uuid, tags, now)?;
+        mutations::set_tags(&mut self.conn, &*self.field_protector, uuid, tags, now)?;
         crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         // Two events: the tag set changed (`TagsChanged`), and the
         // entry's `modified_at` was bumped (`EntriesUpdated`). Frontends
@@ -431,7 +444,14 @@ impl Engine {
         bytes: Vec<u8>,
     ) -> Result<(), EngineError> {
         let now = self.now_ms();
-        mutations::attach_file(&mut self.conn, uuid, name, bytes, now)?;
+        mutations::attach_file(
+            &mut self.conn,
+            &*self.field_protector,
+            uuid,
+            name,
+            bytes,
+            now,
+        )?;
         crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())
@@ -453,7 +473,14 @@ impl Engine {
         bytes: &[u8],
     ) -> Result<(), EngineError> {
         let now = self.now_ms();
-        mutations::set_attachment(&mut self.conn, uuid, name, bytes, now)?;
+        mutations::set_attachment(
+            &mut self.conn,
+            &*self.field_protector,
+            uuid,
+            name,
+            bytes,
+            now,
+        )?;
         crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())
@@ -468,7 +495,7 @@ impl Engine {
     /// - [`EngineError::Sqlite`].
     pub fn remove_attachment(&mut self, uuid: Uuid, name: &str) -> Result<(), EngineError> {
         let now = self.now_ms();
-        mutations::remove_attachment(&mut self.conn, uuid, name, now)?;
+        mutations::remove_attachment(&mut self.conn, &*self.field_protector, uuid, name, now)?;
         crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::AttachmentsChanged(vec![uuid]));
         Ok(())

@@ -337,7 +337,7 @@ pub(crate) fn import_entry(
     // content-addressed pool dedup runs (bytes shared with other entries
     // in the target won't be re-inserted).
     for att in portable.attachments {
-        mutations::attach_file(conn, new_uuid, &att.name, att.bytes, now)?;
+        mutations::attach_file(conn, protector, new_uuid, &att.name, att.bytes, now)?;
     }
 
     Ok((new_uuid, icon_inserted))

@@ -553,6 +553,15 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   via the new `keepass_merge::reconcile_history_tombstones`. That flipped
   `history-delete-propagates.sh` from forcing-function to a `run-all.sh` gate;
   `fuzz-convergence.sh`'s mix gained a deterministic `delete-history` op.
+- **Done (2026-06-24, quota-trim tombstones):** the Engine's edit-path history
+  trim (`mutations::prune_history`) and the `restore_entry_from_history` trim now
+  tombstone every snapshot they evict for `Meta::HistoryMaxItems` /
+  `HistoryMaxSize` (reason `quota_trim`, via the shared
+  `keepass_merge::add_history_tombstone`), closing the drift with the FFI
+  `Vault::trim_entry_history` path — a quota-trimmed snapshot no longer lives on
+  an un-trimmed peer. New `set-history-max` verb;
+  [history-quota-trim-propagates.sh](scenarios/history-quota-trim-propagates.sh)
+  + engine `two_engine_history_quota_trim_propagates`. See Findings.
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the
@@ -684,6 +693,40 @@ GUI) instead of one — short-term effort bought for compounding payoff.
     (teeth-verified: red when the post-pass bases on local). A history-only
     propagation also now surfaces in `MergeStats.history_pruned` instead of
     reading as an all-zero `Applied`.
+
+- **[FIXED] Quota-trim of history didn't propagate on the Engine path — the
+  `quota_trim` twin of the deletion gap above.** The user-delete half (above)
+  tombstones a hand-deleted snapshot, but the Engine's *quota* trim — when an
+  edit pushes an entry's history past `Meta::HistoryMaxItems` /
+  `HistoryMaxSize`, dropping the oldest snapshots — deleted the row from the
+  mirror and wrote **no** tombstone. So a peer that hadn't trimmed yet kept the
+  dropped snapshot forever: a quota-trimmed old secret living on another device
+  (the lossless history merge has no "this is gone" signal of its own). The FFI
+  `Vault::trim_entry_history` path already tombstoned via
+  `keepass_merge::prune_history_with_tombstones`; the Engine's edit-path trim
+  (`mutations::prune_history`, the single funnel every content edit routes
+  through) did not — the two paths had drifted. **Fix:** `prune_history` now
+  tombstones every snapshot it evicts for quota, via the shared
+  `keepass_merge::add_history_tombstone` (reason `quota_trim`), keyed by the
+  record's `(mtime, content-hash)` reconstructed through the **same**
+  `projection::snapshot_to_entry` a peer hashes with — so the tombstone the
+  trimmer writes matches the record the peer holds, no second source of truth
+  for the hash. The session key needed to unwrap a dropped snapshot's protected
+  fields is acquired lazily, only on the rare edit that actually evicts. The
+  identical trim inside `restore_entry_from_history` tombstones the same way.
+  `ingest_peer`'s existing per-entry `reconcile_entry_history_tombstones` then
+  prunes the record on any peer that still holds it — no ingest change needed,
+  the deletion path is already shared. **Scope note (consumer contract):** the
+  owner-rows ingest path *prunes* local history against the unioned tombstone
+  set; it does not union the peer's history *in* (replicas may legitimately
+  differ in history depth — the convergence digest excludes history for exactly
+  this reason). So the guarantee the tombstone delivers is *privacy* — the
+  trimmed snapshot is purged from every replica that held it — not full depth
+  equality. Pinned by
+  [history-quota-trim-propagates.sh](scenarios/history-quota-trim-propagates.sh)
+  (RED before the fix: the trimmed snapshot still lived on the peer; new
+  `set-history-max` verb arms the cap) + engine
+  `two_engine_history_quota_trim_propagates`, both across a fresh disk read.
 
 - **[FIXED] `ingest_peer` ignored vault Meta → a recycle-bin toggle diverged
   replicas permanently (digest-visible).** The owner-rows peer-sync path
