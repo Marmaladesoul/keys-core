@@ -1972,3 +1972,94 @@ fn two_engine_empty_recycle_bin_propagates() {
         "replicas converge after the bin purge propagates",
     );
 }
+
+/// `delete_group` cascade-deletes descendant entries, but `conflict_entry`
+/// has no FK to `entry` — so the cascade removes the entry's own child
+/// tables, NOT its parked conflict rows. Without a per-entry reconcile after
+/// the cascade those rows are orphaned, and the cheap badge query
+/// ([`Engine::entries_with_parked_conflict`], a plain
+/// `SELECT DISTINCT entry_uuid FROM conflict_entry`) keeps counting a
+/// conflict on an entry that no longer exists — a ghost badge healed only by
+/// a later ingest sweep. This asserts the badge clears IMMEDIATELY on the
+/// group delete, the same Finding #11 parity already held by `delete_entry`
+/// and `empty_recycle_bin`.
+#[test]
+fn delete_group_cascade_clears_parked_conflict_immediately() {
+    // Build a vault whose seed entry lives inside a deletable child group, so
+    // the group delete cascades the entry. (The standard `fixture()` seeds at
+    // the root group, which `delete_group` can't target.)
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let group = kdbx
+        .add_group(root, NewGroup::new("Doomed"))
+        .expect("group");
+    let entry = kdbx
+        .add_entry(group, NewEntry::new("inside"))
+        .expect("entry")
+        .0;
+    let group = group.0;
+    let mut engine =
+        Engine::open(&db_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open engine");
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("initial save");
+    engine
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_path))
+        .expect("re-ingest from disk");
+
+    // Park a conflict on the entry: a local edit plus a concurrent disk edit
+    // of the same field, then a park-conflicts reconcile (same machinery as
+    // `park_conflicts_holds_field_conflict_keeping_local`).
+    engine
+        .update_entry(
+            entry,
+            keys_engine::EntryUpdate {
+                title: Some("local-rename".into()),
+                ..Default::default()
+            },
+        )
+        .expect("local edit");
+    let mut external = reopen_kdbx(&kdbx_path);
+    external
+        .edit_entry(
+            keepass_core::model::EntryId(entry),
+            keepass_core::model::HistoryPolicy::Snapshot,
+            |e| {
+                e.set_title("disk-rename");
+            },
+        )
+        .expect("disk edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&kdbx_path, &bytes).expect("write");
+    engine
+        .reconcile_with_disk_park_conflicts(&kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile");
+
+    // Precondition: the conflict is parked, so the badge reports the entry.
+    assert_eq!(
+        engine.entries_with_parked_conflict().expect("badge"),
+        vec![entry],
+        "precondition: the conflict is parked before the delete",
+    );
+
+    // Delete the entry's group — the entry cascade-deletes with it.
+    engine.delete_group(group).expect("delete group");
+    assert!(
+        engine.entry(entry).expect("query").is_none(),
+        "the cascade-deleted entry is gone",
+    );
+
+    // The badge must clear IMMEDIATELY: no orphaned `conflict_entry` row left
+    // to ghost the deleted entry, with no later ingest sweep required.
+    assert!(
+        engine
+            .entries_with_parked_conflict()
+            .expect("badge")
+            .is_empty(),
+        "delete_group must reconcile the cascade-deleted entry's parked conflict rows",
+    );
+}

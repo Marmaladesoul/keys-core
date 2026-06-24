@@ -590,6 +590,12 @@ impl Engine {
     /// self-FK or on `entry.group_uuid`, so the engine walks the
     /// subtree itself. Entry child tables cascade off `entry`.
     ///
+    /// Reconciles each cascade-deleted entry's parked conflict rows like
+    /// [`Engine::delete_entry`] / [`Engine::empty_recycle_bin`] so a
+    /// now-orphaned conflict can't leave a ghost badge: `conflict_entry`
+    /// has no FK to `entry`, so the cascade removes the entry's own child
+    /// tables but not its parked conflict rows (Finding #11).
+    ///
     /// # Errors
     ///
     /// - [`EngineError::NotFound`] (`entity = "group"`).
@@ -597,6 +603,11 @@ impl Engine {
     pub fn delete_group(&mut self, uuid: Uuid) -> Result<(), EngineError> {
         let now = self.now_ms();
         let outcome = mutations::delete_group(&mut self.conn, uuid, now)?;
+        // Snapshot the cascade-deleted entry uuids before the outcome is
+        // consumed by the event builders — needed for the per-entry conflict
+        // reconcile after the events are emitted.
+        let purged_entries: Vec<Uuid> = outcome.deleted_entries.iter().map(|(u, _)| *u).collect();
+
         // One combined `EntriesDeleted` and one combined `GroupsDeleted`
         // covering the entire cascade. Order: entries first, then
         // groups — leaves-up, mirroring the delete order inside the
@@ -621,6 +632,14 @@ impl Engine {
             })
             .collect();
         self.emit(ChangeEvent::GroupsDeleted(groups));
+
+        // Each cascade-deleted entry's parked conflict rows are now orphans;
+        // drop them so the badge doesn't haunt a deleted entry (mirrors
+        // `delete_entry` / `empty_recycle_bin`). Cheap when an entry has no
+        // parked rows (the common case).
+        for uuid in purged_entries {
+            crate::reconcile::reconcile_conflict_rows(self, uuid)?;
+        }
         Ok(())
     }
 
