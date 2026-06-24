@@ -610,6 +610,29 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   level (this chip makes the re-keyed *file* inert under the old key, nothing
   more). No behaviour gap surfaced — the primitive was sound; this closed a
   reachability gap (the mirror seam couldn't drive it).
+- **Done (2026-06-24, post-resolution history fold):** resolving a held
+  conflict converged the live value but could leave the entry's `<History>`
+  permanently divergent across replicas. A resolution snapshots the rejected
+  value (an old, scrubbed-but-recoverable secret) into the resolver's history
+  alone and matches the live values, so the next pull classifies InSync (or
+  AutoMerges then InSync on the bounce-back) and the non-additive history
+  reconcile leaves that loser snapshot — plus each side's pre-conflict unique
+  snapshots — stranded on one device. `ingest_peer` now gates a **lossless
+  history fold** on a conflict resolution being in play for the entry (a
+  `keys.conflict_resolutions.v1` record on either side): it set-unions both
+  sides' histories honouring tombstones, via the new
+  `keepass_merge::fold_entry_history`, basing on whichever side the verdict arm
+  persisted — the peer's when its resolved value was adopted, else local's (the
+  same base-selection trap the adopt-arm tombstone reconcile already navigates).
+  Non-resolved entries keep the non-additive tombstone-only reconcile, so
+  legitimate history-*depth* differences (quota trim, one-sided scrub) are
+  untouched. Proven by
+  [conflict-resolution-history-fold.sh](scenarios/conflict-resolution-history-fold.sh)
+  (keep-mine **and** keep-theirs, each replica growing a snapshot the other
+  never sees; the converged set + the retained loser asserted across a fresh
+  disk read) — red before, green after, the existing history-delete /
+  history-quota-trim / adopt-arm scenarios staying green. keys-core #15 +
+  keepass-core #237.
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the
