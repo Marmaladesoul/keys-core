@@ -624,6 +624,64 @@ impl Engine {
         Ok(())
     }
 
+    /// Permanently purge the recycle bin's contents — hard-delete every entry
+    /// and subgroup inside the bin, recording a `<DeletedObjects>` tombstone
+    /// for each so the purge propagates cross-peer exactly as the
+    /// permanent-delete path does, while keeping the bin group itself. A no-op
+    /// on a vault with no recycle bin group.
+    ///
+    /// Verb-only convenience: composes the existing tombstone+delete
+    /// primitives (`delete_entry` / the `delete_group` cascade), adding no new
+    /// merge or tombstone policy. Emits the same two-event shape as
+    /// [`Engine::delete_group`] (entries, then groups), and reconciles each
+    /// purged entry's parked conflict rows like [`Engine::delete_entry`] so a
+    /// now-orphaned conflict can't leave a ghost badge (Finding #11).
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Sqlite`] on delete failure.
+    pub fn empty_recycle_bin(&mut self) -> Result<(), EngineError> {
+        let now = self.now_ms();
+        let outcome = mutations::empty_recycle_bin(&mut self.conn, now)?;
+        // Snapshot the purged entry uuids before the outcome is consumed by
+        // the event builders — needed for the per-entry conflict reconcile.
+        let purged_entries: Vec<Uuid> = outcome.deleted_entries.iter().map(|(u, _)| *u).collect();
+
+        // Same two-event shape as `delete_group`: entries first, then groups.
+        // Both are guarded — an empty bin (or one of only entries) emits only
+        // the events it actually has.
+        if !outcome.deleted_entries.is_empty() {
+            let entries = outcome
+                .deleted_entries
+                .into_iter()
+                .map(|(uuid, previous_group)| EntryDeletionInfo {
+                    uuid,
+                    previous_group,
+                })
+                .collect();
+            self.emit(ChangeEvent::EntriesDeleted(entries));
+        }
+        if !outcome.deleted_groups.is_empty() {
+            let groups = outcome
+                .deleted_groups
+                .into_iter()
+                .map(|(uuid, previous_parent)| GroupDeletionInfo {
+                    uuid,
+                    previous_parent,
+                })
+                .collect();
+            self.emit(ChangeEvent::GroupsDeleted(groups));
+        }
+
+        // Each purged entry's parked conflict rows are now orphans; drop them
+        // so the badge doesn't haunt a deleted entry (mirrors `delete_entry`).
+        // Cheap when an entry has no parked rows (the common case).
+        for uuid in purged_entries {
+            crate::reconcile::reconcile_conflict_rows(self, uuid)?;
+        }
+        Ok(())
+    }
+
     /// Move a group to a new parent. Rejects cycles: the new parent
     /// cannot be the group itself or any descendant.
     ///

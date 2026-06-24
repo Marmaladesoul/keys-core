@@ -145,6 +145,15 @@ enum Command {
         #[arg(long)]
         delete_bin_contents: bool,
     },
+    /// Permanently purge the recycle bin's contents — hard-delete every
+    /// entry and subgroup sitting in the bin (each tombstoned, so the
+    /// purge propagates to peers), keeping the bin group itself, then
+    /// persist. Composes the existing permanent-delete path; no new sync
+    /// policy. A no-op on a vault with no bin group.
+    EmptyBin {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+    },
     /// Open a vault and print its high-level state (counts, recycle
     /// bin, group tree size). The cheapest end-to-end smoke test.
     Inspect {
@@ -548,6 +557,10 @@ async fn main() -> Result<()> {
             );
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.set_bin(state == "on", delete_bin_contents).await?;
+        }
+        Command::EmptyBin { vault } => {
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.empty_bin().await?;
         }
         Command::Inspect { vault } => {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
@@ -1009,6 +1022,24 @@ impl Session {
                 (None, _) => println!("recycle bin disabled (no bin group existed); saved"),
             }
         }
+        Ok(())
+    }
+
+    /// Permanently purge the recycle bin's contents (each removal
+    /// tombstoned so it propagates to peers) and persist. Keeps the bin
+    /// group itself — emptying is not disabling. The proof that the purge
+    /// hit disk and propagated lives in the scenario, across a mirror-nuked
+    /// reopen and a cross-peer sync.
+    async fn empty_bin(&self) -> Result<()> {
+        let before = self.recycled_count()?;
+        self.engine
+            .empty_recycle_bin()
+            .map_err(|e| anyhow::anyhow!("empty_recycle_bin: {e:?}"))?;
+        self.save().await?;
+        println!(
+            "emptied recycle bin ({before} entr{} were directly in it) and saved to disk",
+            if before == 1 { "y" } else { "ies" }
+        );
         Ok(())
     }
 

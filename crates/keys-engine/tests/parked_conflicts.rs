@@ -1871,3 +1871,104 @@ fn two_engine_group_delete_content_saves_group() {
         "replicas converge after the delete-vs-fill exchange",
     );
 }
+
+/// `empty_recycle_bin` permanently purges the bin's contents, and the purge
+/// PROPAGATES cross-peer: the per-entry `<DeletedObjects>` tombstones the
+/// purge records (the permanent-delete contract it composes) remove the
+/// items on the peer too, the items don't resurrect, and the bin group
+/// itself survives on both. A live entry outside the bin is untouched.
+#[test]
+fn two_engine_empty_recycle_bin_propagates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx_a = dir.path().join("a.kdbx");
+    let kdbx_b = dir.path().join("b.kdbx");
+
+    // Shared base: a keeper + two soon-to-be-recycled entries at root.
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let keeper = kdbx.add_entry(root, NewEntry::new("Keeper")).expect("k").0;
+    let v1 = kdbx
+        .add_entry(root, NewEntry::new("Victim1"))
+        .expect("v1")
+        .0;
+    let v2 = kdbx
+        .add_entry(root, NewEntry::new("Victim2"))
+        .expect("v2")
+        .0;
+
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    // Enable the bin (a bare `create_empty` vault leaves it off, where a
+    // "recycle" would be a permanent delete) so recycling soft-deletes into a
+    // lazily-created bin — the state B forks from.
+    engine_a.set_recycle_bin(true, None).expect("enable bin");
+    // A recycles both victims (bin lazily created), then saves — so the
+    // recycled state is what B forks from.
+    engine_a.recycle_entry(v1).expect("recycle v1");
+    engine_a.recycle_entry(v2).expect("recycle v2");
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save recycled");
+
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut hb0 = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb0, None)
+        .expect("b save");
+    // Precondition: B really did fork WITH the two recycled victims.
+    assert!(engine_b.entry(v1).expect("q").is_some());
+    assert!(engine_b.entry(v2).expect("q").is_some());
+
+    // A empties the bin (purges both victims, tombstoned), then saves.
+    engine_a.empty_recycle_bin().expect("empty bin");
+    assert!(engine_a.entry(v1).expect("q").is_none(), "purged on A");
+    assert!(engine_a.entry(v2).expect("q").is_none(), "purged on A");
+    let mut ha = reopen_kdbx(&kdbx_a);
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut ha, None)
+        .expect("a save purged");
+
+    // Sync both ways: the purge must reach B and must NOT resurrect on A.
+    engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest a");
+    let mut hb = reopen_kdbx(&kdbx_b);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut hb, None)
+        .expect("b save 2");
+    engine_a
+        .ingest_peer_from_kdbx(&kdbx_b, &composite(), "device-b")
+        .expect("a ingest b");
+
+    // Both victims gone on BOTH; the keeper and the bin survive on both.
+    for (e, label) in [(&engine_a, "A"), (&engine_b, "B")] {
+        assert!(
+            e.entry(v1).expect("q").is_none(),
+            "victim-one present on {label} after sync (purge didn't propagate / resurrected)",
+        );
+        assert!(
+            e.entry(v2).expect("q").is_none(),
+            "victim-two present on {label} after sync",
+        );
+        assert!(
+            e.entry(keeper).expect("q").is_some(),
+            "keeper missing on {label} — purge over-reached",
+        );
+        assert!(
+            e.recycle_bin_uuid().expect("bin").is_some(),
+            "bin group missing on {label} after the empty",
+        );
+    }
+    assert_eq!(
+        engine_a.content_digest().expect("a digest"),
+        engine_b.content_digest().expect("b digest"),
+        "replicas converge after the bin purge propagates",
+    );
+}
