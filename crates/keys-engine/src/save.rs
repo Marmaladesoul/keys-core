@@ -40,6 +40,7 @@ use std::io::Write;
 use std::path::Path;
 use std::time::SystemTime;
 
+use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 
 use crate::engine::Engine;
@@ -116,6 +117,43 @@ pub(crate) fn save(
     kdbx: &mut Kdbx<Unlocked>,
     temp_dir: Option<&Path>,
 ) -> Result<(), EngineError> {
+    save_inner(engine, path, kdbx, temp_dir, None)
+}
+
+/// Re-keying entry point. Called from
+/// [`Engine::rekey_to_kdbx`](crate::engine::Engine::rekey_to_kdbx).
+///
+/// Identical to [`save`] except that, after the `SQLite` mirror has
+/// been projected onto `kdbx` and before serialisation, the handle's
+/// crypto envelope is rotated to `new_key` via
+/// [`Kdbx::rekey`](keepass_core::kdbx::Kdbx::rekey). The bytes written
+/// to disk therefore open **only** under `new_key`; the key `kdbx` was
+/// unlocked with no longer decrypts them.
+pub(crate) fn save_rekeyed(
+    engine: &mut Engine,
+    path: &Path,
+    kdbx: &mut Kdbx<Unlocked>,
+    new_key: &CompositeKey,
+    temp_dir: Option<&Path>,
+) -> Result<(), EngineError> {
+    save_inner(engine, path, kdbx, temp_dir, Some(new_key))
+}
+
+/// Shared body of [`save`] and [`save_rekeyed`].
+///
+/// The only difference between a plain save and a re-key is *where the
+/// new ciphertext's key comes from*: a plain save re-encrypts under the
+/// envelope `kdbx` already carries; a re-key rotates that envelope to
+/// `rekey` first. Everything downstream — projection, atomic write,
+/// signatures, blob GC — is identical, so it lives here once rather
+/// than being copied into two near-identical functions.
+fn save_inner(
+    engine: &mut Engine,
+    path: &Path,
+    kdbx: &mut Kdbx<Unlocked>,
+    temp_dir: Option<&Path>,
+    rekey: Option<&CompositeKey>,
+) -> Result<(), EngineError> {
     // 1. Project the SQLite mirror back to a Vault. After migration
     //    0003, the projection reconstitutes the full `Meta` and
     //    `deleted_objects` — no live-handle splice required.
@@ -124,6 +162,21 @@ pub(crate) fn save(
     // 2. Install the projected vault on `kdbx`. The handle's previous
     //    vault contents (entries, groups, meta) are replaced wholesale.
     kdbx.replace_vault(projected);
+
+    // 2b. Re-key path only: rotate the crypto envelope (fresh master
+    //     seed, IV, and KDF salt/transform-seed; transformed key
+    //     re-derived against `new_key`) so the bytes serialised next
+    //     decrypt only under `new_key`. Applied *after* `replace_vault`
+    //     so the `master_key_changed` / `settings_changed` meta stamps
+    //     `rekey` writes land on the vault that actually gets
+    //     serialised (the mirror picks them up on its next ingest from
+    //     disk). The inner-stream key that protects field values is
+    //     untouched — it's independent of the master key — so projected
+    //     protected fields survive the rotation unchanged.
+    if let Some(new_key) = rekey {
+        kdbx.rekey(new_key)
+            .map_err(|e| EngineError::Serialise(e.to_string()))?;
+    }
 
     // 3. Serialise.
     let bytes = kdbx

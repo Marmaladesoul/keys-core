@@ -580,6 +580,36 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   `two_engine_empty_recycle_bin_propagates`. No behaviour gap surfaced: the
   permanent-delete path already tombstones and propagates, so this closed a
   convenience/coverage gap, not a bug.
+- **Done (2026-06-24, vault re-key engine half):** `rekey` rotates a vault's
+  master key material and re-encrypts the KDBX so the OLD password is inert and
+  only the NEW one opens it, contents byte-preserved — the engine half of the
+  revoke / lost-device / share-revoke primitive. The re-encrypt primitive itself
+  already lived at the keepass-core seam (`Kdbx::<Unlocked>::rekey(&CompositeKey)`
+  — fresh master seed + encryption IV + KDF salt/transform-seed, transformed key
+  re-derived against the new key), so nothing was pushed down there. What was
+  missing was reachability through the *mirror* seam the GUI client drives: the
+  pre-existing `keys-ffi` `Vault::rekey` sits on the create-only raw-KDBX object,
+  not the SQLCipher-mirror `Engine`. So the rotation was surfaced as
+  `Engine::rekey_to_kdbx` — the project→replace_vault→serialise save path with a
+  `Kdbx::rekey` step injected right after `replace_vault` (one shared `save_inner`
+  body; a plain save is just the no-rekey case) — and exposed on keys-ffi as the
+  async `Engine::rekey_to_kdbx(kdbx_path, current_password, new_password,
+  temp_dir)`. **Key-material-agnostic seam:** the engine primitive takes a
+  `CompositeKey`, not a password, so the same path serves a password-only
+  rotation now and a password-plus-keyfile rotation once mandated keyfiles land,
+  with no engine change. **Fail-closed invariant (the load-bearing one):** the
+  on-disk envelope is opened under the *current* password first, so a wrong
+  current password can never rotate the vault — the same open-then-reuse guard
+  that protects `save_to_kdbx` (cf. the wrong-password-no-rekey scenarios).
+  Proven by [rekey-old-key-inert.sh](scenarios/rekey-old-key-inert.sh) (old key
+  inert / new key opens / content digest preserved, all across a mirror-nuked
+  fresh ingest from disk; plus teeth — a wrong current password fails closed
+  without rotating) + engine `rekey_to_kdbx` integration tests. Deliberately left
+  for the distribution leg (PR-4/5-gated): redistributing the re-keyed vault /
+  new key material to peers, and "old namespace inert" at the fleet/identity
+  level (this chip makes the re-keyed *file* inert under the old key, nothing
+  more). No behaviour gap surfaced — the primitive was sound; this closed a
+  reachability gap (the mirror seam couldn't drive it).
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the
