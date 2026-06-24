@@ -900,6 +900,17 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   so removing an entry left its parked rows behind. Fixed for free by the
   #10 dissolve-reconciliation: "entry gone locally → drop all its rows."
   Proven by `scenarios/conflict-delete-clears-badge.sh`.
+  - **Cascade-path follow-on:** the dissolve-reconciliation helper covers
+    "entry gone → drop its rows", but each delete *site* must call it. The
+    single-entry sites (`delete_entry`/`recycle_entry`) did; `delete_group`
+    cascade-deletes its descendant entries inside its own transaction and
+    initially did not, so a conflicted entry removed via its group's
+    deletion kept the same ghost badge until the next post-ingest sweep
+    (`reconcile_all_conflict_rows`) or resolver-open lazily healed it.
+    `delete_group` now reconciles each cascade-deleted entry after the
+    cascade commits — matching `empty_recycle_bin`, which composes the same
+    delete primitives and already reconciled. Proven by
+    `scenarios/conflict-group-delete-clears-badge.sh`.
 
 - **[FIXED] Finding #12 — attachment classify asymmetry → cross-peer
   conflict-set divergence** (pre-existing; surfaced by the parity oracle
