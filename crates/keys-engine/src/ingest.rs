@@ -1184,28 +1184,60 @@ pub(crate) fn ingest_peer(
             outcome.moved.push(uuid);
         }
 
-        // History-tombstone propagation (the privacy fix, part 2), also
-        // orthogonal to the content verdict: deleting a history snapshot (the
-        // "scrub this old/leaked version" action) leaves the LIVE entry
-        // unchanged, so classify verdicts the entry InSync and the deletion
-        // would never reach this peer. Reconcile both sides' history tombstones
-        // for every shared entry — union the OR-sets, prune the persisted
-        // entry's matching history records, persist. Runs after the verdict arm
-        // so it survives `advance_local_entry`'s drop+reinsert; touches only
-        // history rows + the tombstone custom_data item, never the live entry,
-        // so it's safe for held conflicts too. Loop-safe: idempotent once both
-        // agree. The base is whichever side's history the arm just persisted:
-        // the peer's when we adopted its resolved value, else local's.
-        let history_changed = if adopted_peer_history {
-            reconcile_entry_history_tombstones(
-                &tx,
-                uuid,
-                peer_entry,
-                local_entry,
-                &peer.binaries,
-                &session_key,
-                &peer_bin_refs,
-            )?
+        // History reconciliation, orthogonal to the content verdict. Two
+        // regimes, gated on whether a conflict RESOLUTION is in play for this
+        // entry (a `keys.conflict_resolutions.v1` record on either side):
+        //
+        //   * Steady state (no resolution) — tombstone-only reconcile: union
+        //     both sides' history tombstones and prune the persisted entry's
+        //     matching records. Deleting a history snapshot (the "scrub this
+        //     old/leaked version" action) leaves the LIVE entry unchanged, so
+        //     classify verdicts it InSync and the deletion would otherwise
+        //     never reach this peer. Plain history DEPTH may legitimately
+        //     differ between replicas here (quota trim, one-sided scrub), so
+        //     this is deliberately NON-additive — it never folds the peer's
+        //     records in.
+        //
+        //   * Post-resolution — lossless fold: a resolution
+        //     snapshots the LOSER (an old, scrubbed-but-recoverable secret)
+        //     into the resolver's history alone, and makes the live values
+        //     match so the next pull classifies InSync/AutoMerge and the
+        //     non-additive reconcile above would leave that snapshot — and each
+        //     side's pre-conflict unique snapshots — stranded on one replica.
+        //     Union the two histories (honouring tombstones) so both converge
+        //     on the same snapshot set.
+        //
+        // Both run after the verdict arm so they survive `advance_local_entry`'s
+        // drop+reinsert; both touch only history rows + the tombstone
+        // custom_data item, never the live entry, so they're safe for held
+        // conflicts too. Loop-safe: idempotent once both sides agree. The base
+        // is whichever side's history the arm just persisted — the peer's when
+        // we adopted its resolved value, else local's (and an adopt always
+        // implies a peer resolution, so the non-fold branch is always local).
+        let resolution_in_play =
+            peer_resolved.contains_key(&uuid) || local_resolved.contains_key(&uuid);
+        let history_changed = if resolution_in_play {
+            if adopted_peer_history {
+                fold_resolved_entry_history(
+                    &tx,
+                    uuid,
+                    peer_entry,
+                    local_entry,
+                    &peer.binaries,
+                    &local.binaries,
+                    &session_key,
+                )?
+            } else {
+                fold_resolved_entry_history(
+                    &tx,
+                    uuid,
+                    local_entry,
+                    peer_entry,
+                    &local.binaries,
+                    &peer.binaries,
+                    &session_key,
+                )?
+            }
         } else {
             reconcile_entry_history_tombstones(
                 &tx,
@@ -2066,6 +2098,57 @@ fn reconcile_entry_history_tombstones(
     }
     let uuid_str = uuid.to_string();
     rewrite_entry_history(tx, &uuid_str, &merged.history, session_key, base_bin_refs)?;
+    let tombstone_item = merged
+        .custom_data
+        .iter()
+        .find(|c| c.key == keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY);
+    write_entry_tombstone_custom_data(tx, &uuid_str, tombstone_item)?;
+    Ok(true)
+}
+
+/// Post-resolution lossless history fold: make `base`'s persisted history the
+/// set-union of both sides' (minus tombstones) so a resolved entry's loser
+/// snapshot — and each side's pre-conflict unique snapshots — converge across
+/// replicas. The additive counterpart to
+/// [`reconcile_entry_history_tombstones`]; only invoked when a conflict
+/// resolution is in play for the entry, since plain in-sync histories are
+/// allowed to differ in depth.
+///
+/// Delegates the union + tombstone CRDT to [`keepass_merge::fold_entry_history`]
+/// (so this can't drift from the auto-merge apply path), then persists exactly
+/// like the tombstone reconcile. `base_binaries` is cloned into an owned pool
+/// that the fold may GROW to import peer-only history-attachment bytes; the
+/// persisted snapshots are sealed against that grown pool so a folded peer
+/// record's attachment `ref_id`s stay valid.
+fn fold_resolved_entry_history(
+    tx: &Connection,
+    uuid: Uuid,
+    base: &Entry,
+    other: &Entry,
+    base_binaries: &[keepass_core::model::Binary],
+    other_binaries: &[keepass_core::model::Binary],
+    session_key: &SessionKey,
+) -> Result<bool, EngineError> {
+    // Cheap pre-check: with no peer history to fold in and no tombstone on
+    // either side, the union is base's own history — nothing to do, and no need
+    // to clone the entry or the binary pool. (A peer history equal to base's is
+    // handled by the idempotent `false` return below.)
+    if other.history.is_empty() && !has_history_tombstone(base) && !has_history_tombstone(other) {
+        return Ok(false);
+    }
+    let mut merged = base.clone();
+    let mut base_pool = base_binaries.to_vec();
+    let changed =
+        keepass_merge::fold_entry_history(&mut merged, other, &mut base_pool, other_binaries)
+            .map_err(|e| EngineError::Serialise(format!("fold_entry_history: {e}")))?;
+    if !changed {
+        return Ok(false);
+    }
+    let uuid_str = uuid.to_string();
+    // Refs into the (possibly grown) base pool — a folded peer record's
+    // attachment `ref_id` now indexes here, not the peer's pool.
+    let grown_refs: Vec<&[u8]> = base_pool.iter().map(|b| b.data.as_slice()).collect();
+    rewrite_entry_history(tx, &uuid_str, &merged.history, session_key, &grown_refs)?;
     let tombstone_item = merged
         .custom_data
         .iter()
