@@ -2564,6 +2564,94 @@ pub(crate) fn delete_group(
     Ok(outcome)
 }
 
+/// Permanently purge the recycle bin's CONTENTS — hard-delete every entry and
+/// subgroup sitting inside the bin, recording a `<DeletedObjects>` tombstone
+/// for each so the purge propagates cross-peer, while KEEPING the bin group
+/// itself (emptying the bin is not the same as disabling it).
+///
+/// A no-op returning an empty outcome when the vault has no recycle bin group
+/// (bin disabled, or never created). This is a pure composition of the
+/// existing permanent-delete primitives — `delete_group_recursive` for the
+/// bin's subgroups, the shared `delete_direct_child_entries` tombstone+delete
+/// for entries sitting directly in the bin — so it inherits the same tombstone
+/// semantics and introduces no new merge or tombstone policy.
+pub(crate) fn empty_recycle_bin(
+    conn: &mut Connection,
+    now: i64,
+) -> Result<DeleteGroupOutcome, EngineError> {
+    let tx = conn.transaction()?;
+    let Some(bin_str) = recycle_bin_uuid(&tx)? else {
+        // No bin group → nothing to purge.
+        tx.commit()?;
+        return Ok(DeleteGroupOutcome::default());
+    };
+    let bin_uuid = Uuid::parse_str(&bin_str)
+        .map_err(|e| EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+
+    let mut outcome = DeleteGroupOutcome::default();
+
+    // Subgroups of the bin (where a recycled *group* lands): cascade-delete
+    // each — entries, nested groups, and every tombstone — but never the bin
+    // itself.
+    let child_groups: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT uuid FROM \"group\" WHERE parent_uuid = ?1")?;
+        stmt.query_map(params![bin_str], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for child in child_groups {
+        delete_group_recursive(&tx, &child, Some(bin_uuid), &mut outcome, now)?;
+    }
+
+    // Entries sitting directly in the bin, attributed to the bin.
+    delete_direct_child_entries(&tx, &bin_str, bin_uuid, &mut outcome, now)?;
+
+    // One orphan-tag sweep at the end of the whole purge (mirrors
+    // `delete_group`): every `entry_tag` row the purge could orphan is gone.
+    gc_orphan_tags(&tx)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// Hard-delete every entry sitting directly in `group_uuid`, recording a
+/// `<DeletedObjects>` tombstone for each (Phase 5b — the owner-rows ingest
+/// reconciles deletes per entry uuid, so without a tombstone a peer would
+/// resurrect these entries, re-parented to root, on the next sync) and
+/// pushing each onto `outcome.deleted_entries` attributed to
+/// `attributed_parent` (the group it sat in immediately before deletion).
+///
+/// Shared by the `delete_group` cascade and `empty_recycle_bin` so the two
+/// bulk-delete paths tombstone identically. The caller owns the orphan-tag
+/// sweep (`gc_orphan_tags`) — run it once at the end of a cascade, not per
+/// frame.
+fn delete_direct_child_entries(
+    tx: &Transaction<'_>,
+    group_uuid: &str,
+    attributed_parent: Uuid,
+    outcome: &mut DeleteGroupOutcome,
+    now: i64,
+) -> Result<(), EngineError> {
+    // Collect uuids first for the event.
+    let child_entries: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT uuid FROM entry WHERE group_uuid = ?1")?;
+        stmt.query_map(params![group_uuid], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for entry_uuid_str in child_entries {
+        let entry_uuid = Uuid::parse_str(&entry_uuid_str).map_err(|e| {
+            EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
+        outcome
+            .deleted_entries
+            .push((entry_uuid, attributed_parent));
+        record_tombstone(tx, &entry_uuid_str, now)?;
+    }
+    tx.execute(
+        "DELETE FROM entry WHERE group_uuid = ?1",
+        params![group_uuid],
+    )?;
+    Ok(())
+}
+
 fn delete_group_recursive(
     tx: &Transaction<'_>,
     uuid: &str,
@@ -2584,25 +2672,9 @@ fn delete_group_recursive(
         delete_group_recursive(tx, &child, Some(self_uuid), outcome, now)?;
     }
 
-    // Direct child entries — collect uuids first for the event.
-    let child_entries: Vec<String> = {
-        let mut stmt = tx.prepare("SELECT uuid FROM entry WHERE group_uuid = ?1")?;
-        stmt.query_map(params![uuid], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    for entry_uuid_str in child_entries {
-        let entry_uuid = Uuid::parse_str(&entry_uuid_str).map_err(|e| {
-            EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-        })?;
-        outcome.deleted_entries.push((entry_uuid, self_uuid));
-        // Each cascade-deleted entry needs its own `<DeletedObjects>` tombstone
-        // (Phase 5b) — the owner-rows ingest reconciles deletes per entry uuid,
-        // so without this a peer would resurrect these entries (re-parented to
-        // root) on the next sync.
-        record_tombstone(tx, &entry_uuid_str, now)?;
-    }
+    // Direct child entries (tombstoned + recorded, attributed to this group).
+    delete_direct_child_entries(tx, uuid, self_uuid, outcome, now)?;
 
-    tx.execute("DELETE FROM entry WHERE group_uuid = ?1", params![uuid])?;
     tx.execute("DELETE FROM \"group\" WHERE uuid = ?1", params![uuid])?;
     outcome.deleted_groups.push((self_uuid, parent_uuid));
     // Tombstone the group itself too (kdbx-native `<DeletedObjects>` covers

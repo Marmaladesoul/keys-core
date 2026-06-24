@@ -440,6 +440,11 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.ensure_recycle_bin()?))
     }
 
+    /// See [`keys_engine::Engine::empty_recycle_bin`].
+    pub fn empty_recycle_bin(&self) -> Result<(), EngineError> {
+        self.with_engine_mut(|e| Ok(e.empty_recycle_bin()?))
+    }
+
     /// See [`keys_engine::Engine::set_history_max_items`].
     pub fn set_history_max_items(&self, max: i32) -> Result<(), EngineError> {
         self.with_engine_mut(|e| Ok(e.set_history_max_items(max)?))

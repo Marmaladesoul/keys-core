@@ -367,6 +367,140 @@ fn recycle_entry_unknown_returns_not_found() {
     ));
 }
 
+// ── empty_recycle_bin ──────────────────────────────────────────────────
+
+#[test]
+fn empty_recycle_bin_purges_contents_keeps_bin_and_tombstones() {
+    // empty-bin permanently purges everything inside the bin — loose recycled
+    // entries AND a subgroup parked in the bin with its own entry — recording
+    // a `<DeletedObjects>` tombstone for each so the purge propagates
+    // cross-peer (the permanent-delete contract), while keeping the bin group
+    // itself and any live entry outside the bin.
+    let (mut engine, root, dir) = engine_with_empty_vault();
+    let path = dir.path().join("keys.db");
+
+    let bin = engine
+        .create_group(
+            root,
+            NewGroupFields {
+                name: "Recycle Bin".into(),
+                notes: String::new(),
+                icon: IconRef::Builtin(43),
+            },
+        )
+        .expect("create bin");
+    engine.set_recycle_bin(true, Some(bin)).expect("set bin");
+
+    let keeper = engine
+        .create_entry(root, new_entry("keeper", "p"))
+        .expect("keeper");
+    let v1 = engine
+        .create_entry(root, new_entry("victim-one", "p"))
+        .expect("v1");
+    let v2 = engine
+        .create_entry(root, new_entry("victim-two", "p"))
+        .expect("v2");
+    engine.recycle_entry(v1).expect("recycle v1");
+    engine.recycle_entry(v2).expect("recycle v2");
+
+    // A subgroup parked in the bin, holding its own entry → empty-bin must
+    // cascade (the nested entry AND the subgroup), not just the loose ones.
+    let oldproj = engine
+        .create_group(
+            root,
+            NewGroupFields {
+                name: "Old Project".into(),
+                notes: String::new(),
+                icon: IconRef::Builtin(48),
+            },
+        )
+        .expect("create subgroup");
+    let nested = engine
+        .create_entry(oldproj, new_entry("nested-secret", "p"))
+        .expect("nested");
+    engine
+        .move_group(oldproj, bin)
+        .expect("park subgroup in bin");
+
+    engine.empty_recycle_bin().expect("empty bin");
+
+    // Everything inside the bin is gone; the keeper and the bin survive.
+    assert!(
+        engine.entry(v1).unwrap().is_none(),
+        "loose recycled entry purged"
+    );
+    assert!(
+        engine.entry(v2).unwrap().is_none(),
+        "loose recycled entry purged"
+    );
+    assert!(
+        engine.entry(nested).unwrap().is_none(),
+        "nested entry purged via the subgroup cascade"
+    );
+    assert!(
+        engine.entry(keeper).unwrap().is_some(),
+        "live entry outside the bin untouched"
+    );
+    assert!(
+        !engine
+            .group_tree()
+            .unwrap()
+            .iter()
+            .any(|g| g.uuid == oldproj),
+        "bin subgroup purged"
+    );
+    let bin_str = bin.to_string();
+    assert_eq!(
+        engine.recycle_bin_uuid().unwrap().as_deref(),
+        Some(bin_str.as_str()),
+        "the bin group itself survives an empty"
+    );
+    assert!(
+        engine.recycle_bin_enabled().unwrap(),
+        "empty does not disable the bin"
+    );
+
+    engine.close().expect("close");
+
+    // Each purged entry AND the subgroup left a tombstone.
+    let raw = raw_open(&path);
+    for (id, what) in [
+        (v1, "v1"),
+        (v2, "v2"),
+        (nested, "nested"),
+        (oldproj, "oldproj"),
+    ] {
+        let ct: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM meta_deleted_object WHERE uuid = ?1",
+                params![id.to_string()],
+                |r| r.get(0),
+            )
+            .expect("count tombstones");
+        assert_eq!(ct, 1, "{what} tombstoned by empty-bin");
+    }
+}
+
+#[test]
+fn empty_recycle_bin_without_bin_is_a_noop() {
+    // A vault with no recycle bin group (bin disabled) → empty-bin removes
+    // nothing and errors not. The lone live entry survives.
+    let (mut engine, root, _dir) = engine_with_empty_vault();
+    assert!(engine.recycle_bin_uuid().unwrap().is_none());
+    let e = engine
+        .create_entry(root, new_entry("solo", "p"))
+        .expect("create");
+
+    engine
+        .empty_recycle_bin()
+        .expect("empty (no bin) is a clean no-op");
+
+    assert!(
+        engine.entry(e).unwrap().is_some(),
+        "no-bin empty-bin touched a live entry"
+    );
+}
+
 // ── delete_entry ───────────────────────────────────────────────────────
 
 #[test]

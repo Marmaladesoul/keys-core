@@ -562,12 +562,30 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   an un-trimmed peer. New `set-history-max` verb;
   [history-quota-trim-propagates.sh](scenarios/history-quota-trim-propagates.sh)
   + engine `two_engine_history_quota_trim_propagates`. See Findings.
+- **Done (2026-06-24, empty-bin verb):** `empty-bin` permanently purges the
+  recycle bin's contents — hard-deletes every entry and subgroup sitting in the
+  bin, while KEEPING the bin group itself (emptying is not disabling). Verb-only:
+  it composes the existing permanent-delete path (each removed entry/group leaves
+  a `<DeletedObjects>` tombstone), so the purge propagates cross-peer with no new
+  merge or tombstone policy. The `empty_recycle_bin` helper was pushed DOWN into
+  `keys-engine` (a mirror twin of `delete_group`, reusing a shared
+  `delete_direct_child_entries` so the two bulk-delete paths tombstone
+  identically) and surfaced on keys-ffi (`Engine::empty_recycle_bin`) — so a GUI
+  calls the proven path rather than looping `delete_entry` above the FFI line.
+  New verb `empty-bin`; proven by
+  [empty-bin-propagates.sh](scenarios/empty-bin-propagates.sh) (loose entries +
+  a subgroup cascade are purged, the purge propagates to the peer without
+  resurrecting, and the bin group survives — across a fresh disk read) + engine
+  `empty_recycle_bin_purges_contents_keeps_bin_and_tombstones` /
+  `two_engine_empty_recycle_bin_propagates`. No behaviour gap surfaced: the
+  permanent-delete path already tombstones and propagates, so this closed a
+  convenience/coverage gap, not a bug.
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the
-  covered `set-attachment`). Then: previous-parent merge rules; `empty-bin`
-  verb; vault-level `<Meta><CustomData>` peer-path convergence; the
-  save-fidelity breadth pass (unknown-XML + fidelity fuzzer).
+  covered `set-attachment`). Then: previous-parent merge rules; vault-level
+  `<Meta><CustomData>` peer-path convergence; the save-fidelity breadth pass
+  (unknown-XML + fidelity fuzzer).
 - **Repo home (2026-06-11):** keyhole lives *inside the keys-core
   workspace* (`keyhole/`), not as its own repo. It evolves in lockstep
   with `keys-ffi` (the #138 export PR existed purely because of the old
