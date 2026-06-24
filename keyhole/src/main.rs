@@ -459,6 +459,25 @@ enum Command {
         #[arg(long = "field", value_name = "KEY=SIDE")]
         field: Vec<String>,
     },
+    /// Re-key the vault: rotate its master key material and re-encrypt
+    /// the KDBX so the OLD password no longer opens it and the NEW one
+    /// does, contents preserved. The engine half of the
+    /// revoke / lost-device / share-revoke primitive.
+    ///
+    /// Reads the CURRENT master password from `$KEYHOLE_PASSWORD` (like
+    /// every verb) and the NEW one from `$KEYHOLE_NEW_PASSWORD` — both
+    /// kept off argv. The on-disk envelope is opened under the current
+    /// password FIRST, so a wrong current password fails closed: it can
+    /// never rotate the vault to the wrong key.
+    Rekey {
+        /// Path to the .kdbx vault to re-key.
+        vault: PathBuf,
+        /// Environment variable holding the NEW master password. Kept
+        /// off argv (and shell history) on purpose, like the current
+        /// password.
+        #[arg(long, default_value = "KEYHOLE_NEW_PASSWORD")]
+        new_password_env: String,
+    },
 }
 
 // Flat verb dispatch: one match arm per CLI verb, growing linearly
@@ -717,6 +736,16 @@ async fn main() -> Result<()> {
             let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
             session.resolve(entry, side, &overrides).await?;
         }
+        Command::Rekey {
+            vault,
+            new_password_env,
+        } => {
+            // The new master password is sensitive, so it rides an env
+            // var (like the current one) rather than argv.
+            let new_password = read_password(&new_password_env)?;
+            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            session.rekey(new_password).await?;
+        }
     }
     Ok(())
 }
@@ -844,6 +873,28 @@ impl Session {
             )
             .await
             .map_err(|e| anyhow::anyhow!("save_to_kdbx: {e:?}"))
+    }
+
+    /// Rotate the vault's master key to `new_password` and re-encrypt
+    /// the KDBX on disk. Opens under the session's CURRENT password
+    /// first (the engine's fail-closed guard), then rotates: afterwards
+    /// the OLD password no longer opens the file and the NEW one does,
+    /// contents preserved. The honest "did it really rotate on disk?"
+    /// proof lives in the scenario, across a `rm -rf <vault>.mirror`
+    /// reopen — a fresh ingest from disk is the only test that can't be
+    /// answered by carried-over mirror state.
+    async fn rekey(&self, new_password: String) -> Result<()> {
+        self.engine
+            .rekey_to_kdbx(
+                self.vault_path.to_string_lossy().into_owned(),
+                self.password.clone(),
+                new_password,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("rekey_to_kdbx: {e:?}"))?;
+        println!("re-keyed {} and saved to disk", self.vault_path.display());
+        Ok(())
     }
 
     fn inspect(&self) -> Result<()> {

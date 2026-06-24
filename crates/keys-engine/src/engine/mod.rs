@@ -621,6 +621,65 @@ impl Engine {
         Ok(())
     }
 
+    /// Rotate the vault's key material and re-encrypt the KDBX so it
+    /// opens **only** under `new_key`, with contents byte-preserved.
+    ///
+    /// This is the engine half of the vault re-key primitive that
+    /// underpins the revoke / lost-device / share-revoke paths: given an
+    /// unlocked vault, it rotates the on-disk file's crypto envelope so
+    /// the key material `kdbx` was unlocked with no longer decrypts the
+    /// result.
+    ///
+    /// `kdbx` must be a handle opened under the vault's **current** key
+    /// (callers obtain it exactly as for [`Self::save_to_kdbx`] — open
+    /// the on-disk file under the current password/keyfile). Requiring a
+    /// current-key handle is what makes re-key *fail closed*: you cannot
+    /// rotate a vault you can't already open, so a wrong current key
+    /// surfaces as an open failure upstream rather than a silent re-key
+    /// to the wrong material.
+    ///
+    /// `new_key` is the rotated [`CompositeKey`] the file is re-encrypted
+    /// under. The primitive is deliberately **key-material-agnostic** at
+    /// this seam: it accepts a composite key, not a password or keyfile,
+    /// so the same path serves a password-only rotation today and a
+    /// password-plus-keyfile rotation once mandated keyfiles land —
+    /// neither requires changing this method.
+    ///
+    /// Mechanics (delegated to
+    /// [`Kdbx::rekey`](keepass_core::kdbx::Kdbx::rekey) on the save
+    /// path): a fresh master seed, a fresh encryption IV, and a fresh
+    /// KDF salt (KDBX4) / transform seed (KDBX3) are generated from the
+    /// OS CSPRNG, and the transformed key is re-derived against
+    /// `new_key`. Because the master seed and KDF salt both change, an
+    /// attacker holding the *old* file learns nothing reusable even if
+    /// they later recover `new_key`.
+    ///
+    /// The mirror is the source of truth for content: the projected
+    /// `SQLite` state is what gets serialised, so entries / groups /
+    /// protected fields are preserved exactly as [`Self::save_to_kdbx`]
+    /// preserves them. Records the same post-write signatures as a plain
+    /// save; emits [`ChangeEvent::SaveCompleted`].
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Projection`] if projecting the mirror fails.
+    /// - [`EngineError::Serialise`] if the re-key KDF step or
+    ///   `keepass-core`'s `save_to_bytes` rejects the vault.
+    /// - [`EngineError::Io`] for tempfile / write / rename / stat
+    ///   failures (the original file is left intact on a write failure,
+    ///   exactly as for [`Self::save_to_kdbx`]).
+    pub fn rekey_to_kdbx(
+        &mut self,
+        path: &Path,
+        kdbx: &mut Kdbx<Unlocked>,
+        new_key: &CompositeKey,
+        temp_dir: Option<&Path>,
+    ) -> Result<(), EngineError> {
+        save::save_rekeyed(self, path, kdbx, new_key, temp_dir)?;
+        self.emit(ChangeEvent::SaveCompleted);
+        Ok(())
+    }
+
     /// The `(mtime, size)` of the most recent KDBX file this engine
     /// wrote, or `None` if no save has happened yet on this handle.
     ///

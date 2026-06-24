@@ -1016,6 +1016,62 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.save_to_kdbx(&path, &mut kdbx, temp_dir.as_deref())?))
     }
 
+    /// Rotate the vault's key material and re-encrypt the KDBX at
+    /// `kdbx_path` so it opens **only** under `new_password`, contents
+    /// preserved — the engine half of the vault re-key primitive.
+    ///
+    /// `current_password` must be the vault's present master password:
+    /// the on-disk file is opened under it first (as the crypto-envelope
+    /// template), so a wrong `current_password` makes the call **fail
+    /// closed** at the open step and can never re-key the vault to the
+    /// wrong material — the same open-then-reuse guard that protects
+    /// [`Self::save_to_kdbx`]. `new_password` is the rotated master
+    /// password the file is re-encrypted under.
+    ///
+    /// Keyfile-agnostic foundation: this entry point rotates a
+    /// password-derived composite key (the only key factor the current
+    /// stack uses). The underlying
+    /// [`keys_engine::Engine::rekey_to_kdbx`] accepts a `CompositeKey`,
+    /// so a future keyfile-aware entry point can rotate to a
+    /// password-plus-keyfile composite over the *same* engine primitive
+    /// without reworking it.
+    ///
+    /// `temp_dir` behaves exactly as for [`Self::save_to_kdbx`] — pass
+    /// it on sandboxed macOS callers whose security-scoped bookmark
+    /// covers only the kdbx file.
+    ///
+    /// Slow: pays the Argon2 unlock of the on-disk file plus a second
+    /// Argon2 to re-derive the transformed key under the new material.
+    /// Runs on the tokio runtime; the FFI side `await`s.
+    pub async fn rekey_to_kdbx(
+        &self,
+        kdbx_path: String,
+        current_password: String,
+        new_password: String,
+        temp_dir: Option<String>,
+    ) -> Result<(), EngineError> {
+        let path = PathBuf::from(kdbx_path);
+        let current_pw = SecretString::from(current_password);
+        let new_pw = SecretString::from(new_password);
+        let temp_dir = temp_dir.map(PathBuf::from);
+        let path_for_open = path.clone();
+        // Open the on-disk file under the CURRENT key off-thread (the
+        // slow Argon2 unlock), exactly as `save_to_kdbx` does. This
+        // doubles as the fail-closed guard: a wrong current password
+        // can't open the envelope, so it never reaches the rotation.
+        let mut kdbx =
+            tokio::task::spawn_blocking(move || open_unlocked(&path_for_open, &current_pw))
+                .await
+                .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
+        // Derive the rotated composite from the new password. Cheap
+        // (SHA-256 chain); the expensive KDF runs inside the engine
+        // primitive against this composite.
+        let new_key = CompositeKey::from_password(new_pw.expose_secret().as_bytes());
+        self.with_engine_mut(|e| {
+            Ok(e.rekey_to_kdbx(&path, &mut kdbx, &new_key, temp_dir.as_deref())?)
+        })
+    }
+
     /// Reconcile SQLite against the on-disk KDBX at `kdbx_path`.
     pub async fn reconcile_with_disk(
         &self,
