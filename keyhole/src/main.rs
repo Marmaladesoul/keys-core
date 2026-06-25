@@ -51,6 +51,15 @@ struct Cli {
     #[arg(long, default_value = "KEYHOLE_PASSWORD", global = true)]
     password_env: String,
 
+    /// Path to the vault's keyfile — the raw keyfile *file content* (32-byte
+    /// binary, 64-char hex, or an XML `.keyx`). Supplied alongside the
+    /// password to open / save / rekey a keyfile-keyed vault. On `create`, a
+    /// fresh `.keyx` is minted at this path if it does not yet exist. Unlike
+    /// the password this rides argv on purpose — a keyfile is a path/file, not
+    /// a secret string (its secrecy comes from where it is stored).
+    #[arg(long, global = true)]
+    keyfile: Option<PathBuf>,
+
     /// Pin the engine clock to this instant (epoch-milliseconds) for the
     /// duration of the command. Every mutation then stamps exactly this
     /// time on `modified_at` / `location_changed_at` / tombstones —
@@ -477,6 +486,14 @@ enum Command {
         /// password.
         #[arg(long, default_value = "KEYHOLE_NEW_PASSWORD")]
         new_password_env: String,
+
+        /// Path to the NEW keyfile to rotate to (the rotation target). Minted
+        /// as a fresh `.keyx` if the path does not yet exist. Omit to rotate
+        /// to a password-only vault — removing any keyfile requirement, the
+        /// deliberate authenticated downgrade (you must still open under the
+        /// CURRENT `--keyfile` to do it).
+        #[arg(long)]
+        new_keyfile: Option<PathBuf>,
     },
 }
 
@@ -515,10 +532,26 @@ async fn main() -> Result<()> {
     let password = read_password(&cli.password_env)?;
     let clock_ms = cli.clock_ms;
     let uuid_seed = cli.uuid_seed;
+    // `--keyfile` is global. `create` mints one at the path if absent (handled
+    // in its own arm); every other (Session-opening) verb loads the bytes here
+    // — tolerant of an as-yet-unminted path so the same flag works for both.
+    let keyfile_path = cli.keyfile.clone();
+    let keyfile: Option<Vec<u8>> = match keyfile_path.as_deref() {
+        Some(p) if p.exists() => {
+            Some(std::fs::read(p).with_context(|| format!("read keyfile {}", p.display()))?)
+        }
+        _ => None,
+    };
 
     match cli.command {
         Command::Create { vault } => {
-            create_vault(&vault, &password, clock_ms, uuid_seed)?;
+            create_vault(
+                &vault,
+                &password,
+                clock_ms,
+                uuid_seed,
+                keyfile_path.as_deref(),
+            )?;
         }
         Command::CreateEntry {
             vault,
@@ -527,7 +560,8 @@ async fn main() -> Result<()> {
             entry_password,
             group,
         } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session
                 .create_entry(title, username, entry_password, group)
                 .await?;
@@ -558,11 +592,13 @@ async fn main() -> Result<()> {
                 icon: None,
                 expires_at: None,
             };
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.update_entry(uuid, update).await?;
         }
         Command::EnsureBin { vault } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.ensure_bin().await?;
         }
         Command::SetBin {
@@ -574,19 +610,23 @@ async fn main() -> Result<()> {
                 !(state == "on" && delete_bin_contents),
                 "--delete-bin-contents only applies with `off`"
             );
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.set_bin(state == "on", delete_bin_contents).await?;
         }
         Command::EmptyBin { vault } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.empty_bin().await?;
         }
         Command::Inspect { vault } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.inspect()?;
         }
         Command::List { vault, group } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.list(group)?;
         }
         Command::Recycle {
@@ -594,7 +634,8 @@ async fn main() -> Result<()> {
             uuid,
             no_save,
         } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.recycle(uuid, !no_save).await?;
         }
         Command::IngestPeer {
@@ -602,27 +643,33 @@ async fn main() -> Result<()> {
             peer_kdbx,
             owner,
         } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.ingest_peer(owner, &peer_kdbx).await?;
         }
         Command::ListConflicts { vault } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.list_conflicts()?;
         }
         Command::ShowConflict { vault, entry } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.show_conflict(entry).await?;
         }
         Command::ConflictOwners { vault, entry } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.conflict_owners(entry)?;
         }
         Command::AddCustomIcon { vault, entry, data } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.add_custom_icon(entry, data).await?;
         }
         Command::CustomIconBytes { vault, icon } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.custom_icon_bytes(icon)?;
         }
         Command::SetField {
@@ -631,19 +678,23 @@ async fn main() -> Result<()> {
             name,
             value,
         } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.set_field(entry, name, value).await?;
         }
         Command::SetTags { vault, entry, tags } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.set_tags(entry, tags).await?;
         }
         Command::Tags { vault, entry } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.tags(entry)?;
         }
         Command::History { vault, entry } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.history(entry)?;
         }
         Command::DeleteHistory {
@@ -651,15 +702,18 @@ async fn main() -> Result<()> {
             entry,
             index,
         } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.delete_history(entry, index).await?;
         }
         Command::SetHistoryMax { vault, items } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.set_history_max(items).await?;
         }
         Command::Digest { vault } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.digest()?;
         }
         Command::CreateGroup {
@@ -667,35 +721,43 @@ async fn main() -> Result<()> {
             name,
             parent,
         } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.create_group(name, parent).await?;
         }
         Command::RenameGroup { vault, uuid, name } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.rename_group(uuid, name).await?;
         }
         Command::MoveGroup { vault, uuid, to } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.move_group(uuid, to).await?;
         }
         Command::DeleteGroup { vault, uuid } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.delete_group(uuid).await?;
         }
         Command::ListGroups { vault } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.list_groups()?;
         }
         Command::MoveEntry { vault, uuid, to } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.move_entry(uuid, to).await?;
         }
         Command::Restore { vault, uuid } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.restore(uuid).await?;
         }
         Command::DeleteEntry { vault, uuid } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.delete_entry(uuid).await?;
         }
         Command::SetAttachment {
@@ -704,17 +766,20 @@ async fn main() -> Result<()> {
             name,
             text,
         } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session
                 .set_attachment(uuid, name, text.into_bytes())
                 .await?;
         }
         Command::CatAttachment { vault, uuid, name } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.cat_attachment(uuid, name)?;
         }
         Command::RemoveAttachment { vault, uuid, name } => {
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.remove_attachment(uuid, name).await?;
         }
         Command::Resolve {
@@ -733,18 +798,28 @@ async fn main() -> Result<()> {
                     Ok((key.to_owned(), parse_side(side_str)?))
                 })
                 .collect::<Result<Vec<(String, ConflictSideFfi)>>>()?;
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.resolve(entry, side, &overrides).await?;
         }
         Command::Rekey {
             vault,
             new_password_env,
+            new_keyfile,
         } => {
             // The new master password is sensitive, so it rides an env
             // var (like the current one) rather than argv.
             let new_password = read_password(&new_password_env)?;
-            let session = Session::open(&vault, &password, clock_ms, uuid_seed).await?;
-            session.rekey(new_password).await?;
+            // The rotation-target keyfile, if any — minted at its path if it
+            // doesn't exist yet (keyhole stands in for a client minting one).
+            // Omitted → rotate to a password-only vault (drop the keyfile).
+            let new_keyfile = match new_keyfile.as_deref() {
+                Some(p) => Some(ensure_keyfile(p)?),
+                None => None,
+            };
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.rekey(new_password, new_keyfile).await?;
         }
     }
     Ok(())
@@ -760,6 +835,10 @@ struct Session {
     /// Kept so mutating verbs can `save_to_kdbx` back to the source.
     vault_path: PathBuf,
     password: String,
+    /// The vault's keyfile bytes, if it is keyfile-keyed. Threaded into every
+    /// open / save / rekey so a keyfile-keyed vault stays openable and is never
+    /// silently re-saved as password-only. `None` for a plain password vault.
+    keyfile: Option<Vec<u8>>,
 }
 
 impl Session {
@@ -778,6 +857,7 @@ impl Session {
         password: &str,
         clock_ms: Option<i64>,
         uuid_seed: Option<u64>,
+        keyfile: Option<Vec<u8>>,
     ) -> Result<Self> {
         anyhow::ensure!(vault.exists(), "vault not found: {}", vault.display());
 
@@ -825,6 +905,7 @@ impl Session {
             engine,
             vault_path: vault.to_path_buf(),
             password: password.to_owned(),
+            keyfile,
         };
 
         let recorded = session
@@ -835,7 +916,11 @@ impl Session {
             None => {
                 session
                     .engine
-                    .ingest_from_kdbx(vault.to_string_lossy().into_owned(), password.to_owned())
+                    .ingest_from_kdbx_with_keyfile(
+                        vault.to_string_lossy().into_owned(),
+                        password.to_owned(),
+                        session.keyfile.clone(),
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("ingest_from_kdbx: {e:?}"))?;
             }
@@ -844,9 +929,10 @@ impl Session {
                 if sig.mtime_ms != mtime_ms || sig.byte_count != byte_count {
                     let result = session
                         .engine
-                        .reconcile_with_disk_park_conflicts(
+                        .reconcile_with_disk_park_conflicts_with_keyfile(
                             vault.to_string_lossy().into_owned(),
                             password.to_owned(),
+                            session.keyfile.clone(),
                         )
                         .await
                         .map_err(|e| {
@@ -866,9 +952,10 @@ impl Session {
     /// tail of every mutating verb.
     async fn save(&self) -> Result<()> {
         self.engine
-            .save_to_kdbx(
+            .save_to_kdbx_with_keyfile(
                 self.vault_path.to_string_lossy().into_owned(),
                 self.password.clone(),
+                self.keyfile.clone(),
                 None,
             )
             .await
@@ -883,12 +970,14 @@ impl Session {
     /// proof lives in the scenario, across a `rm -rf <vault>.mirror`
     /// reopen — a fresh ingest from disk is the only test that can't be
     /// answered by carried-over mirror state.
-    async fn rekey(&self, new_password: String) -> Result<()> {
+    async fn rekey(&self, new_password: String, new_keyfile: Option<Vec<u8>>) -> Result<()> {
         self.engine
-            .rekey_to_kdbx(
+            .rekey_to_kdbx_with_keyfile(
                 self.vault_path.to_string_lossy().into_owned(),
                 self.password.clone(),
+                self.keyfile.clone(),
                 new_password,
+                new_keyfile,
                 None,
             )
             .await
@@ -1725,15 +1814,23 @@ fn create_vault(
     password: &str,
     clock_ms: Option<i64>,
     uuid_seed: Option<u64>,
+    keyfile: Option<&Path>,
 ) -> Result<()> {
     anyhow::ensure!(
         !vault.exists(),
         "refusing to overwrite existing file: {}",
         vault.display()
     );
+    // Mint the keyfile at its path if it doesn't exist yet (keyhole stands in
+    // for a client that mints + stores one); an existing file is used as-is,
+    // which also lets a scenario point `create` at a foreign client's keyfile.
+    let keyfile_bytes = match keyfile {
+        Some(p) => Some(ensure_keyfile(p)?),
+        None => None,
+    };
     let path = vault.to_string_lossy().into_owned();
-    match (clock_ms, uuid_seed) {
-        (Some(ms), Some(seed)) => {
+    match (clock_ms, uuid_seed, keyfile_bytes) {
+        (Some(ms), Some(seed), None) => {
             Vault::create_empty_deterministic(
                 path,
                 password.to_owned(),
@@ -1745,8 +1842,26 @@ fn create_vault(
             )
             .map_err(|e| anyhow::anyhow!("create_empty_deterministic: {e:?}"))?;
         }
-        (None, Some(_)) => anyhow::bail!("--uuid-seed requires --at on create"),
-        (_, None) => {
+        (Some(_), Some(_), Some(_)) => {
+            // No scenario needs deterministic + keyfile and the FFI has no
+            // deterministic keyfile constructor; reject explicitly.
+            anyhow::bail!(
+                "--keyfile with deterministic create (--at + --uuid-seed) is not supported"
+            );
+        }
+        (None, Some(_), _) => anyhow::bail!("--uuid-seed requires --at on create"),
+        (_, None, Some(kf)) => {
+            Vault::create_empty_with_keyfile(
+                path,
+                password.to_owned(),
+                kf,
+                "keyhole".to_owned(),
+                Some(Arc::new(FixedProtector)),
+                None,
+            )
+            .map_err(|e| anyhow::anyhow!("create_empty_with_keyfile: {e:?}"))?;
+        }
+        (_, None, None) => {
             Vault::create_empty(
                 path,
                 password.to_owned(),
@@ -1759,6 +1874,23 @@ fn create_vault(
     }
     println!("created {}", vault.display());
     Ok(())
+}
+
+/// Read a keyfile's bytes, minting a fresh `.keyx` at `path` if it
+/// does not yet exist. keyhole has no keychain, so it stands in for a client by
+/// minting the keyfile to a file (via [`keys_ffi::generate_keyfile`]) and
+/// reading it back. An existing file is used verbatim — which lets a scenario
+/// point keyhole at a foreign client's keyfile to prove interop.
+fn ensure_keyfile(path: &Path) -> Result<Vec<u8>> {
+    if path.exists() {
+        std::fs::read(path).with_context(|| format!("read keyfile {}", path.display()))
+    } else {
+        let bytes =
+            keys_ffi::generate_keyfile().map_err(|e| anyhow::anyhow!("generate_keyfile: {e:?}"))?;
+        std::fs::write(path, &bytes)
+            .with_context(|| format!("write keyfile {}", path.display()))?;
+        Ok(bytes)
+    }
 }
 
 fn read_password(var: &str) -> Result<String> {

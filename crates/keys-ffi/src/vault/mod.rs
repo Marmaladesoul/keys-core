@@ -158,6 +158,45 @@ impl Vault {
         Self::create_empty_inner(
             path,
             password,
+            None,
+            database_name,
+            field_protector,
+            temp_dir,
+            None,
+        )
+    }
+
+    /// Like [`Self::create_empty`] but keyed by a **password plus a keyfile**
+    /// — the standard interoperable KDBX composite
+    /// (`SHA-256(SHA-256(password) || keyfile_hash)`). `keyfile` is the raw
+    /// keyfile *file content*: a Keys-minted `.keyx` (see
+    /// [`crate::generate_keyfile`]), or a foreign 32-byte-binary / hex /
+    /// `.keyx` keyfile from another client. The resulting vault opens
+    /// only when the same keyfile is supplied again, so the keyfile must be
+    /// stored by the caller (OS keychain on the GUI clients) — the engine
+    /// keeps no copy.
+    ///
+    /// A keyfile that cannot be reduced to 32 bytes (malformed `.keyx`, failed
+    /// integrity checksum) fails closed: no weaker password-only vault is
+    /// written in its place.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::create_empty`], plus [`VaultError::WrongKey`] if `keyfile`
+    /// is malformed.
+    #[uniffi::constructor]
+    pub fn create_empty_with_keyfile(
+        path: String,
+        password: String,
+        keyfile: Vec<u8>,
+        database_name: String,
+        field_protector: Option<Arc<dyn VaultFieldProtector>>,
+        temp_dir: Option<String>,
+    ) -> Result<Arc<Self>, VaultError> {
+        Self::create_empty_inner(
+            path,
+            password,
+            Some(keyfile),
             database_name,
             field_protector,
             temp_dir,
@@ -197,6 +236,7 @@ impl Vault {
         Self::create_empty_inner(
             path,
             password,
+            None,
             database_name,
             field_protector,
             temp_dir,
@@ -295,6 +335,7 @@ impl Vault {
     fn create_empty_inner(
         path: String,
         password: String,
+        keyfile: Option<Vec<u8>>,
         database_name: String,
         field_protector: Option<Arc<dyn VaultFieldProtector>>,
         temp_dir: Option<String>,
@@ -302,7 +343,14 @@ impl Vault {
     ) -> Result<Arc<Self>, VaultError> {
         let path_buf = PathBuf::from(&path);
         let secret = SecretString::from(password);
-        let composite = CompositeKey::from_password(secret.expose_secret().as_bytes());
+        // Password-only or password-plus-keyfile composite, per the standard
+        // interoperable KDBX construction. A malformed keyfile fails closed
+        // (no weak password-only vault is written in its place).
+        let composite = crate::keyfile::composite_from_factors(
+            secret.expose_secret().as_bytes(),
+            keyfile.as_deref(),
+        )
+        .map_err(|_| VaultError::WrongKey)?;
         let bridged = bridge_protector(field_protector);
 
         // Build the unlocked vault, derive the transformed key against the

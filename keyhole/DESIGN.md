@@ -651,6 +651,28 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 
 ## Findings (surfaced by keyhole)
 
+- **[FORCING FUNCTION — keepass-core gap closed] keyhole's first keyfile-bearing
+  surface forced foreign `.keyx` ingest into `keepass-core`.** Adding `--keyfile`
+  / `--new-keyfile` (the first key factor beyond a password to cross the
+  `keys-ffi` seam) immediately surfaced that `keepass_core::keyfile_hash`
+  *refused* XML keyfiles (KeyFile v1/v2 — the `.keyx` that KeePassXC / KeePass 2
+  generate by default), so a Keys-minted keyfile and a foreign one took
+  different paths and a real-world keyfile vault couldn't be opened. The gap
+  closed at the crate that owns the format: `keepass-core` now decodes v1
+  (base64) and v2 (hex + the 4-byte SHA-256 integrity checksum) to the 32-byte
+  keyfile hash verbatim, and mints v2 (`generate_keyfile_keyx_v2`), with golden
+  round-trip vectors. The seam invariant `scenarios/keyfile-vault.sh` pins: a
+  keyfile-keyed vault is **fail-closed without its keyfile** (absent *or* wrong →
+  no unlock; the crypto is the only enforcement — there is no "needs-a-keyfile"
+  flag to flip), **round-trips** across a `rm -rf "$VAULT.mirror"` fresh-ingest
+  reopen, and **rekeys** to a new keyfile (old inert, new opens, content digest
+  unchanged) — asserted on **both KDBX 3.1 and KDBX 4**. The v3.1 leg is reached
+  by `rekey`-ing the vendored password-only fixture to *add* a keyfile, which the
+  engine does without upgrading the on-disk format — proving the composite is
+  format-agnostic. The keyfile factor is a client-storage concern: `keys-ffi`
+  mints and consumes keyfile *bytes* and never chooses where they live (keyhole
+  uses a file; it has no keychain).
+
 - **[CHARACTERISED — seam is data-safe] No `keys-ffi` path re-keys an existing
   vault under a wrong password; the skip-ingest fast path is not a password
   check.** The seam invariant, pinned by the three `scenarios/wrong-password-*.sh`
