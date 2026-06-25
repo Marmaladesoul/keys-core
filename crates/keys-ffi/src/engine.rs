@@ -967,12 +967,29 @@ impl Engine {
         kdbx_path: String,
         password: String,
     ) -> Result<(), EngineError> {
+        self.ingest_from_kdbx_with_keyfile(kdbx_path, password, None)
+            .await
+    }
+
+    /// Keyfile-aware [`Self::ingest_from_kdbx`]: builds the composite from the
+    /// password plus `keyfile` (raw keyfile file content — 32-byte binary,
+    /// hex, or an XML `.keyx`) when present, else password-only. A vault keyed
+    /// with a keyfile is unreadable without it, so an absent or wrong keyfile
+    /// fails closed at the unlock step.
+    pub async fn ingest_from_kdbx_with_keyfile(
+        &self,
+        kdbx_path: String,
+        password: String,
+        keyfile: Option<Vec<u8>>,
+    ) -> Result<(), EngineError> {
         let path = PathBuf::from(kdbx_path);
         let pw = SecretString::from(password);
         let path_for_open = path.clone();
-        let result = tokio::task::spawn_blocking(move || open_unlocked(&path_for_open, &pw))
-            .await
-            .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
+        let result = tokio::task::spawn_blocking(move || {
+            open_unlocked_kf(&path_for_open, &pw, keyfile.as_deref())
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
         self.with_engine_mut(|e| {
             e.ingest_from_kdbx(&result)?;
             // Record the post-ingest kdbx-state signature so the
@@ -1006,13 +1023,31 @@ impl Engine {
         password: String,
         temp_dir: Option<String>,
     ) -> Result<(), EngineError> {
+        self.save_to_kdbx_with_keyfile(kdbx_path, password, None, temp_dir)
+            .await
+    }
+
+    /// Keyfile-aware [`Self::save_to_kdbx`]. The on-disk file is opened under
+    /// the password plus `keyfile` (when present) as the crypto-envelope
+    /// template, so a keyfile-keyed vault is re-saved under the same factors —
+    /// the keyfile requirement is preserved across the save, never silently
+    /// dropped to password-only.
+    pub async fn save_to_kdbx_with_keyfile(
+        &self,
+        kdbx_path: String,
+        password: String,
+        keyfile: Option<Vec<u8>>,
+        temp_dir: Option<String>,
+    ) -> Result<(), EngineError> {
         let path = PathBuf::from(kdbx_path);
         let pw = SecretString::from(password);
         let temp_dir = temp_dir.map(PathBuf::from);
         let path_for_open = path.clone();
-        let mut kdbx = tokio::task::spawn_blocking(move || open_unlocked(&path_for_open, &pw))
-            .await
-            .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
+        let mut kdbx = tokio::task::spawn_blocking(move || {
+            open_unlocked_kf(&path_for_open, &pw, keyfile.as_deref())
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
         self.with_engine_mut(|e| Ok(e.save_to_kdbx(&path, &mut kdbx, temp_dir.as_deref())?))
     }
 
@@ -1050,23 +1085,58 @@ impl Engine {
         new_password: String,
         temp_dir: Option<String>,
     ) -> Result<(), EngineError> {
+        self.rekey_to_kdbx_with_keyfile(
+            kdbx_path,
+            current_password,
+            None,
+            new_password,
+            None,
+            temp_dir,
+        )
+        .await
+    }
+
+    /// Keyfile-aware [`Self::rekey_to_kdbx`]: rotate to a new
+    /// password-plus-keyfile (or password-only) composite. The on-disk file is
+    /// opened under the CURRENT password + `current_keyfile` first (the
+    /// fail-closed guard — a wrong current factor can never rotate the vault),
+    /// then re-encrypted under the NEW password + `new_keyfile`.
+    ///
+    /// All four factor transitions are expressible: add a keyfile to a
+    /// password-only vault (`current_keyfile: None` → `new_keyfile: Some`),
+    /// rotate to a fresh keyfile (`Some` → `Some`), or *remove* the keyfile
+    /// requirement (`Some` → `None`) — the deliberate, authenticated downgrade
+    /// (you must present the current keyfile to drop it).
+    pub async fn rekey_to_kdbx_with_keyfile(
+        &self,
+        kdbx_path: String,
+        current_password: String,
+        current_keyfile: Option<Vec<u8>>,
+        new_password: String,
+        new_keyfile: Option<Vec<u8>>,
+        temp_dir: Option<String>,
+    ) -> Result<(), EngineError> {
         let path = PathBuf::from(kdbx_path);
         let current_pw = SecretString::from(current_password);
         let new_pw = SecretString::from(new_password);
         let temp_dir = temp_dir.map(PathBuf::from);
         let path_for_open = path.clone();
-        // Open the on-disk file under the CURRENT key off-thread (the
-        // slow Argon2 unlock), exactly as `save_to_kdbx` does. This
-        // doubles as the fail-closed guard: a wrong current password
-        // can't open the envelope, so it never reaches the rotation.
-        let mut kdbx =
-            tokio::task::spawn_blocking(move || open_unlocked(&path_for_open, &current_pw))
-                .await
-                .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
-        // Derive the rotated composite from the new password. Cheap
-        // (SHA-256 chain); the expensive KDF runs inside the engine
-        // primitive against this composite.
-        let new_key = CompositeKey::from_password(new_pw.expose_secret().as_bytes());
+        // Open the on-disk file under the CURRENT factors off-thread (the
+        // slow Argon2 unlock), exactly as `save_to_kdbx` does. This doubles
+        // as the fail-closed guard: a wrong current password OR keyfile can't
+        // open the envelope, so it never reaches the rotation.
+        let mut kdbx = tokio::task::spawn_blocking(move || {
+            open_unlocked_kf(&path_for_open, &current_pw, current_keyfile.as_deref())
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
+        // Derive the rotated composite from the new factors. Cheap (SHA-256
+        // chain); the expensive KDF runs inside the engine primitive against
+        // this composite.
+        let new_key = crate::keyfile::composite_for_engine(
+            new_pw.expose_secret().as_bytes(),
+            new_keyfile.as_deref(),
+        )?;
         self.with_engine_mut(|e| {
             Ok(e.rekey_to_kdbx(&path, &mut kdbx, &new_key, temp_dir.as_deref())?)
         })
@@ -1102,13 +1172,27 @@ impl Engine {
         kdbx_path: String,
         password: String,
     ) -> Result<ParkConflictsResultFfi, EngineError> {
+        self.reconcile_with_disk_park_conflicts_with_keyfile(kdbx_path, password, None)
+            .await
+    }
+
+    /// Keyfile-aware [`Self::reconcile_with_disk_park_conflicts`] — the
+    /// disk-watcher reconcile path for a vault keyed with a keyfile. Opens the
+    /// changed-on-disk KDBX under the password plus `keyfile`; an absent or
+    /// wrong keyfile fails closed before any merge is applied.
+    pub async fn reconcile_with_disk_park_conflicts_with_keyfile(
+        &self,
+        kdbx_path: String,
+        password: String,
+        keyfile: Option<Vec<u8>>,
+    ) -> Result<ParkConflictsResultFfi, EngineError> {
         let path = PathBuf::from(kdbx_path);
         let pw = SecretString::from(password);
         let composite = tokio::task::spawn_blocking(move || {
-            CompositeKey::from_password(pw.expose_secret().as_bytes())
+            crate::keyfile::composite_for_engine(pw.expose_secret().as_bytes(), keyfile.as_deref())
         })
         .await
-        .map_err(|e| EngineError::Internal(format!("join: {e}")))?;
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
         self.with_engine_mut(|e| {
             Ok(
                 e.reconcile_with_disk_park_conflicts(&path, &composite, chrono::Utc::now())?
@@ -1419,11 +1503,17 @@ fn hex_encode_32(bytes: [u8; 32]) -> String {
 /// Open the KDBX file at `path`, unlocking under `password`. Pulled out
 /// so the three async-slow-op methods can `spawn_blocking` it without
 /// repeating the open dance.
-fn open_unlocked(
+/// Unlock the on-disk KDBX under the password plus an optional keyfile (raw
+/// keyfile file content). A vault keyed with a keyfile cannot be unlocked
+/// without it, so an absent / wrong keyfile fails closed here at the unlock
+/// step. Pulled out so the slow-op methods can `spawn_blocking` it.
+fn open_unlocked_kf(
     path: &std::path::Path,
     password: &SecretString,
+    keyfile: Option<&[u8]>,
 ) -> Result<Kdbx<keepass_core::kdbx::Unlocked>, EngineError> {
-    let composite = CompositeKey::from_password(password.expose_secret().as_bytes());
+    let composite =
+        crate::keyfile::composite_for_engine(password.expose_secret().as_bytes(), keyfile)?;
     Kdbx::open(path)
         .and_then(keepass_core::kdbx::Kdbx::<keepass_core::kdbx::Sealed>::read_header)
         .and_then(|k| k.unlock(&composite))
