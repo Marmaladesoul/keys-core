@@ -24,6 +24,7 @@ mod adapters;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -32,10 +33,10 @@ use keys_ffi::{
     DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, Engine, EngineEntryUpdate,
     EntryAttachmentChoiceFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, IconRef,
     NewEntryFields, Page, ParkConflictsResultFfi, ResolutionFfi, Vault, VaultIdentityVerdict,
-    verify_vault_identity,
+    purge_vault_local_data, verify_vault_identity,
 };
 
-use adapters::{FixedDbKey, FixedProtector};
+use adapters::{FixedDbKey, FixedProtector, RecordingDbKey};
 
 #[derive(Parser)]
 #[command(
@@ -162,6 +163,19 @@ enum Command {
     /// policy. A no-op on a vault with no bin group.
     EmptyBin {
         /// Path to the .kdbx vault.
+        vault: PathBuf,
+    },
+    /// Destroy a vault's LOCAL-device data: the persistent `SQLCipher`
+    /// mirror sidecar (the on-disk encrypted local copy) plus its
+    /// `SQLCipher` DB key. The teardown a client drives when a vault is
+    /// *removed* from the device. The source KDBX file is NOT touched —
+    /// purge is local-only (removing a vault from a device is not the
+    /// same as deleting the vault). Drives the engine-owned
+    /// `purge_vault_local_data`, which deletes the sidecar files it owns
+    /// the layout of (DB + `-wal`/`-shm`/`-journal`) and calls the key
+    /// provider's `deleteDbKey`.
+    Purge {
+        /// Path to the .kdbx vault whose local mirror to destroy.
         vault: PathBuf,
     },
     /// Open a vault and print its high-level state (counts, recycle
@@ -659,6 +673,12 @@ async fn main() -> Result<()> {
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.empty_bin().await?;
         }
+        Command::Purge { vault } => {
+            // Teardown, not a Session op: purge is path-based (no engine
+            // opened), so it deliberately skips Session's ingest/reconcile
+            // dance — we're erasing the mirror, not reading it.
+            purge_vault(&vault)?;
+        }
         Command::Inspect { vault } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
@@ -912,7 +932,7 @@ impl Session {
         let mirror_dir = mirror_dir_for(vault);
         std::fs::create_dir_all(&mirror_dir)
             .with_context(|| format!("create mirror dir {}", mirror_dir.display()))?;
-        let mirror_db = mirror_dir.join("mirror.sqlite");
+        let mirror_db = mirror_db_for(vault);
 
         // `--at` pins the engine clock and `--uuid-seed` pins entity ids,
         // so the LWW stamps and ids a mutation writes are deterministic;
@@ -1685,6 +1705,13 @@ fn mirror_dir_for(vault: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// The vault's persistent mirror DB file: `<vault>.mirror/mirror.sqlite`.
+/// The one place the mirror filename is spelled, shared by `Session::open`
+/// (which opens it) and `purge_vault` (which destroys it).
+fn mirror_db_for(vault: &Path) -> PathBuf {
+    mirror_dir_for(vault).join("mirror.sqlite")
+}
+
 /// `(mtime_ms, byte_count)` of the on-disk KDBX, computed with the
 /// exact formula `keys_engine::KdbxStateSignature::from_path` uses
 /// (truncating-millisecond i64, pre-1970 clamped negative) so the
@@ -1921,6 +1948,55 @@ fn create_vault(
         }
     }
     println!("created {}", vault.display());
+    Ok(())
+}
+
+/// Destroy a vault's LOCAL-device data: its persistent `SQLCipher`
+/// mirror sidecar and the mirror's DB key. The teardown a client drives
+/// when a vault is *removed* from the device.
+///
+/// The source KDBX is deliberately NOT touched — purge is local-only
+/// (removing a vault from a device is not the same as deleting it), so
+/// after a purge the canonical vault still opens and a reopen re-ingests
+/// it from scratch into a fresh mirror.
+///
+/// Drives the same path-based `keys_ffi::purge_vault_local_data` the GUI
+/// clients drive — no engine is opened (keyhole runs one verb per
+/// process, so nothing holds the mirror open). keyhole has no real
+/// keystore to inspect, so it passes a [`RecordingDbKey`] and asserts
+/// its `delete_db_key` fired — proving the engine drove BOTH halves
+/// (sidecar-file deletion AND key deletion), not just the files. The
+/// honest "is the local copy really gone?" proof — the sidecar file
+/// vanished, a fresh process must re-ingest — lives in the scenario.
+fn purge_vault(vault: &Path) -> Result<()> {
+    anyhow::ensure!(vault.exists(), "vault not found: {}", vault.display());
+    let mirror_db = mirror_db_for(vault);
+
+    let provider = Arc::new(RecordingDbKey::new());
+    let deleted = provider.deletion_flag();
+
+    let sidecars_removed =
+        purge_vault_local_data(mirror_db.to_string_lossy().into_owned(), provider)
+            .map_err(|e| anyhow::anyhow!("purge: {e:?}"))?;
+
+    // keyhole's keystore stand-in: the purge must have called
+    // delete_db_key, or the key-deletion half of teardown is missing.
+    let key_deleted = deleted.load(Ordering::SeqCst);
+    anyhow::ensure!(
+        key_deleted,
+        "purge did not invoke delete_db_key — the key-deletion half of teardown is missing"
+    );
+    // keyhole always seeds a real mirror before purging, so a zero count
+    // means db_path resolved to nothing on disk — a regression here, not
+    // a benign already-purged re-run.
+    anyhow::ensure!(
+        sidecars_removed > 0,
+        "purge removed no sidecar files — db_path resolved to nothing on disk (mis-targeted purge)"
+    );
+
+    println!("db-key-deleted: {key_deleted}");
+    println!("sidecars-removed: {sidecars_removed}");
+    println!("purged local data for {}", vault.display());
     Ok(())
 }
 

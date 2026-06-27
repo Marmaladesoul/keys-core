@@ -633,6 +633,65 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   disk read) — red before, green after, the existing history-delete /
   history-quota-trim / adopt-arm scenarios staying green. keys-core #15 +
   keepass-core #237.
+- **Done (2026-06-27, vault local-data purge):** removing a vault from a
+  device must destroy its on-disk `SQLCipher` mirror sidecar (the vault's
+  full contents, encrypted) **and** the mirror's DB key — otherwise the
+  removed vault's data stays recoverable on-device indefinitely. Made it
+  an engine-owned seam op instead of each client garbage-collecting
+  ad-hoc. The `VaultDbKeyProvider` port (already the platform-keystore
+  seam, via `acquire_db_key`) gains `delete_db_key`, and a new keys-ffi
+  `purge_vault_local_data(db_path, key_provider)` orchestrates the
+  teardown: the engine destroys the DB key first (via
+  `key_provider.delete_db_key()`, so an interrupted purge leaves inert
+  ciphertext rather than a live key beside a deleted file), then unlinks
+  the sidecar files whose layout it owns (the DB file + its
+  `-wal`/`-shm`/`-journal` siblings, **never** the containing directory —
+  a shared container holds other vaults' sidecars). **Engine owns the
+  *sequence*; the platform
+  owns the *mechanism*** — the `VaultFieldProtector` inversion-of-control
+  pattern applied to teardown. Path-based (an associated
+  `Engine::purge_local_data`, not a live-engine method): teardown runs
+  once the vault is closed, so a consumer reaches it with no open handle,
+  and `db_path` is the same path it passed to `Engine::open`. Resilient
+  (every step attempted even if an earlier one fails, absent files
+  tolerated, the first error surfaced) and idempotent, so a
+  partially-failed purge re-runs to convergence. Only the **local
+  mirror** is destroyed — the canonical KDBX is never touched (removing a
+  vault from a device is not deleting the vault), so a fresh process
+  re-ingests it cleanly. Hardened invariants (from the security review):
+  the engine-trait `delete_db_key` default **fails closed** — a
+  `KeyProvider` that doesn't override it makes `purge_local_data` return
+  `KeyUnavailable` rather than unlink the ciphertext and report success
+  with the key still live (the FFI `with_foreign` trait additionally keeps
+  `delete_db_key` *required*, so every platform implementor wires the
+  keystore delete). `purge_local_data` returns the **count of sidecars
+  unlinked**: a zero count is the "nothing was here" signal a consumer
+  must surface (a mis-targeted / stale `db_path`), since the seam can't
+  own a client's mirror-filename convention or cross-check path↔provider —
+  the consumer derives both from one vault identity at a single call site.
+  The contract, stated on the trait: purge is **crypto-shredding** (unlink,
+  not byte-scrub — overwrite-before-unlink is unreliable on flash/CoW and
+  `secure_delete` only touches in-DB free pages, so confidentiality rests
+  on the key's destruction); the key item MUST be non-synchronizable +
+  backup-excluded and MUST NOT be re-minted by the next `acquire_db_key`
+  (open never provisions — the vault-add path does); and the caller MUST
+  quiesce the path (de-register so nothing — including an auxiliary
+  consumer sharing the container — re-opens it via the CREATE-and-ingest
+  open path). New keyhole verb `purge`; pinned by
+  [purge-destroys-local-data.sh](scenarios/purge-destroys-local-data.sh)
+  (sidecar + every WAL/SHM sibling gone, `deleteDbKey` invoked, a non-zero
+  sidecars-removed count, KDBX untouched, digest preserved across the
+  re-ingest) + engine
+  `purge_destroys_sidecar_files_and_invokes_key_deletion` /
+  `purge_removes_files_then_surfaces_key_deletion_failure` /
+  `purge_with_unimplemented_delete_shreds_files_then_fails_closed` /
+  `purge_deletes_key_before_unlinking_files` /
+  `purge_only_removes_its_own_files_not_the_directory` /
+  `purge_is_absent_tolerant_and_idempotent` and keys-ffi
+  `purge_vault_local_data_destroys_sidecar_and_deletes_key`. No engine
+  behaviour gap surfaced — this closed an ownership/drift gap (clients had
+  each reimplemented the teardown sequence the engine is best placed to
+  own).
 - **Done (2026-06-27, vault-identity verification — the relink guard):** a
   consumer that re-anchors a vault to a user-picked KDBX (a path-based
   "Locate…" recovery flow) needs to REJECT a file that is a *different* vault
