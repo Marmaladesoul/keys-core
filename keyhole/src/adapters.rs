@@ -16,6 +16,9 @@
 //! invocations like a real client's local store), but it only ever
 //! mirrors *throwaway test vaults*, so a fixed key remains fine.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use keys_ffi::{
     VaultDbKeyProvider, VaultDbKeyProviderError, VaultFieldProtector, VaultProtectorError,
 };
@@ -31,6 +34,61 @@ pub struct FixedDbKey;
 impl VaultDbKeyProvider for FixedDbKey {
     fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError> {
         Ok(MIRROR_DB_KEY.to_vec())
+    }
+
+    fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError> {
+        // keyhole's mirror key is a compile-time constant, not stored in
+        // a keystore, so there is nothing to delete — the no-op success
+        // a real provider returns once the keystore entry is gone. The
+        // `purge` verb uses [`RecordingDbKey`] instead, to *observe* this
+        // call; ordinary opens use this boring stub.
+        Ok(())
+    }
+}
+
+/// A db-key provider that records whether `delete_db_key` was invoked.
+///
+/// keyhole has no real keystore to inspect after a purge, so this
+/// stands in: the `purge` verb passes one of these to
+/// [`keys_ffi::purge_vault_local_data`], then asserts the flag flipped —
+/// proving the teardown drove the key-deletion half (not just the file
+/// deletion). The acquired key matches the fixed mirror key, so a caller
+/// that does open the mirror still unlocks it.
+pub struct RecordingDbKey {
+    deleted: Arc<AtomicBool>,
+}
+
+impl RecordingDbKey {
+    /// A fresh provider whose deletion flag starts unset.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            deleted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// A handle on the shared deletion flag, readable after `purge` to
+    /// confirm `delete_db_key` fired.
+    #[must_use]
+    pub fn deletion_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.deleted)
+    }
+}
+
+impl Default for RecordingDbKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VaultDbKeyProvider for RecordingDbKey {
+    fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError> {
+        Ok(MIRROR_DB_KEY.to_vec())
+    }
+
+    fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError> {
+        self.deleted.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 

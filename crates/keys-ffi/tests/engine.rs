@@ -34,12 +34,18 @@ impl VaultDbKeyProvider for FixedDbKey {
     fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError> {
         Ok(DB_KEY.to_vec())
     }
+    fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError> {
+        Ok(())
+    }
 }
 
 struct WrongDbKey;
 impl VaultDbKeyProvider for WrongDbKey {
     fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError> {
         Ok([0u8; 32].to_vec())
+    }
+    fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError> {
+        Ok(())
     }
 }
 
@@ -49,6 +55,26 @@ impl VaultDbKeyProvider for FailingDbKey {
         Err(VaultDbKeyProviderError::KeyUnavailable(
             "synthetic keychain-locked failure".into(),
         ))
+    }
+    fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError> {
+        Ok(())
+    }
+}
+
+/// A db-key provider that records whether `delete_db_key` was invoked —
+/// the assertion surface for `purge_vault_local_data` driving the
+/// key-deletion half of teardown.
+struct RecordingDbKey {
+    deleted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl VaultDbKeyProvider for RecordingDbKey {
+    fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError> {
+        Ok(DB_KEY.to_vec())
+    }
+    fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError> {
+        self.deleted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -116,6 +142,45 @@ fn engine_open_close_round_trip() {
     matches!(err, EngineError::NotFound { ref entity } if entity == "engine")
         .then_some(())
         .expect("NotFound engine");
+}
+
+#[test]
+fn purge_vault_local_data_destroys_sidecar_and_deletes_key() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use keys_ffi::purge_vault_local_data;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+
+    // Open then close so the SQLCipher file is real on disk (schema +
+    // migrations write pages) with no live handle — the state a vault
+    // is in at teardown time.
+    open_fresh_engine(&db_path).close().expect("close");
+    assert!(db_path.exists(), "mirror sidecar must exist before purge");
+
+    // Purge: deletes the sidecar file(s) AND invokes the key provider's
+    // delete_db_key (the engine owns the sequence; the provider the
+    // mechanism).
+    let deleted = Arc::new(AtomicBool::new(false));
+    let provider = Arc::new(RecordingDbKey {
+        deleted: deleted.clone(),
+    });
+    purge_vault_local_data(db_path.to_string_lossy().into_owned(), provider).expect("purge ok");
+
+    // 1. the encrypted sidecar is gone from disk (incl. WAL siblings).
+    assert!(!db_path.exists(), "mirror sidecar must be gone after purge");
+    let wal = db_path.with_file_name("keys.db-wal");
+    let shm = db_path.with_file_name("keys.db-shm");
+    assert!(!wal.exists(), "WAL sidecar must be gone after purge");
+    assert!(!shm.exists(), "SHM sidecar must be gone after purge");
+
+    // 2. the db key deletion was driven through the provider.
+    assert!(
+        deleted.load(Ordering::SeqCst),
+        "purge must invoke the key provider's delete_db_key",
+    );
 }
 
 /// Regression: when a foreign-implemented `VaultDbKeyProvider` throws

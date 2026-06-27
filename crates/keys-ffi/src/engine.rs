@@ -1519,3 +1519,42 @@ fn open_unlocked_kf(
         .and_then(|k| k.unlock(&composite))
         .map_err(|e| EngineError::Internal(format!("open kdbx: {e}")))
 }
+
+/// Destroy a vault's local-device data: delete the `SQLCipher` `SQLite`
+/// mirror sidecar files at `db_path` **and** remove the database key
+/// from the platform keystore via `key_provider`.
+///
+/// The teardown counterpart to [`Engine::open`] — the engine-owned
+/// operation a client drives when a vault is *removed* from the device,
+/// so its encrypted local copy and key don't linger recoverable. The
+/// engine owns the *sequence* (delete the mirror's DB file + its
+/// `-wal`/`-shm`/`-journal` siblings, whose layout it knows → ask
+/// `key_provider` to delete the key); the platform owns the *mechanism*
+/// (the keystore delete behind [`VaultDbKeyProvider::delete_db_key`]).
+///
+/// Only the **local mirror** is destroyed — the canonical KDBX the
+/// mirror was ingested from is never touched. A free function rather
+/// than an [`Engine`] method on purpose: teardown happens after the
+/// vault is closed, so callers reach it with no live engine, and
+/// `db_path` is the same path they passed to [`Engine::open`]. The
+/// caller must ensure no engine is open over `db_path` when this runs.
+///
+/// Resilient: every step is attempted even if an earlier one fails,
+/// absent sidecar files are not an error, and the first error
+/// encountered is returned (so a caller can surface and retry it).
+/// Idempotent, so a re-run of a partially-failed purge converges.
+///
+/// # Errors
+///
+/// - [`EngineError::KeyProvider`] if the keystore refused the key
+///   deletion.
+/// - [`EngineError::Internal`] if a sidecar file existed but couldn't be
+///   removed.
+#[uniffi::export]
+pub fn purge_vault_local_data(
+    db_path: String,
+    key_provider: Arc<dyn VaultDbKeyProvider>,
+) -> Result<(), EngineError> {
+    let kp = BridgeDbKeyProvider::new(key_provider);
+    Ok(eng::Engine::purge_local_data(&PathBuf::from(db_path), &kp)?)
+}

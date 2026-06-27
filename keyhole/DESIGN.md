@@ -633,6 +633,45 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   disk read) — red before, green after, the existing history-delete /
   history-quota-trim / adopt-arm scenarios staying green. keys-core #15 +
   keepass-core #237.
+- **Done (2026-06-27, vault local-data purge):** removing a vault from a
+  device must destroy its on-disk `SQLCipher` mirror sidecar (the vault's
+  full contents, encrypted) **and** the mirror's DB key — otherwise the
+  removed vault's data stays recoverable on-device indefinitely. Made it
+  an engine-owned seam op instead of each client garbage-collecting
+  ad-hoc. The `VaultDbKeyProvider` port (already the platform-keystore
+  seam, via `acquire_db_key`) gains `delete_db_key`, and a new keys-ffi
+  `purge_vault_local_data(db_path, key_provider)` orchestrates the
+  teardown: the engine deletes the sidecar files whose layout it owns
+  (the DB file + its `-wal`/`-shm`/`-journal` siblings, **never** the
+  containing directory — a shared container holds other vaults'
+  sidecars), then calls `key_provider.delete_db_key()` to drop the key
+  from the platform store. **Engine owns the *sequence*; the platform
+  owns the *mechanism*** — the `VaultFieldProtector` inversion-of-control
+  pattern applied to teardown. Path-based (an associated
+  `Engine::purge_local_data`, not a live-engine method): teardown runs
+  once the vault is closed, so a consumer reaches it with no open handle,
+  and `db_path` is the same path it passed to `Engine::open`. Resilient
+  (every step attempted even if an earlier one fails, absent files
+  tolerated, the first error surfaced) and idempotent, so a
+  partially-failed purge re-runs to convergence. Only the **local
+  mirror** is destroyed — the canonical KDBX is never touched (removing a
+  vault from a device is not deleting the vault), so a fresh process
+  re-ingests it cleanly. The `delete_db_key` default on the *engine* trait
+  is a no-op (read-only test doubles); the obligation is enforced where it
+  matters — the FFI `with_foreign` trait makes it required, so every
+  platform implementor must wire the keystore delete. New keyhole verb
+  `purge`; pinned by
+  [purge-destroys-local-data.sh](scenarios/purge-destroys-local-data.sh)
+  (sidecar + every WAL/SHM sibling gone, `deleteDbKey` invoked, KDBX
+  untouched, digest preserved across the re-ingest) + engine
+  `purge_destroys_sidecar_files_and_invokes_key_deletion` /
+  `purge_removes_files_then_surfaces_key_deletion_failure` /
+  `purge_only_removes_its_own_files_not_the_directory` /
+  `purge_is_absent_tolerant_and_idempotent` and keys-ffi
+  `purge_vault_local_data_destroys_sidecar_and_deletes_key`. No engine
+  behaviour gap surfaced — this closed an ownership/drift gap (clients had
+  each reimplemented the teardown sequence the engine is best placed to
+  own).
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the

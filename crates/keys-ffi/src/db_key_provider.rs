@@ -48,6 +48,27 @@ pub trait VaultDbKeyProvider: Send + Sync {
     /// underlying key material can't be produced (e.g. Keychain auth
     /// failure or missing entry).
     fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError>;
+
+    /// Destroy the database key, so the `SQLCipher` mirror it unlocks can
+    /// never be decrypted again.
+    ///
+    /// Called by `purge_vault_local_data` as the key-deletion half of
+    /// vault teardown: the engine deletes the on-disk mirror sidecar files (it
+    /// owns the layout) and calls this to remove the key from the
+    /// platform secret store (Keychain on Apple, Keystore on Android,
+    /// DPAPI on Windows). The engine owns the *sequence*; this
+    /// implementation owns the *mechanism* — the actual keystore delete.
+    ///
+    /// Implementations MUST be idempotent: deleting an already-absent
+    /// key is success, so a re-run of a partially-failed purge converges
+    /// rather than erroring on the second pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultDbKeyProviderError::KeyUnavailable`] if the
+    /// platform refuses the deletion (e.g. keystore locked / auth
+    /// failure).
+    fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError>;
 }
 
 /// FFI-facing parallel of `keys_engine::KeyProviderError`.
@@ -126,17 +147,31 @@ impl KeyProvider for BridgeDbKeyProvider {
         bytes.zeroize();
         Ok(key)
     }
+
+    fn delete_db_key(&self) -> Result<(), EngineKeyProviderError> {
+        // Pure forwarding: the platform mechanism lives behind the
+        // foreign trait. No secret material crosses here — just the
+        // success / keystore-error signal.
+        self.inner
+            .delete_db_key()
+            .map_err(EngineKeyProviderError::from)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     struct FixedKey(Vec<u8>);
 
     impl VaultDbKeyProvider for FixedKey {
         fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError> {
             Ok(self.0.clone())
+        }
+        fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError> {
+            Ok(())
         }
     }
 
@@ -145,6 +180,25 @@ mod tests {
     impl VaultDbKeyProvider for FailingKey {
         fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError> {
             Err(VaultDbKeyProviderError::KeyUnavailable(self.0.clone()))
+        }
+        fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError> {
+            Err(VaultDbKeyProviderError::KeyUnavailable(self.0.clone()))
+        }
+    }
+
+    /// Records whether `delete_db_key` was invoked, so the bridge's
+    /// forwarding can be asserted.
+    struct RecordingKey {
+        deleted: AtomicBool,
+    }
+
+    impl VaultDbKeyProvider for RecordingKey {
+        fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError> {
+            Ok(vec![5u8; 32])
+        }
+        fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError> {
+            self.deleted.store(true, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -191,6 +245,28 @@ mod tests {
         let err = bridge.acquire_db_key().expect_err("must propagate");
         let msg = unwrap_unavailable(err);
         assert_eq!(msg, "keychain locked");
+    }
+
+    #[test]
+    fn bridge_forwards_delete_to_foreign() {
+        let recording = Arc::new(RecordingKey {
+            deleted: AtomicBool::new(false),
+        });
+        let bridge = BridgeDbKeyProvider::new(recording.clone());
+        assert!(!recording.deleted.load(Ordering::SeqCst));
+        bridge.delete_db_key().expect("delete forwards ok");
+        assert!(
+            recording.deleted.load(Ordering::SeqCst),
+            "bridge must forward delete_db_key to the foreign provider",
+        );
+    }
+
+    #[test]
+    fn bridge_propagates_foreign_delete_error() {
+        let bridge = BridgeDbKeyProvider::new(Arc::new(FailingKey("keystore locked".into())));
+        let err = bridge.delete_db_key().expect_err("delete must propagate");
+        let msg = unwrap_unavailable(err);
+        assert_eq!(msg, "keystore locked");
     }
 
     #[test]

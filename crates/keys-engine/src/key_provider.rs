@@ -78,6 +78,35 @@ pub trait KeyProvider: Send + Sync + Debug {
     /// key material can't be produced (e.g. Keychain auth failure or
     /// missing entry).
     fn acquire_db_key(&self) -> Result<DbKey, KeyProviderError>;
+
+    /// Destroy the database key this provider sources, so the encrypted
+    /// `SQLite` mirror it unlocked can never be decrypted again.
+    ///
+    /// Called by [`Engine::purge_local_data`](crate::Engine::purge_local_data)
+    /// as the key-deletion half of vault teardown: the engine deletes the
+    /// on-disk mirror sidecar files (it owns the layout) and asks the
+    /// provider to remove the key from wherever the platform keeps it
+    /// (Keychain / Keystore / DPAPI). The engine owns the *sequence*;
+    /// the provider owns the *mechanism*.
+    ///
+    /// Must be idempotent: deleting an already-absent key is success,
+    /// so a re-run of a partially-failed purge converges.
+    ///
+    /// The default implementation is a deliberate no-op — for providers
+    /// that never drive a purge (the engine's own read-only test doubles
+    /// and any acquire-only provider). The real platform contract is the
+    /// FFI `VaultDbKeyProvider` trait, whose foreign implementors (Swift
+    /// on the Keychain, etc.) MUST implement this; that obligation is
+    /// enforced at the FFI seam, so the no-op default can never mask a
+    /// missing key-deletion in a shipping client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyProviderError::KeyUnavailable`] if the platform
+    /// refuses the deletion (e.g. keystore locked).
+    fn delete_db_key(&self) -> Result<(), KeyProviderError> {
+        Ok(())
+    }
 }
 
 /// Errors surfaced by a [`KeyProvider`] implementation.
@@ -148,6 +177,48 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "db key provider key unavailable: keychain locked",
+        );
+    }
+
+    #[test]
+    fn delete_db_key_defaults_to_noop_success() {
+        // A provider that only implements `acquire_db_key` inherits the
+        // trait's no-op `delete_db_key` — success, nothing deleted.
+        let provider = FixedKey([1u8; 32]);
+        provider
+            .delete_db_key()
+            .expect("default delete is a no-op success");
+    }
+
+    #[derive(Debug)]
+    struct RecordingKey {
+        // `KeyProvider: Send + Sync`, so interior mutability must be
+        // thread-safe — an atomic, not a `Cell`.
+        deleted: std::sync::atomic::AtomicBool,
+    }
+
+    impl KeyProvider for RecordingKey {
+        fn acquire_db_key(&self) -> Result<DbKey, KeyProviderError> {
+            Ok(DbKey::from_bytes([2u8; 32]))
+        }
+        fn delete_db_key(&self) -> Result<(), KeyProviderError> {
+            self.deleted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delete_db_key_override_is_invoked() {
+        use std::sync::atomic::Ordering;
+        let provider = RecordingKey {
+            deleted: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert!(!provider.deleted.load(Ordering::SeqCst));
+        provider.delete_db_key().expect("override delete succeeds");
+        assert!(
+            provider.deleted.load(Ordering::SeqCst),
+            "override must record the deletion",
         );
     }
 }

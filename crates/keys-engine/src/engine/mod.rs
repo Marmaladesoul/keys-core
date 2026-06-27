@@ -8,7 +8,7 @@
 //! built-in PBKDF2 key derivation.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use keepass_core::CompositeKey;
@@ -1152,6 +1152,77 @@ impl Engine {
             .map_err(|(_, err)| EngineError::Sqlite(err))
     }
 
+    /// Destroy a vault's local-device data: the `SQLCipher` `SQLite`
+    /// mirror sidecar files at `db_path` **and** the database key that
+    /// decrypts them.
+    ///
+    /// The teardown counterpart to [`Engine::open`] — the engine-owned
+    /// operation a client drives when a vault is *removed* from the
+    /// device, so its encrypted local copy and key don't linger
+    /// recoverable. It destroys only the **local mirror**; the canonical
+    /// KDBX the mirror was ingested from is never touched (removing a
+    /// vault from a device is not the same as deleting the vault).
+    ///
+    /// `db_path` is the same path an [`Engine::open`] was (or would be)
+    /// pointed at. Deliberately an associated function, **not** a method
+    /// on an open engine: teardown happens once the vault is closed, so a
+    /// client (and keyhole) reaches it with no live handle — re-opening
+    /// the engine merely to destroy it would be wasted work. The caller
+    /// is responsible for ensuring no engine is open over `db_path` when
+    /// this runs (deleting a file out from under an open `SQLite`
+    /// connection is the caller's footgun to avoid).
+    ///
+    /// Orchestration (the engine owns the *sequence*):
+    /// 1. delete the mirror's on-disk sidecar files — `db_path` plus its
+    ///    `-wal` / `-shm` / `-journal` siblings (the engine knows this
+    ///    layout; only these files are removed, never the containing
+    ///    directory, which on a real client holds *other* vaults'
+    ///    sidecars);
+    /// 2. ask `key_provider` to remove the database key from wherever the
+    ///    platform keeps it (the platform owns the *mechanism* —
+    ///    Keychain / Keystore / DPAPI).
+    ///
+    /// Best-effort and resilient: every step is attempted even if an
+    /// earlier one fails (a single un-removable sidecar must not block
+    /// the key deletion, and vice versa), missing sidecar files are not
+    /// an error (WAL/SHM may already be checkpointed away), and the
+    /// *first* error encountered is returned so a caller can surface and
+    /// retry it. Re-running a partially-failed purge converges: file
+    /// removal is absent-tolerant and `key_provider.delete_db_key` is
+    /// required to be idempotent.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Io`] if a sidecar file existed but could not be
+    ///   removed.
+    /// - [`EngineError::KeyProvider`] if the platform refused to delete
+    ///   the database key.
+    pub fn purge_local_data(
+        db_path: &Path,
+        key_provider: &dyn KeyProvider,
+    ) -> Result<(), EngineError> {
+        let mut first_err: Option<EngineError> = None;
+
+        // The mirror's on-disk footprint: the DB file plus the WAL-mode
+        // sidecars SQLite maintains beside it (and a legacy rollback
+        // journal, present only if WAL was never engaged).
+        for suffix in ["-wal", "-shm", "-journal", ""] {
+            let target = sidecar_path(db_path, suffix);
+            if let Err(err) = remove_file_if_present(&target) {
+                first_err.get_or_insert(EngineError::Io(err));
+            }
+        }
+
+        if let Err(err) = key_provider.delete_db_key() {
+            first_err.get_or_insert(EngineError::KeyProvider(err));
+        }
+
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
     /// Install a [`DataChangeObserver`]. Replaces any previously
     /// installed observer. Subsequent successful mutations will invoke
     /// [`DataChangeObserver::on_event`] synchronously on the mutation
@@ -1277,6 +1348,33 @@ fn is_wrong_key(err: &rusqlite::Error) -> bool {
         err,
         rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::NotADatabase
     )
+}
+
+/// The sidecar file beside the mirror DB at `base` for a given `SQLite`
+/// suffix. An empty suffix is `base` itself; otherwise the suffix is
+/// appended to the filename verbatim (`SQLite` names WAL-mode sidecars
+/// `<db>-wal` / `<db>-shm` and a rollback journal `<db>-journal`, with
+/// no separating dot). Built by extending the `OsStr` so it is correct
+/// regardless of the path's extension.
+fn sidecar_path(base: &Path, suffix: &str) -> PathBuf {
+    if suffix.is_empty() {
+        return base.to_path_buf();
+    }
+    let mut os = base.as_os_str().to_owned();
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
+/// Remove `path`, treating "already absent" as success. Used by
+/// [`Engine::purge_local_data`]: a WAL/SHM sidecar may have been
+/// checkpointed away before teardown, and a re-run of a partial purge
+/// must converge — neither case is an error.
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Walk `group` (and its descendants) looking for the parent

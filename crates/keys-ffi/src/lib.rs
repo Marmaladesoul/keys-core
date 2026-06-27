@@ -29,7 +29,7 @@ pub use dto::{
     AutoType, AutoTypeAssociation, CustomField, Entry, EntryCreate, EntryPatch, EntrySummary,
     Group, GroupPatch, HistoryRecord, ProtectedField,
 };
-pub use engine::Engine;
+pub use engine::{Engine, purge_vault_local_data};
 pub use engine_error::EngineError;
 pub use engine_file_watcher::{FileWatcherEvent, VaultFileWatcher, VaultFileWatcherObserver};
 pub use engine_observer::{
