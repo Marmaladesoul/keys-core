@@ -32,7 +32,8 @@ use keys_ffi::{
     AttachmentChoiceFfi, AttachmentChoiceKindFfi, ConflictPayloadFfi, ConflictSideFfi,
     DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, Engine, EngineEntryUpdate,
     EntryAttachmentChoiceFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, IconRef,
-    NewEntryFields, Page, ParkConflictsResultFfi, ResolutionFfi, Vault, purge_vault_local_data,
+    NewEntryFields, Page, ParkConflictsResultFfi, ResolutionFfi, Vault, VaultIdentityVerdict,
+    purge_vault_local_data, verify_vault_identity,
 };
 
 use adapters::{FixedDbKey, FixedProtector, RecordingDbKey};
@@ -509,6 +510,45 @@ enum Command {
         #[arg(long)]
         new_keyfile: Option<PathBuf>,
     },
+    /// Print the vault's stable identity — its root-group UUID (the
+    /// parentless node of the group tree), read from the engine over the
+    /// mirror. The root-group UUID is minted once at create and preserved
+    /// across every save / re-key / sync, so it is what answers "are these
+    /// two files the same vault?".
+    ///
+    /// This is the EXPECTED side of an identity check: a client recovering a
+    /// vault whose KDBX went missing reads this from the vault's own engine /
+    /// `SQLite` sidecar (no master password needed), then compares it against a
+    /// user-picked file's identity via `verify-identity`.
+    RootUuid {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+    },
+    /// Verify a user-picked KDBX file against an expected vault identity —
+    /// the headless twin of a client's "Locate…" recovery guard that must
+    /// refuse to re-anchor a vault to the WRONG file.
+    ///
+    /// Decrypts `picked` with `$KEYHOLE_PASSWORD` (+ the global `--keyfile`)
+    /// and compares its root-group UUID to `--expect` (see `root-uuid`),
+    /// printing the verdict to stdout and setting the exit code so a consumer
+    /// can key a relink decision off EITHER:
+    ///
+    /// - `match`          → exit 0   — the same vault; proceed.
+    /// - `mismatch`       → exit 1   — decrypts but a DIFFERENT vault; reject.
+    /// - `undecryptable`  → exit 1   — won't open under the supplied
+    ///   credential. AMBIGUOUS (wrong file, corrupt, or the genuine vault
+    ///   re-keyed since this credential was cached), NOT a "different vault"
+    ///   verdict — a real consumer re-derives / re-prompts before rejecting.
+    ///
+    /// Only `match` exits 0. A missing / non-KDBX file errors (exit 1, message
+    /// on stderr). This is a pure read: no mirror is created or touched.
+    VerifyIdentity {
+        /// Path to the user-picked .kdbx whose identity to check.
+        picked: PathBuf,
+        /// The expected root-group UUID (e.g. from `root-uuid`).
+        #[arg(long)]
+        expect: String,
+    },
 }
 
 // Flat verb dispatch: one match arm per CLI verb, growing linearly
@@ -840,6 +880,14 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.rekey(new_password, new_keyfile).await?;
+        }
+        Command::RootUuid { vault } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            println!("{}", session.root_uuid()?);
+        }
+        Command::VerifyIdentity { picked, expect } => {
+            verify_identity(&picked, &expect, &password, keyfile.clone())?;
         }
     }
     Ok(())
@@ -1966,6 +2014,57 @@ fn ensure_keyfile(path: &Path) -> Result<Vec<u8>> {
         std::fs::write(path, &bytes)
             .with_context(|| format!("write keyfile {}", path.display()))?;
         Ok(bytes)
+    }
+}
+
+/// Verify a picked KDBX file against an `expected` root-group UUID — the
+/// recovery-flow guard, headless. Calls the `keys-ffi` `verify_vault_identity`
+/// seam (a pure read — no mirror) and surfaces its three-way verdict on stdout
+/// + the exit code:
+///
+/// - `match`         → prints `match`, exits 0 (the same vault; proceed);
+/// - `mismatch`      → prints `mismatch`, exits non-zero (a DIFFERENT vault);
+/// - `undecryptable` → prints `undecryptable`, exits non-zero — ambiguous
+///   (wrong file, corrupt, or a genuine vault re-keyed since this credential
+///   was cached), which a real consumer resolves by re-deriving, not by
+///   declaring a different vault.
+///
+/// Only `match` exits 0, so a consumer keying off the exit code can never read
+/// a reject as success. A missing / non-KDBX file errors (exit non-zero).
+fn verify_identity(
+    picked: &Path,
+    expected: &str,
+    password: &str,
+    keyfile: Option<Vec<u8>>,
+) -> Result<()> {
+    anyhow::ensure!(
+        picked.exists(),
+        "picked file not found: {}",
+        picked.display()
+    );
+    let verdict = verify_vault_identity(
+        picked.to_string_lossy().into_owned(),
+        password.to_owned(),
+        keyfile,
+        expected.to_owned(),
+    )
+    .map_err(|e| anyhow::anyhow!("verify: {e}"))?;
+    match verdict {
+        VaultIdentityVerdict::Match => {
+            println!("match");
+            Ok(())
+        }
+        VaultIdentityVerdict::Mismatch => {
+            println!("mismatch");
+            anyhow::bail!("picked file is a different vault (root-group UUID mismatch)");
+        }
+        VaultIdentityVerdict::Undecryptable => {
+            println!("undecryptable");
+            anyhow::bail!(
+                "picked file did not decrypt under the supplied credential — wrong file, \
+                 corrupt, or a genuine vault re-keyed since this credential was cached"
+            );
+        }
     }
 }
 

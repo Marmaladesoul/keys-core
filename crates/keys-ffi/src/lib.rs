@@ -16,6 +16,7 @@ mod engine_observer;
 mod engine_portable;
 mod engine_types;
 mod error;
+mod identity;
 mod keyfile;
 mod merge;
 mod observer;
@@ -46,6 +47,7 @@ pub use engine_types::{
     SearchScope, SmartFolder, Strength, StrengthBucket, TagUsageCount, VaultState,
 };
 pub use error::VaultError;
+pub use identity::{VaultIdentityVerdict, verify_vault_identity};
 pub use keyfile::generate_keyfile;
 pub use merge::{
     AttachmentChoiceFfi, AttachmentChoiceKindFfi, AttachmentDeltaFfi, AttachmentDeltaKindFfi,

@@ -692,6 +692,57 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   behaviour gap surfaced — this closed an ownership/drift gap (clients had
   each reimplemented the teardown sequence the engine is best placed to
   own).
+- **Done (2026-06-27, vault-identity verification — the relink guard):** a
+  consumer that re-anchors a vault to a user-picked KDBX (a path-based
+  "Locate…" recovery flow) needs to REJECT a file that is a *different* vault
+  before re-pointing this vault's stable identity (and local store) at it —
+  otherwise the next unlock ingests the wrong file's contents. A vault's
+  identity is its **root-group UUID** (minted once at create, preserved
+  verbatim across every save / sync **and re-key** — re-key rotates the
+  credential but leaves the inner XML, so identity is unchanged), so "same
+  vault?" == "same root-group UUID?". The capability splits into an EXPECTED
+  side and a PICKED side. The expected side already existed below the FFI
+  line — the open engine's `group_tree()` root (read from the SQLCipher
+  sidecar with only the mirror key, no master password). The missing half was
+  the PICKED side: no seam primitive read a *foreign* KDBX's identity. Added
+  keys-ffi `verify_vault_identity(path, password, keyfile, expected_root_uuid)
+  -> Result<VaultIdentityVerdict, VaultError>` — a pure raw-KDBX read (decrypt
+  + compare the root-group UUID), no `Engine` / mirror involved, hence it lives
+  beside `Vault` (the raw-KDBX handle), not on the mirror seam. **The verdict
+  is the seam primitive, three-way (centralised here so every client inherits
+  the policy — and the re-key nuance — rather than re-deriving and fumbling
+  it):**
+  - `Match` — decrypts and the root-group UUID equals the expected one;
+    proceed.
+  - `Mismatch` — decrypts but a *different* (or nil/absent) root-group UUID;
+    the definitive reject. (A nil/all-zeros root is never an identity — two
+    files with absent `<UUID>` elements must not compare equal — so it can
+    never `Match`.)
+  - `Undecryptable` — won't open under the supplied credential. **Ambiguous,
+    NOT "different vault":** a wrong file, a corrupt file, *or the genuine
+    vault re-keyed since the consumer cached its credential* (identity
+    preserved, credential rotated). A consumer must therefore **re-derive /
+    re-prompt** for the current credential and retry rather than hard-reject —
+    else a re-keyed vault recovered on a device holding the stale credential is
+    falsely rejected. (Missing / non-KDBX files surface as `Err(Io)` /
+    `Err(Format)`.) keyhole is the first consumer, driving the shape with two
+    verbs: `root-uuid` (the expected side, from the engine) and
+    `verify-identity <picked> --expect <uuid>` (the picked side — a pure read
+    that creates no mirror, printing the verdict to stdout AND exiting 0 only
+    on `match`, so a consumer keying off the exit code can't read a reject as
+    success). Pinned by
+  [vault-identity-verify.sh](scenarios/vault-identity-verify.sh) (same vault →
+  match, even **relocated** to a new path — the whole point of recovery; a
+  different vault that decrypts under the same password → mismatch; a
+  wrong-password file → undecryptable; **a re-keyed genuine vault is
+  `undecryptable` under the stale credential — re-derive, not reject — and
+  `match` under the new, proving identity survives re-key**; a keyfile vault
+  matches WITH its keyfile and is undecryptable WITHOUT it; symmetry teeth) +
+  keys-ffi `tests/verify_vault_identity.rs` and the `classify` unit tests
+  (nil / malformed expected). No behaviour gap surfaced — the identity was
+  always present in the root-group UUID; this closed a *reachability* gap (the
+  seam couldn't read a picked file's identity below the GUI line) and pins the
+  verdict contract a relink guard inherits.
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the
