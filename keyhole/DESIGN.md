@@ -641,11 +641,13 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   ad-hoc. The `VaultDbKeyProvider` port (already the platform-keystore
   seam, via `acquire_db_key`) gains `delete_db_key`, and a new keys-ffi
   `purge_vault_local_data(db_path, key_provider)` orchestrates the
-  teardown: the engine deletes the sidecar files whose layout it owns
-  (the DB file + its `-wal`/`-shm`/`-journal` siblings, **never** the
-  containing directory — a shared container holds other vaults'
-  sidecars), then calls `key_provider.delete_db_key()` to drop the key
-  from the platform store. **Engine owns the *sequence*; the platform
+  teardown: the engine destroys the DB key first (via
+  `key_provider.delete_db_key()`, so an interrupted purge leaves inert
+  ciphertext rather than a live key beside a deleted file), then unlinks
+  the sidecar files whose layout it owns (the DB file + its
+  `-wal`/`-shm`/`-journal` siblings, **never** the containing directory —
+  a shared container holds other vaults' sidecars). **Engine owns the
+  *sequence*; the platform
   owns the *mechanism*** — the `VaultFieldProtector` inversion-of-control
   pattern applied to teardown. Path-based (an associated
   `Engine::purge_local_data`, not a live-engine method): teardown runs
@@ -656,16 +658,34 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   partially-failed purge re-runs to convergence. Only the **local
   mirror** is destroyed — the canonical KDBX is never touched (removing a
   vault from a device is not deleting the vault), so a fresh process
-  re-ingests it cleanly. The `delete_db_key` default on the *engine* trait
-  is a no-op (read-only test doubles); the obligation is enforced where it
-  matters — the FFI `with_foreign` trait makes it required, so every
-  platform implementor must wire the keystore delete. New keyhole verb
-  `purge`; pinned by
+  re-ingests it cleanly. Hardened invariants (from the security review):
+  the engine-trait `delete_db_key` default **fails closed** — a
+  `KeyProvider` that doesn't override it makes `purge_local_data` return
+  `KeyUnavailable` rather than unlink the ciphertext and report success
+  with the key still live (the FFI `with_foreign` trait additionally keeps
+  `delete_db_key` *required*, so every platform implementor wires the
+  keystore delete). `purge_local_data` returns the **count of sidecars
+  unlinked**: a zero count is the "nothing was here" signal a consumer
+  must surface (a mis-targeted / stale `db_path`), since the seam can't
+  own a client's mirror-filename convention or cross-check path↔provider —
+  the consumer derives both from one vault identity at a single call site.
+  The contract, stated on the trait: purge is **crypto-shredding** (unlink,
+  not byte-scrub — overwrite-before-unlink is unreliable on flash/CoW and
+  `secure_delete` only touches in-DB free pages, so confidentiality rests
+  on the key's destruction); the key item MUST be non-synchronizable +
+  backup-excluded and MUST NOT be re-minted by the next `acquire_db_key`
+  (open never provisions — the vault-add path does); and the caller MUST
+  quiesce the path (de-register so nothing — including an auxiliary
+  consumer sharing the container — re-opens it via the CREATE-and-ingest
+  open path). New keyhole verb `purge`; pinned by
   [purge-destroys-local-data.sh](scenarios/purge-destroys-local-data.sh)
-  (sidecar + every WAL/SHM sibling gone, `deleteDbKey` invoked, KDBX
-  untouched, digest preserved across the re-ingest) + engine
+  (sidecar + every WAL/SHM sibling gone, `deleteDbKey` invoked, a non-zero
+  sidecars-removed count, KDBX untouched, digest preserved across the
+  re-ingest) + engine
   `purge_destroys_sidecar_files_and_invokes_key_deletion` /
   `purge_removes_files_then_surfaces_key_deletion_failure` /
+  `purge_with_unimplemented_delete_shreds_files_then_fails_closed` /
+  `purge_deletes_key_before_unlinking_files` /
   `purge_only_removes_its_own_files_not_the_directory` /
   `purge_is_absent_tolerant_and_idempotent` and keys-ffi
   `purge_vault_local_data_destroys_sidecar_and_deletes_key`. No engine

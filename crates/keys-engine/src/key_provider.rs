@@ -72,11 +72,26 @@ pub trait KeyProvider: Send + Sync + Debug {
     /// for fetching its backing key material on each call; this crate
     /// does not cache the returned [`DbKey`].
     ///
+    /// ## Durability contract (the purge counterpart)
+    ///
+    /// This method MUST NOT silently mint a fresh key to satisfy an open
+    /// of an existing mirror: a missing keystore entry MUST surface as
+    /// [`KeyProviderError::KeyUnavailable`]. Provisioning a key is the
+    /// exclusive job of the client's deliberate vault-*add* path, which
+    /// writes the keystore entry **before** the first open. That split is
+    /// what makes
+    /// [`Engine::purge_local_data`](crate::Engine::purge_local_data)
+    /// durable: after a purge the entry is intentionally gone, and it
+    /// stays gone until a deliberate re-add provisions a new one — *open
+    /// never provisions*. A mint-on-miss `acquire_db_key` would hand out
+    /// a usable key on the next open and reopen the crypto-shred window.
+    ///
     /// # Errors
     ///
-    /// Returns [`KeyProviderError::KeyUnavailable`] if the underlying
-    /// key material can't be produced (e.g. Keychain auth failure or
-    /// missing entry).
+    /// Returns [`KeyProviderError::KeyUnavailable`] if the underlying key
+    /// material can't be produced (e.g. Keychain auth failure, or a
+    /// missing entry — which, per the contract above, is surfaced, never
+    /// auto-minted).
     fn acquire_db_key(&self) -> Result<DbKey, KeyProviderError>;
 
     /// Destroy the database key this provider sources, so the encrypted
@@ -89,23 +104,48 @@ pub trait KeyProvider: Send + Sync + Debug {
     /// (Keychain / Keystore / DPAPI). The engine owns the *sequence*;
     /// the provider owns the *mechanism*.
     ///
-    /// Must be idempotent: deleting an already-absent key is success,
-    /// so a re-run of a partially-failed purge converges.
+    /// ## Contract (load-bearing — purge is crypto-shredding)
     ///
-    /// The default implementation is a deliberate no-op — for providers
-    /// that never drive a purge (the engine's own read-only test doubles
-    /// and any acquire-only provider). The real platform contract is the
-    /// FFI `VaultDbKeyProvider` trait, whose foreign implementors (Swift
-    /// on the Keychain, etc.) MUST implement this; that obligation is
-    /// enforced at the FFI seam, so the no-op default can never mask a
-    /// missing key-deletion in a shipping client.
+    /// The mirror file is *unlinked*, not byte-scrubbed, so the
+    /// confidentiality of a purged vault rests **entirely** on this key
+    /// becoming unrecoverable. The seam cannot verify the platform
+    /// honoured it, so it is a contract:
+    ///
+    /// - The key item MUST be destroyed such that it cannot resurface,
+    ///   which means it MUST have been created **non-synchronizable**
+    ///   (never propagated to a cloud keychain) and **backup-excluded** —
+    ///   this call reaches only the local store, so a copy synced or
+    ///   captured in a device backup survives and, paired with the
+    ///   (unlinked but physically lingering) ciphertext, defeats the
+    ///   crypto-shred.
+    /// - It MUST be idempotent: deleting an already-absent key is
+    ///   **success**, so a re-run of a partially-failed purge converges.
+    ///
+    /// ## Default — fails closed
+    ///
+    /// The default implementation **returns an error**, not `Ok`. A
+    /// provider that reaches the purge sequence without a real
+    /// key-destruction mechanism must not be able to report a successful
+    /// purge while leaving the key live — the worst direction, since the
+    /// unlinked ciphertext lingers in free blocks and the key is the
+    /// recoverable remnant. So an unoverridden `delete_db_key` makes
+    /// [`Engine::purge_local_data`](crate::Engine::purge_local_data)
+    /// return [`KeyProviderError::KeyUnavailable`] rather than silently
+    /// succeed. Acquire-only providers (the engine's read-only test
+    /// doubles) inherit this default but never call purge, so they never
+    /// hit it. The shipping contract is additionally enforced at the FFI
+    /// `VaultDbKeyProvider` seam, where this method is *required*, so
+    /// every platform implementor wires a real keystore delete.
     ///
     /// # Errors
     ///
     /// Returns [`KeyProviderError::KeyUnavailable`] if the platform
-    /// refuses the deletion (e.g. keystore locked).
+    /// refuses the deletion (e.g. keystore locked), or — for the
+    /// fail-closed default — if the provider does not implement it.
     fn delete_db_key(&self) -> Result<(), KeyProviderError> {
-        Ok(())
+        Err(KeyProviderError::KeyUnavailable(
+            "delete_db_key not implemented for this KeyProvider".into(),
+        ))
     }
 }
 
@@ -181,13 +221,20 @@ mod tests {
     }
 
     #[test]
-    fn delete_db_key_defaults_to_noop_success() {
+    fn delete_db_key_default_fails_closed() {
         // A provider that only implements `acquire_db_key` inherits the
-        // trait's no-op `delete_db_key` — success, nothing deleted.
+        // trait's fail-closed `delete_db_key`: it must REFUSE, not claim
+        // success, so a purge can't report done while the key lives on.
         let provider = FixedKey([1u8; 32]);
-        provider
+        match provider
             .delete_db_key()
-            .expect("default delete is a no-op success");
+            .expect_err("default delete must fail closed")
+        {
+            KeyProviderError::KeyUnavailable(msg) => assert!(
+                msg.contains("not implemented"),
+                "default error should name the unimplemented method: {msg}",
+            ),
+        }
     }
 
     #[derive(Debug)]

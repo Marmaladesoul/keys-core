@@ -1927,8 +1927,9 @@ fn purge_vault(vault: &Path) -> Result<()> {
     let provider = Arc::new(RecordingDbKey::new());
     let deleted = provider.deletion_flag();
 
-    purge_vault_local_data(mirror_db.to_string_lossy().into_owned(), provider)
-        .map_err(|e| anyhow::anyhow!("purge: {e:?}"))?;
+    let sidecars_removed =
+        purge_vault_local_data(mirror_db.to_string_lossy().into_owned(), provider)
+            .map_err(|e| anyhow::anyhow!("purge: {e:?}"))?;
 
     // keyhole's keystore stand-in: the purge must have called
     // delete_db_key, or the key-deletion half of teardown is missing.
@@ -1937,8 +1938,16 @@ fn purge_vault(vault: &Path) -> Result<()> {
         key_deleted,
         "purge did not invoke delete_db_key — the key-deletion half of teardown is missing"
     );
+    // keyhole always seeds a real mirror before purging, so a zero count
+    // means db_path resolved to nothing on disk — a regression here, not
+    // a benign already-purged re-run.
+    anyhow::ensure!(
+        sidecars_removed > 0,
+        "purge removed no sidecar files — db_path resolved to nothing on disk (mis-targeted purge)"
+    );
 
     println!("db-key-deleted: {key_deleted}");
+    println!("sidecars-removed: {sidecars_removed}");
     println!("purged local data for {}", vault.display());
     Ok(())
 }

@@ -167,7 +167,15 @@ fn purge_vault_local_data_destroys_sidecar_and_deletes_key() {
     let provider = Arc::new(RecordingDbKey {
         deleted: deleted.clone(),
     });
-    purge_vault_local_data(db_path.to_string_lossy().into_owned(), provider).expect("purge ok");
+    let removed =
+        purge_vault_local_data(db_path.to_string_lossy().into_owned(), provider).expect("purge ok");
+
+    // 0. a populated mirror reports at least the base DB file unlinked —
+    //    the non-zero "something was actually here" signal.
+    assert!(
+        removed >= 1,
+        "purge of a populated mirror must report >= 1 sidecar removed, got {removed}",
+    );
 
     // 1. the encrypted sidecar is gone from disk (incl. WAL siblings).
     assert!(!db_path.exists(), "mirror sidecar must be gone after purge");

@@ -73,6 +73,16 @@ out="$("$KEYHOLE" purge "$VAULT" 2>&1)" \
 printf '%s\n' "$out" | grep -q '^db-key-deleted: true$' \
     || { echo "FAIL: purge did not report the db key was deleted"; printf '%s\n' "$out" | sed 's/^/    /'; exit 1; }
 
+# 3b. the verb reports a NON-ZERO sidecar-removed count — a populated
+#     mirror was actually destroyed, not a silent no-op success on a
+#     mis-targeted path (the "nothing to purge" signal must be > 0 here).
+removed="$(printf '%s\n' "$out" | sed -n 's/^sidecars-removed: //p')"
+case "$removed" in
+    ''|*[!0-9]*) echo "FAIL: purge did not report a numeric sidecars-removed count"; printf '%s\n' "$out" | sed 's/^/    /'; exit 1 ;;
+esac
+[ "$removed" -ge 1 ] \
+    || { echo "FAIL: purge removed $removed sidecar file(s) — expected >= 1 (mis-targeted purge masquerading as success)"; exit 1; }
+
 # 2. every mirror sidecar file is gone — the encrypted local copy is
 #    destroyed (not merely the main DB file: WAL/SHM siblings too).
 if [ -f "$SIDECAR" ]; then

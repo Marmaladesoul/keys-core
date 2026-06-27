@@ -42,32 +42,61 @@ pub trait VaultDbKeyProvider: Send + Sync {
     /// exactly 32 bytes long. Any other length surfaces as
     /// [`VaultDbKeyProviderError::KeyUnavailable`].
     ///
+    /// ## Durability contract (the purge counterpart)
+    ///
+    /// This MUST NOT silently mint a fresh key to satisfy an open of an
+    /// existing mirror: a missing keystore entry MUST surface as
+    /// [`VaultDbKeyProviderError::KeyUnavailable`]. Provisioning a key is
+    /// the exclusive job of the client's deliberate vault-*add* path,
+    /// which writes the keystore entry **before** the first open. That
+    /// split is what makes `purge_vault_local_data` durable: after a purge
+    /// the entry is intentionally gone and stays gone until a deliberate
+    /// re-add provisions a new one — *open never provisions*. A
+    /// mint-on-miss `acquire_db_key` would hand out a usable key on the
+    /// next open and reopen the crypto-shred window.
+    ///
     /// # Errors
     ///
     /// Returns [`VaultDbKeyProviderError::KeyUnavailable`] if the
     /// underlying key material can't be produced (e.g. Keychain auth
-    /// failure or missing entry).
+    /// failure, or a missing entry — which, per the contract above, is
+    /// surfaced, never auto-minted).
     fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError>;
 
     /// Destroy the database key, so the `SQLCipher` mirror it unlocks can
     /// never be decrypted again.
     ///
     /// Called by `purge_vault_local_data` as the key-deletion half of
-    /// vault teardown: the engine deletes the on-disk mirror sidecar files (it
-    /// owns the layout) and calls this to remove the key from the
+    /// vault teardown: the engine deletes the on-disk mirror sidecar files
+    /// (it owns the layout) and calls this to remove the key from the
     /// platform secret store (Keychain on Apple, Keystore on Android,
     /// DPAPI on Windows). The engine owns the *sequence*; this
     /// implementation owns the *mechanism* — the actual keystore delete.
     ///
-    /// Implementations MUST be idempotent: deleting an already-absent
-    /// key is success, so a re-run of a partially-failed purge converges
-    /// rather than erroring on the second pass.
+    /// ## Contract (load-bearing — purge is crypto-shredding)
+    ///
+    /// The mirror file is *unlinked*, not byte-scrubbed, so the
+    /// confidentiality of a purged vault rests **entirely** on this key
+    /// becoming unrecoverable. So:
+    ///
+    /// - The key item MUST be destroyed such that it cannot resurface,
+    ///   which means it MUST have been created **non-synchronizable**
+    ///   (never propagated to a cloud keychain, e.g. on Apple
+    ///   `kSecAttrSynchronizable = false`) and **backup-excluded** (e.g.
+    ///   `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` or stricter) —
+    ///   this call reaches only the local store, so a copy synced to a
+    ///   cloud keychain or captured in a device backup survives and,
+    ///   paired with the (unlinked but physically lingering) ciphertext,
+    ///   defeats the crypto-shred.
+    /// - It MUST be idempotent: deleting an already-absent key is
+    ///   **success** (e.g. do not surface a not-found status as an
+    ///   error), so a re-run of a partially-failed purge converges.
     ///
     /// # Errors
     ///
     /// Returns [`VaultDbKeyProviderError::KeyUnavailable`] if the
     /// platform refuses the deletion (e.g. keystore locked / auth
-    /// failure).
+    /// failure). An already-absent key is NOT a failure — return success.
     fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError>;
 }
 

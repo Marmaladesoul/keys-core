@@ -1152,9 +1152,9 @@ impl Engine {
             .map_err(|(_, err)| EngineError::Sqlite(err))
     }
 
-    /// Destroy a vault's local-device data: the `SQLCipher` `SQLite`
-    /// mirror sidecar files at `db_path` **and** the database key that
-    /// decrypts them.
+    /// Destroy a vault's local-device data: the database key that
+    /// decrypts the `SQLCipher` `SQLite` mirror **and** the mirror
+    /// sidecar files at `db_path`.
     ///
     /// The teardown counterpart to [`Engine::open`] — the engine-owned
     /// operation a client drives when a vault is *removed* from the
@@ -1166,60 +1166,120 @@ impl Engine {
     /// `db_path` is the same path an [`Engine::open`] was (or would be)
     /// pointed at. Deliberately an associated function, **not** a method
     /// on an open engine: teardown happens once the vault is closed, so a
-    /// client (and keyhole) reaches it with no live handle — re-opening
-    /// the engine merely to destroy it would be wasted work. The caller
-    /// is responsible for ensuring no engine is open over `db_path` when
-    /// this runs (deleting a file out from under an open `SQLite`
-    /// connection is the caller's footgun to avoid).
+    /// client (and keyhole) reaches it with no live handle.
     ///
-    /// Orchestration (the engine owns the *sequence*):
-    /// 1. delete the mirror's on-disk sidecar files — `db_path` plus its
+    /// ## Orchestration (the engine owns the *sequence*)
+    ///
+    /// 1. ask `key_provider` to destroy the database key (the platform
+    ///    owns the *mechanism* — Keychain / Keystore / DPAPI). This runs
+    ///    **first**: the key is the irrecoverable secret, so destroying
+    ///    it before the files means an interrupted purge (crash / IO
+    ///    error between the two steps) leaves *inert ciphertext whose key
+    ///    is already gone* — a completed crypto-shred — rather than a live
+    ///    key beside a deleted file.
+    /// 2. delete the mirror's on-disk sidecar files — `db_path` plus its
     ///    `-wal` / `-shm` / `-journal` siblings (the engine knows this
     ///    layout; only these files are removed, never the containing
     ///    directory, which on a real client holds *other* vaults'
-    ///    sidecars);
-    /// 2. ask `key_provider` to remove the database key from wherever the
-    ///    platform keeps it (the platform owns the *mechanism* —
-    ///    Keychain / Keystore / DPAPI).
+    ///    sidecars).
     ///
-    /// Best-effort and resilient: every step is attempted even if an
-    /// earlier one fails (a single un-removable sidecar must not block
-    /// the key deletion, and vice versa), missing sidecar files are not
-    /// an error (WAL/SHM may already be checkpointed away), and the
-    /// *first* error encountered is returned so a caller can surface and
-    /// retry it. Re-running a partially-failed purge converges: file
-    /// removal is absent-tolerant and `key_provider.delete_db_key` is
-    /// required to be idempotent.
+    /// Returns the number of sidecar files actually unlinked (`0..=4`). A
+    /// **zero** count means `db_path` resolved to nothing on disk —
+    /// already-purged, or (the hazard) a wrong / stale / typo path. It is
+    /// NOT an error (absent-tolerance is deliberate; see below), but the
+    /// caller SHOULD surface a zero count rather than treat it as a
+    /// completed purge. A non-zero count is **not** proof the path was
+    /// correct — only that some file at that prefix existed and was
+    /// removed.
+    ///
+    /// ## Caller contract — quiescence and correspondence
+    ///
+    /// The caller MUST ensure, for the duration of the purge:
+    /// 1. no engine handle is open over `db_path`; **and**
+    /// 2. nothing can *re-open* `db_path` — the vault is removed from
+    ///    every consumer's registry first, including any auxiliary
+    ///    consumer (e.g. an extension sharing the container). Because
+    ///    [`Engine::open`] opens with `SQLITE_OPEN_CREATE` and re-ingests
+    ///    from the untouched KDBX, anything that opens the path during or
+    ///    after purge silently re-materialises the mirror — defeating the
+    ///    teardown.
+    ///
+    /// The engine cannot validate that `db_path` is *this* vault's mirror
+    /// (it has no mirror-filename convention) nor that `key_provider`
+    /// targets the same vault (the provider is opaque). So the caller
+    /// MUST derive `db_path` and construct `key_provider` from the **same
+    /// vault identity, at a single call site** — a right-path / wrong-key
+    /// mis-pairing is a caller-construction bug this seam cannot detect.
+    ///
+    /// ## Durability — why unlink, not overwrite
+    ///
+    /// Purge is **crypto-shredding**: the sidecar is unlinked, not
+    /// byte-scrubbed, so confidentiality rests on the DB key becoming
+    /// unrecoverable (the [`KeyProvider::delete_db_key`] contract), not on
+    /// the ciphertext bytes being erased. Overwrite-before-unlink is
+    /// deliberately NOT done — on flash / copy-on-write filesystems an
+    /// in-place overwrite does not reliably rewrite the physical blocks
+    /// that held the old pages, and `PRAGMA secure_delete` only zeroes
+    /// within-DB free pages (and there is no live connection here to run
+    /// it) — so byte-scrubbing would buy false assurance, not durability.
+    /// The unlinked mirror is unrecoverable **iff** the key is genuinely
+    /// destroyed and not regenerated (see [`KeyProvider::acquire_db_key`])
+    /// and, for *total* vault destruction, the canonical KDBX is also
+    /// gone. That boundary is only as strong as the foreign
+    /// `delete_db_key` the engine cannot verify.
+    ///
+    /// ## Resilience
+    ///
+    /// Best-effort: every step is attempted even if an earlier one fails
+    /// (a failed key deletion does not skip the file deletion, nor vice
+    /// versa), missing sidecar files are not an error, and the *first*
+    /// error encountered is returned. Re-running a partially-failed purge
+    /// converges: file removal is absent-tolerant and
+    /// `key_provider.delete_db_key` is required to be idempotent. A
+    /// mid-purge state of "files present, key already gone" is the
+    /// *intended* crypto-shred end-state, not a half-failure — a re-run
+    /// simply unlinks the now-inert ciphertext.
     ///
     /// # Errors
     ///
+    /// - [`EngineError::KeyProvider`] if the platform refused to delete
+    ///   the database key (including the fail-closed default of a provider
+    ///   that doesn't implement `delete_db_key`).
     /// - [`EngineError::Io`] if a sidecar file existed but could not be
     ///   removed.
-    /// - [`EngineError::KeyProvider`] if the platform refused to delete
-    ///   the database key.
     pub fn purge_local_data(
         db_path: &Path,
         key_provider: &dyn KeyProvider,
-    ) -> Result<(), EngineError> {
+    ) -> Result<u32, EngineError> {
         let mut first_err: Option<EngineError> = None;
 
-        // The mirror's on-disk footprint: the DB file plus the WAL-mode
-        // sidecars SQLite maintains beside it (and a legacy rollback
-        // journal, present only if WAL was never engaged).
-        for suffix in ["-wal", "-shm", "-journal", ""] {
-            let target = sidecar_path(db_path, suffix);
-            if let Err(err) = remove_file_if_present(&target) {
-                first_err.get_or_insert(EngineError::Io(err));
-            }
-        }
-
+        // Destroy the irrecoverable secret FIRST (see the orchestration
+        // note above): an interrupted purge then leaves inert ciphertext
+        // whose key is already gone, not a live key beside a deleted file.
         if let Err(err) = key_provider.delete_db_key() {
             first_err.get_or_insert(EngineError::KeyProvider(err));
         }
 
+        // The mirror's on-disk footprint: the DB file plus the WAL-mode
+        // sidecars SQLite maintains beside it (and a legacy rollback
+        // journal, present only if WAL was never engaged). Count the files
+        // actually unlinked so the caller can detect a `db_path` that
+        // resolved to nothing (a zero count — see the return doc).
+        let mut sidecars_removed: u32 = 0;
+        for suffix in ["-wal", "-shm", "-journal", ""] {
+            let target = sidecar_path(db_path, suffix);
+            match remove_file_if_present(&target) {
+                Ok(true) => sidecars_removed += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    first_err.get_or_insert(EngineError::Io(err));
+                }
+            }
+        }
+
         match first_err {
             Some(err) => Err(err),
-            None => Ok(()),
+            None => Ok(sidecars_removed),
         }
     }
 
@@ -1365,14 +1425,18 @@ fn sidecar_path(base: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
-/// Remove `path`, treating "already absent" as success. Used by
-/// [`Engine::purge_local_data`]: a WAL/SHM sidecar may have been
+/// Remove `path`, treating "already absent" as success. Returns whether
+/// a file was actually removed (`true`) or was already absent (`false`).
+/// Used by [`Engine::purge_local_data`]: a WAL/SHM sidecar may have been
 /// checkpointed away before teardown, and a re-run of a partial purge
-/// must converge — neither case is an error.
-fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+/// must converge — neither case is an error, and the distinction lets
+/// purge count what it actually unlinked (a crypto-shred unlinks the
+/// ciphertext; it does not scrub the freed blocks — confidentiality
+/// rests on the destroyed key, per `Engine::purge_local_data`).
+fn remove_file_if_present(path: &Path) -> std::io::Result<bool> {
     match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
     }
 }

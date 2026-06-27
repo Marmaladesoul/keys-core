@@ -1520,41 +1520,69 @@ fn open_unlocked_kf(
         .map_err(|e| EngineError::Internal(format!("open kdbx: {e}")))
 }
 
-/// Destroy a vault's local-device data: delete the `SQLCipher` `SQLite`
-/// mirror sidecar files at `db_path` **and** remove the database key
-/// from the platform keystore via `key_provider`.
+/// Destroy a vault's local-device data: remove the database key from the
+/// platform keystore via `key_provider` **and** delete the `SQLCipher`
+/// `SQLite` mirror sidecar files at `db_path`.
 ///
 /// The teardown counterpart to [`Engine::open`] — the engine-owned
 /// operation a client drives when a vault is *removed* from the device,
 /// so its encrypted local copy and key don't linger recoverable. The
-/// engine owns the *sequence* (delete the mirror's DB file + its
-/// `-wal`/`-shm`/`-journal` siblings, whose layout it knows → ask
-/// `key_provider` to delete the key); the platform owns the *mechanism*
-/// (the keystore delete behind [`VaultDbKeyProvider::delete_db_key`]).
+/// engine owns the *sequence* (destroy the key first, then unlink the
+/// mirror's DB file + its `-wal`/`-shm`/`-journal` siblings, whose layout
+/// it knows); the platform owns the *mechanism* (the keystore delete
+/// behind [`VaultDbKeyProvider::delete_db_key`]). Only the **local
+/// mirror** is destroyed — the canonical KDBX the mirror was ingested
+/// from is never touched.
 ///
-/// Only the **local mirror** is destroyed — the canonical KDBX the
-/// mirror was ingested from is never touched. A free function rather
-/// than an [`Engine`] method on purpose: teardown happens after the
-/// vault is closed, so callers reach it with no live engine, and
-/// `db_path` is the same path they passed to [`Engine::open`]. The
-/// caller must ensure no engine is open over `db_path` when this runs.
+/// A free function rather than an [`Engine`] method on purpose: teardown
+/// happens after the vault is closed, so callers reach it with no live
+/// engine, and `db_path` is the same path they passed to [`Engine::open`].
+///
+/// Returns the number of sidecar files actually unlinked (`0..=4`). A
+/// **zero** return means `db_path` resolved to nothing on disk
+/// (already-purged, or a wrong/stale path). Because purge is
+/// absent-tolerant this is reported as success, so the CONSUMER MUST
+/// treat zero as a signal that `db_path` was wrong/stale/already-purged
+/// (log / telemetry), never as confirmation that a populated mirror was
+/// destroyed. A non-zero return is NOT proof the path was correct — only
+/// that some file at that prefix existed.
+///
+/// ## Consumer contract
+///
+/// - Before calling, ensure no engine is open over `db_path` AND that
+///   nothing can re-open it: remove the vault from every consumer
+///   registry that could re-open it — including any auxiliary consumer
+///   such as an extension sharing the container — because [`Engine::open`]
+///   is create-and-ingest and will re-materialise the mirror from the
+///   untouched KDBX if anything opens the path during or after purge.
+/// - Derive `db_path` and construct `key_provider` from the **same vault
+///   identity, at a single call site**: this seam cannot cross-check that
+///   the path and the provider's key target the same vault, so a
+///   right-path/wrong-key mis-pairing is a caller-construction bug it
+///   cannot detect.
+/// - Purge is **crypto-shredding**: durability rests on the key being
+///   genuinely destroyed and never re-minted (see
+///   [`VaultDbKeyProvider::acquire_db_key`] /
+///   [`VaultDbKeyProvider::delete_db_key`]); the unlinked ciphertext is
+///   not byte-scrubbed.
 ///
 /// Resilient: every step is attempted even if an earlier one fails,
-/// absent sidecar files are not an error, and the first error
-/// encountered is returned (so a caller can surface and retry it).
-/// Idempotent, so a re-run of a partially-failed purge converges.
+/// absent sidecar files are not an error, and the first error encountered
+/// is returned (so a caller can surface and retry it). Idempotent, so a
+/// re-run of a partially-failed purge converges.
 ///
 /// # Errors
 ///
 /// - [`EngineError::KeyProvider`] if the keystore refused the key
-///   deletion.
+///   deletion (including the fail-closed default of a provider that
+///   doesn't implement `delete_db_key`).
 /// - [`EngineError::Internal`] if a sidecar file existed but couldn't be
 ///   removed.
 #[uniffi::export]
 pub fn purge_vault_local_data(
     db_path: String,
     key_provider: Arc<dyn VaultDbKeyProvider>,
-) -> Result<(), EngineError> {
+) -> Result<u32, EngineError> {
     let kp = BridgeDbKeyProvider::new(key_provider);
     Ok(eng::Engine::purge_local_data(&PathBuf::from(db_path), &kp)?)
 }
