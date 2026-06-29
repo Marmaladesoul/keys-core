@@ -33,7 +33,8 @@ use keys_ffi::{
     DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, Engine, EngineEntryUpdate,
     EntryAttachmentChoiceFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, IconRef,
     NewEntryFields, Page, ParkConflictsResultFfi, ResolutionFfi, Vault, VaultIdentityVerdict,
-    purge_vault_local_data, verify_vault_identity,
+    open_vault_self_healing, purge_vault_local_data, rebuild_vault_local_data,
+    verify_vault_identity,
 };
 
 use adapters::{FixedDbKey, FixedProtector, RecordingDbKey};
@@ -176,6 +177,18 @@ enum Command {
     /// provider's `deleteDbKey`.
     Purge {
         /// Path to the .kdbx vault whose local mirror to destroy.
+        vault: PathBuf,
+    },
+    /// Discard a vault's stale local mirror sidecar and rebuild it from
+    /// the canonical KDBX, KEEPING the mirror's DB key. The recovery a
+    /// client drives when the sidecar's cached *session* key has been
+    /// rotated out and protected reads fail (the post-open arm of the
+    /// self-heal; the open-time arm runs automatically inside every
+    /// open). Drives the engine-owned `rebuild_vault_local_data`. Unlike
+    /// `purge`, the DB key is preserved — the rebuilt sidecar is sealed
+    /// under it.
+    Rebuild {
+        /// Path to the .kdbx vault whose local mirror to rebuild.
         vault: PathBuf,
     },
     /// Open a vault and print its high-level state (counts, recycle
@@ -679,6 +692,13 @@ async fn main() -> Result<()> {
             // dance — we're erasing the mirror, not reading it.
             purge_vault(&vault)?;
         }
+        Command::Rebuild { vault } => {
+            // Recovery, not a Session op: rebuild is path-based (it drives
+            // the engine-owned discard + re-ingest), re-gating on the
+            // password via the KDBX unlock, so it skips Session's own
+            // ingest/reconcile dance.
+            rebuild_vault(&vault, &password, keyfile.clone()).await?;
+        }
         Command::Inspect { vault } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
@@ -949,25 +969,45 @@ impl Session {
                 None,
                 ms,
                 seed,
-            ),
+            )
+            .map_err(|e| anyhow::anyhow!("engine open: {e:?}"))?,
             (Some(ms), None) => Engine::open_with_fixed_clock(
                 db_path,
                 Arc::new(FixedDbKey),
                 Arc::new(FixedProtector),
                 None,
                 ms,
-            ),
+            )
+            .map_err(|e| anyhow::anyhow!("engine open: {e:?}"))?,
             (None, Some(_)) => {
                 anyhow::bail!("--uuid-seed requires --at (a pinned clock) to be reproducible");
             }
-            (None, None) => Engine::open(
-                db_path,
-                Arc::new(FixedDbKey),
-                Arc::new(FixedProtector),
-                None, // no file watcher — keyhole drives state explicitly
-            ),
-        }
-        .map_err(|e| anyhow::anyhow!("engine open: {e:?}"))?;
+            // Production-shaped open (system clock, random ids): drive the
+            // self-healing path the GUI clients drive. A sidecar whose
+            // cached key no longer decrypts it (a wiped / rotated mirror
+            // key) is discarded and rebuilt from the KDBX rather than
+            // blocking the unlock. Only this path can meet a real keystore;
+            // the deterministic clock/uuid paths above always mint a fresh
+            // mirror under the fixed key, so they never hit the heal.
+            (None, None) => {
+                let outcome = open_vault_self_healing(
+                    db_path,
+                    vault.to_string_lossy().into_owned(),
+                    password.to_owned(),
+                    keyfile.clone(),
+                    Arc::new(FixedDbKey),
+                    Arc::new(FixedProtector),
+                    None, // no file watcher — keyhole drives state explicitly
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("engine open: {e:?}"))?;
+                if outcome.rebuilt {
+                    // Diagnostics on stderr; scenarios grep this marker.
+                    eprintln!("note: self-heal: rebuilt mirror from kdbx (stale sidecar key)");
+                }
+                outcome.engine
+            }
+        };
 
         let session = Self {
             engine,
@@ -1997,6 +2037,40 @@ fn purge_vault(vault: &Path) -> Result<()> {
     println!("db-key-deleted: {key_deleted}");
     println!("sidecars-removed: {sidecars_removed}");
     println!("purged local data for {}", vault.display());
+    Ok(())
+}
+
+/// Discard a vault's stale local mirror sidecar and rebuild it from the
+/// canonical KDBX, KEEPING the mirror's DB key (the post-open arm of the
+/// self-heal — the SE/session-key case). Drives the engine-owned
+/// `rebuild_vault_local_data`, which discards the sidecar files, re-opens
+/// a fresh mirror under the *same* key, and re-ingests from the KDBX under
+/// the master password (so a wrong password fails closed here, just as at
+/// a normal open).
+///
+/// The open-time arm (a wiped/rotated *DB* key) needs no verb — it runs
+/// automatically inside every `Session::open`. This verb exists for the
+/// post-open arm a real client triggers off its SE-failure signal, which
+/// is not observable at open.
+async fn rebuild_vault(vault: &Path, password: &str, keyfile: Option<Vec<u8>>) -> Result<()> {
+    anyhow::ensure!(vault.exists(), "vault not found: {}", vault.display());
+    let mirror_db = mirror_db_for(vault);
+
+    let sidecars_discarded = rebuild_vault_local_data(
+        mirror_db.to_string_lossy().into_owned(),
+        vault.to_string_lossy().into_owned(),
+        password.to_owned(),
+        keyfile,
+        Arc::new(FixedDbKey),
+        Arc::new(FixedProtector),
+        None,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("rebuild: {e:?}"))?;
+
+    println!("rebuilt: true");
+    println!("sidecars-discarded: {sidecars_discarded}");
+    println!("rebuilt local mirror for {} from kdbx", vault.display());
     Ok(())
 }
 

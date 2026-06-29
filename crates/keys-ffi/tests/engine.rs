@@ -1093,3 +1093,172 @@ fn engine_custom_icon_surface_round_trips_via_ffi() {
         .expect("blob retained");
     assert_eq!(still_there, icon_bytes);
 }
+
+/// `open_vault_self_healing` rebuilds a sidecar whose cached db key no
+/// longer decrypts it, re-ingesting from the KDBX — the open-time arm of
+/// the self-heal (a wiped / rotated `SQLCipher` mirror key).
+#[tokio::test(flavor = "multi_thread")]
+async fn open_vault_self_healing_rebuilds_a_stale_keyed_sidecar() {
+    use keys_ffi::open_vault_self_healing;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    seed_kdbx(&kdbx_path);
+
+    // Populate a sidecar sealed under DB_KEY, then release it.
+    let engine = open_fresh_engine(&db_path);
+    engine
+        .ingest_from_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("seed ingest");
+    engine.close().expect("close");
+
+    // The keystore now hands back a DIFFERENT key (WrongDbKey): the open
+    // must self-heal rather than fail.
+    let healed = open_vault_self_healing(
+        db_path.to_string_lossy().into_owned(),
+        kdbx_path.to_string_lossy().into_owned(),
+        KDBX_PASSWORD.to_owned(),
+        None,
+        Arc::new(WrongDbKey),
+        Arc::new(FixedProtector),
+        None,
+    )
+    .await
+    .expect("self-healing open must succeed under a stale key");
+    assert!(healed.rebuilt, "a stale db key must trigger a rebuild");
+    let entries = healed
+        .engine
+        .list_entries(
+            None,
+            Page {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .expect("list");
+    assert!(
+        !entries.is_empty(),
+        "the rebuilt sidecar must hold the re-ingested entry"
+    );
+    healed.engine.close().expect("close healed");
+
+    // Idempotent: the sidecar is now sealed under WrongDbKey's key, so a
+    // second open under the same key does NOT heal again.
+    let second = open_vault_self_healing(
+        db_path.to_string_lossy().into_owned(),
+        kdbx_path.to_string_lossy().into_owned(),
+        KDBX_PASSWORD.to_owned(),
+        None,
+        Arc::new(WrongDbKey),
+        Arc::new(FixedProtector),
+        None,
+    )
+    .await
+    .expect("second open ok");
+    assert!(
+        !second.rebuilt,
+        "a freshly-rebuilt sidecar must not re-heal"
+    );
+}
+
+/// The self-heal is NOT an auth bypass: a stale db key combined with a
+/// WRONG master password fails closed — the rebuild's re-ingest must
+/// unlock the KDBX under the password, which a wrong one cannot.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_vault_self_healing_wrong_password_fails_closed() {
+    use keys_ffi::open_vault_self_healing;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    seed_kdbx(&kdbx_path);
+
+    let engine = open_fresh_engine(&db_path);
+    engine
+        .ingest_from_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("seed ingest");
+    engine.close().expect("close");
+
+    let err = open_vault_self_healing(
+        db_path.to_string_lossy().into_owned(),
+        kdbx_path.to_string_lossy().into_owned(),
+        "the-wrong-password".to_owned(),
+        None,
+        Arc::new(WrongDbKey),
+        Arc::new(FixedProtector),
+        None,
+    )
+    .await
+    .expect_err("stale key + wrong password must fail closed, not open");
+    // The surfaced error is the KDBX unlock failure (the re-ingest), never
+    // a silent success.
+    let msg = format!("{err:?}");
+    assert!(
+        msg.to_lowercase().contains("kdbx"),
+        "wrong-password failure must surface the KDBX unlock error, got: {msg}",
+    );
+}
+
+/// `rebuild_vault_local_data` (the post-open / session-key arm) rebuilds
+/// the sidecar and, crucially, does NOT delete the keystore db key —
+/// deleting it would brick the rebuild's re-open.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_vault_local_data_rebuilds_without_deleting_the_key() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use keys_ffi::rebuild_vault_local_data;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    seed_kdbx(&kdbx_path);
+
+    open_fresh_engine(&db_path).close().expect("seed mirror");
+
+    let deleted = Arc::new(AtomicBool::new(false));
+    let discarded = rebuild_vault_local_data(
+        db_path.to_string_lossy().into_owned(),
+        kdbx_path.to_string_lossy().into_owned(),
+        KDBX_PASSWORD.to_owned(),
+        None,
+        Arc::new(RecordingDbKey {
+            deleted: deleted.clone(),
+        }),
+        Arc::new(FixedProtector),
+        None,
+    )
+    .await
+    .expect("rebuild ok");
+    assert!(
+        discarded >= 1,
+        "rebuild discards the existing sidecar (>= 1 file)"
+    );
+    assert!(
+        !deleted.load(Ordering::SeqCst),
+        "rebuild must NOT delete the keystore db key — that would brick the re-open",
+    );
+
+    // The rebuilt sidecar opens under the same key and holds the entry.
+    let entries = open_fresh_engine(&db_path)
+        .list_entries(
+            None,
+            Page {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .expect("list");
+    assert!(
+        !entries.is_empty(),
+        "the rebuilt sidecar must hold the re-ingested entry"
+    );
+}
