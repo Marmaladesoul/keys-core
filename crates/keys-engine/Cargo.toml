@@ -34,5 +34,5 @@ uuid = { version = "1", features = ["serde", "v4"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [dev-dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 rand = "0.8"
