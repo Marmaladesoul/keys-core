@@ -1069,6 +1069,44 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   {1,6,20} and 12/12 at one round, with convergence still 240/240 green over
   the new op stream. The general trap is in `reference_bash_subshell_random`.
 
+- **[FIXED] The replay-determinism harness swallowed the inner fuzzer's
+  evidence.** `fuzz-replay-determinism.sh` ran each `fuzz-convergence.sh`
+  replay with `>/dev/null` under `set -e`, so when the inner fuzzer's
+  convergence/parity oracle fired (a `fail()` — digest divergence, held-
+  conflict set differs, contended edit didn't park) the harness exited
+  non-zero with **no output at all**: the failing seed's line never printed,
+  the `fail()` dump (both devices' `list` / `list-groups` / `inspect`) and the
+  `artefacts preserved in: …` path were discarded, and `set -e` aborted before
+  later seeds in the sweep could run. The CI line `FAILED:
+  fuzz-replay-determinism.sh` thus carried zero signal about *which* seed or
+  *which* oracle. **Fix:** capture each run's stdout+stderr to a per-run log
+  and, on failure, print it indented under a seed-named header and `return`
+  non-zero (so the sweep continues instead of `set -e` aborting). This is the
+  instrument for the non-replayable convergence catches below: it does NOT add
+  retry/tolerance — a red is still a real catch — it just stops the gate from
+  hiding the catch. (Surfaced when an intermittent seed-777 convergence catch
+  reddened `main` with an empty log; same seed green on the immediately prior
+  build of the identical tree.)
+
+- **[FIXED] `fuzz-attachments.sh` was not replayable from its seed (the same
+  subshell-`$RANDOM` trap, never migrated).** The attachment fuzzer's header
+  claimed "seeded random", but both its entry picker (`awk -v r=$((RANDOM))`
+  evaluated inside `e="$(random_entry …)"`) and its per-device op count
+  (`$(seq 1 $((RANDOM % 3 + 1)))`) drew `$RANDOM` inside a subshell — the exact
+  two traps `fuzz-convergence.sh` was fixed away from (the picker fix and the
+  op-count residual above), never applied to its attachment twin. Verified
+  latent: two runs of seed 777 produced 26 vs 25 ops with different targets.
+  **Fix (prophylactic — found by auditing `grep -rn '\$RANDOM' scenarios/`, not
+  by a failure):** the picker selects via a deterministic main-shell counter
+  (`pick_idx`) against the title-sorted list, and the count is drawn in the
+  main shell first — mirroring the convergence fuzzer. After: the canonical
+  (op, entry-position, attachment) stream is byte-identical across two seed-777
+  runs; functional soak stayed green over {42,43,777,115,179,7} × {1,6,20}.
+  `fuzz-attachments` has no replay twin gating it, so this was a latent hole (a
+  failing run couldn't be replayed), not a live red. **Lesson reinforced: any
+  `$RANDOM` reached through `$(...)`/`$(seq …)` is the bug — audit every
+  seeded scenario, not just the one a failure points at.**
+
 - **[FIXED] Finding #10 — a dissolved conflict left a ghost badge
   (`parked_conflict_uuids` reported a conflict `held_conflict_payload`
   considered gone).** Surfaced by the hardened fuzzer (parity oracle;

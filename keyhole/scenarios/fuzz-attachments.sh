@@ -12,6 +12,13 @@
 # Names are device-prefixed: same-name both-sided attachment edits
 # stay on the conservative no-auto-pick path until the remaining 5c
 # slice (both-sided attachment park/resolve) lands.
+#
+# Reproducibility: the op stream is a pure function of FUZZ_SEED. Both the
+# entry picker and the per-device op count draw from the MAIN-shell seeded
+# $RANDOM stream (the picker via a deterministic main-shell counter), never
+# inside a `$(...)`/`$(seq …)` subshell — bash reseeds a subshell's $RANDOM
+# with run-varying entropy, which would desync the stream from the seed and
+# make a failing run unreplayable. See reference_bash_subshell_random.
 
 set -euo pipefail
 
@@ -42,10 +49,22 @@ for t in alpha beta gamma; do
 done
 cp "$A" "$B"
 
+# Deterministic pick index from the main-shell op counter $n and the seed.
+# CRUCIAL: this must NOT read $RANDOM, because random_entry runs inside a
+# `$(...)` command substitution (`e="$(random_entry …)"`) and bash reseeds a
+# subshell's $RANDOM with run-varying entropy — so a $RANDOM-based pick is not
+# reproducible across runs, silently desyncing the op stream from the seed
+# (the same trap fuzz-convergence.sh was fixed away from; see
+# reference_bash_subshell_random + DESIGN.md Findings). $n is a main-shell
+# counter, a pure function of the seeded run, so a pick derived from it replays.
+pick_idx() { # $1=op counter → a large deterministic non-negative int
+    echo $(( ($1 * 48271 + SEED * 2654435761) % 1000000000 ))
+}
+
 random_entry() { # $1=vault → uuid of a random entry (title-sorted index)
     "$KEYHOLE" list "$1" 2>/dev/null | awk 'NF>1 && $1 ~ /^[0-9a-f-]{36}$/ {print $2, $1}' \
         | sort | awk '{print $2}' \
-        | awk -v r=$((RANDOM)) 'BEGIN{srand(r)} {a[NR]=$0} END{if (NR) print a[int(rand()*NR)+1]}'
+        | awk -v idx="$(pick_idx "$n")" '{a[NR]=$0} END{if (NR) print a[(idx % NR)+1]}'
 }
 
 n=0
@@ -62,8 +81,14 @@ mutate() { # $1=vault $2=device-prefix — one random attachment op
 }
 
 for round in $(seq 1 "$ROUNDS"); do
-    for _ in $(seq 1 $((RANDOM % 3 + 1))); do mutate "$A" a; done
-    for _ in $(seq 1 $((RANDOM % 3 + 1))); do mutate "$B" b; done
+    # Draw the per-device op count in the MAIN shell first. Reading $RANDOM
+    # directly inside `$(seq 1 $((RANDOM % 3 + 1)))` evaluates it in the
+    # command-substitution subshell, which bash reseeds with run-varying
+    # entropy — so the count (hence the whole op stream) would desync across
+    # runs of one seed. A main-shell assignment is a pure function of the
+    # seeded stream, so it replays. Same subshell-$RANDOM trap as the picker.
+    na=$((RANDOM % 3 + 1)); for _ in $(seq 1 "$na"); do mutate "$A" a; done
+    nb=$((RANDOM % 3 + 1)); for _ in $(seq 1 "$nb"); do mutate "$B" b; done
 
     "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
     "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
