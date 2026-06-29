@@ -743,6 +743,55 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   always present in the root-group UUID; this closed a *reachability* gap (the
   seam couldn't read a picked file's identity below the GUI line) and pins the
   verdict contract a relink guard inherits.
+- **Done (2026-06-29, sidecar self-heal):** a vault's local `SQLCipher`
+  sidecar is a *disposable derived cache* of the canonical KDBX, so when it
+  can't be opened because its cached key material is missing/invalid, the
+  seam discards it and re-ingests from the KDBX rather than letting a dead
+  cache block a *correct* unlock. Two recovery shapes, split by where the
+  failure surfaces: (1) the `SQLCipher` *mirror key* no longer decrypts the
+  sidecar — `Engine::open` returns `WrongKey`, the sole recoverable signal
+  *at open* (open takes no master password and no KDBX path, so a wrong
+  password can never reach it). Handled automatically by the new keys-ffi
+  `open_vault_self_healing`. (2) the field-protection *session key* was
+  rotated out — protected reads fail AES-GCM *after* a successful open (not
+  observable at open), driven explicitly via `rebuild_vault_local_data`.
+  The classifier `EngineError::is_recoverable_sidecar_failure` is the one
+  source of truth — engine-side, **before** the FFI flatten folds the
+  recoverable read-side unwrap errors and genuine corruption into one
+  opaque variant. It covers `WrongKey` + the projection/reveal `Unwrap` /
+  `SessionKey` family, and deliberately EXCLUDES: the *write-side*
+  `Wrap` / `Ingest` seal failures **and the top-level `SessionKey`** (all
+  minted only on the mutation path — a rebuild would silently drop an
+  in-flight write); `KeyProvider` / `KeyUnavailable` (couldn't acquire a
+  key at all — re-open is futile and `acquire_db_key` never provisions on a
+  miss, so it would brick); and the KDBX-layer wrong-password / parse
+  errors (which surface a rung below, at ingest/reconcile). **Safe by
+  construction:** the rebuild re-ingests from the KDBX, which must unlock
+  under the master password — a wrong password fails closed, so this is
+  never an auth bypass; it only stops a stale cache from blocking a correct
+  unlock. **At-most-once:** a single discard + open + ingest, no retry; a
+  failed rebuild surfaces the real error rather than looping. The recovery
+  reuses the purge teardown's file machinery via a shared
+  `unlink_sidecar_files`, but through a NEW `Engine::discard_sidecar` that
+  unlinks the sidecar files while **keeping** the keystore DB key — the
+  load-bearing difference from `purge_local_data` (which destroys the key
+  first): deleting the key here would turn a recoverable stale-sidecar into
+  a permanent key-unavailable brick. keyhole forces the broken state with
+  env-overridable adapter keys (seed under one mirror/session key, reopen
+  under another) and drives both arms — the open-time heal through every
+  `Session::open`, the session-key arm through a new `rebuild` verb. Pinned
+  by [sidecar-self-heal.sh](scenarios/sidecar-self-heal.sh) (auto-heal on a
+  stale mirror key; one-shot; wrong password fails closed; a corrupt KDBX
+  surfaces the real error without looping) +
+  [sidecar-self-heal-session-key.sh](scenarios/sidecar-self-heal-session-key.sh)
+  (a rotated session key breaks protected reads, the rebuild re-seals from
+  the KDBX) + engine `discard_sidecar_removes_files_but_keeps_the_db_key` /
+  `rebuild_local_data_recovers_a_stale_keyed_sidecar` + the
+  `is_recoverable_sidecar_failure` truth-table unit tests + keys-ffi
+  `open_vault_self_healing_*` / `rebuild_vault_local_data_*`. No behaviour
+  gap surfaced below the seam — this added a recovery the seam was best
+  placed to own: a consumer otherwise can't tell a stale cache from a wrong
+  password, and would hard-fail a correct unlock against a dead sidecar.
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the

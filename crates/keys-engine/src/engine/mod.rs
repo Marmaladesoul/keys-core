@@ -1265,22 +1265,87 @@ impl Engine {
         // journal, present only if WAL was never engaged). Count the files
         // actually unlinked so the caller can detect a `db_path` that
         // resolved to nothing (a zero count — see the return doc).
-        let mut sidecars_removed: u32 = 0;
-        for suffix in ["-wal", "-shm", "-journal", ""] {
-            let target = sidecar_path(db_path, suffix);
-            match remove_file_if_present(&target) {
-                Ok(true) => sidecars_removed += 1,
-                Ok(false) => {}
-                Err(err) => {
-                    first_err.get_or_insert(EngineError::Io(err));
-                }
-            }
+        let (sidecars_removed, io_err) = unlink_sidecar_files(db_path);
+        if let Some(err) = io_err {
+            first_err.get_or_insert(EngineError::Io(err));
         }
 
         match first_err {
             Some(err) => Err(err),
             None => Ok(sidecars_removed),
         }
+    }
+
+    /// Delete this vault's local `SQLCipher` sidecar files **without**
+    /// touching the keystore DB key — the recovery counterpart to
+    /// [`Engine::purge_local_data`].
+    ///
+    /// Where `purge_local_data` crypto-shreds a *removed* vault (key
+    /// deleted first, so the unlinked ciphertext is unrecoverable),
+    /// `discard_sidecar` throws away a *stale* sidecar so it can be rebuilt
+    /// from the canonical KDBX. The DB key MUST survive: the rebuild's
+    /// re-open re-acquires the same key to seal the fresh sidecar, and
+    /// [`KeyProvider::acquire_db_key`] does not provision on a miss — so
+    /// deleting the key here would convert a recoverable stale-sidecar into
+    /// a permanent "key unavailable" brick. This is the load-bearing
+    /// difference from purge: same file teardown, key left intact.
+    ///
+    /// Best-effort, absent-tolerant, and idempotent like
+    /// [`Engine::purge_local_data`]: returns the count of sidecar files
+    /// actually unlinked (`0` ⇒ `db_path` resolved to nothing on disk), or
+    /// the first IO error if a present file could not be removed.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Io`] if a sidecar file existed but could not be
+    ///   removed.
+    pub fn discard_sidecar(db_path: &Path) -> Result<u32, EngineError> {
+        let (removed, io_err) = unlink_sidecar_files(db_path);
+        match io_err {
+            Some(err) => Err(EngineError::Io(err)),
+            None => Ok(removed),
+        }
+    }
+
+    /// Discard this vault's stale local sidecar and rebuild it from the
+    /// canonical KDBX — the recovery path the self-heal drives when an open
+    /// fails because the sidecar's cached key material is missing/invalid
+    /// (see [`EngineError::is_recoverable_sidecar_failure`]).
+    ///
+    /// Sequence: [`Engine::discard_sidecar`] (unlink the mirror files,
+    /// **keeping** the keystore DB key) → a fresh [`Engine::open`] (mints a
+    /// clean sidecar under the *current* key) → [`Engine::ingest_from_kdbx`]
+    /// (re-seals every protected field under the *current* session key).
+    /// The engine stays password-free: the caller unlocks the KDBX and
+    /// hands in the already-[`Unlocked`] vault, exactly as
+    /// [`Engine::ingest_from_kdbx`] takes it. Re-gating on
+    /// the master password is therefore the caller's unlock step, so this
+    /// is never an auth bypass.
+    ///
+    /// **At-most-once by construction:** a single discard + open + ingest,
+    /// no internal retry. If the fresh open or the ingest fails, that error
+    /// is surfaced — the caller must not feed it back into another rebuild.
+    ///
+    /// Returns the rebuilt engine and the count of stale sidecar files that
+    /// were discarded (the latter lets a caller confirm a populated sidecar
+    /// was actually torn down, not a no-op on a mis-targeted path).
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Io`] from the discard step.
+    /// - Any error from the fresh [`Engine::open`] or the
+    ///   [`Engine::ingest_from_kdbx`] that repopulates the sidecar.
+    pub fn rebuild_local_data(
+        db_path: &Path,
+        key_provider: &dyn KeyProvider,
+        field_protector: Arc<dyn FieldProtector>,
+        file_watcher: Option<Arc<dyn FileWatcher>>,
+        kdbx: &Kdbx<Unlocked>,
+    ) -> Result<(Self, u32), EngineError> {
+        let discarded = Self::discard_sidecar(db_path)?;
+        let mut engine = Self::open(db_path, key_provider, field_protector, file_watcher)?;
+        engine.ingest_from_kdbx(kdbx)?;
+        Ok((engine, discarded))
     }
 
     /// Install a [`DataChangeObserver`]. Replaces any previously
@@ -1439,6 +1504,28 @@ fn remove_file_if_present(path: &Path) -> std::io::Result<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
     }
+}
+
+/// Unlink the mirror's full on-disk footprint at `base`: the DB file plus
+/// the WAL-mode `-wal` / `-shm` siblings and a legacy `-journal`. Returns
+/// the count of files actually unlinked and the first IO error (if any) —
+/// every suffix is attempted regardless, and absent files are not errors.
+/// The shared teardown both [`Engine::purge_local_data`] (which also
+/// destroys the key) and [`Engine::discard_sidecar`] (which keeps it) drive,
+/// so the two can never drift on which files constitute "the sidecar".
+fn unlink_sidecar_files(base: &Path) -> (u32, Option<std::io::Error>) {
+    let mut removed: u32 = 0;
+    let mut first_err: Option<std::io::Error> = None;
+    for suffix in ["-wal", "-shm", "-journal", ""] {
+        match remove_file_if_present(&sidecar_path(base, suffix)) {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(err) => {
+                first_err.get_or_insert(err);
+            }
+        }
+    }
+    (removed, first_err)
 }
 
 /// Walk `group` (and its descendants) looking for the parent

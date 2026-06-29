@@ -1586,3 +1586,159 @@ pub fn purge_vault_local_data(
     let kp = BridgeDbKeyProvider::new(key_provider);
     Ok(eng::Engine::purge_local_data(&PathBuf::from(db_path), &kp)?)
 }
+
+/// The outcome of [`open_vault_self_healing`]: the opened engine, plus
+/// whether the open had to self-heal a stale sidecar.
+#[derive(uniffi::Record, Debug)]
+pub struct SelfHealingOpen {
+    /// The opened, ready-to-use engine.
+    pub engine: Arc<Engine>,
+    /// `true` iff the sidecar could not be opened under its cached key and
+    /// was discarded + rebuilt from the KDBX before this open succeeded.
+    ///
+    /// A client SHOULD log this loudly. A one-off is the expected recovery
+    /// from a keystore reset; a *recurring* rebuild is a red flag that the
+    /// key material is being lost repeatedly — a deeper problem the
+    /// self-heal would otherwise paper over.
+    pub rebuilt: bool,
+}
+
+/// Open the vault's `SQLCipher` sidecar at `db_path`, self-healing a stale
+/// sidecar if necessary.
+///
+/// Tries an ordinary [`Engine::open`]. If — and only if — that fails
+/// because the sidecar's cached key material no longer decrypts it
+/// ([`keys_engine::EngineError::is_recoverable_sidecar_failure`]; at open
+/// that is exclusively a wrong `SQLCipher` mirror key, never a wrong master
+/// password, which this call never sees), the sidecar is treated as the
+/// disposable derived cache it is: discarded and rebuilt from the KDBX at
+/// `kdbx_path` under `password` (+ optional `keyfile`). The keystore DB key
+/// is preserved across the rebuild (the fresh sidecar is sealed under it).
+///
+/// Any *other* open failure is surfaced unchanged. A wrong password or
+/// corrupt KDBX surfaced by the rebuild's own re-ingest is likewise
+/// surfaced — the re-ingest re-gates on the password, so the self-heal can
+/// never be an auth bypass. **At most one rebuild per call:** if the
+/// post-rebuild open or ingest fails, the real error is returned, never a
+/// loop.
+///
+/// On the happy path (the sidecar opened cleanly) this does NOT ingest —
+/// the caller keeps its own skip-vs-ingest decision (the
+/// kdbx-state-signature fast path). Only the heal path re-ingests, because
+/// a freshly-rebuilt sidecar is empty; it then records the post-ingest
+/// signature so the caller's next open still takes the fast path. If that
+/// signature write fails *after* a successful rebuild, the call surfaces
+/// the error even though the rebuilt sidecar is durable on disk — a soft,
+/// self-correcting state: the caller's next open finds no signature and
+/// re-ingests (the same posture as the main `ingest_from_kdbx` path).
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn open_vault_self_healing(
+    db_path: String,
+    kdbx_path: String,
+    password: String,
+    keyfile: Option<Vec<u8>>,
+    key_provider: Arc<dyn VaultDbKeyProvider>,
+    field_protector: Arc<dyn VaultFieldProtector>,
+    file_watcher: Option<Arc<dyn VaultFileWatcher>>,
+) -> Result<SelfHealingOpen, EngineError> {
+    let pw = SecretString::from(password);
+    tokio::task::spawn_blocking(move || {
+        let db = PathBuf::from(&db_path);
+        let kdbx = PathBuf::from(&kdbx_path);
+        let kp = BridgeDbKeyProvider::new(key_provider);
+        // A fresh bridged protector per open (the engine takes it by value).
+        let bridged_protector = || -> Arc<dyn keepass_core::protector::FieldProtector> {
+            Arc::new(BridgeProtector::new(Arc::clone(&field_protector)))
+        };
+        match eng::Engine::open(
+            &db,
+            &kp,
+            bridged_protector(),
+            engine_file_watcher::bridge(file_watcher.clone()),
+        ) {
+            Ok(inner) => Ok(SelfHealingOpen {
+                engine: wrap_engine(inner),
+                rebuilt: false,
+            }),
+            Err(e) if e.is_recoverable_sidecar_failure() => {
+                // Re-gate on the password by unlocking the KDBX first: a
+                // wrong password / corrupt KDBX fails closed HERE and is
+                // surfaced as the genuine error, never masked as a heal.
+                let unlocked = open_unlocked_kf(&kdbx, &pw, keyfile.as_deref())?;
+                let (mut inner, _discarded) = eng::Engine::rebuild_local_data(
+                    &db,
+                    &kp,
+                    bridged_protector(),
+                    engine_file_watcher::bridge(file_watcher.clone()),
+                    &unlocked,
+                )?;
+                inner.record_kdbx_state_signature(&kdbx)?;
+                Ok(SelfHealingOpen {
+                    engine: wrap_engine(inner),
+                    rebuilt: true,
+                })
+            }
+            Err(e) => Err(e.into()),
+        }
+    })
+    .await
+    .map_err(|e| EngineError::Internal(format!("join: {e}")))?
+}
+
+/// Discard a vault's stale local sidecar and rebuild it from the canonical
+/// KDBX, **keeping** the keystore DB key — the post-open counterpart to
+/// [`open_vault_self_healing`].
+///
+/// A client drives this when it observes — *after* a successful open — that
+/// its field-protection (session) key has been rotated out and protected
+/// reads have begun to fail (the Secure-Enclave session-key case, which is
+/// not observable at open). Like the open-time heal it re-gates on the
+/// master password via the KDBX unlock, so a wrong password fails closed.
+///
+/// Returns the count of stale sidecar files discarded (`>= 1` confirms a
+/// populated sidecar was actually torn down, not a no-op on a stale path).
+/// The rebuilt sidecar is flushed to disk as the engine handle is dropped.
+///
+/// Caller note: this rebuilds from the KDBX, so any local mutation not yet
+/// saved back to the KDBX is dropped. That is intrinsic to "re-ingest from
+/// the source of truth" and is acceptable for the mid-session SE-failure
+/// case (the session was already unusable for protected fields).
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn rebuild_vault_local_data(
+    db_path: String,
+    kdbx_path: String,
+    password: String,
+    keyfile: Option<Vec<u8>>,
+    key_provider: Arc<dyn VaultDbKeyProvider>,
+    field_protector: Arc<dyn VaultFieldProtector>,
+    file_watcher: Option<Arc<dyn VaultFileWatcher>>,
+) -> Result<u32, EngineError> {
+    let pw = SecretString::from(password);
+    tokio::task::spawn_blocking(move || {
+        let db = PathBuf::from(&db_path);
+        let kdbx = PathBuf::from(&kdbx_path);
+        let kp = BridgeDbKeyProvider::new(key_provider);
+        let fp: Arc<dyn keepass_core::protector::FieldProtector> =
+            Arc::new(BridgeProtector::new(field_protector));
+        let unlocked = open_unlocked_kf(&kdbx, &pw, keyfile.as_deref())?;
+        let (mut inner, discarded) = eng::Engine::rebuild_local_data(
+            &db,
+            &kp,
+            fp,
+            engine_file_watcher::bridge(file_watcher),
+            &unlocked,
+        )?;
+        inner.record_kdbx_state_signature(&kdbx)?;
+        drop(inner);
+        Ok(discarded)
+    })
+    .await
+    .map_err(|e| EngineError::Internal(format!("join: {e}")))?
+}
+
+/// Wrap an opened [`keys_engine::Engine`] in the FFI handle.
+fn wrap_engine(inner: eng::Engine) -> Arc<Engine> {
+    Arc::new(Engine {
+        inner: Mutex::new(Some(inner)),
+    })
+}
