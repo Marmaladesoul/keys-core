@@ -162,6 +162,64 @@ pub enum EngineError {
     },
 }
 
+impl EngineError {
+    /// True iff this error means the vault's local `SQLCipher` *sidecar* —
+    /// a disposable derived cache of the canonical KDBX — can't be used
+    /// because its cached key material is missing/invalid, so the engine
+    /// can self-heal by discarding the sidecar and re-ingesting from the
+    /// KDBX (via [`Engine::rebuild_local_data`](crate::Engine::rebuild_local_data)).
+    ///
+    /// Two recoverable shapes, distinguished by where they surface:
+    /// - [`WrongKey`](Self::WrongKey) — the `SQLCipher` mirror key no
+    ///   longer decrypts the sidecar (a wiped / rotated keystore key).
+    ///   This is the ONLY recoverable signal observable from
+    ///   [`Engine::open`](crate::Engine::open); that call never sees the
+    ///   master password or the KDBX, so it can never be a wrong-password
+    ///   failure in disguise.
+    /// - the protected-field *read* failures —
+    ///   [`Projection`](Self::Projection) / [`Reveal`](Self::Reveal)
+    ///   `Unwrap` / `SessionKey` — meaning the field-protection session
+    ///   key can't open the sidecar's sealed blobs (a rotated
+    ///   Secure-Enclave session key). These surface only *after* a
+    ///   successful open, on the first protected read / projection.
+    ///
+    /// Deliberately **not** recoverable — rebuilding can't help, or would
+    /// mask a real fault, or would lose data:
+    /// - [`KeyProvider`](Self::KeyProvider): the keystore couldn't yield a
+    ///   key at all (transient lock, or a durably-absent entry). A rebuild
+    ///   re-enters the same `acquire_db_key` on re-open, so it is futile —
+    ///   and, because open never provisions, would leave the vault bricked.
+    /// - [`Wrap`](Self::Wrap), the top-level [`SessionKey`](Self::SessionKey),
+    ///   and [`Ingest`](Self::Ingest): *write*-side seal / session-key /
+    ///   source-KDBX failures on a live mutation or ingest, not a stale
+    ///   read cache. The read-side stale-session-key case is covered above
+    ///   by the `Projection` / `Reveal` `SessionKey` arms; the top-level
+    ///   `SessionKey` variant is minted only on the mutation path, so
+    ///   rebuilding it would silently discard the in-flight write — the
+    ///   same hazard the `Wrap` exclusion guards against.
+    /// - wrong master password / corrupt KDBX: never reach this classifier
+    ///   at all — they surface at the ingest / reconcile (KDBX) layer, a
+    ///   rung below the sidecar.
+    /// - [`Sqlite`](Self::Sqlite), [`Migration`](Self::Migration),
+    ///   [`Random`](Self::Random), [`Io`](Self::Io) and the rest: genuine
+    ///   faults that must be surfaced, never silently healed.
+    ///
+    /// This is the single source of truth for the self-heal trigger, and
+    /// it is deliberately classified on the *engine* error — the
+    /// FFI-flattened error folds the recoverable unwrap failures and
+    /// genuine corruption into one opaque variant, so the decision must be
+    /// made here, before that boundary.
+    #[must_use]
+    pub fn is_recoverable_sidecar_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::WrongKey
+                | Self::Projection(ProjectionError::Unwrap(_) | ProjectionError::SessionKey(_))
+                | Self::Reveal(RevealError::Unwrap(_) | RevealError::SessionKey(_))
+        )
+    }
+}
+
 /// Errors surfaced specifically by [`crate::Engine::project_to_vault`].
 ///
 /// Projection is mostly a fan of `SELECT`s + an AES-GCM unwrap pass;
@@ -224,4 +282,67 @@ pub enum RevealError {
     /// [`ProjectionError::Json`].
     #[error("history snapshot deserialisation failed: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::key_provider::KeyProviderError;
+
+    #[test]
+    fn recoverable_sidecar_failures_are_exactly_the_stale_key_class() {
+        // RECOVERABLE: a wiped/rotated mirror key (at open) and the
+        // protected-field unwrap / session-key-unavailable failures (a
+        // rotated session key, surfaced post-open).
+        let recoverable = [
+            EngineError::WrongKey,
+            // The read-side stale-session-key failures (a rotated session
+            // key, surfaced post-open on a projection / reveal).
+            EngineError::Projection(ProjectionError::Unwrap("tag mismatch".into())),
+            EngineError::Projection(ProjectionError::SessionKey("se gone".into())),
+            EngineError::Reveal(RevealError::Unwrap("tag mismatch".into())),
+            EngineError::Reveal(RevealError::SessionKey("se gone".into())),
+        ];
+        for err in &recoverable {
+            assert!(
+                err.is_recoverable_sidecar_failure(),
+                "{err:?} should be a recoverable sidecar failure",
+            );
+        }
+    }
+
+    #[test]
+    fn non_recoverable_failures_are_not_self_healed() {
+        // NOT recoverable: rebuilding can't help, or would mask a real
+        // fault, or would discard an in-flight write.
+        let not_recoverable = [
+            // Couldn't acquire a key at all — re-open re-enters the same
+            // acquire; a rebuild is futile.
+            EngineError::KeyProvider(KeyProviderError::KeyUnavailable("locked".into())),
+            // WRITE-side seal / session-key on a live mutation — not a
+            // stale read cache; rebuilding would drop the in-flight write.
+            // (The read-side stale-session-key case is the Projection /
+            // Reveal SessionKey arms above; the top-level SessionKey is
+            // minted only on the mutation path.)
+            EngineError::Wrap("seal failed".into()),
+            EngineError::SessionKey("se gone".into()),
+            EngineError::Ingest(IngestError::Wrap("seal failed".into())),
+            EngineError::Ingest(IngestError::SessionKey("se gone".into())),
+            // The disk-KDBX layer: wrong password / corruption surface here,
+            // never as a sidecar failure.
+            EngineError::Serialise("unlock disk kdbx: decryption failed".into()),
+            // Producer mismatch / genuine corruption of the sidecar shape.
+            EngineError::Projection(ProjectionError::SchemaInvariant("no root group".into())),
+            // Plain faults that must be surfaced.
+            EngineError::NotEvaluable,
+            EngineError::CycleDetected,
+            EngineError::NotFound { entity: "password" },
+        ];
+        for err in &not_recoverable {
+            assert!(
+                !err.is_recoverable_sidecar_failure(),
+                "{err:?} must NOT be self-healed",
+            );
+        }
+    }
 }
