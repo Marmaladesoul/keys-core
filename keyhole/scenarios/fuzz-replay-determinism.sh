@@ -42,16 +42,31 @@ ROUNDS="${FUZZ_ROUNDS:-6}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-run() { # $1=seed $2=capture-dir
-    FUZZ_SEED="$1" FUZZ_ROUNDS="$ROUNDS" FUZZ_KEEP="$2" bash "$FUZZER" >/dev/null
+# Captures the fuzzer's stdout+stderr (which carries fail() diagnostics from
+# fuzz-convergence.sh, plus the preserved-artefacts path) to a per-run log so
+# a failure surfaces the actual assertion rather than silently exiting via
+# set -e. Returning non-zero (rather than letting set -e abort here) lets the
+# loop print the captured log and move on to the next seed — without that, a
+# fuzzer failure on the first seed eats every later seed's signal too.
+run() { # $1=seed $2=capture-dir $3=log-path
+    if ! FUZZ_SEED="$1" FUZZ_ROUNDS="$ROUNDS" FUZZ_KEEP="$2" \
+         bash "$FUZZER" >"$3" 2>&1; then
+        echo "FAIL: seed=$1 — underlying fuzzer (fuzz-convergence.sh) failed; output:"
+        sed 's/^/    /' "$3"
+        return 1
+    fi
 }
 
 fails=0
 for seed in $SEEDS; do
     d1="$TMP/$seed/run1"
     d2="$TMP/$seed/run2"
-    run "$seed" "$d1"
-    run "$seed" "$d2"
+    if ! run "$seed" "$d1" "$TMP/$seed.run1.log"; then
+        fails=$((fails + 1)); continue
+    fi
+    if ! run "$seed" "$d2" "$TMP/$seed.run2.log"; then
+        fails=$((fails + 1)); continue
+    fi
 
     if ! diff -r "$d1" "$d2" >"$TMP/$seed.delta" 2>&1; then
         echo "FAIL: seed=$seed ($ROUNDS rounds) — runs diverged, fuzzer is not byte-reproducible:"
