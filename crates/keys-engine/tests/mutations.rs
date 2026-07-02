@@ -292,6 +292,113 @@ fn recycle_entry_enabled_without_bin_lazy_creates_and_recycles() {
     );
 }
 
+// ── entry_count_excluding_recycle_bin (the "live" tile / All-Items count) ──
+
+#[test]
+fn live_count_excludes_a_directly_recycled_entry() {
+    let (mut engine, root, _dir) = engine_with_empty_vault();
+    engine.set_recycle_bin(true, None).expect("enable bin");
+    let _keep = engine
+        .create_entry(root, new_entry("keep", "p"))
+        .expect("create");
+    let bin_me = engine
+        .create_entry(root, new_entry("bin", "p"))
+        .expect("create");
+
+    assert_eq!(engine.entry_count_excluding_recycle_bin().unwrap(), 2);
+    engine.recycle_entry(bin_me).expect("recycle");
+    assert_eq!(
+        engine.entry_count_excluding_recycle_bin().unwrap(),
+        1,
+        "the recycled entry drops out of the live count"
+    );
+    assert_eq!(
+        engine.entry_count(None).unwrap(),
+        2,
+        "but it still exists — it's binned, not gone"
+    );
+}
+
+#[test]
+fn live_count_excludes_an_entry_buried_in_a_recycled_group() {
+    // The membership-vs-flag case. Recycling a *group* (re-parenting it
+    // under the bin) does NOT set `is_recycled` on its descendant entries
+    // in the live mirror — only a later ingest re-derives that from
+    // ancestry. So a `WHERE is_recycled = 0` count would wrongly keep the
+    // buried entry; the live count must exclude it by bin-subtree
+    // membership, matching the entry list the tile summarises.
+    let (mut engine, root, _dir) = engine_with_empty_vault();
+    let bin = engine
+        .create_group(
+            root,
+            NewGroupFields {
+                name: "Recycle Bin".into(),
+                notes: String::new(),
+                icon: IconRef::Builtin(43),
+            },
+        )
+        .expect("create bin");
+    engine.set_recycle_bin(true, Some(bin)).expect("set bin");
+
+    let _alpha = engine
+        .create_entry(root, new_entry("alpha", "p"))
+        .expect("create");
+    let doomed = engine
+        .create_group(
+            root,
+            NewGroupFields {
+                name: "Doomed".into(),
+                notes: String::new(),
+                icon: IconRef::Builtin(48),
+            },
+        )
+        .expect("create group");
+    let buried = engine
+        .create_entry(doomed, new_entry("buried", "p"))
+        .expect("create");
+
+    assert_eq!(
+        engine.entry_count_excluding_recycle_bin().unwrap(),
+        2,
+        "alpha + buried both live while Doomed is at root"
+    );
+
+    engine.move_group(doomed, bin).expect("recycle the group");
+
+    assert!(
+        !engine.entry(buried).unwrap().unwrap().is_recycled,
+        "group recycle leaves the descendant flag untouched in the live mirror"
+    );
+    assert_eq!(
+        engine.entry_count_excluding_recycle_bin().unwrap(),
+        1,
+        "only alpha is live — buried is excluded by membership despite is_recycled = 0"
+    );
+}
+
+#[test]
+fn live_count_equals_total_when_bin_disabled() {
+    // Bin disabled → recycling permanently deletes, so there is no
+    // live/binned distinction and every surviving entry is live.
+    let (mut engine, root, _dir) = engine_with_empty_vault();
+    engine.set_recycle_bin(true, None).expect("enable bin");
+    let _a = engine
+        .create_entry(root, new_entry("a", "p"))
+        .expect("create");
+    let b = engine
+        .create_entry(root, new_entry("b", "p"))
+        .expect("create");
+    engine.recycle_entry(b).expect("recycle");
+    assert_eq!(engine.entry_count_excluding_recycle_bin().unwrap(), 1);
+
+    engine.set_recycle_bin(false, None).expect("disable bin");
+    assert_eq!(
+        engine.entry_count_excluding_recycle_bin().unwrap(),
+        engine.entry_count(None).unwrap(),
+        "disabled: the live count is just the plain total"
+    );
+}
+
 #[test]
 fn ensure_recycle_bin_creates_when_enabled_and_is_idempotent() {
     // Enabled but no bin group (the freshly-added-vault state). `ensure`

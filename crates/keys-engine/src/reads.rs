@@ -652,6 +652,51 @@ pub(crate) fn entry_count(conn: &Connection, group: Option<Uuid>) -> Result<u64,
     Ok(u64_from_db_column(count, 0)?)
 }
 
+/// Count of entries *outside* the recycle bin — the "live" entry count a
+/// client shows on a vault tile / an "All Items" collection, without
+/// hydrating a single entry.
+///
+/// Exclusion is by bin-subtree **membership** (the recursive CTE), not
+/// the per-entry `is_recycled` flag. Recycling an entry directly sets
+/// `is_recycled`, but recycling a *group* only re-parents it under the
+/// bin — its descendant entries keep `is_recycled = 0` in the live
+/// mirror until the next ingest re-derives the flag from ancestry. So a
+/// flag-based `COUNT(... WHERE is_recycled = 0)` transiently over-counts
+/// entries stranded inside a just-recycled group — exactly the
+/// warm-mirror state a client reads right after the mutation, when the
+/// tile is meant to update. Membership is correct in that state and
+/// matches the entry list's own exclusion (it filters by the bin group's
+/// descendants), so a tile count and the list it summarises never
+/// disagree.
+///
+/// Gated on the bin being **enabled**: with it disabled there is no
+/// live/binned distinction (recycling permanently deletes — see
+/// `mutations::recycle_entry`), so every surviving entry is live and the
+/// plain total is returned.
+pub(crate) fn entry_count_excluding_recycle_bin(
+    conn: &Connection,
+) -> Result<u64, EngineError> {
+    if !crate::meta::read_recycle_bin_enabled(conn)? {
+        return entry_count(conn, None);
+    }
+    // `NOT IN` an empty subtree (bin enabled but not yet lazily created)
+    // is true for every row, so a binless-but-enabled vault counts all
+    // entries — correct, nothing is recycled yet.
+    let count: i64 = conn.query_row(
+        "WITH RECURSIVE bin_subtree(uuid) AS ( \
+             SELECT uuid FROM \"group\" WHERE is_recycle_bin = 1 \
+             UNION ALL \
+             SELECT g.uuid FROM \"group\" g \
+                 JOIN bin_subtree b ON g.parent_uuid = b.uuid \
+         ) \
+         SELECT COUNT(*) FROM entry \
+         WHERE group_uuid NOT IN (SELECT uuid FROM bin_subtree)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(u64_from_db_column(count, 0)?)
+}
+
 /// Return the historical snapshots of an entry, ordered oldest-first.
 ///
 /// `EngineError::NotFound { entity: "entry" }` if the entry itself

@@ -335,6 +335,15 @@ impl Engine {
         self.with_engine(|e| Ok(e.entry_count(group)?))
     }
 
+    /// Count of entries outside the recycle bin — the "live" entry count
+    /// a client shows on a vault tile / "All Items", computed with a
+    /// single query and no entry hydration. Bin-subtree membership is
+    /// excluded only while the bin is enabled; see
+    /// `keys_engine`'s `entry_count_excluding_recycle_bin`.
+    pub fn entry_count_excluding_recycle_bin(&self) -> Result<u64, EngineError> {
+        self.with_engine(|e| Ok(e.entry_count_excluding_recycle_bin()?))
+    }
+
     pub fn group_tree(&self) -> Result<Vec<GroupNode>, EngineError> {
         self.with_engine(|e| Ok(e.group_tree()?.into_iter().map(Into::into).collect()))
     }
