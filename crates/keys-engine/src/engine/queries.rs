@@ -73,7 +73,8 @@ impl Engine {
 
     /// Count of entries outside the recycle bin — the vault's "live"
     /// entry count (bin-subtree membership excluded when the bin is
-    /// enabled). See [`crate::reads::entry_count_excluding_recycle_bin`].
+    /// enabled). See `reads::entry_count_excluding_recycle_bin` for the
+    /// membership-vs-flag rationale.
     ///
     /// # Errors
     ///
