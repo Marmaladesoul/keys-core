@@ -71,6 +71,18 @@ impl Engine {
         crate::reads::entry_count(&self.conn, group)
     }
 
+    /// Count of entries outside the recycle bin — the vault's "live"
+    /// entry count (bin-subtree membership excluded when the bin is
+    /// enabled). See `reads::entry_count_excluding_recycle_bin` for the
+    /// membership-vs-flag rationale.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn entry_count_excluding_recycle_bin(&self) -> Result<u64, EngineError> {
+        crate::reads::entry_count_excluding_recycle_bin(&self.conn)
+    }
+
     /// Return every unique tag name in use across the vault, sorted
     /// alphabetically. Empty if no entries are tagged.
     ///

@@ -197,6 +197,13 @@ enum Command {
         /// Path to the .kdbx vault.
         vault: PathBuf,
     },
+    /// Print the count of entries outside the recycle bin (the "live"
+    /// count a client shows on a vault tile / "All Items"), one integer
+    /// on stdout. The engine-owned `entry_count_excluding_recycle_bin`.
+    LiveCount {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+    },
     /// List entry summaries, optionally scoped to a group UUID.
     List {
         /// Path to the .kdbx vault.
@@ -704,6 +711,11 @@ async fn main() -> Result<()> {
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.inspect()?;
         }
+        Command::LiveCount { vault } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.live_count()?;
+        }
         Command::List { vault, group } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
@@ -1103,6 +1115,10 @@ impl Session {
             .engine
             .entry_count(None)
             .map_err(|e| anyhow::anyhow!("entry_count: {e:?}"))?;
+        let live = self
+            .engine
+            .entry_count_excluding_recycle_bin()
+            .map_err(|e| anyhow::anyhow!("entry_count_excluding_recycle_bin: {e:?}"))?;
         let groups = self
             .engine
             .group_tree()
@@ -1124,6 +1140,7 @@ impl Session {
 
         println!("state:        {state:?}");
         println!("entries:      {total}");
+        println!("live entries: {live}");
         println!("groups:       {}", groups.len());
         println!("recycle bin:  {}", if bin { "enabled" } else { "disabled" });
         println!(
@@ -1135,6 +1152,18 @@ impl Session {
             "blob pool:    {} blob(s), {} byte(s)",
             pool.count, pool.bytes
         );
+        Ok(())
+    }
+
+    /// Print the live (recycle-bin-excluded) entry count as a bare
+    /// integer — the greppable assertion surface for the tile / "All
+    /// Items" count a client shows.
+    fn live_count(&self) -> Result<()> {
+        let live = self
+            .engine
+            .entry_count_excluding_recycle_bin()
+            .map_err(|e| anyhow::anyhow!("entry_count_excluding_recycle_bin: {e:?}"))?;
+        println!("{live}");
         Ok(())
     }
 

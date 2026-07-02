@@ -792,6 +792,36 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   gap surfaced below the seam — this added a recovery the seam was best
   placed to own: a consumer otherwise can't tell a stale cache from a wrong
   password, and would hard-fail a correct unlock against a dead sidecar.
+- **Done (2026-07-02, recycle-bin-excluded "live" entry count):** the
+  engine now owns `entry_count_excluding_recycle_bin` — the "live" entry
+  count a client shows on a vault tile / an "All Items" collection,
+  computed with one query and NO entry hydration (`reads.rs`, surfaced on
+  `Engine` in `engine/queries.rs` and on keys-ffi's `Engine`). Previously
+  a consumer wanting this had to either count a fully-hydrated entry list
+  (a per-entry `entry` fetch + per-custom-field call, just to take a
+  length) or re-derive the bin-subtree exclusion itself over
+  `group_tree()`. The exclusion is by bin-subtree **membership** (a
+  recursive CTE from the `is_recycle_bin` group down), gated on the bin
+  being *enabled* — matching the read path the entry list uses, so a tile
+  count and the list it summarises never disagree. Membership, not the
+  per-entry `is_recycled` flag, is load-bearing: recycling a *group*
+  re-parents it under the bin but leaves its descendant entries'
+  `is_recycled = 0` in the live mirror until the next ingest re-derives it
+  from ancestry, so a `WHERE is_recycled = 0` count over-counts the buried
+  entries in exactly the warm-mirror state a client reads right after the
+  mutation. New verb `live-count` (+ a `live entries:` line on `inspect`);
+  pinned by [live-entry-count.sh](scenarios/live-entry-count.sh) — the
+  discriminating buried-in-a-recycled-group case is asserted **warm**
+  (a cold re-ingest normalises the flag, so it can't catch the
+  regression), with teeth verified by swapping in the flag count and
+  watching step 2 go red — plus engine
+  `live_count_excludes_a_directly_recycled_entry` /
+  `live_count_excludes_an_entry_buried_in_a_recycled_group` /
+  `live_count_equals_total_when_bin_disabled`. No behaviour gap below the
+  seam — this closed an ownership/efficiency gap (each client was best
+  served by the engine owning the count rather than hydrating or
+  re-deriving it). GUI hand-off: Keys-Mac's `DatabaseManager.fastEntryCount`
+  becomes a thin call to `Engine.entryCountExcludingRecycleBin()`.
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the
