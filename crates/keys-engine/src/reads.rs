@@ -673,9 +673,7 @@ pub(crate) fn entry_count(conn: &Connection, group: Option<Uuid>) -> Result<u64,
 /// live/binned distinction (recycling permanently deletes — see
 /// `mutations::recycle_entry`), so every surviving entry is live and the
 /// plain total is returned.
-pub(crate) fn entry_count_excluding_recycle_bin(
-    conn: &Connection,
-) -> Result<u64, EngineError> {
+pub(crate) fn entry_count_excluding_recycle_bin(conn: &Connection) -> Result<u64, EngineError> {
     if !crate::meta::read_recycle_bin_enabled(conn)? {
         return entry_count(conn, None);
     }
