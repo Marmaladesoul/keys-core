@@ -32,9 +32,9 @@ use keys_ffi::{
     AttachmentChoiceFfi, AttachmentChoiceKindFfi, ConflictPayloadFfi, ConflictSideFfi,
     DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, Engine, EngineEntryUpdate,
     EntryAttachmentChoiceFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, IconRef,
-    NewEntryFields, Page, ParkConflictsResultFfi, ResolutionFfi, Vault, VaultIdentityVerdict,
-    open_vault_self_healing, purge_vault_local_data, rebuild_vault_local_data,
-    verify_vault_identity,
+    NewEntryFields, Page, ParkConflictsResultFfi, RecycleBinFilter, ResolutionFfi, SearchScope,
+    Vault, VaultIdentityVerdict, open_vault_self_healing, purge_vault_local_data,
+    rebuild_vault_local_data, verify_vault_identity,
 };
 
 use adapters::{FixedDbKey, FixedProtector, RecordingDbKey};
@@ -211,6 +211,24 @@ enum Command {
         /// Only list entries directly inside this group UUID.
         #[arg(long)]
         group: Option<String>,
+    },
+    /// Full-text search over entry fields (title / username / url /
+    /// notes / tags; tokens AND, fields OR), with an EXPLICIT
+    /// recycle-bin filter — the seam contract: bin inclusion is the
+    /// caller's choice (a "Deleted items" view searches *inside* the
+    /// bin), never an implicit policy. Membership is by bin-subtree
+    /// ancestry, so an entry buried in a just-recycled group filters
+    /// correctly even before a re-ingest re-derives its `is_recycled`
+    /// flag.
+    Search {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// Query string.
+        query: String,
+        /// Recycle-bin filter: `exclude` (live entries only), `only`
+        /// (inside the bin only), or `include` (no filtering).
+        #[arg(long, default_value = "exclude", value_parser = ["exclude", "only", "include"])]
+        bin: String,
     },
     /// Recycle (soft-delete) an entry, then persist to the KDBX.
     ///
@@ -720,6 +738,11 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.list(group)?;
+        }
+        Command::Search { vault, query, bin } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.search(&query, &bin)?;
         }
         Command::Recycle {
             vault,
@@ -1338,6 +1361,29 @@ impl Session {
         Ok(())
     }
 
+    /// Full-text search with an explicit recycle-bin filter. Output
+    /// matches `list`: one `uuid  title  <username>` line per hit,
+    /// machine-greppable.
+    fn search(&self, query: &str, bin: &str) -> Result<()> {
+        let bin = match bin {
+            "exclude" => RecycleBinFilter::ExcludeRecycled,
+            "only" => RecycleBinFilter::RecycledOnly,
+            "include" => RecycleBinFilter::IncludeRecycled,
+            other => anyhow::bail!("unknown --bin filter: {other}"),
+        };
+        let page = Page {
+            offset: 0,
+            limit: u64::MAX,
+        };
+        let hits = self
+            .engine
+            .search(query.to_owned(), SearchScope::AnyField, bin, page)
+            .map_err(|e| anyhow::anyhow!("search: {e:?}"))?;
+
+        print_summaries(&hits, "(no matches)", "match", "matches");
+        Ok(())
+    }
+
     fn list(&self, group: Option<String>) -> Result<()> {
         let page = Page {
             offset: 0,
@@ -1348,23 +1394,7 @@ impl Session {
             .list_entries(group, page)
             .map_err(|e| anyhow::anyhow!("list_entries: {e:?}"))?;
 
-        if entries.is_empty() {
-            println!("(no entries)");
-            return Ok(());
-        }
-        for e in &entries {
-            let user = if e.username.is_empty() {
-                String::new()
-            } else {
-                format!("  <{}>", e.username)
-            };
-            println!("{}  {}{user}", e.uuid, e.title);
-        }
-        println!(
-            "\n{} entr{}",
-            entries.len(),
-            if entries.len() == 1 { "y" } else { "ies" }
-        );
+        print_summaries(&entries, "(no entries)", "entry", "entries");
         Ok(())
     }
 
@@ -1797,6 +1827,31 @@ fn disk_signature(vault: &Path) -> Result<(i64, u64)> {
 
 /// Render a park-reconcile outcome. `label` names the operation; the
 /// parked-conflict UUIDs print one per line for scenario grep.
+/// Print entry summaries the way `list` and `search` present them: one
+/// `uuid  title  <username>` line per row (machine-greppable), then a
+/// `\nN <noun>` count footer; `empty` alone when there are no rows.
+fn print_summaries(
+    rows: &[keys_ffi::EngineEntrySummary],
+    empty: &str,
+    singular: &str,
+    plural: &str,
+) {
+    if rows.is_empty() {
+        println!("{empty}");
+        return;
+    }
+    for e in rows {
+        let user = if e.username.is_empty() {
+            String::new()
+        } else {
+            format!("  <{}>", e.username)
+        };
+        println!("{}  {}{user}", e.uuid, e.title);
+    }
+    let noun = if rows.len() == 1 { singular } else { plural };
+    println!("\n{} {noun}", rows.len());
+}
+
 fn print_park_result(label: &str, r: &ParkConflictsResultFfi) {
     match r {
         ParkConflictsResultFfi::NoChange => println!("{label}: no change"),

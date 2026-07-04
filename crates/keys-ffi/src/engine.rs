@@ -64,7 +64,7 @@ use crate::engine_types::{
     AttachmentBlobStats, ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull,
     EntrySave, EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi,
     MergeResult, NewEntryFields, NewGroupFields, Page, ParkConflictsResultFfi, Predicate,
-    SearchScope, SmartFolder, TagUsageCount, VaultState, parse_uuid,
+    RecycleBinFilter, SearchScope, SmartFolder, TagUsageCount, VaultState, parse_uuid,
 };
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
@@ -519,14 +519,20 @@ impl Engine {
         self.with_engine(|e| Ok(e.custom_icon_bytes(u)?))
     }
 
+    /// See [`keys_engine::Engine::search`]. `bin` decides how the
+    /// recycle bin participates — an explicit caller choice, never an
+    /// implicit policy: `ExcludeRecycled` for a search box over live
+    /// entries, `RecycledOnly` for a "Deleted items" view searching
+    /// inside the bin, `IncludeRecycled` for no filtering.
     pub fn search(
         &self,
         query: String,
         scope: SearchScope,
+        bin: RecycleBinFilter,
         page: Page,
     ) -> Result<Vec<EngineEntrySummary>, EngineError> {
         self.with_engine(|e| {
-            Ok(e.search(&query, scope.into(), page.into())?
+            Ok(e.search(&query, scope.into(), bin.into(), page.into())?
                 .into_iter()
                 .map(Into::into)
                 .collect())

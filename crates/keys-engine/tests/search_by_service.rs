@@ -251,6 +251,12 @@ fn search_by_service_excludes_recycled_entries() {
             .expect("add");
     });
 
+    // A `Vault::empty`-based fixture has the bin DISABLED, under which
+    // `recycle_entry` permanently deletes — the exclusion would pass
+    // vacuously with no recycled row ever existing. Enable the bin so
+    // "doomed" genuinely sits in it.
+    engine.set_recycle_bin(true, None).expect("enable bin");
+
     // Find the "doomed" uuid and recycle it.
     let doomed_uuid: Uuid = {
         let all = engine

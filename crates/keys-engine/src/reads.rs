@@ -41,7 +41,7 @@ use uuid::Uuid;
 use crate::error::EngineError;
 use crate::model::{
     AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, GroupNode, HistoricEntry, IconRef,
-    Pagination, SearchScope, StrengthBucket,
+    Pagination, RecycleBinFilter, SearchScope, StrengthBucket,
 };
 
 /// SQL fragment listing the columns `EntrySummary` needs, plus the
@@ -55,6 +55,18 @@ pub(crate) const SUMMARY_COLUMNS: &str = "\
     (SELECT COUNT(*) FROM entry_attachment ea WHERE ea.entry_uuid = entry.uuid) \
         AS attachment_count, \
     has_totp";
+
+/// Recursive CTE naming every group in the recycle-bin subtree (the
+/// `is_recycle_bin` group and all its descendants). Bin membership is
+/// decided against this — entry ancestry — never the per-entry
+/// `is_recycled` flag; see [`entry_count_excluding_recycle_bin`] for
+/// why the flag is stale on a warm mirror after a group recycle.
+pub(crate) const BIN_SUBTREE_CTE: &str = "WITH RECURSIVE bin_subtree(uuid) AS ( \
+     SELECT uuid FROM \"group\" WHERE is_recycle_bin = 1 \
+     UNION ALL \
+     SELECT g.uuid FROM \"group\" g \
+         JOIN bin_subtree b ON g.parent_uuid = b.uuid \
+ ) ";
 
 pub(crate) fn list_entries(
     conn: &Connection,
@@ -335,6 +347,26 @@ pub(crate) fn is_descendant_of(
 /// Protected fields (passwords, custom protected fields) are never
 /// searched.
 ///
+/// # Recycle bin
+///
+/// `bin` decides how the recycle bin participates — an explicit caller
+/// choice, never an implicit policy (a "Deleted items" view must be
+/// able to search *inside* the bin). Bin membership is decided by
+/// bin-subtree **ancestry** (a recursive walk down from the
+/// `is_recycle_bin` group), not the per-entry `is_recycled` flag:
+/// recycling a *group* re-parents it under the bin but leaves its
+/// descendant entries' `is_recycled = 0` in the live mirror until the
+/// next ingest re-derives the flag, so a flag-based filter would leak
+/// those buried entries into live search results in exactly the
+/// warm-mirror state a client searches right after the mutation (same
+/// rationale as [`entry_count_excluding_recycle_bin`]).
+///
+/// With the bin **disabled** there is no live/binned distinction
+/// (recycling permanently deletes — see `mutations::recycle_entry`):
+/// [`RecycleBinFilter::ExcludeRecycled`] and
+/// [`RecycleBinFilter::IncludeRecycled`] both match every entry, and
+/// [`RecycleBinFilter::RecycledOnly`] returns nothing.
+///
 /// # Empty query
 ///
 /// Empty / whitespace-only queries return an empty Vec without
@@ -349,12 +381,32 @@ pub(crate) fn search(
     conn: &Connection,
     query: &str,
     scope: SearchScope,
+    bin: RecycleBinFilter,
     page: Pagination,
 ) -> Result<Vec<EntrySummary>, EngineError> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
+
+    // Resolve the bin filter to a (CTE, extra WHERE clause) pair up
+    // front. `NOT IN` an empty subtree (bin enabled but not yet lazily
+    // created) is true for every row, and `IN` it is false — both
+    // correct: nothing is recycled yet.
+    let bin_enabled = crate::meta::read_recycle_bin_enabled(conn)?;
+    let (cte, bin_clause) = match bin {
+        RecycleBinFilter::IncludeRecycled => ("", ""),
+        RecycleBinFilter::ExcludeRecycled if !bin_enabled => ("", ""),
+        RecycleBinFilter::ExcludeRecycled => (
+            BIN_SUBTREE_CTE,
+            " AND entry.group_uuid NOT IN (SELECT uuid FROM bin_subtree)",
+        ),
+        RecycleBinFilter::RecycledOnly if !bin_enabled => return Ok(Vec::new()),
+        RecycleBinFilter::RecycledOnly => (
+            BIN_SUBTREE_CTE,
+            " AND entry.group_uuid IN (SELECT uuid FROM bin_subtree)",
+        ),
+    };
 
     let tokens: Vec<String> = trimmed
         .split_whitespace()
@@ -397,9 +449,9 @@ pub(crate) fn search(
     let offset_placeholder = tokens.len() + 2;
 
     let sql = format!(
-        "SELECT {SUMMARY_COLUMNS} \
+        "{cte}SELECT {SUMMARY_COLUMNS} \
          FROM entry \
-         WHERE {where_clause} \
+         WHERE ({where_clause}){bin_clause} \
          ORDER BY entry.title COLLATE NOCASE ASC, entry.uuid ASC \
          LIMIT ?{limit_placeholder} OFFSET ?{offset_placeholder}"
     );
@@ -681,14 +733,10 @@ pub(crate) fn entry_count_excluding_recycle_bin(conn: &Connection) -> Result<u64
     // is true for every row, so a binless-but-enabled vault counts all
     // entries — correct, nothing is recycled yet.
     let count: i64 = conn.query_row(
-        "WITH RECURSIVE bin_subtree(uuid) AS ( \
-             SELECT uuid FROM \"group\" WHERE is_recycle_bin = 1 \
-             UNION ALL \
-             SELECT g.uuid FROM \"group\" g \
-                 JOIN bin_subtree b ON g.parent_uuid = b.uuid \
-         ) \
-         SELECT COUNT(*) FROM entry \
-         WHERE group_uuid NOT IN (SELECT uuid FROM bin_subtree)",
+        &format!(
+            "{BIN_SUBTREE_CTE}SELECT COUNT(*) FROM entry \
+             WHERE group_uuid NOT IN (SELECT uuid FROM bin_subtree)"
+        ),
         [],
         |r| r.get(0),
     )?;
