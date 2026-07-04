@@ -68,6 +68,12 @@ pub(crate) const BIN_SUBTREE_CTE: &str = "WITH RECURSIVE bin_subtree(uuid) AS ( 
          JOIN bin_subtree b ON g.parent_uuid = b.uuid \
  ) ";
 
+/// WHERE fragment excluding entries whose group sits in the
+/// [`BIN_SUBTREE_CTE`] subtree. Kept beside the CTE so the clause and
+/// the CTE's column name can't drift apart across its call sites.
+pub(crate) const BIN_MEMBER_EXCLUDE_CLAUSE: &str =
+    " AND entry.group_uuid NOT IN (SELECT uuid FROM bin_subtree)";
+
 pub(crate) fn list_entries(
     conn: &Connection,
     group: Option<Uuid>,
@@ -397,10 +403,7 @@ pub(crate) fn search(
     let (cte, bin_clause) = match bin {
         RecycleBinFilter::IncludeRecycled => ("", ""),
         RecycleBinFilter::ExcludeRecycled if !bin_enabled => ("", ""),
-        RecycleBinFilter::ExcludeRecycled => (
-            BIN_SUBTREE_CTE,
-            " AND entry.group_uuid NOT IN (SELECT uuid FROM bin_subtree)",
-        ),
+        RecycleBinFilter::ExcludeRecycled => (BIN_SUBTREE_CTE, BIN_MEMBER_EXCLUDE_CLAUSE),
         RecycleBinFilter::RecycledOnly if !bin_enabled => return Ok(Vec::new()),
         RecycleBinFilter::RecycledOnly => (
             BIN_SUBTREE_CTE,
@@ -485,7 +488,13 @@ pub(crate) fn search(
 ///    inside `entry.url` (LIKE `%id%`). Last-resort tier for entries
 ///    that don't have a parseable URL.
 ///
-/// Recycled entries are excluded.
+/// Recycled entries are excluded — by bin-subtree **membership**, not
+/// the per-entry `is_recycled` flag, and only while the recycle bin is
+/// enabled (with it disabled every surviving entry is live). Same
+/// warm-mirror rationale as [`search`]'s recycle-bin notes: a flag
+/// filter would keep serving entries buried in a just-recycled group
+/// until the next ingest re-derives the flag from ancestry — exactly
+/// the in-session state a client fills from right after the mutation.
 ///
 /// Results are deduplicated by entry uuid (keeping the best tier),
 /// ordered by tier ascending, then `last_used_at DESC NULLS LAST`,
@@ -532,16 +541,28 @@ pub(crate) fn search_by_service(
     // host, but escape anyway as defence in depth.
     let etld_suffix_like = format!("%.{}", escape_like(&etld1));
 
+    // Bin exclusion is by subtree membership, spliced in as a leading
+    // CTE ahead of `ranked` (the statement opens its own WITH clause,
+    // so the const supplies the `WITH RECURSIVE` when it applies).
+    // With the bin disabled there is nothing to exclude — every
+    // surviving entry is live. `NOT IN` an empty subtree (bin enabled
+    // but not yet lazily created) is true for every row — correct:
+    // nothing is recycled yet.
+    let bin_enabled = crate::meta::read_recycle_bin_enabled(conn)?;
+    let (with_clause, bin_clause) = if bin_enabled {
+        (format!("{BIN_SUBTREE_CTE},"), BIN_MEMBER_EXCLUDE_CLAUSE)
+    } else {
+        ("WITH".to_owned(), "")
+    };
+
     // SQL strategy: pull every candidate row, tag it with the best
     // tier it satisfies, dedupe by uuid taking MIN(tier), then sort
     // by tier + recency. The CASE expression encodes tier priority
-    // (1 = exact host, 2 = eTLD+1, 3 = substring).
-    //
-    // `entry.is_recycled = 0` filters out recycle-bin entries up
-    // front. The candidate set is bounded by the WHERE clause: any
-    // row that matches at least one tier.
+    // (1 = exact host, 2 = eTLD+1, 3 = substring). The candidate set
+    // is bounded by the WHERE clause: any row that matches at least
+    // one tier.
     let sql = format!(
-        "WITH ranked AS ( \
+        "{with_clause} ranked AS ( \
              SELECT entry.uuid AS uuid, \
                     CASE \
                         WHEN entry.url_host = ?1 THEN 1 \
@@ -551,13 +572,12 @@ pub(crate) fn search_by_service(
                         ELSE 99 \
                     END AS tier \
              FROM entry \
-             WHERE entry.is_recycled = 0 \
-               AND ( \
+             WHERE ( \
                    entry.url_host = ?1 \
                    OR entry.url_host = ?2 \
                    OR entry.url_host LIKE ?3 ESCAPE '\\' \
                    OR entry.url LIKE ?4 ESCAPE '\\' COLLATE NOCASE \
-               ) \
+               ){bin_clause} \
          ), \
          best AS ( \
              SELECT uuid AS best_uuid, MIN(tier) AS best_tier \
