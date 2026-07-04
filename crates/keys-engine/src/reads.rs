@@ -184,18 +184,28 @@ pub(crate) fn entry(conn: &Connection, uuid: Uuid) -> Result<Option<EntryFull>, 
 /// haven't been re-ingested since migration 0004 and therefore all
 /// share the default `sort_order = 0`).
 ///
-/// `entry_count_direct` counts entries whose `group_uuid` matches the
-/// row, with one wrinkle: for the recycle bin group itself we **do**
-/// include recycled entries in the count (otherwise it would always
-/// read 0, which hides what's in the bin). Regular groups exclude
-/// recycled entries — those live in the recycle bin's count instead.
+/// `entry_count_direct` is a plain count of the entries whose
+/// `group_uuid` matches the row — location alone decides attribution,
+/// never the per-entry `is_recycled` flag. Recycling an entry moves it
+/// into the bin group, so it counts there; recycling a *group* only
+/// re-parents the group under the bin, entries still inside, so they
+/// keep counting on that group (a client wanting "how much is in the
+/// Trash?" sums the bin subtree). The bin-subtree membership rule the
+/// other read paths splice in via [`BIN_SUBTREE_CTE`] needs no clause
+/// here: for a direct count an entry's bin membership is exactly its
+/// own group's, so "exclude bin members, except under the bin" filters
+/// nothing. Filtering on `is_recycled` instead did filter — wrongly:
+/// the flag is re-derived from ancestry only at ingest, so entries
+/// buried under a just-recycled group (flag still 0) counted warm but
+/// dropped out of *every* group's count after a reopen (flag 1, group
+/// not the bin root), making the same vault report different counts
+/// warm vs cold.
 pub(crate) fn group_tree(conn: &Connection) -> Result<Vec<GroupNode>, EngineError> {
     let mut stmt = conn.prepare(
         "SELECT uuid, parent_uuid, name, icon_index, icon_custom_uuid, is_recycle_bin, \
                 sort_order, \
                 (SELECT COUNT(*) FROM entry \
-                 WHERE entry.group_uuid = \"group\".uuid \
-                   AND (entry.is_recycled = 0 OR \"group\".is_recycle_bin = 1)) \
+                 WHERE entry.group_uuid = \"group\".uuid) \
                     AS entry_count_direct \
          FROM \"group\" \
          ORDER BY (parent_uuid IS NOT NULL), sort_order ASC, name ASC, uuid ASC",
