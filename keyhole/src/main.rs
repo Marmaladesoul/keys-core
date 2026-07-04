@@ -230,6 +230,18 @@ enum Command {
         #[arg(long, default_value = "exclude", value_parser = ["exclude", "only", "include"])]
         bin: String,
     },
+    /// AutoFill-style service lookup (`search_by_service` on the seam):
+    /// match entries against a service identifier — a bare host, a full
+    /// URL, or anything in between — via the engine's tiered host
+    /// matching. Recycle-bin entries are excluded by subtree
+    /// membership, same as `search --bin exclude`; with the bin
+    /// disabled every entry is live.
+    Service {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// Service identifier — bare host (`example.com`) or full URL.
+        identifier: String,
+    },
     /// Recycle (soft-delete) an entry, then persist to the KDBX.
     ///
     /// The save is the whole point: a recycle that isn't written back
@@ -743,6 +755,11 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.search(&query, &bin)?;
+        }
+        Command::Service { vault, identifier } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.service(&identifier)?;
         }
         Command::Recycle {
             vault,
@@ -1379,6 +1396,19 @@ impl Session {
             .engine
             .search(query.to_owned(), SearchScope::AnyField, bin, page)
             .map_err(|e| anyhow::anyhow!("search: {e:?}"))?;
+
+        print_summaries(&hits, "(no matches)", "match", "matches");
+        Ok(())
+    }
+
+    /// AutoFill-style service lookup (`search_by_service` on the
+    /// seam). Output matches `list`: one `uuid  title  <username>`
+    /// line per hit, machine-greppable.
+    fn service(&self, identifier: &str) -> Result<()> {
+        let hits = self
+            .engine
+            .search_by_service(identifier.to_owned(), u64::MAX)
+            .map_err(|e| anyhow::anyhow!("search_by_service: {e:?}"))?;
 
         print_summaries(&hits, "(no matches)", "match", "matches");
         Ok(())

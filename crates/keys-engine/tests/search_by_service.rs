@@ -10,6 +10,7 @@ use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::NewEntry;
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError};
+use secrecy::SecretString;
 use uuid::Uuid;
 
 // ── test wiring (mirrors crates/keys-engine/tests/search.rs) ────────────
@@ -272,6 +273,111 @@ fn search_by_service_excludes_recycled_entries() {
     let rows = engine.search_by_service("google.com", 10).expect("search");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].title, "alive");
+}
+
+#[test]
+fn search_by_service_bin_filter_is_by_subtree_membership_not_flag() {
+    // The discriminating warm-mirror case (mirrors
+    // search_bin_filter_is_by_subtree_membership_not_flag in search.rs):
+    // recycling a GROUP re-parents it under the bin but leaves its
+    // descendant entries' `is_recycled = 0` until the next ingest
+    // re-derives the flag from ancestry. A flag-based filter would keep
+    // serving the buried entry to the service lookup in exactly the
+    // state a client fills from right after the mutation.
+    let (mut engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("alive").url("https://google.com"))
+            .expect("add");
+    });
+    engine.set_recycle_bin(true, None).expect("enable bin");
+    engine.ensure_recycle_bin().expect("ensure bin");
+
+    let root = engine
+        .group_tree()
+        .expect("tree")
+        .into_iter()
+        .find(|g| g.parent_uuid.is_none())
+        .expect("root")
+        .uuid;
+    let doomed_group = engine
+        .create_group(
+            root,
+            keys_engine::NewGroupFields {
+                name: "Doomed".into(),
+                notes: String::new(),
+                icon: keys_engine::IconRef::Builtin(0),
+            },
+        )
+        .expect("create group");
+    engine
+        .create_entry(
+            doomed_group,
+            keys_engine::NewEntryFields {
+                title: "buried".into(),
+                username: String::new(),
+                url: "https://google.com".into(),
+                notes: String::new(),
+                password: SecretString::from("pw"),
+                icon: keys_engine::IconRef::Builtin(0),
+                custom_fields: Vec::new(),
+                tags: Vec::new(),
+            },
+        )
+        .expect("create entry");
+
+    // Both visible while the group is live.
+    assert_eq!(
+        engine
+            .search_by_service("google.com", 10)
+            .expect("pre-recycle")
+            .len(),
+        2
+    );
+
+    engine.recycle_group(doomed_group).expect("recycle group");
+
+    // Warm mirror, flag still 0 on the buried entry — membership must
+    // decide anyway.
+    let rows = engine.search_by_service("google.com", 10).expect("search");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].title, "alive");
+}
+
+#[test]
+fn search_by_service_with_bin_disabled_treats_every_entry_as_live() {
+    // Disabling the bin erases the live/binned distinction (matching
+    // Engine::search's ExcludeRecycled): entries still sitting under
+    // the old bin subtree come back into lookup results rather than
+    // being filtered by their stale `is_recycled` flag.
+    let (mut engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("alive").url("https://google.com"))
+            .expect("add");
+        kdbx.add_entry(root, NewEntry::new("binned").url("https://google.com"))
+            .expect("add");
+    });
+    engine.set_recycle_bin(true, None).expect("enable bin");
+
+    let binned_uuid: Uuid = engine
+        .search_by_service("google.com", 10)
+        .expect("pre-recycle")
+        .iter()
+        .find(|s| s.title == "binned")
+        .expect("binned present")
+        .uuid;
+    engine.recycle_entry(binned_uuid).expect("recycle");
+    assert_eq!(
+        engine
+            .search_by_service("google.com", 10)
+            .expect("bin on")
+            .len(),
+        1
+    );
+
+    engine.set_recycle_bin(false, None).expect("disable bin");
+
+    let rows = engine.search_by_service("google.com", 10).expect("bin off");
+    assert_eq!(rows.len(), 2);
 }
 
 #[test]

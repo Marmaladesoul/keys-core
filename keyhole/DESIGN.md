@@ -852,7 +852,25 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   exercised. NB `search_by_service` itself still filters by the `is_recycled`
   flag, so the AutoFill path inherits the warm-mirror leak for
   buried-in-a-recycled-group entries — a candidate follow-up, left untouched
-  here.
+  there; closed by the next entry.
+- **Done (2026-07-04, service-lookup recycle-bin membership):**
+  `search_by_service` — the AutoFill-style tiered host lookup — now excludes
+  bin members by subtree **membership** (the shared `BIN_SUBTREE_CTE`), gated
+  on the bin being enabled, closing the warm-mirror leak the previous entry
+  flagged: a group recycle re-parents without cascading the per-entry flag,
+  so the flag filter kept serving buried entries to the lookup until the next
+  ingest re-derived it. Higher stakes than `search` — this is the lookup a
+  credential-fill UI drives, so the leak *offers up* a deleted credential
+  rather than mis-rendering a list. With the bin disabled every surviving
+  entry is live (nothing filtered), matching `search`'s `ExcludeRecycled`.
+  New keyhole verb `service <vault> <identifier>` — the first headless
+  consumer of the lookup; pinned by
+  [service-lookup-bin-filter.sh](scenarios/service-lookup-bin-filter.sh)
+  (direct recycle warm + across a mirror-nuked reopen, the
+  buried-under-a-recycled-group case warm — the flag regression turns it
+  red — and the bin-disabled degradation) + engine
+  `search_by_service_bin_filter_is_by_subtree_membership_not_flag` /
+  `search_by_service_with_bin_disabled_treats_every_entry_as_live`.
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the

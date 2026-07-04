@@ -565,9 +565,13 @@ impl Engine {
     /// 3. Substring match — the identifier appears anywhere inside
     ///    `entry.url`. Last-resort tier for unparseable URLs.
     ///
-    /// Recycled entries are excluded. Results dedupe by uuid (best
-    /// tier wins) and sort by tier, then `last_used_at` desc, then
-    /// `modified_at` desc. Capped at `limit` rows.
+    /// Recycled entries are excluded by bin-subtree membership — the
+    /// same warm-mirror-safe rule as [`Engine::search`] with
+    /// [`crate::RecycleBinFilter::ExcludeRecycled`]; with the recycle
+    /// bin disabled every surviving entry is live and nothing is
+    /// filtered. Results dedupe by uuid (best tier wins) and sort by
+    /// tier, then `last_used_at` desc, then `modified_at` desc. Capped
+    /// at `limit` rows.
     ///
     /// Empty / whitespace identifiers and `limit = 0` return an empty
     /// `Vec` without touching the database.
