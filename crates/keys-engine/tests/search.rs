@@ -11,7 +11,9 @@ use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::NewEntry;
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
-use keys_engine::{DbKey, Engine, KeyProvider, KeyProviderError, Pagination, SearchScope};
+use keys_engine::{
+    DbKey, Engine, KeyProvider, KeyProviderError, Pagination, RecycleBinFilter, SearchScope,
+};
 use secrecy::SecretString;
 
 // ── test wiring ────────────────────────────────────────────────────────
@@ -77,11 +79,21 @@ fn search_empty_query_returns_empty() {
     });
 
     let rows = engine
-        .search("", SearchScope::AnyField, Pagination::all())
+        .search(
+            "",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     assert!(rows.is_empty());
     let rows = engine
-        .search("   ", SearchScope::AnyField, Pagination::all())
+        .search(
+            "   ",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search ws");
     assert!(rows.is_empty());
 }
@@ -104,7 +116,12 @@ fn search_substring_matches_mid_word() {
     });
 
     let rows = engine
-        .search("a", SearchScope::AnyField, Pagination::all())
+        .search(
+            "a",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     let t = titles(&rows);
     assert!(t.contains(&"aaaa"));
@@ -129,7 +146,12 @@ fn search_matches_mid_word_token() {
     });
 
     let rows = engine
-        .search("manag", SearchScope::AnyField, Pagination::all())
+        .search(
+            "manag",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     let t = titles(&rows);
     assert_eq!(t.len(), 2);
@@ -146,7 +168,12 @@ fn search_is_case_insensitive() {
 
     for q in &["banking", "BANKING", "BaNkInG"] {
         let rows = engine
-            .search(q, SearchScope::AnyField, Pagination::all())
+            .search(
+                q,
+                SearchScope::AnyField,
+                RecycleBinFilter::ExcludeRecycled,
+                Pagination::all(),
+            )
             .expect("search");
         assert_eq!(rows.len(), 1, "case-insensitive miss for {q}");
     }
@@ -168,7 +195,12 @@ fn search_multi_token_ands_with_field_or() {
     });
 
     let rows = engine
-        .search("one two", SearchScope::AnyField, Pagination::all())
+        .search(
+            "one two",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     let t = titles(&rows);
     assert_eq!(t, vec!["Tone and Atwog"], "got {t:?}");
@@ -194,17 +226,32 @@ fn search_anyfield_spans_multiple_fields() {
 
     // Notes
     let rows = engine
-        .search("matching", SearchScope::AnyField, Pagination::all())
+        .search(
+            "matching",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     assert_eq!(titles(&rows), vec!["title-hit"]);
     // URL
     let rows = engine
-        .search("acme", SearchScope::AnyField, Pagination::all())
+        .search(
+            "acme",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     assert_eq!(titles(&rows), vec!["url-hit"]);
     // Username
     let rows = engine
-        .search("alice", SearchScope::AnyField, Pagination::all())
+        .search(
+            "alice",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     assert_eq!(titles(&rows), vec!["u-hit"]);
 }
@@ -219,7 +266,12 @@ fn search_anyfield_matches_tag() {
     });
 
     let rows = engine
-        .search("banking", SearchScope::AnyField, Pagination::all())
+        .search(
+            "banking",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     assert_eq!(titles(&rows), vec!["acme"]);
 }
@@ -238,7 +290,12 @@ fn search_title_only_excludes_other_fields() {
     });
 
     let rows = engine
-        .search("banking", SearchScope::TitleOnly, Pagination::all())
+        .search(
+            "banking",
+            SearchScope::TitleOnly,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     assert_eq!(titles(&rows), vec!["Banking site"]);
 }
@@ -256,7 +313,12 @@ fn search_notes_only_excludes_other_fields() {
     });
 
     let rows = engine
-        .search("banking", SearchScope::NotesOnly, Pagination::all())
+        .search(
+            "banking",
+            SearchScope::NotesOnly,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     assert_eq!(titles(&rows), vec!["plain"]);
 }
@@ -274,7 +336,12 @@ fn search_results_are_sorted_alphabetically() {
     });
 
     let rows = engine
-        .search("banking", SearchScope::AnyField, Pagination::all())
+        .search(
+            "banking",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     assert_eq!(
         titles(&rows),
@@ -311,7 +378,12 @@ fn search_handles_special_characters_without_error() {
         "a_b",
     ] {
         let _ = engine
-            .search(q, SearchScope::AnyField, Pagination::all())
+            .search(
+                q,
+                SearchScope::AnyField,
+                RecycleBinFilter::ExcludeRecycled,
+                Pagination::all(),
+            )
             .expect("no error");
     }
 }
@@ -329,7 +401,12 @@ fn search_like_wildcards_in_query_are_escaped() {
     });
 
     let rows = engine
-        .search("50%", SearchScope::AnyField, Pagination::all())
+        .search(
+            "50%",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     assert_eq!(titles(&rows), vec!["50% off coupon"]);
 }
@@ -348,6 +425,7 @@ fn search_paginates() {
         .search(
             "banking",
             SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
             Pagination {
                 offset: 0,
                 limit: 2,
@@ -358,6 +436,7 @@ fn search_paginates() {
         .search(
             "banking",
             SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
             Pagination {
                 offset: 2,
                 limit: 2,
@@ -368,6 +447,7 @@ fn search_paginates() {
         .search(
             "banking",
             SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
             Pagination {
                 offset: 4,
                 limit: 2,
@@ -397,7 +477,12 @@ fn search_returns_empty_for_no_matches() {
     });
 
     let rows = engine
-        .search("nonexistentterm", SearchScope::AnyField, Pagination::all())
+        .search(
+            "nonexistentterm",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     assert!(rows.is_empty());
 }
@@ -426,7 +511,12 @@ fn search_perf_877() {
 
     let start = std::time::Instant::now();
     let rows = engine
-        .search("banking", SearchScope::AnyField, Pagination::all())
+        .search(
+            "banking",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
         .expect("search");
     let elapsed = start.elapsed();
     eprintln!("877-entry search took {elapsed:?}, {} hits", rows.len());
@@ -434,5 +524,162 @@ fn search_perf_877() {
     assert!(
         elapsed < Duration::from_millis(50),
         "877-entry search must complete in <50ms, took {elapsed:?}",
+    );
+}
+
+// ── recycle-bin filter ─────────────────────────────────────────────────
+//
+// Pins the `RecycleBinFilter` contract. The exclusion mirrors
+// `search_by_service_excludes_recycled_entries`; the bin-only and
+// include variants pin that bin inclusion is the CALLER's choice (a
+// "Deleted items" view searches inside the bin), never a blanket
+// policy.
+
+/// Search + filter, all rows, `AnyField` — the shape every test below uses.
+fn search_with(engine: &Engine, q: &str, bin: RecycleBinFilter) -> Vec<String> {
+    engine
+        .search(q, SearchScope::AnyField, bin, Pagination::all())
+        .expect("search")
+        .into_iter()
+        .map(|s| s.title)
+        .collect()
+}
+
+/// Seed two matching entries, recycle "banking doomed", return the engine.
+///
+/// A `Vault::empty`-based fixture has the bin DISABLED (recycling would
+/// permanently delete — no `is_recycled` row would ever exist), so
+/// enable it first: these tests need an entry genuinely sitting in the
+/// bin.
+fn engine_with_one_recycled() -> (Engine, tempfile::TempDir) {
+    let (mut engine, dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("banking alive"))
+            .expect("add");
+        kdbx.add_entry(root, NewEntry::new("banking doomed"))
+            .expect("add");
+    });
+    engine.set_recycle_bin(true, None).expect("enable bin");
+    let doomed = engine
+        .search(
+            "doomed",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
+        .expect("pre-recycle")
+        .pop()
+        .expect("doomed present")
+        .uuid;
+    engine.recycle_entry(doomed).expect("recycle");
+    (engine, dir)
+}
+
+#[test]
+fn search_exclude_recycled_omits_recycled_entries() {
+    let (engine, _dir) = engine_with_one_recycled();
+    let titles = search_with(&engine, "banking", RecycleBinFilter::ExcludeRecycled);
+    assert_eq!(titles, vec!["banking alive"]);
+}
+
+#[test]
+fn search_recycled_only_finds_only_bin_contents() {
+    let (engine, _dir) = engine_with_one_recycled();
+    let titles = search_with(&engine, "banking", RecycleBinFilter::RecycledOnly);
+    assert_eq!(titles, vec!["banking doomed"]);
+}
+
+#[test]
+fn search_include_recycled_spans_live_and_bin() {
+    let (engine, _dir) = engine_with_one_recycled();
+    let titles = search_with(&engine, "banking", RecycleBinFilter::IncludeRecycled);
+    assert_eq!(titles, vec!["banking alive", "banking doomed"]);
+}
+
+#[test]
+fn search_bin_filter_is_by_subtree_membership_not_flag() {
+    // The discriminating warm-mirror case: recycling a GROUP re-parents
+    // it under the bin but leaves its descendant entries'
+    // `is_recycled = 0` until the next ingest re-derives the flag from
+    // ancestry. A flag-based filter would leak the buried entry into
+    // live results (and hide it from bin-only results) in exactly the
+    // state a client searches right after the mutation.
+    let (mut engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("banking alive"))
+            .expect("add");
+    });
+    engine.set_recycle_bin(true, None).expect("enable bin");
+    engine.ensure_recycle_bin().expect("ensure bin");
+
+    let root = engine
+        .group_tree()
+        .expect("tree")
+        .into_iter()
+        .find(|g| g.parent_uuid.is_none())
+        .expect("root")
+        .uuid;
+    let doomed_group = engine
+        .create_group(
+            root,
+            keys_engine::NewGroupFields {
+                name: "Doomed".into(),
+                notes: String::new(),
+                icon: keys_engine::IconRef::Builtin(0),
+            },
+        )
+        .expect("create group");
+    engine
+        .create_entry(
+            doomed_group,
+            keys_engine::NewEntryFields {
+                title: "banking buried".into(),
+                username: String::new(),
+                url: String::new(),
+                notes: String::new(),
+                password: SecretString::from("pw"),
+                icon: keys_engine::IconRef::Builtin(0),
+                custom_fields: Vec::new(),
+                tags: Vec::new(),
+            },
+        )
+        .expect("create entry");
+
+    engine.recycle_group(doomed_group).expect("recycle group");
+
+    // Warm mirror, flag still 0 on the buried entry — membership must
+    // decide anyway.
+    assert_eq!(
+        search_with(&engine, "banking", RecycleBinFilter::ExcludeRecycled),
+        vec!["banking alive"]
+    );
+    assert_eq!(
+        search_with(&engine, "banking", RecycleBinFilter::RecycledOnly),
+        vec!["banking buried"]
+    );
+}
+
+#[test]
+fn search_with_bin_disabled_treats_every_entry_as_live() {
+    // With the bin disabled there is no live/binned distinction
+    // (recycling permanently deletes), so exclusion filters nothing and
+    // bin-only matches nothing.
+    let (mut engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("banking a"))
+            .expect("add");
+        kdbx.add_entry(root, NewEntry::new("banking b"))
+            .expect("add");
+    });
+    engine.set_recycle_bin(false, None).expect("disable bin");
+
+    assert_eq!(
+        search_with(&engine, "banking", RecycleBinFilter::ExcludeRecycled),
+        vec!["banking a", "banking b"]
+    );
+    assert!(search_with(&engine, "banking", RecycleBinFilter::RecycledOnly).is_empty());
+    assert_eq!(
+        search_with(&engine, "banking", RecycleBinFilter::IncludeRecycled),
+        vec!["banking a", "banking b"]
     );
 }

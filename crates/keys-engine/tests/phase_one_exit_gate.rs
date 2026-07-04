@@ -170,6 +170,7 @@ fn phase_one_exit_gate_full_lifecycle_with_search() {
         .search(
             "banking",
             keys_engine::SearchScope::AnyField,
+            keys_engine::RecycleBinFilter::ExcludeRecycled,
             keys_engine::Pagination::all(),
         )
         .expect("search");

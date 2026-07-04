@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use crate::error::EngineError;
 use crate::events::ChangeEvent;
-use crate::model::{EntryFull, EntrySummary, GroupNode, Pagination, SearchScope, SmartFolder};
+use crate::model::{
+    EntryFull, EntrySummary, GroupNode, Pagination, RecycleBinFilter, SearchScope, SmartFolder,
+};
 use crate::mutations;
 use crate::predicate::Predicate;
 
@@ -505,7 +507,6 @@ impl Engine {
     /// Full-text search across title / username / URL / notes, with
     /// a tag-substring fallback.
     ///
-    /// Backed by the FTS5 virtual table built in migration 0001.
     /// Case-insensitive substring search across entry fields, scoped
     /// by `scope`.
     ///
@@ -515,6 +516,18 @@ impl Engine {
     /// fields participate: [`SearchScope::AnyField`] matches title,
     /// username, url, notes, and tags; [`SearchScope::TitleOnly`] and
     /// [`SearchScope::NotesOnly`] restrict to a single field.
+    ///
+    /// `bin` decides how the recycle bin participates — an explicit
+    /// caller choice: [`RecycleBinFilter::ExcludeRecycled`] for a
+    /// search box over live entries, [`RecycleBinFilter::RecycledOnly`]
+    /// for a "Deleted items" view searching inside the bin,
+    /// [`RecycleBinFilter::IncludeRecycled`] for no filtering.
+    /// Membership is by bin-subtree ancestry, not the per-entry
+    /// `is_recycled` flag, so entries buried in a just-recycled group
+    /// filter correctly on a warm mirror (see `reads::search`);
+    /// with the bin disabled every surviving entry is live, so
+    /// `RecycledOnly` returns nothing and the other filters match
+    /// everything.
     ///
     /// Results are alphabetised by title (case-insensitive) with uuid
     /// as a deterministic tie-breaker, then paginated by `page`.
@@ -529,9 +542,10 @@ impl Engine {
         &self,
         query: &str,
         scope: SearchScope,
+        bin: RecycleBinFilter,
         page: Pagination,
     ) -> Result<Vec<EntrySummary>, EngineError> {
-        crate::reads::search(&self.conn, query, scope, page)
+        crate::reads::search(&self.conn, query, scope, bin, page)
     }
 
     /// Find entries matching an `AutoFill` service identifier.

@@ -822,6 +822,37 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   served by the engine owning the count rather than hydrating or
   re-deriving it). GUI hand-off: Keys-Mac's `DatabaseManager.fastEntryCount`
   becomes a thin call to `Engine.entryCountExcludingRecycleBin()`.
+- **Done (2026-07-04, search recycle-bin filter):** `Engine::search` takes an
+  explicit `RecycleBinFilter` (`ExcludeRecycled` / `RecycledOnly` /
+  `IncludeRecycled`) — bin inclusion is the CALLER's choice on the seam, never
+  an implicit policy (a "Deleted items" view must be able to search *inside*
+  the bin), and never a client-side post-filter (each consumer was re-deriving
+  bin policy over the engine's results). Exclusion is by bin-subtree
+  **membership** (the shared `BIN_SUBTREE_CTE`, now factored out of
+  `entry_count_excluding_recycle_bin`), not the per-entry `is_recycled` flag —
+  the same warm-mirror rationale as the live count: a group recycle re-parents
+  without cascading the flag, so a flag filter leaks buried entries into live
+  results until the next ingest. With the bin disabled every surviving entry
+  is live (`RecycledOnly` → nothing, the others → no filtering). Surfaced on
+  keys-ffi (`Engine::search(query, scope, bin, page)`); new keyhole verb
+  `search --bin exclude|only|include`; pinned by
+  [search-bin-filter.sh](scenarios/search-bin-filter.sh) (all three filters
+  warm, exclusion across a mirror-nuked reopen, the buried-under-a-recycled-
+  group case warm — teeth verified by swapping in the flag filter and watching
+  it go red — and the bin-disabled degradation) + engine
+  `search_exclude_recycled_omits_recycled_entries` /
+  `search_recycled_only_finds_only_bin_contents` /
+  `search_include_recycled_spans_live_and_bin` /
+  `search_bin_filter_is_by_subtree_membership_not_flag` /
+  `search_with_bin_disabled_treats_every_entry_as_live`. In passing:
+  `search_by_service_excludes_recycled_entries` was pinning its exclusion
+  **vacuously** — the `Vault::empty`-based fixture has the bin disabled, so
+  its "recycled" entry was permanently deleted and no `is_recycled` row ever
+  existed; it now enables the bin first so the exclusion is genuinely
+  exercised. NB `search_by_service` itself still filters by the `is_recycled`
+  flag, so the AutoFill path inherits the warm-mirror leak for
+  buried-in-a-recycled-group entries — a candidate follow-up, left untouched
+  here.
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the

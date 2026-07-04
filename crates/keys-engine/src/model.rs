@@ -88,6 +88,29 @@ pub enum SearchScope {
     NotesOnly,
 }
 
+/// Recycle-bin filter for [`crate::Engine::search`].
+///
+/// Bin inclusion is an explicit choice the caller makes, not a blanket
+/// policy: a search box over live entries wants [`ExcludeRecycled`],
+/// while a "Deleted items" view searching *inside* the bin wants
+/// [`RecycledOnly`]. Membership is decided by bin-subtree ancestry, not
+/// the per-entry `is_recycled` flag — see [`crate::Engine::search`] for
+/// why that distinction is load-bearing on a warm mirror.
+///
+/// [`ExcludeRecycled`]: RecycleBinFilter::ExcludeRecycled
+/// [`RecycledOnly`]: RecycleBinFilter::RecycledOnly
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecycleBinFilter {
+    /// Live entries only — everything outside the recycle-bin subtree.
+    #[default]
+    ExcludeRecycled,
+    /// Entries inside the recycle-bin subtree only.
+    RecycledOnly,
+    /// No bin filtering — live and recycled entries both match.
+    IncludeRecycled,
+}
+
 /// Reference to an entry / group icon.
 ///
 /// KDBX stores icons either as a built-in index (0–68) into `KeePass`'s

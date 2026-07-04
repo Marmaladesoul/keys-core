@@ -44,7 +44,7 @@ pub use migrations::MigrationError;
 pub use model::{
     AttachmentRef, CustomDataItemRef, CustomFieldRef, EntryFull, EntrySave, EntrySummary,
     EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, IconRef, NewCustomField, NewEntryFields,
-    NewGroupFields, Pagination, SearchScope, SmartFolder, StrengthBucket,
+    NewGroupFields, Pagination, RecycleBinFilter, SearchScope, SmartFolder, StrengthBucket,
 };
 pub use portable::{PortableAttachment, PortableEntry};
 pub use predicate::Predicate;

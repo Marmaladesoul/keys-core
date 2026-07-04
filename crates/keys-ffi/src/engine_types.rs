@@ -124,6 +124,32 @@ impl From<SearchScope> for eng::SearchScope {
     }
 }
 
+/// Recycle-bin filter for an [`crate::Engine::search`] query. See
+/// [`keys_engine::RecycleBinFilter`] — bin inclusion is an explicit
+/// caller choice (a "Deleted items" view searches *inside* the bin),
+/// and membership is by bin-subtree ancestry, so entries buried in a
+/// just-recycled group filter correctly on a warm mirror.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecycleBinFilter {
+    /// Live entries only — everything outside the recycle-bin subtree.
+    #[default]
+    ExcludeRecycled,
+    /// Entries inside the recycle-bin subtree only.
+    RecycledOnly,
+    /// No bin filtering — live and recycled entries both match.
+    IncludeRecycled,
+}
+
+impl From<RecycleBinFilter> for eng::RecycleBinFilter {
+    fn from(f: RecycleBinFilter) -> Self {
+        match f {
+            RecycleBinFilter::ExcludeRecycled => Self::ExcludeRecycled,
+            RecycleBinFilter::RecycledOnly => Self::RecycledOnly,
+            RecycleBinFilter::IncludeRecycled => Self::IncludeRecycled,
+        }
+    }
+}
+
 /// Password strength bucket. See [`keys_engine::StrengthBucket`].
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrengthBucket {
