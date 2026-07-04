@@ -95,6 +95,11 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # quick-xml < 0.41 DoS pair, reachable only as 0.39.4 via
+          # plist 1.9.0 <- netdev <- netwatch <- iroh (local system
+          # config parsing, not attacker XML). Mirrors the deny.toml
+          # ignore block — drop when plist > 1.9.0 releases.
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
 
   deny:
     name: cargo deny
