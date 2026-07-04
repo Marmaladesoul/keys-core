@@ -45,6 +45,17 @@ ignore = [
     # bincode unmaintained — iroh-docs uses it. Bincode 2.x exists
     # but the iroh crates haven't migrated. No exploit, just lifecycle.
     "RUSTSEC-2025-0141",
+    # quick-xml < 0.41 DoS pair (quadratic duplicate-attribute check;
+    # unbounded NsReader namespace allocation). The KDBX parsing path
+    # (keepass-core) is on the patched 0.41; the only remaining
+    # pre-0.41 copy is 0.39.4 via plist 1.9.0 <- netdev <- netwatch <-
+    # iroh, where plist only ever parses local system configuration
+    # output, not attacker-supplied XML. plist master is already on
+    # quick-xml 0.41 — drop both ignores (and the matching ones in
+    # ci.yml's audit job) when plist > 1.9.0 releases and iroh's cone
+    # picks it up.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 # ---------------------------------------------------------------------------
