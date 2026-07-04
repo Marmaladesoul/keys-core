@@ -107,11 +107,17 @@ cargo run --release -p uniffi-bindgen-swift-029 -- \
     "target/aarch64-apple-darwin/$PROFILE_DIR/$LIB_NAME" \
     "$HEADERS_STAGING"
 
-# 3b. Re-nest headers under a module-named subdir so they don't collide
-# with KeysCoreFFI's `Headers/module.modulemap` when both xcframeworks
+# 3b. Re-nest headers under a subdir so they don't collide with
+# KeysCoreFFI's `Headers/module.modulemap` when both xcframeworks
 # land in Xcode's `BUILT_PRODUCTS_DIR/include/`. Without this nesting
 # Xcode raises "Multiple commands produce include/module.modulemap".
-HEADERS_NESTED="$HEADERS_STAGING/nested/$SWIFT_MODULE"
+# The subdir MUST be named exactly after the C module: clang's
+# module-map discovery for `-I <dir>` search paths is name-directed —
+# it probes `<dir>/<module-name>/module.modulemap` — so any other
+# subdir name leaves the module unfindable (canImport silently false,
+# then RustBuffer/RustCallStatus resolution errors in the generated
+# Swift).
+HEADERS_NESTED="$HEADERS_STAGING/nested/$C_MODULE"
 rm -rf "$HEADERS_STAGING/nested"
 mkdir -p "$HEADERS_NESTED"
 mv "$HEADERS_STAGING"/*.h "$HEADERS_STAGING"/module.modulemap "$HEADERS_NESTED/"
