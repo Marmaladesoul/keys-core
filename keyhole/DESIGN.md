@@ -871,6 +871,33 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   red — and the bin-disabled degradation) + engine
   `search_by_service_bin_filter_is_by_subtree_membership_not_flag` /
   `search_by_service_with_bin_disabled_treats_every_entry_as_live`.
+- **Done (2026-07-05, reconcile write-back convergence guard):** the
+  disk-watcher reconcile path (`reconcile_with_disk_park_conflicts`) now tells
+  its caller whether the merged local state carries content the ingested file
+  lacks. `ParkConflictsResult::Applied` gains `needs_write_back: bool`, computed
+  as `keepass_merge::vault_content_digest(remote) != Engine::content_digest()`
+  — the same content-digest oracle the fuzz harness converges on — surfaced on
+  keys-ffi's `ParkConflictsResultFfi::Applied`. The contract: a client saves the
+  advanced projection back to disk **only** on `needs_write_back == true`. A
+  digest-equal ingest (a one-way external edit, now adopted) writes nothing:
+  rewriting a file that already holds everything local does is pure byte-churn —
+  it bumps the mtime for every other watcher, and between two rewrite-on-ingest
+  clients sharing a vault over a file-sync transport (syncthing/rsync) it
+  ping-pongs without terminating. `true` covers the genuine two-sided merge and
+  the parked-conflict held-local value (which the park model deliberately
+  projects over the file until resolved). Computed only on the `Applied` arm, so
+  the common `NoChange` path never pays for a projection. keyhole is the first
+  consumer: its open-path reference-client policy saves iff the flag is set, and
+  prints the verdict (`write-back: needed|not needed`). Pinned by
+  [reconcile-write-back-guard.sh](scenarios/reconcile-write-back-guard.sh) —
+  arm (a): a one-way disk edit is adopted and the on-disk bytes are left
+  byte-identical (`cmp`), so a stray save turns it red; arm (b): a two-sided
+  divergence (a saved local add an external overwrite clobbered off disk) is
+  written back exactly once, a second open does NOT re-save (loop terminates),
+  and all three entries converge across a mirror-nuke re-ingest — plus engine
+  `park_one_sided_disk_edit_needs_no_write_back` /
+  `park_two_sided_merge_needs_write_back`. Teeth-verified: forcing the
+  discriminator true reddens arm (a).
 - **Next (the headline):** the rest of the history-surgery cluster
   (`restore_entry_from_history`, `clear_entry_custom_icon`,
   `save_entry`-atomic-snapshot — `attach_file` dropped as redundant with the

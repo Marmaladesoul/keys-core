@@ -967,6 +967,12 @@ pub enum ParkConflictsResultFfi {
     Applied {
         applied: MergeStats,
         parked: ParkedConflictsSummaryFfi,
+        /// Merged local state differs from the ingested file (by content
+        /// digest) — the client should write the projection back to disk.
+        /// `false` ⇒ disk already current; a write-back would be byte-churn
+        /// (and, between two rewrite-on-ingest clients, a save ping-pong
+        /// seed). See `keys_engine::ParkConflictsResult::Applied`.
+        needs_write_back: bool,
     },
 }
 
@@ -974,9 +980,14 @@ impl From<eng::ParkConflictsResult> for ParkConflictsResultFfi {
     fn from(r: eng::ParkConflictsResult) -> Self {
         match r {
             eng::ParkConflictsResult::NoChange => Self::NoChange,
-            eng::ParkConflictsResult::Applied { applied, parked } => Self::Applied {
+            eng::ParkConflictsResult::Applied {
+                applied,
+                parked,
+                needs_write_back,
+            } => Self::Applied {
                 applied: applied.into(),
                 parked: parked.into(),
+                needs_write_back,
             },
             other => {
                 let _ = other;

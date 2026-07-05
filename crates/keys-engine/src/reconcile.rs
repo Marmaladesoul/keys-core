@@ -154,6 +154,16 @@ pub enum ParkConflictsResult {
         applied: MergeStats,
         /// Per-bucket lists of entries the parker touched.
         parked: ParkedConflictsSummary,
+        /// Whether the merged local state now differs from what the
+        /// ingested file holds (by content digest — the convergence
+        /// oracle). `true` ⇒ the local side carries content the disk
+        /// peer lacks, and — the file peer having no other transport —
+        /// the client should write the projection back. `false` ⇒ the
+        /// ingest was one-way (disk already holds everything local
+        /// does); a write-back would be pure byte-churn, bumping the
+        /// file's mtime for every other watcher and, between two
+        /// rewrite-on-ingest clients, seeding a save ping-pong.
+        needs_write_back: bool,
     },
 }
 
@@ -669,7 +679,14 @@ fn child_contains_entry(group: &keepass_core::model::Group, id: EntryId) -> bool
 /// The badge ([`entries_with_parked_conflict`]) and the resolver's "theirs"
 /// ([`held_conflict_payload`]) both read the owner rows directly — no derived
 /// `held_conflicts` kv, no theirs-stash, no baseline refresh on this path.
-/// Keys-Mac saves the KDBX from the advanced projection on `Applied`.
+///
+/// **Write-back contract:** a client saves the KDBX from the advanced
+/// projection on `Applied { needs_write_back: true }` — and ONLY then. A
+/// digest-equal ingest (`needs_write_back: false`) means the disk file
+/// already holds everything local does; rewriting it churns the file's
+/// mtime for every other watcher, and between two rewrite-on-ingest
+/// clients (two clients sharing a vault over syncthing/rsync) would
+/// ping-pong forever.
 pub(crate) fn reconcile_with_disk_park_conflicts(
     engine: &mut Engine,
     kdbx_path: &Path,
@@ -764,6 +781,18 @@ fn ingest_kdbx_as_owner(
         ..Default::default()
     };
 
+    // The write-back discriminator: does the merged local state differ from
+    // what the file we just ingested holds? Compared with the content-digest
+    // convergence oracle — the same equality the fuzz harness asserts with.
+    // Digest-equal ⇒ the ingest was one-way (a pure external edit, now adopted)
+    // and rewriting the file would add nothing; digest-unequal ⇒ local holds
+    // content the disk peer lacks (a genuine two-sided merge, or a parked
+    // conflict's held local value — which the park model deliberately projects
+    // over the file until resolved). Computed only on the Applied arm, so the
+    // common NoChange path never pays for a projection.
+    let needs_write_back =
+        keepass_merge::vault_content_digest(&remote_vault) != engine.content_digest()?;
+
     engine.emit(ChangeEvent::ExternalChangeMerged {
         applied: stats.clone(),
     });
@@ -771,6 +800,7 @@ fn ingest_kdbx_as_owner(
     Ok(ParkConflictsResult::Applied {
         applied: stats,
         parked,
+        needs_write_back,
     })
 }
 

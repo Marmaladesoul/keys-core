@@ -1101,6 +1101,21 @@ impl Session {
                     // Diagnostics on stderr: scenarios parse stdout.
                     eprintln!("note: KDBX changed on disk — reconciled");
                     eprint_park_result(&result);
+                    // The reference-client write-back policy: persist the
+                    // advanced projection iff the reconcile says the disk
+                    // file lacks content we now hold. A digest-equal ingest
+                    // (a pure external edit, adopted) leaves the file
+                    // untouched — rewriting it would churn its mtime for
+                    // every other watcher and, between two rewrite-on-ingest
+                    // clients, ping-pong forever.
+                    if let ParkConflictsResultFfi::Applied {
+                        needs_write_back: true,
+                        ..
+                    } = result
+                    {
+                        session.save().await?;
+                        eprintln!("note: reconcile wrote back merged state");
+                    }
                 }
             }
         }
@@ -1885,7 +1900,11 @@ fn print_summaries(
 fn print_park_result(label: &str, r: &ParkConflictsResultFfi) {
     match r {
         ParkConflictsResultFfi::NoChange => println!("{label}: no change"),
-        ParkConflictsResultFfi::Applied { applied, parked } => {
+        ParkConflictsResultFfi::Applied {
+            applied,
+            parked,
+            needs_write_back,
+        } => {
             println!(
                 "{label}: entries +{} ~{} -{} moved {}; groups +{} ~{} -{} moved {}; history pruned {}",
                 applied.entries_added,
@@ -1897,6 +1916,14 @@ fn print_park_result(label: &str, r: &ParkConflictsResultFfi) {
                 applied.groups_deleted,
                 applied.groups_moved,
                 applied.history_pruned,
+            );
+            println!(
+                "write-back: {}",
+                if *needs_write_back {
+                    "needed"
+                } else {
+                    "not needed"
+                }
             );
             for u in &parked.entries_with_parked_conflict {
                 println!("parked conflict: {u}");
@@ -1916,13 +1943,22 @@ fn print_park_result(label: &str, r: &ParkConflictsResultFfi) {
 fn eprint_park_result(r: &ParkConflictsResultFfi) {
     match r {
         ParkConflictsResultFfi::NoChange => eprintln!("note: reconcile found no change"),
-        ParkConflictsResultFfi::Applied { applied, parked } => {
+        ParkConflictsResultFfi::Applied {
+            applied,
+            parked,
+            needs_write_back,
+        } => {
             eprintln!(
-                "note: reconcile applied entries +{} ~{} -{}; parked {} conflict(s)",
+                "note: reconcile applied entries +{} ~{} -{}; parked {} conflict(s); write-back {}",
                 applied.entries_added,
                 applied.entries_updated,
                 applied.entries_deleted,
                 parked.entries_with_parked_conflict.len(),
+                if *needs_write_back {
+                    "needed"
+                } else {
+                    "not needed"
+                },
             );
         }
     }
