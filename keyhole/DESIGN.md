@@ -916,6 +916,26 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 
 ## Findings (surfaced by keyhole)
 
+- **[FIXED] `group_tree`'s per-group entry counts filtered on the per-entry
+  `is_recycled` flag → the same vault counted differently warm vs cold, and
+  entries buried under a recycled group counted NOWHERE after a fresh
+  ingest.** The flag is only re-derived from ancestry at ingest; a group
+  recycle re-parents the group without cascading it. So in the live mirror a
+  just-recycled group kept its count (flag still 0 — accidentally right),
+  but after a `rm -rf "$VAULT.mirror"` reopen the re-derived flag (1)
+  excluded those entries from their own group while the bin root never held
+  them — they vanished from every count in the tree. This was the last
+  flag-scoped read path; `search` / `search_by_service` /
+  `entry_count_excluding_recycle_bin` had already moved to bin-subtree
+  membership. For a *direct* count membership needs no clause at all — an
+  entry's bin membership is definitionally its own group's, so the exclusion
+  reduces to a plain per-group `COUNT(*)`: location alone attributes the
+  count, the bin root counts only what sits directly in it, and a group
+  recycled with its entries keeps its own count wherever it lives (subtree
+  sums are the consumer's job). Pinned by `scenarios/group-counts-in-bin.sh`
+  (warm + cold across a fresh ingest) and the engine tests
+  `group_tree_counts_are_by_location_not_flag_{warm,cold}`.
+
 - **[FORCING FUNCTION — keepass-core gap closed] keyhole's first keyfile-bearing
   surface forced foreign `.keyx` ingest into `keepass-core`.** Adding `--keyfile`
   / `--new-keyfile` (the first key factor beyond a password to cross the
