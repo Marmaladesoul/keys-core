@@ -195,11 +195,11 @@ pub(crate) fn entry(conn: &Connection, uuid: Uuid) -> Result<Option<EntryFull>, 
 /// here: for a direct count an entry's bin membership is exactly its
 /// own group's, so "exclude bin members, except under the bin" filters
 /// nothing. Filtering on `is_recycled` instead did filter — wrongly:
-/// the flag is re-derived from ancestry only at ingest, so entries
-/// buried under a just-recycled group (flag still 0) counted warm but
-/// dropped out of *every* group's count after a reopen (flag 1, group
-/// not the bin root), making the same vault report different counts
-/// warm vs cold.
+/// the flag is warm-stale after a group recycle (see
+/// [`entry_count_excluding_recycle_bin`]), so entries buried under one
+/// counted warm but dropped out of *every* group's count after a
+/// reopen re-derived the flag — the same vault reporting different
+/// counts warm vs cold.
 pub(crate) fn group_tree(conn: &Connection) -> Result<Vec<GroupNode>, EngineError> {
     let mut stmt = conn.prepare(
         "SELECT uuid, parent_uuid, name, icon_index, icon_custom_uuid, is_recycle_bin, \

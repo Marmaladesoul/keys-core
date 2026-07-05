@@ -443,15 +443,18 @@ impl Engine {
     ///
     /// Tree shape is reconstructed by the caller from each
     /// [`GroupNode`]'s `parent_uuid` reference; the root group has
-    /// `parent_uuid = None`. Rows are ordered root-first then
-    /// alphabetically by name (with `uuid` as a deterministic tie
-    /// breaker), so callers can rely on a stable iteration order
+    /// `parent_uuid = None`. Rows are ordered root-first then by
+    /// sibling `sort_order` (name, then `uuid`, as deterministic tie
+    /// breakers), so callers can rely on a stable iteration order
     /// across runs of the same vault.
     ///
-    /// `entry_count_direct` counts entries directly in each group.
-    /// Regular groups exclude recycled entries; the recycle bin group
-    /// itself includes its contents (so the bin's count is the number
-    /// of items the user could empty).
+    /// `entry_count_direct` counts the entries located directly in
+    /// each group: the bin counts what sits directly in it, and a
+    /// group recycled with its entries keeps its own count. A total
+    /// ("how much is in the Trash?", "how much would emptying purge?")
+    /// is therefore a subtree sum, owned by the caller. The private
+    /// `reads::group_tree` explains why attribution is by location
+    /// alone, never the per-entry `is_recycled` flag.
     ///
     /// # Errors
     ///
