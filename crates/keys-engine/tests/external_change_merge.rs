@@ -511,7 +511,9 @@ fn park_one_sided_password_edit_auto_merges_and_advances() {
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile");
     match result {
-        ParkConflictsResult::Applied { applied, parked } => {
+        ParkConflictsResult::Applied {
+            applied, parked, ..
+        } => {
             assert_eq!(applied.entries_updated, 1, "the peer edit advanced local");
             assert!(
                 parked.entries_with_parked_conflict.is_empty(),
@@ -583,6 +585,107 @@ fn park_genuine_concurrent_edit_holds_and_stores_row() {
     );
     let after = f.engine.entry(seed_uuid).expect("entry").expect("present");
     assert_eq!(after.title, "local-rename", "hold-open keeps local's title");
+}
+
+/// A pure disk-side edit, once adopted, leaves the merged local state
+/// content-digest-equal to the file that delivered it — so `Applied`
+/// reports `needs_write_back: false`. This is the write-back
+/// convergence guard: a client that saves here anyway churns the file's
+/// mtime for nothing (and between two rewrite-on-ingest clients sharing
+/// a vault over a file-sync transport, would ping-pong forever).
+#[test]
+fn park_one_sided_disk_edit_needs_no_write_back() {
+    let mut f = fixture();
+    let seed_uuid = f
+        .engine
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list")[0]
+        .uuid;
+
+    // Disk: a title edit local never saw. Local stays on the ancestor.
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .edit_entry(
+            keepass_core::model::EntryId(seed_uuid),
+            keepass_core::model::HistoryPolicy::Snapshot,
+            |e| e.set_title("disk-rename"),
+        )
+        .expect("disk edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    let result = f
+        .engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile");
+    match result {
+        ParkConflictsResult::Applied {
+            applied,
+            needs_write_back,
+            ..
+        } => {
+            assert_eq!(applied.entries_updated, 1, "the disk edit advanced local");
+            assert!(
+                !needs_write_back,
+                "adopting a one-way ingest converges onto the file — nothing to push back",
+            );
+        }
+        other => panic!("expected Applied, got {other:?}"),
+    }
+}
+
+/// A genuine two-sided merge — local holds an unsaved edit while the
+/// disk file brings independent news — leaves the merged state holding
+/// content the file lacks, so `Applied` reports
+/// `needs_write_back: true`: the file peer's only transport is a
+/// client write-back, and exactly one save converges the pair.
+#[test]
+fn park_two_sided_merge_needs_write_back() {
+    let mut f = fixture();
+    let seed_uuid = f
+        .engine
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list")[0]
+        .uuid;
+
+    // Local: an unsaved username edit (mirror only, not on disk).
+    f.engine
+        .update_entry(
+            seed_uuid,
+            keys_engine::EntryUpdate {
+                username: Some("local-user".into()),
+                ..Default::default()
+            },
+        )
+        .expect("local edit");
+
+    // Disk: an independent new entry (no overlap with the local edit).
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    let root = external.vault().root.id;
+    external
+        .add_entry(root, NewEntry::new("disk-addition"))
+        .expect("disk add");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    let result = f
+        .engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile");
+    match result {
+        ParkConflictsResult::Applied {
+            applied,
+            needs_write_back,
+            ..
+        } => {
+            assert_eq!(applied.entries_added, 1, "the disk addition advanced local");
+            assert!(
+                needs_write_back,
+                "the merged state holds a local edit the file lacks — push it back",
+            );
+        }
+        other => panic!("expected Applied, got {other:?}"),
+    }
 }
 
 #[test]

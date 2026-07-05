@@ -444,7 +444,9 @@ fn park_conflicts_held_entry_group_rename_adopts_and_stays_loop_safe() {
         .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile");
     match result {
-        ParkConflictsResult::Applied { applied, parked } => {
+        ParkConflictsResult::Applied {
+            applied, parked, ..
+        } => {
             assert_eq!(applied.groups_updated, 1, "the group rename was adopted");
             assert_eq!(
                 parked.entries_with_parked_conflict,
@@ -860,7 +862,9 @@ fn two_engine_one_sided_title_edit_updates_without_parking() {
         .expect("b reconcile");
 
     match result {
-        ParkConflictsResult::Applied { applied, parked } => {
+        ParkConflictsResult::Applied {
+            applied, parked, ..
+        } => {
             assert!(
                 parked.entries_with_parked_conflict.is_empty(),
                 "B should not park; got: {:?}",
