@@ -916,6 +916,46 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 
 ## Findings (surfaced by keyhole)
 
+- **[CHARACTERISED — inherent interop limit, data-safe at the seam] An
+  entry-level last-writer-wins peer that folds a concurrent field edit into
+  `<History>` presents an ancestor the field-level reconcile cannot distinguish
+  from a deliberate revert.** Keys reconciles an external KDBX change with a
+  per-field 3-way merge, basing each field on the true common ancestor found by
+  walking both sides' `<History>` (`keepass_merge::find_common_ancestor`). Most
+  other KeePass clients merge at **entry granularity**: the newer-modified entry
+  wins wholesale and the losing record is preserved as the most-recent history
+  rung. That model cannot represent two concurrent edits to *different fields*
+  of one record, so on save it linearises the two siblings — burying the other
+  side's still-current edit beneath its own as a history rung (with that rung's
+  original modification time intact). When such a file lands on our path,
+  `find_common_ancestor` **correctly** selects the latest version shared by both
+  lineages — which is now that folded edit — and the per-field merge auto-takes
+  the peer's value for every field the peer moved off it. Concretely: a local
+  `title` edit the peer folded reads as `local == base`, so the peer's (older,
+  untouched) title is taken and the local edit reverts, with no conflict parked.
+  This is **byte-and-timestamp identical** to the peer having deliberately
+  edited that field back — history rungs keep their own modification times, so
+  the fold leaves no anomaly — so no merge (LCA or otherwise) can tell the two
+  apart, and no client-side logic can recover the edit or raise a non-spurious
+  conflict. The only disambiguating signal is out-of-band causality ("did the
+  peer actually observe this edit before building past it"), which exists on a
+  Keys-controlled sync channel but **not** on a shared file co-edited with a
+  foreign client; a file-timestamp heuristic can't separate the two and would
+  re-open the mixed-clock precision hazard fixed elsewhere in these Findings.
+  **The seam is data-safe:** the loss is committed by the folding peer *before*
+  Keys reads the file (its current already holds the reverted value), the
+  field-level reconcile merely converges to it and adds no loss, and the folded
+  edit survives in `<History>`. This is **not** a regression of the
+  ancestor-selection findings below — the ancestor selected here is the genuine
+  latest-shared version; the *input lineage* is what the peer folded, not the
+  selection. The positive half is the whole point of field-level merge: a
+  **fair** peer (history honest to the true base, no fold) reconciles with both
+  concurrent field edits preserved. Pinned by
+  `scenarios/reconcile-lww-peer-fold.sh` — Arm A (fair peer → both edits
+  survive, no conflict) guards the merge's promise; Arm B (folding peer →
+  converges to the peer's folded state, no conflict) pins the accepted limit so
+  any future hardening trips it consciously.
+
 - **[FIXED] `group_tree`'s per-group entry counts filtered on the per-entry
   `is_recycled` flag → the same vault counted differently warm vs cold, and
   entries buried under a recycled group counted NOWHERE after a fresh
