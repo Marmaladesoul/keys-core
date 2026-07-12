@@ -1,26 +1,24 @@
-//! External-change merge — Phase 4 task 4.6.
+//! External-change reconcile — the owner-rows ("park conflicts") path.
 //!
-//! Implements [`Engine::reconcile_with_disk`](crate::Engine::reconcile_with_disk):
-//! detects external KDBX changes (`KeeWeb`, autofill, sync drop-in), runs
-//! a two-way merge via [`keepass_merge::merge`] against the engine's
-//! current `SQLite` state, applies any non-conflicting diffs to `SQLite`
-//! inside a single transaction, and either emits
-//! [`ChangeEvent::ExternalChangeMerged`]
-//! or [`ChangeEvent::ConflictDetected`].
-//!
-//! The merge algorithm uses each entry's `<History>` list as the
-//! per-entry common ancestor (see `keepass-merge`'s top-level
-//! comment); the engine's `setting.last_saved_kdbx_bytes` is the
-//! vault-level "agreed baseline" that the next reconcile will run
-//! against, refreshed to the disk bytes after every successful
-//! `Merged` / `NoChange` result.
+//! Implements
+//! [`Engine::reconcile_with_disk_park_conflicts`](crate::Engine::reconcile_with_disk_park_conflicts)
+//! and its iroh twin [`Engine::ingest_peer`](crate::Engine::ingest_peer):
+//! external KDBX changes (`KeeWeb`, autofill, sync drop-in, a peer blob)
+//! are ingested as an owner-tagged replica, non-conflicting diffs are
+//! applied to `SQLite`, and conflicting facets are held as `conflict_*`
+//! owner rows — sync never blocks on a resolver. The rich payload for
+//! the resolver UI is rebuilt on demand by
+//! [`Engine::held_conflict_payload`](crate::Engine::held_conflict_payload),
+//! and resolution converges through
+//! [`Engine::apply_conflict_resolution`](crate::Engine::apply_conflict_resolution),
+//! which emits [`ChangeEvent::ExternalChangeMerged`].
 //!
 //! ## Atomicity
 //!
-//! The apply step re-ingests the merged [`Vault`] into the engine's
-//! `SQLite` mirror via the engine's ingest path, which holds a single
-//! transaction across the entire walk. A failure mid-apply rolls the
-//! transaction back; the engine state is unchanged and no events fire.
+//! The apply step writes through the engine's ingest path, which holds
+//! a single transaction across the entire walk. A failure mid-apply
+//! rolls the transaction back; the engine state is unchanged and no
+//! events fire.
 //!
 //! ## Composite key
 //!
@@ -34,7 +32,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::Kdbx;
-use keepass_core::model::{EntryId, Vault};
+use keepass_core::model::EntryId;
 
 use crate::conflict_rows;
 use crate::engine::Engine;
@@ -64,27 +62,6 @@ const FILE_OWNER: &str = "file";
 /// quota-trim ([`crate::mutations`]) still pins them so a cleanup pass can
 /// find them. No code path writes it any more.
 pub(crate) const FIELD_CONFLICT_CUSTOM_DATA_KEY: &str = "keys.field_conflict.v1";
-
-/// Outcome of a successful [`Engine::reconcile_with_disk`] call.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum MergeResult {
-    /// Engine's `SQLite` state and the disk file were already
-    /// equivalent — no merge needed. `setting.last_saved_kdbx_bytes`
-    /// is refreshed to the disk bytes regardless, so subsequent
-    /// reconciles use the latest disk state as their baseline.
-    NoChange,
-    /// Non-conflicting changes were applied to `SQLite`. `applied`
-    /// summarises the per-bucket counts.
-    Merged {
-        /// Per-bucket counts of merge mutations applied.
-        applied: MergeStats,
-    },
-    /// Conflicts require user resolution. `SQLite` was **not**
-    /// mutated; the payload is stashed on the engine for a later
-    /// `apply_conflict_resolution` call (task 4.7).
-    Conflict(ConflictPayload),
-}
 
 /// Aggregate counts of merge mutations applied to `SQLite`.
 ///
@@ -131,16 +108,15 @@ pub struct MergeStats {
 /// Outcome of a successful
 /// [`Engine::reconcile_with_disk_park_conflicts`] call.
 ///
-/// Mirrors [`MergeResult`] for the non-conflict cases (`NoChange`,
-/// `Merged`); the third variant is `Parked` rather than `Conflict`
-/// because the conflicting entries have been resolved into local's
-/// `<History>` with `keys.field_conflict.v1` markers attached — sync
-/// never blocks. The user reviews via the resolver UI at their leisure.
+/// Two variants only — there is no `Conflict` case, because conflicting
+/// facets are held as owner rows rather than blocking the ingest — sync
+/// never stalls on a resolver. The user reviews via the resolver UI at
+/// their leisure.
 ///
-/// `applied` reflects the same per-bucket stats as
-/// [`MergeResult::Merged`]; `parked` lists the entry UUIDs whose
-/// conflicts were parked plus the auto-handled categories from
-/// [`keepass_merge::ParkedConflictsReport`] for downstream UX.
+/// `applied` carries the per-bucket [`MergeStats`]; `parked` lists the
+/// entry UUIDs whose conflicts were parked plus the auto-handled
+/// categories from [`keepass_merge::ParkedConflictsReport`] for
+/// downstream UX.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ParkConflictsResult {
@@ -189,139 +165,6 @@ pub struct ParkedConflictsSummary {
 /// local — there's no need for global uniqueness; the id only has to
 /// distinguish concurrent payloads stashed on the same engine handle.
 pub(crate) static NEXT_CONFLICT_ID: AtomicI64 = AtomicI64::new(1);
-
-/// The merge implementation. Pulled out of [`Engine`] so the
-/// surrounding method body stays narrow.
-pub(crate) fn reconcile_with_disk(
-    engine: &mut Engine,
-    kdbx_path: &Path,
-    composite_key: &CompositeKey,
-) -> Result<MergeResult, EngineError> {
-    // 1. Read the disk bytes.
-    let disk_bytes = std::fs::read(kdbx_path)?;
-
-    // 2. Parse the disk vault.
-    let disk_kdbx = Kdbx::open_from_bytes(disk_bytes.clone())
-        .map_err(|e| EngineError::Serialise(format!("open disk kdbx: {e}")))?
-        .read_header()
-        .map_err(|e| EngineError::Serialise(format!("read disk header: {e}")))?
-        .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
-        .map_err(|e| EngineError::Serialise(format!("unlock disk kdbx: {e}")))?;
-
-    // 3. Project the engine's current state to a Vault (local side).
-    let local_vault = engine.project_to_vault()?;
-
-    // 4. Build the remote-side vault. Use `vault_with_unwrapped_protected`
-    //    so the merge sees plaintext on protected fields, matching the
-    //    projection's shape — keepass-merge compares by value and
-    //    cannot reason about the wrap layer.
-    let remote_vault = disk_kdbx
-        .vault_with_unwrapped_protected()
-        .map_err(|e| EngineError::Serialise(format!("unwrap disk protected: {e}")))?;
-
-    // 5. Quick equality check: if the disk bytes are byte-identical to
-    //    the engine's last-saved baseline, short-circuit with NoChange.
-    //    Every engine save produces fresh bytes from a new nonce only
-    //    when something actually changed, so byte equality against the
-    //    agreed baseline IS content equality. If we have no baseline
-    //    (first-ever reconcile), fall through and let the merge run.
-    let baseline = engine.last_saved_kdbx_bytes()?;
-    if let Some(ref b) = baseline {
-        if b == &disk_bytes {
-            engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-            return Ok(MergeResult::NoChange);
-        }
-    }
-
-    // 6. Run the merge.
-    let outcome = keepass_merge::merge(&local_vault, &remote_vault)
-        .map_err(|e| EngineError::Serialise(format!("merge: {e}")))?;
-
-    // 6a. Empty-merge short-circuit. The byte-equivalence check above
-    //     catches the "same kdbx file" case, but two byte-different
-    //     kdbx files can carry content-identical vaults (fresh
-    //     encryption nonce on each save). Without this guard, an
-    //     empty-bucket merge would still return `Merged`, which makes
-    //     SyncManager save + push fresh bytes that the peer then sees
-    //     as a new disk update — an infinite ping-pong loop.
-    if outcome_is_no_op(&outcome, &local_vault, &remote_vault) {
-        engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-        return Ok(MergeResult::NoChange);
-    }
-
-    // 7. Conflict path — surface and bail without mutating SQLite.
-    if !outcome.entry_conflicts.is_empty() || !outcome.delete_edit_conflicts.is_empty() {
-        let id = NEXT_CONFLICT_ID.fetch_add(1, Ordering::Relaxed);
-        let payload = ConflictPayload {
-            id,
-            entry_conflicts: outcome.entry_conflicts.clone(),
-            delete_edit_conflicts: outcome.delete_edit_conflicts.clone(),
-        };
-        engine.stash_conflict_payload(payload.clone());
-        engine.stash_conflict_context(crate::conflict_resolution::PendingConflictContext {
-            payload: payload.clone(),
-            outcome,
-            local_vault,
-            remote_vault,
-        });
-        engine.emit(ChangeEvent::ConflictDetected(payload.clone()));
-        return Ok(MergeResult::Conflict(payload));
-    }
-
-    // 8. Compute stats from the outcome before consuming it.
-    let stats = MergeStats {
-        entries_added: outcome.added_on_disk.len(),
-        entries_updated: outcome.disk_only_changes.len() + outcome.local_only_changes.len(),
-        entries_deleted: outcome.deleted_on_disk.len(),
-        entries_moved: 0,
-        groups_added: count_groups_remote_only(&local_vault, &remote_vault),
-        groups_updated: 0,
-        groups_deleted: count_groups_tombstoned(&local_vault, &remote_vault),
-        groups_moved: 0,
-        // The disk-reconcile path folds history-tombstone reconciliation into
-        // its eager merge (`apply_merge`), so it has no separate count.
-        history_pruned: 0,
-    };
-
-    // 9. Apply the merge to a clone of the local vault.
-    let mut merged = local_vault;
-    keepass_merge::apply_merge(
-        &mut merged,
-        &remote_vault,
-        &outcome,
-        &keepass_merge::Resolution::default(),
-    )
-    .map_err(|e| EngineError::Serialise(format!("apply_merge: {e}")))?;
-    keepass_merge::reconcile_timestamps(&mut merged, &remote_vault);
-
-    // 10. Atomically replace SQLite contents with the merged vault.
-    //     We re-use `ingest`, which wraps the entire write in a single
-    //     transaction — failure mid-walk rolls back and the engine
-    //     state is unchanged. The disk Kdbx is the convenient carrier
-    //     for the merged vault since it already has the protector and
-    //     crypto envelope wired up.
-    let mut disk_kdbx = Kdbx::open_from_bytes(disk_bytes.clone())
-        .map_err(|e| EngineError::Serialise(format!("re-open disk kdbx: {e}")))?
-        .read_header()
-        .map_err(|e| EngineError::Serialise(format!("re-read disk header: {e}")))?
-        .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
-        .map_err(|e| EngineError::Serialise(format!("re-unlock disk kdbx: {e}")))?;
-    disk_kdbx.replace_vault(merged);
-    engine.ingest_merged(&disk_kdbx)?;
-
-    // 11. Refresh the common ancestor to the disk bytes — the agreed
-    //     baseline for the next reconcile. The merged result lives in
-    //     SQLite now; a follow-up save_to_kdbx will overwrite the disk
-    //     file (and the ancestor) with the combined state.
-    engine.set_last_saved_kdbx_bytes(&disk_bytes)?;
-
-    // 12. Emit the success event.
-    engine.emit(ChangeEvent::ExternalChangeMerged {
-        applied: stats.clone(),
-    });
-
-    Ok(MergeResult::Merged { applied: stats })
-}
 
 /// Rebuild the rich conflict payload for the **held** (parked) entries from
 /// the owner-rows store and stash a context so they can be resolved through
@@ -638,8 +481,8 @@ fn child_contains_entry(group: &keepass_core::model::Group, id: EntryId) -> bool
         || group.groups.iter().any(|g| child_contains_entry(g, id))
 }
 
-/// Park-conflicts variant of [`reconcile_with_disk`] — the live sync path,
-/// now backed by the multi-peer **owner-rows** store.
+/// The external-change reconcile — the live sync path, backed by the
+/// multi-peer **owner-rows** store.
 ///
 /// Reads / parses / unlocks the disk kdbx and projects the remote vault, then
 /// hands it to [`Engine::ingest_peer`] (the owner-rows ingest) under the
@@ -787,45 +630,6 @@ fn ingest_kdbx_as_owner(
     })
 }
 
-/// Count groups present only on the remote side (will be added by
-/// the apply step's LWW group-tree pass).
-fn count_groups_remote_only(local: &Vault, remote: &Vault) -> usize {
-    use std::collections::HashSet;
-    let mut local_ids: HashSet<uuid::Uuid> = HashSet::new();
-    let mut remote_ids: HashSet<uuid::Uuid> = HashSet::new();
-    collect_group_ids(&local.root, &mut local_ids);
-    collect_group_ids(&remote.root, &mut remote_ids);
-    remote_ids.difference(&local_ids).count()
-}
-
-/// Count groups present locally whose uuid is in the remote
-/// tombstone set with a `deleted_at` that wins over the local mtime
-/// (the conservative apply rule).
-fn count_groups_tombstoned(local: &Vault, remote: &Vault) -> usize {
-    use std::collections::HashMap;
-    let remote_tomb: HashMap<uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>> = remote
-        .deleted_objects
-        .iter()
-        .map(|t| (t.uuid, t.deleted_at))
-        .collect();
-    let mut local_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-    collect_group_ids(&local.root, &mut local_ids);
-    local_ids
-        .iter()
-        .filter(|id| remote_tomb.contains_key(*id))
-        .count()
-}
-
-fn collect_group_ids(
-    group: &keepass_core::model::Group,
-    out: &mut std::collections::HashSet<uuid::Uuid>,
-) {
-    out.insert(group.id.0);
-    for sub in &group.groups {
-        collect_group_ids(sub, out);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Parked-conflict surface — queries + marker-clearing.
 // ---------------------------------------------------------------------------
@@ -863,27 +667,4 @@ pub(crate) fn clear_parked_conflict_marker(
     _now: chrono::DateTime<chrono::Utc>,
 ) -> Result<u32, EngineError> {
     conflict_rows::drop_conflict_rows(engine.conn(), entry_uuid)
-}
-
-/// True when a merge outcome has no actual state change for the
-/// engine to apply: no entry buckets populated, no group structural
-/// changes, no conflicts. Used by both reconcile variants to break
-/// the iroh ping-pong loop where each `save_to_kdbx` produces fresh
-/// bytes (new nonce) even when the logical content is unchanged.
-///
-/// `entry_conflicts` and `delete_edit_conflicts` deliberately count
-/// as "something happened" — even though they don't mutate `SQLite` in
-/// the classic reconcile path, the park-conflicts variant pushes a
-/// marked snapshot into history and the engine state genuinely
-/// advances.
-fn outcome_is_no_op(outcome: &keepass_merge::MergeOutcome, local: &Vault, remote: &Vault) -> bool {
-    outcome.added_on_disk.is_empty()
-        && outcome.disk_only_changes.is_empty()
-        && outcome.local_only_changes.is_empty()
-        && outcome.deleted_on_disk.is_empty()
-        && outcome.local_deletions_pending_sync.is_empty()
-        && outcome.entry_conflicts.is_empty()
-        && outcome.delete_edit_conflicts.is_empty()
-        && count_groups_remote_only(local, remote) == 0
-        && count_groups_tombstoned(local, remote) == 0
 }

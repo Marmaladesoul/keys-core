@@ -3,15 +3,16 @@
 //! Wraps the engine in a [`Mutex`] for FFI-side `&self`/`Send`/`Sync`
 //! satisfaction (the engine itself takes `&self` for reads and `&mut
 //! self` for mutations; the mutex serialises both). Reads land sync;
-//! the four slow ops (`ingest_from_kdbx`, `save_to_kdbx`,
-//! `reconcile_with_disk`, `apply_conflict_resolution`) are `async` and
-//! dispatched onto a tokio multi-thread runtime.
+//! the slow ops (`ingest_from_kdbx`, `save_to_kdbx`,
+//! `reconcile_with_disk_park_conflicts`, `apply_conflict_resolution`)
+//! are `async` and dispatched onto a tokio multi-thread runtime.
 //!
 //! ## What's exposed
 //!
 //! Mirrors every public `Engine::*` method except the test-only /
 //! `#[doc(hidden)]` ones. KDBX-handle-bearing methods
-//! (`ingest_from_kdbx`, `save_to_kdbx`, `reconcile_with_disk`) take a
+//! (`ingest_from_kdbx`, `save_to_kdbx`,
+//! `reconcile_with_disk_park_conflicts`) take a
 //! `kdbx_path: String` + `password: String` and open the kdbx in-method
 //! — there's no FFI-side `Kdbx` Object to pass through (one could be
 //! added later if call sites need to amortise the open cost; for now
@@ -28,8 +29,8 @@
 //!   file-watcher path.
 //! - `Engine::fingerprint` / `Engine::strength` — pure helpers that
 //!   the FFI hasn't needed yet; trivial to add if a frontend asks.
-//! - `Engine::last_self_write` / `last_saved_kdbx_bytes` — internal
-//!   diagnostics.
+//! - `Engine::last_self_write` — internal to the file-watcher
+//!   self-write suppression.
 //! - The `#[doc(hidden)]` test accessors.
 
 // uniffi-exported methods take owned `String` even when they only borrow
@@ -63,8 +64,8 @@ use crate::engine_portable::EnginePortableEntry;
 use crate::engine_types::{
     AttachmentBlobStats, ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull,
     EntrySave, EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi,
-    MergeResult, NewEntryFields, NewGroupFields, Page, ParkConflictsResultFfi, Predicate,
-    RecycleBinFilter, SearchScope, SmartFolder, TagUsageCount, VaultState, parse_uuid,
+    NewEntryFields, NewGroupFields, Page, ParkConflictsResultFfi, Predicate, RecycleBinFilter,
+    SearchScope, SmartFolder, TagUsageCount, VaultState, parse_uuid,
 };
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
@@ -1157,25 +1158,7 @@ impl Engine {
         })
     }
 
-    /// Reconcile SQLite against the on-disk KDBX at `kdbx_path`.
-    pub async fn reconcile_with_disk(
-        &self,
-        kdbx_path: String,
-        password: String,
-    ) -> Result<MergeResult, EngineError> {
-        let path = PathBuf::from(kdbx_path);
-        let pw = SecretString::from(password);
-        // Build the composite key off-thread (cheap, but matches the
-        // async-everywhere posture for slow ops).
-        let composite = tokio::task::spawn_blocking(move || {
-            CompositeKey::from_password(pw.expose_secret().as_bytes())
-        })
-        .await
-        .map_err(|e| EngineError::Internal(format!("join: {e}")))?;
-        self.with_engine_mut(|e| Ok(e.reconcile_with_disk(&path, &composite)?.into()))
-    }
-
-    /// Park-conflicts variant of [`Self::reconcile_with_disk`]. See
+    /// Reconcile SQLite against the on-disk KDBX at `kdbx_path`. See
     /// [`keys_engine::Engine::reconcile_with_disk_park_conflicts`].
     ///
     /// Returned `ParkConflictsResultFfi::Applied` carries the
@@ -1241,9 +1224,8 @@ impl Engine {
     }
 
     /// Build the rich conflict payload for the currently **held** (parked)
-    /// conflicts and stash a context so they can be resolved through the same
-    /// [`Self::apply_conflict_resolution`] entry point the live
-    /// [`Self::reconcile_with_disk`] path uses.
+    /// conflicts and stash a context so they can be resolved through the
+    /// [`Self::apply_conflict_resolution`] entry point.
     ///
     /// This is the resolver-open companion to
     /// [`Self::entries_with_parked_conflict`] (which only drives the badge):
@@ -1324,10 +1306,8 @@ impl Engine {
     /// Peek the stashed [`ConflictPayloadFfi`] for `id` without
     /// consuming it.
     ///
-    /// The frontend calls this after receiving a
-    /// `ChangeEvent::ConflictDetected { id }` observer notification (or
-    /// after a `reconcile_with_disk` call that returned
-    /// `MergeResult::Conflict { id }`) to render the resolver UI. The
+    /// The frontend calls this after [`Self::held_conflict_payload`]
+    /// minted the id on resolver-open, to render the resolver UI. The
     /// payload is a clone — repeated calls with the same `id` return
     /// the same data until [`Self::apply_conflict_resolution`]
     /// consumes the matching context, at which point this returns
@@ -1365,9 +1345,8 @@ impl Engine {
 
     /// Discard a stashed conflict by `id` without resolving it.
     ///
-    /// The resolver-open path ([`Self::held_conflict_payload`]) and the
-    /// live [`Self::reconcile_with_disk`] path both stash a rich payload
-    /// plus a context (two in-memory vaults — sizeable on a big vault)
+    /// The resolver-open path ([`Self::held_conflict_payload`])
+    /// stashes a rich payload plus a context (two in-memory vaults — sizeable on a big vault)
     /// keyed by `id`. [`Self::apply_conflict_resolution`] consumes that
     /// stash, but a resolver the user dismisses with "Resolve Later"
     /// never resolves — so Keys-Mac calls this on dismiss to drop the

@@ -54,7 +54,7 @@ pub use predicate_builtin::{
     recycle_bin_contents, weak_password,
 };
 pub use predicate_sql::{CompileError, CompiledPredicate, compile as compile_predicate};
-pub use reconcile::{MergeResult, MergeStats, ParkConflictsResult, ParkedConflictsSummary};
+pub use reconcile::{MergeStats, ParkConflictsResult, ParkedConflictsSummary};
 // Re-export the keepass-merge resolution surface as the engine's
 // canonical "conflict resolution" carrier. Phase 4 task 4.7 mirrors
 // `keepass-merge`'s shape verbatim — wrapping it would be a layer of

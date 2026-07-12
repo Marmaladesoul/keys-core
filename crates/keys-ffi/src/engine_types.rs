@@ -920,47 +920,14 @@ fn secs_to_duration(secs: i64) -> Duration {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// MergeResult / MergeStats — reconcile_with_disk outcome
+// MergeStats / ParkConflictsResultFfi — reconcile outcome
 // ────────────────────────────────────────────────────────────────────────
-
-/// Outcome of a successful [`crate::Engine::reconcile_with_disk`] call.
-///
-/// `Conflict` carries the synthetic id only — the full payload is
-/// fetched separately via [`crate::Engine::pending_conflict`], which
-/// gives the resolver UI a peek-only view of the stashed payload
-/// keyed by id. Matches the maintainer's 2026-05-16 "big payload = opaque id +
-/// accessor" decision.
-#[derive(uniffi::Enum, Debug, Clone)]
-pub enum MergeResult {
-    NoChange,
-    Merged { applied: MergeStats },
-    Conflict { id: i64 },
-}
-
-impl From<eng::MergeResult> for MergeResult {
-    fn from(r: eng::MergeResult) -> Self {
-        match r {
-            eng::MergeResult::NoChange => Self::NoChange,
-            eng::MergeResult::Merged { applied } => Self::Merged {
-                applied: applied.into(),
-            },
-            eng::MergeResult::Conflict(p) => Self::Conflict { id: p.id },
-            // `#[non_exhaustive]` upstream — collapse to `NoChange`.
-            other => {
-                let _ = other;
-                Self::NoChange
-            }
-        }
-    }
-}
 
 /// Outcome of a successful
 /// [`crate::Engine::reconcile_with_disk_park_conflicts`] call.
 ///
-/// Slice 5b's non-blocking replacement for [`MergeResult::Conflict`]:
-/// conflicts are parked into the merged vault's history rather than
-/// stashed for a modal. The third variant carries a list of entry
-/// UUIDs the resolver UI uses to render its review list.
+/// Non-blocking by design: conflicts are held as owner rows rather
+/// than stashed for a modal, so there is no `Conflict` variant.
 #[derive(uniffi::Enum, Debug, Clone)]
 pub enum ParkConflictsResultFfi {
     NoChange,

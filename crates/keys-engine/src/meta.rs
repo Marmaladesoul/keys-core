@@ -212,8 +212,8 @@ pub(crate) fn clear_meta_tables(conn: &Connection) -> Result<(), rusqlite::Error
     conn.execute("DELETE FROM meta_custom_data", [])?;
     conn.execute("DELETE FROM meta_deleted_object", [])?;
     // Setting rows: only delete meta.* keys, not fingerprint_key /
-    // last_saved_kdbx_bytes / meta.recycle_bin_enabled (the last is
-    // re-written by ingest, but using a wildcard keeps cleanup honest).
+    // meta.recycle_bin_enabled (the latter is re-written by ingest,
+    // but using a wildcard keeps cleanup honest).
     conn.execute(
         "DELETE FROM setting WHERE key LIKE 'meta.%' AND key != 'meta.recycle_bin_enabled'",
         [],

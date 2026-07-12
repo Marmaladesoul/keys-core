@@ -16,7 +16,7 @@ use keepass_core::model::{CustomFieldValue, EntryId, HistoryPolicy, NewEntry};
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{
     AttachmentChoice, ChangeEvent, ConflictResolution, ConflictSide, DataChangeObserver, DbKey,
-    DeleteEditChoice, Engine, EngineError, KeyProvider, KeyProviderError, MergeResult,
+    Engine, EngineError, KeyProvider, KeyProviderError,
 };
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
@@ -125,8 +125,10 @@ fn fixture() -> Fixture {
 }
 
 /// Drive a Title-field conflict: engine edits Title to `local`, disk
-/// edits to `disk`, reconcile detects the conflict and stashes it.
-/// Returns the stash id.
+/// edits to `disk`, the park reconcile holds it as owner rows, and
+/// `held_conflict_payload` rebuilds + stashes the rich payload — the
+/// same setup the production resolver-open path uses. Returns the
+/// stash id.
 fn drive_title_conflict(f: &mut Fixture, local_title: &str, disk_title: &str) -> i64 {
     f.engine
         .update_entry(
@@ -148,14 +150,15 @@ fn drive_title_conflict(f: &mut Fixture, local_title: &str, disk_title: &str) ->
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    let result = f
+    f.engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park");
+    let payload = f
         .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
-    match result {
-        MergeResult::Conflict(payload) => payload.id,
-        other => panic!("expected Conflict, got {other:?}"),
-    }
+        .held_conflict_payload(&f.kdbx_path, &composite(), None)
+        .expect("held payload")
+        .expect("a conflict is held");
+    payload.id
 }
 
 /// Build a `Resolution` that resolves the single Title-field conflict
@@ -788,14 +791,15 @@ fn apply_resolution_mixed_choices() {
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    let id = match f
+    f.engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park");
+    let id = f
         .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile")
-    {
-        MergeResult::Conflict(p) => p.id,
-        other => panic!("expected Conflict, got {other:?}"),
-    };
+        .held_conflict_payload(&f.kdbx_path, &composite(), None)
+        .expect("held payload")
+        .expect("a conflict is held")
+        .id;
 
     let mut fields: HashMap<String, ConflictSide> = HashMap::new();
     fields.insert("Title".into(), ConflictSide::Local);
@@ -866,14 +870,15 @@ fn apply_resolution_with_custom_field_choice() {
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    let id = match f
+    f.engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park");
+    let id = f
         .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile")
-    {
-        MergeResult::Conflict(p) => p.id,
-        other => panic!("expected Conflict, got {other:?}"),
-    };
+        .held_conflict_payload(&f.kdbx_path, &composite(), None)
+        .expect("held payload")
+        .expect("a conflict is held")
+        .id;
 
     let mut fields: HashMap<String, ConflictSide> = HashMap::new();
     fields.insert("Server".into(), ConflictSide::Remote);
@@ -952,21 +957,22 @@ fn apply_resolution_handles_attachment_conflicts() {
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    let (id, attachment_name) = match f
-        .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile")
-    {
-        MergeResult::Conflict(p) => {
-            assert_eq!(p.entry_conflicts.len(), 1);
-            let conflict = &p.entry_conflicts[0];
-            let delta = conflict
-                .attachment_deltas
-                .first()
-                .expect("attachment delta");
-            (p.id, delta.name.clone())
-        }
-        other => panic!("expected Conflict, got {other:?}"),
+    f.engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park");
+    let (id, attachment_name) = {
+        let p = f
+            .engine
+            .held_conflict_payload(&f.kdbx_path, &composite(), None)
+            .expect("held payload")
+            .expect("a conflict is held");
+        assert_eq!(p.entry_conflicts.len(), 1);
+        let conflict = &p.entry_conflicts[0];
+        let delta = conflict
+            .attachment_deltas
+            .first()
+            .expect("attachment delta");
+        (p.id, delta.name.clone())
     };
 
     let mut atts: HashMap<String, AttachmentChoice> = HashMap::new();
@@ -1037,23 +1043,21 @@ fn apply_resolution_handles_icon_conflict() {
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    let result = f
-        .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
+    f.engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park");
     // Icon-only divergence may auto-resolve via the 3-way classifier
-    // when the LCA carries neither uuid; in that case the test
-    // becomes a no-op assertion of the auto-merged side. If the
-    // classifier surfaces a true conflict, drive it through apply
-    // with `ConflictSide::Remote`.
-    // If the classifier auto-resolves (e.g. when the LCA carries
-    // neither uuid), the merge pipeline takes the auto path and
-    // there's nothing for apply to do — reaching that branch
-    // confirms the icon divergence doesn't crash the merge. If the
-    // classifier surfaces a true conflict, drive it through apply
-    // with `ConflictSide::Remote` (plus any sibling field deltas
-    // the title bump may have brought along).
-    if let MergeResult::Conflict(payload) = result {
+    // when the LCA carries neither uuid; in that case nothing is held
+    // and the test becomes a no-op assertion of the auto-merged side —
+    // reaching that branch confirms the icon divergence doesn't crash
+    // the merge. If the classifier holds a true conflict, drive it
+    // through apply with `ConflictSide::Remote` (plus any sibling
+    // field deltas the title bump may have brought along).
+    if let Some(payload) = f
+        .engine
+        .held_conflict_payload(&f.kdbx_path, &composite(), None)
+        .expect("held payload")
+    {
         let mut resolution = ConflictResolution::default();
         for conflict in &payload.entry_conflicts {
             let mut fields: HashMap<String, ConflictSide> = HashMap::new();
@@ -1077,67 +1081,10 @@ fn apply_resolution_handles_icon_conflict() {
     }
 }
 
-#[test]
-fn apply_resolution_handles_delete_edit_choice() {
-    // Disk deletes the entry; local then edits it after the deletion
-    // tombstone. `KeepLocal` keeps the edited entry alive;
-    // `AcceptRemoteDelete` honours the deletion. The order matters
-    // for the merger's `local_edited_after(local, deleted_at)` check
-    // — local must mtime AFTER the tombstone for the delete-edit
-    // bucket to fire (otherwise the merger correctly classifies as a
-    // clean remote-delete adoption).
-    let mut f = fixture();
-
-    let mut external = reopen_kdbx(&f.kdbx_path);
-    external
-        .delete_entry(EntryId(f.seed_uuid))
-        .expect("disk delete");
-    let bytes = external.save_to_bytes().expect("save");
-    std::fs::write(&f.kdbx_path, &bytes).expect("write");
-
-    // Ensure the local edit's wall-clock mtime is strictly after the
-    // tombstone AT DISK PRECISION. Every KDBX serialisation of a
-    // timestamp is second-resolution, and the projection now floors to
-    // match (Finding #4: sync decisions must be pure functions of
-    // synced bytes) — so a same-second edit-vs-delete is a tie, and
-    // ties go to the delete (the documented 5b rule). Crossing a whole
-    // second boundary is what makes this a genuine edit-after-delete.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    f.engine
-        .update_entry(
-            f.seed_uuid,
-            keys_engine::EntryUpdate {
-                title: Some("local-rescue".into()),
-                ..Default::default()
-            },
-        )
-        .expect("local edit");
-
-    let id = match f
-        .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile")
-    {
-        MergeResult::Conflict(p) => {
-            assert_eq!(p.delete_edit_conflicts.len(), 1);
-            p.id
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    };
-
-    let mut resolution = ConflictResolution::default();
-    resolution
-        .delete_edit_choices
-        .insert(EntryId(f.seed_uuid), DeleteEditChoice::KeepLocal);
-
-    f.engine
-        .apply_conflict_resolution(id, &resolution)
-        .expect("apply delete-edit");
-
-    let after = f.engine.entry(f.seed_uuid).expect("entry");
-    assert!(after.is_some(), "entry survived KeepLocal");
-    assert_eq!(after.unwrap().title, "local-rescue");
-}
+// NB: the pre-owner-rows `apply_resolution_handles_delete_edit_choice`
+// test retired with the classic reconcile path — under the owner-rows
+// ingest a post-delete edit auto-resolves edit-wins (no held conflict),
+// covered end-to-end by keyhole's `delete-vs-edit.sh` scenario.
 
 #[test]
 fn apply_resolution_consumes_stash() {
@@ -1408,11 +1355,10 @@ fn pending_conflict_parent_groups_covers_every_conflict_entry() {
 
 /// Drive a Password-field conflict on the seed entry. Engine sets
 /// local password via `update_entry`; disk sets via `edit_entry` /
-/// `set_password`. We also bump the Title on both sides because
-/// `reconcile_with_disk`'s cheap-equivalence short-circuit only
-/// compares `(title, username, url, notes)` — a password-only diff
-/// would short-circuit to `NoChange` and we'd never reach the
-/// conflict path. Returns the stash id.
+/// `set_password`. We also bump the Title on both sides so the diff
+/// is unambiguous for the merge's comparators. The park reconcile
+/// holds the conflict as owner rows and `held_conflict_payload`
+/// rebuilds + stashes the rich payload. Returns the stash id.
 fn drive_password_conflict(f: &mut Fixture, local_pw: &str, disk_pw: &str) -> i64 {
     f.engine
         .update_entry(
@@ -1436,14 +1382,15 @@ fn drive_password_conflict(f: &mut Fixture, local_pw: &str, disk_pw: &str) -> i6
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    match f
+    f.engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park");
+    let payload = f
         .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile")
-    {
-        MergeResult::Conflict(payload) => payload.id,
-        other => panic!("expected Conflict, got {other:?}"),
-    }
+        .held_conflict_payload(&f.kdbx_path, &composite(), None)
+        .expect("held payload")
+        .expect("a conflict is held");
+    payload.id
 }
 
 #[test]
@@ -1573,14 +1520,15 @@ fn reveal_conflict_field_handles_protected_custom_field() {
     let bytes = external.save_to_bytes().expect("save");
     std::fs::write(&f.kdbx_path, &bytes).expect("write");
 
-    let id = match f
+    f.engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("park");
+    let id = f
         .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile")
-    {
-        MergeResult::Conflict(p) => p.id,
-        other => panic!("expected Conflict, got {other:?}"),
-    };
+        .held_conflict_payload(&f.kdbx_path, &composite(), None)
+        .expect("held payload")
+        .expect("a conflict is held")
+        .id;
 
     let local = f
         .engine

@@ -1,6 +1,6 @@
 //! `Engine` conflict-resolution methods — the bridge between
-//! `reconcile_with_disk` (which stashes a `ConflictPayload` when the
-//! merge can't be fully auto-resolved) and the caller's eventual
+//! `held_conflict_payload` (which stashes a `ConflictPayload` when the
+//! resolver opens on held owner rows) and the caller's eventual
 //! `apply_conflict_resolution` call.
 //!
 //! Read-side accessors (`pending_conflict`,
@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::protector::FieldProtector;
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -32,9 +31,8 @@ use super::{Engine, find_entry_parent_group};
 impl Engine {
     /// Peek a stashed conflict payload by `id` without consuming it.
     ///
-    /// Frontends call this after receiving
-    /// [`crate::events::ChangeEvent::ConflictDetected`]
-    /// to render the resolver UI, then later call
+    /// Frontends call this after [`Self::held_conflict_payload`]
+    /// stashes a payload on resolver-open, then later call
     /// [`Self::apply_conflict_resolution`] (which consumes the
     /// matching context) once the user has picked their per-field /
     /// per-attachment / per-icon / delete-vs-edit choices.
@@ -44,7 +42,7 @@ impl Engine {
     /// point on this returns `None` for that id. A frontend that
     /// abandons the resolution (e.g. user closes the window) leaves
     /// the payload in the stash; a fresh
-    /// [`Self::reconcile_with_disk`] produces a new
+    /// [`Self::held_conflict_payload`] call produces a new
     /// [`ConflictPayload`] with a fresh id.
     ///
     /// # Panics
@@ -199,10 +197,9 @@ impl Engine {
     /// Apply a user-resolved [`keepass_merge::Resolution`] to a
     /// previously-stashed conflict.
     ///
-    /// `id` is the synthetic id from the
-    /// [`crate::events::ChangeEvent::ConflictDetected`] event (and
-    /// the matching [`ConflictPayload::id`] field) that surfaced the
-    /// conflict via [`Engine::reconcile_with_disk`]. `resolution`
+    /// `id` is the synthetic id minted when
+    /// [`Self::held_conflict_payload`] stashed the payload (the
+    /// matching [`ConflictPayload::id`] field). `resolution`
     /// carries the user's per-field, per-attachment, per-icon and
     /// delete-vs-edit decisions. See the [`keepass_merge::Resolution`]
     /// docs for the validation contract.
@@ -216,8 +213,8 @@ impl Engine {
     ///
     /// The stash is consumed by this call: a second call with the
     /// same `id` returns [`EngineError::NotFound`]. A retry needs a
-    /// fresh `reconcile_with_disk` because the caller's mental model
-    /// of the conflict shape may be stale by then.
+    /// fresh [`Self::held_conflict_payload`] because the caller's
+    /// mental model of the conflict shape may be stale by then.
     ///
     /// # Errors
     ///
@@ -242,8 +239,8 @@ impl Engine {
     /// [`ConflictPayload`] mirror and the internal resolution context
     /// — for `id` without resolving it.
     ///
-    /// Both the live ([`Self::reconcile_with_disk`]) and held
-    /// ([`Self::held_conflict_payload`]) paths stash a payload plus a
+    /// The resolver-open path ([`Self::held_conflict_payload`])
+    /// stashes a payload plus a
     /// context (two in-memory [`Vault`](keepass_core::model::Vault)s —
     /// sizeable on a big vault) keyed by `id`.
     /// [`Self::apply_conflict_resolution`] consumes both; but if the
@@ -352,20 +349,6 @@ impl Engine {
             entry_uuid,
             field_name,
         )
-    }
-
-    /// Crate-internal: re-ingest a merged [`Kdbx`] into `SQLite`.
-    /// The single-transaction discipline lives in
-    /// [`crate::ingest::ingest`]; the reconcile path uses this so
-    /// failure rolls back cleanly without firing events.
-    pub(crate) fn ingest_merged(&mut self, kdbx: &Kdbx<Unlocked>) -> Result<(), EngineError> {
-        let _outcome = crate::ingest::ingest(
-            &mut self.conn,
-            &self.fingerprint_key,
-            &*self.field_protector,
-            kdbx,
-        )?;
-        Ok(())
     }
 
     /// Crate-internal: re-ingest an in-memory [`Vault`] without

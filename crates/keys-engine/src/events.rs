@@ -94,11 +94,6 @@ pub enum ChangeEvent {
         /// Counts of merge mutations applied to `SQLite`.
         applied: crate::reconcile::MergeStats,
     },
-    /// A merge conflict was detected and requires user resolution.
-    /// `SQLite` state was **not** mutated; the engine has stashed the
-    /// payload (keyed by [`ConflictPayload::id`]) for a later
-    /// `apply_conflict_resolution` call (task 4.7).
-    ConflictDetected(ConflictPayload),
     /// One or more meta scalars were updated. Carries the setting-row
     /// keys whose value just changed (e.g.
     /// `"meta.history_max_items"`), so observers can subscribe to a
@@ -161,7 +156,7 @@ pub struct GroupMove {
 /// Conflict surface for an external-change merge that requires user
 /// resolution before any state lands in `SQLite`.
 ///
-/// Produced by [`crate::Engine::reconcile_with_disk`] when the
+/// Produced by [`crate::Engine::held_conflict_payload`] when the
 /// underlying `keepass-merge` run reports per-entry conflicts (both
 /// sides edited the same field differently against the per-entry
 /// history ancestor) or `delete vs edit` conflicts. The shape mirrors

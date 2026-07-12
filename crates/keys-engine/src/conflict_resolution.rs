@@ -1,10 +1,10 @@
 //! Conflict-resolution apply — Phase 4 task 4.7.
 //!
 //! Implements [`Engine::apply_conflict_resolution`](crate::Engine::apply_conflict_resolution):
-//! the back half of the external-change merge dance kicked off by task
-//! 4.6's [`Engine::reconcile_with_disk`](crate::Engine::reconcile_with_disk).
+//! the back half of the conflict dance kicked off by the resolver-open
+//! path ([`Engine::held_conflict_payload`](crate::Engine::held_conflict_payload)).
 //!
-//! When `reconcile_with_disk` surfaces irreconcilable conflicts it
+//! When `held_conflict_payload` rebuilds a held conflict it
 //! stashes a `PendingConflictContext` on the engine alongside the
 //! public [`crate::events::ConflictPayload`] (both keyed by a
 //! synthetic `i64`). The frontend renders a resolver UI, gathers the
@@ -38,8 +38,8 @@
 //! wraps the entire `SQLite` walk in a single transaction. The stash
 //! is consumed *before* either step, so a failed apply does not leave
 //! the same id reusable — by design, a retry needs a fresh
-//! `reconcile_with_disk` run because the caller's mental model of the
-//! conflict shape may be stale.
+//! `held_conflict_payload` rebuild because the caller's mental model of
+//! the conflict shape may be stale.
 //!
 //! ## Resolution validation
 //!
@@ -110,7 +110,8 @@ impl std::fmt::Debug for PendingConflictContext {
 }
 
 /// The apply implementation. Pulled out of [`Engine`] so the method
-/// body stays narrow — mirrors `reconcile::reconcile_with_disk`.
+/// body stays narrow — mirrors the free-function split used across
+/// `reconcile`.
 pub(crate) fn apply_conflict_resolution(
     engine: &mut Engine,
     id: i64,
