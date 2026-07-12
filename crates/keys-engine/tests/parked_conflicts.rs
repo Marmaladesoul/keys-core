@@ -759,11 +759,12 @@ fn empty_outcome_after_byte_different_input_returns_no_change() {
         .save_to_kdbx(&kdbx_path, &mut kdbx, None)
         .expect("a re-save");
     let disk_bytes_after_resave = std::fs::read(&kdbx_path).expect("read");
-    // Force a difference from A's last-saved baseline so the byte-
-    // equality short-circuit doesn't fire — we need to exercise the
-    // post-merge outcome_is_no_op path. Open the kdbx fresh and
-    // re-save it via a separate handle so the bytes on disk differ
-    // from what A wrote.
+    // Rewrite the file so the on-disk bytes differ from what A just
+    // wrote (fresh nonce, identical content) — this exercises the
+    // content-digest no-op discrimination on the park path, where
+    // byte-different-but-content-identical must still resolve to
+    // NoChange. Open the kdbx fresh and re-save it via a separate
+    // handle so the bytes on disk differ from what A wrote.
     let external = reopen_kdbx(&kdbx_path);
     let alt_bytes = external.save_to_bytes().expect("external save");
     assert_ne!(

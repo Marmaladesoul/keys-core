@@ -7,7 +7,7 @@
 //! inside the impl if needed.
 //!
 //! Big payloads (the full `ConflictPayload`) cross by opaque id —
-//! [`ChangeEvent::ConflictDetected`] carries the id; the frontend
+//! [`crate::Engine::held_conflict_payload`] mints the id; the frontend
 //! fetches richer detail via [`crate::Engine::pending_conflict`]
 //! (peek-only) and later hands a resolution back to
 //! [`crate::Engine::apply_conflict_resolution`]. Matches the maintainer's
@@ -102,9 +102,6 @@ pub enum ChangeEvent {
     SaveCompleted,
     ExternalChangeMerged {
         applied: MergeStats,
-    },
-    ConflictDetected {
-        id: i64,
     },
     VaultLocked,
     VaultUnlocked,
@@ -225,7 +222,6 @@ impl From<EngChangeEvent> for ChangeEvent {
             EngChangeEvent::ExternalChangeMerged { applied } => Self::ExternalChangeMerged {
                 applied: applied.into(),
             },
-            EngChangeEvent::ConflictDetected(p) => Self::ConflictDetected { id: p.id },
             EngChangeEvent::VaultLocked => Self::VaultLocked,
             EngChangeEvent::VaultUnlocked => Self::VaultUnlocked,
             EngChangeEvent::MetaUpdated { keys } => Self::MetaUpdated { keys },

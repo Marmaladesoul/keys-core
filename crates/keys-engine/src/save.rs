@@ -189,14 +189,7 @@ fn save_inner(
     // 5. Record signature.
     engine.set_last_self_write(signature);
 
-    // 6. Persist the just-written bytes as the common ancestor for the
-    //    next external-change 3-way merge (task 4.4). Raw bytes — per
-    //    the 2026-05-16 decision, SQLCipher already encrypts at rest and
-    //    KDBX is already internally compressed, so gzip would buy <5%
-    //    at the cost of an extra moving part.
-    engine.set_last_saved_kdbx_bytes(&bytes)?;
-
-    // 7. Record the kdbx-state signature so Keys-Mac can skip re-ingest
+    // 6. Record the kdbx-state signature so Keys-Mac can skip re-ingest
     //    on the next unlock if SQLite already matches the on-disk KDBX.
     //    Stored separately from the self-write signature because that
     //    one is consume-on-match (file-watcher suppression) — sharing
@@ -204,7 +197,7 @@ fn save_inner(
     //    external-change event.
     engine.record_kdbx_state_signature(path)?;
 
-    // 8. Sweep the mirror's attachment blob pool — the mirror-side twin
+    // 7. Sweep the mirror's attachment blob pool — the mirror-side twin
     //    of keepass-core's save-time `gc_binaries_pool` for the file
     //    just written. Runs after the projection so the serialised
     //    state never references a row this removes (it only ever drops

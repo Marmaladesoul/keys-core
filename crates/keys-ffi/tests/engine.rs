@@ -608,20 +608,21 @@ async fn engine_async_reconcile_completes() {
         )
         .await
         .expect("save");
-    // Reconcile with unchanged disk → NoChange or Merged
+    // Reconcile with unchanged disk → NoChange or Applied
     let result = engine
-        .reconcile_with_disk(
+        .reconcile_with_disk_park_conflicts(
             kdbx_path.to_string_lossy().into_owned(),
             KDBX_PASSWORD.to_owned(),
         )
         .await
         .expect("reconcile");
-    // NoChange or Merged (a save_to_kdbx writes the projection, which
+    // NoChange or Applied (a save_to_kdbx writes the projection, which
     // is structurally identical to local).
     assert!(
         matches!(
             result,
-            keys_ffi::MergeResult::NoChange | keys_ffi::MergeResult::Merged { .. }
+            keys_ffi::ParkConflictsResultFfi::NoChange
+                | keys_ffi::ParkConflictsResultFfi::Applied { .. }
         ),
         "got {result:?}",
     );
@@ -690,7 +691,7 @@ async fn engine_pending_conflict_peek_then_apply() {
     use keepass_core::model::{EntryId, HistoryPolicy};
     use keys_ffi::{
         ConflictSideFfi, DeleteEditChoiceEntryFfi, EngineEntryUpdate, EntryAttachmentChoiceFfi,
-        EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, MergeResult, ResolutionFfi,
+        EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, ResolutionFfi,
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -760,18 +761,25 @@ async fn engine_pending_conflict_peek_then_apply() {
     let bytes = disk_kdbx.save_to_bytes().expect("save bytes");
     std::fs::write(&kdbx_path, &bytes).expect("write");
 
-    // Reconcile — expect a conflict.
-    let result = engine
-        .reconcile_with_disk(
+    // Reconcile — the concurrent edit is held as owner rows; the
+    // resolver-open path rebuilds + stashes the rich payload.
+    engine
+        .reconcile_with_disk_park_conflicts(
             kdbx_path.to_string_lossy().into_owned(),
             KDBX_PASSWORD.to_owned(),
         )
         .await
-        .expect("reconcile");
-    let conflict_id = match result {
-        MergeResult::Conflict { id } => id,
-        other => panic!("expected Conflict, got {other:?}"),
-    };
+        .expect("park reconcile");
+    let conflict_id = engine
+        .held_conflict_payload(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+            None,
+        )
+        .await
+        .expect("held payload")
+        .expect("a conflict is held")
+        .id;
 
     // FFI peek — twice, same shape.
     let first = engine

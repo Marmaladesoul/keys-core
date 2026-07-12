@@ -1,19 +1,19 @@
-//! Integration tests for Phase 4 task 4.6 — external-change merge.
+//! Integration tests for the external-change reconcile path.
 //!
-//! Covers [`Engine::reconcile_with_disk`] end to end: `NoChange`,
-//! adds/updates/deletes from disk, conflict surfacing, event
-//! emission, transaction atomicity on failure, common-ancestor
-//! refresh, and a full file-watcher round-trip.
+//! Covers [`Engine::reconcile_with_disk_park_conflicts`] end to end:
+//! one-sided auto-merge, genuine-conflict hold (owner rows), the
+//! `needs_write_back` loop-safety contract on both ends, and a full
+//! file-watcher round-trip.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
-use keepass_core::model::{NewEntry, NewGroup};
+use keepass_core::model::NewEntry;
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{
-    ChangeEvent, DataChangeObserver, DbKey, Engine, KeyProvider, KeyProviderError, MergeResult,
+    ChangeEvent, DataChangeObserver, DbKey, Engine, KeyProvider, KeyProviderError,
     NotifyFileWatcher, ParkConflictsResult,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -129,351 +129,6 @@ fn fixture() -> Fixture {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
-
-#[test]
-fn reconcile_no_change_returns_nochange() {
-    let mut f = fixture();
-    let result = f
-        .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
-    assert!(
-        matches!(result, MergeResult::NoChange),
-        "engine + disk in sync after save → NoChange, got {result:?}"
-    );
-}
-
-#[test]
-fn reconcile_adds_external_entry() {
-    let mut f = fixture();
-
-    // External: open the kdbx file, add an entry, save it back.
-    let mut external = reopen_kdbx(&f.kdbx_path);
-    let root = external.vault().root.id;
-    let new_id = external
-        .add_entry(root, NewEntry::new("from-disk"))
-        .expect("add external");
-    let bytes = external.save_to_bytes().expect("save_to_bytes");
-    std::fs::write(&f.kdbx_path, &bytes).expect("write disk");
-
-    let result = f
-        .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
-
-    match result {
-        MergeResult::Merged { applied } => {
-            assert_eq!(applied.entries_added, 1, "one entry added");
-        }
-        other => panic!("expected Merged, got {other:?}"),
-    }
-
-    // Round-trip via SQLite: the new entry is now visible.
-    let summaries = f
-        .engine
-        .list_entries(None, keys_engine::Pagination::all())
-        .expect("list entries");
-    assert!(
-        summaries.iter().any(|s| s.uuid == new_id.0),
-        "added entry should appear in list_entries",
-    );
-}
-
-#[test]
-fn reconcile_adds_external_group() {
-    let mut f = fixture();
-
-    let mut external = reopen_kdbx(&f.kdbx_path);
-    let root = external.vault().root.id;
-    let new_group_id = external
-        .add_group(root, NewGroup::new("Logins-on-disk"))
-        .expect("add group");
-    let bytes = external.save_to_bytes().expect("save_to_bytes");
-    std::fs::write(&f.kdbx_path, &bytes).expect("write disk");
-
-    let result = f
-        .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
-    match result {
-        MergeResult::Merged { applied } => {
-            assert_eq!(applied.groups_added, 1, "one group added");
-        }
-        other => panic!("expected Merged, got {other:?}"),
-    }
-
-    let groups = f.engine.group_tree().expect("group_tree");
-    assert!(
-        groups.iter().any(|g| g.uuid == new_group_id.0),
-        "added group should appear in group_tree",
-    );
-}
-
-#[test]
-fn reconcile_deletes_locally_when_disk_deletes() {
-    let mut f = fixture();
-    // Find the seed entry uuid.
-    let summaries = f
-        .engine
-        .list_entries(None, keys_engine::Pagination::all())
-        .expect("list");
-    let seed_uuid = summaries[0].uuid;
-
-    let mut external = reopen_kdbx(&f.kdbx_path);
-    external
-        .delete_entry(keepass_core::model::EntryId(seed_uuid))
-        .expect("delete on disk");
-    let bytes = external.save_to_bytes().expect("save_to_bytes");
-    std::fs::write(&f.kdbx_path, &bytes).expect("write disk");
-
-    let result = f
-        .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
-    match result {
-        MergeResult::Merged { applied } => {
-            assert_eq!(applied.entries_deleted, 1, "one entry deleted");
-        }
-        other => panic!("expected Merged, got {other:?}"),
-    }
-    let after = f
-        .engine
-        .list_entries(None, keys_engine::Pagination::all())
-        .expect("list after");
-    assert!(
-        !after.iter().any(|s| s.uuid == seed_uuid),
-        "deleted entry should be gone from SQLite",
-    );
-}
-
-#[test]
-fn reconcile_updates_when_disk_updates() {
-    let mut f = fixture();
-    let summaries = f
-        .engine
-        .list_entries(None, keys_engine::Pagination::all())
-        .expect("list");
-    let seed_uuid = summaries[0].uuid;
-
-    // External: tweak the entry's title.
-    let mut external = reopen_kdbx(&f.kdbx_path);
-    {
-        let root = external.vault().root.id;
-        external
-            .edit_entry(
-                keepass_core::model::EntryId(seed_uuid),
-                keepass_core::model::HistoryPolicy::Snapshot,
-                |e| {
-                    e.set_title("renamed-on-disk");
-                },
-            )
-            .expect("edit entry");
-        let _ = root;
-    }
-    let bytes = external.save_to_bytes().expect("save");
-    std::fs::write(&f.kdbx_path, &bytes).expect("write");
-
-    let result = f
-        .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
-    match result {
-        MergeResult::Merged { applied } => {
-            assert_eq!(applied.entries_updated, 1, "one entry updated");
-        }
-        other => panic!("expected Merged, got {other:?}"),
-    }
-    let after = f.engine.entry(seed_uuid).expect("entry").expect("present");
-    assert_eq!(after.title, "renamed-on-disk");
-}
-
-#[test]
-fn reconcile_detects_conflict_on_field() {
-    let mut f = fixture();
-    let summaries = f
-        .engine
-        .list_entries(None, keys_engine::Pagination::all())
-        .expect("list");
-    let seed_uuid = summaries[0].uuid;
-
-    // Local edit via the engine.
-    f.engine
-        .update_entry(
-            seed_uuid,
-            keys_engine::EntryUpdate {
-                title: Some("local-rename".into()),
-                ..Default::default()
-            },
-        )
-        .expect("local edit");
-
-    // Disk edit via keepass-core.
-    let mut external = reopen_kdbx(&f.kdbx_path);
-    external
-        .edit_entry(
-            keepass_core::model::EntryId(seed_uuid),
-            keepass_core::model::HistoryPolicy::Snapshot,
-            |e| {
-                e.set_title("disk-rename");
-            },
-        )
-        .expect("disk edit");
-    let bytes = external.save_to_bytes().expect("save");
-    std::fs::write(&f.kdbx_path, &bytes).expect("write");
-
-    let result = f
-        .engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
-    match result {
-        MergeResult::Conflict(payload) => {
-            assert_eq!(payload.entry_conflicts.len(), 1, "one entry conflict");
-            let c = &payload.entry_conflicts[0];
-            assert_eq!(c.entry_id.0, seed_uuid);
-            assert!(
-                c.field_deltas.iter().any(|d| d.key == "Title"),
-                "conflict surfaces the Title field delta",
-            );
-        }
-        other => panic!("expected Conflict, got {other:?}"),
-    }
-    assert_eq!(
-        f.engine.pending_conflict_count_for_test(),
-        1,
-        "conflict payload stashed on engine",
-    );
-}
-
-#[test]
-fn reconcile_emits_external_change_merged_event() {
-    let mut f = fixture();
-    let observer = Arc::new(CaptureObserver::default());
-    f.engine.set_observer(observer.clone());
-
-    let mut external = reopen_kdbx(&f.kdbx_path);
-    let root = external.vault().root.id;
-    external
-        .add_entry(root, NewEntry::new("from-disk"))
-        .expect("add");
-    let bytes = external.save_to_bytes().expect("save");
-    std::fs::write(&f.kdbx_path, &bytes).expect("write");
-
-    f.engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
-
-    let events = observer.snapshot();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, ChangeEvent::ExternalChangeMerged { .. })),
-        "expected ExternalChangeMerged in {events:?}",
-    );
-}
-
-#[test]
-fn reconcile_emits_conflict_detected_event() {
-    let mut f = fixture();
-    let observer = Arc::new(CaptureObserver::default());
-    f.engine.set_observer(observer.clone());
-
-    let summaries = f
-        .engine
-        .list_entries(None, keys_engine::Pagination::all())
-        .expect("list");
-    let seed_uuid = summaries[0].uuid;
-    f.engine
-        .update_entry(
-            seed_uuid,
-            keys_engine::EntryUpdate {
-                title: Some("local".into()),
-                ..Default::default()
-            },
-        )
-        .expect("local edit");
-
-    // Discard the EntriesUpdated event that arrived during the local
-    // edit so we can assert the next observer call is the conflict.
-    observer.events.lock().unwrap().clear();
-
-    let mut external = reopen_kdbx(&f.kdbx_path);
-    external
-        .edit_entry(
-            keepass_core::model::EntryId(seed_uuid),
-            keepass_core::model::HistoryPolicy::Snapshot,
-            |e| {
-                e.set_title("disk");
-            },
-        )
-        .expect("disk edit");
-    let bytes = external.save_to_bytes().expect("save");
-    std::fs::write(&f.kdbx_path, &bytes).expect("write");
-
-    f.engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
-
-    let events = observer.snapshot();
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, ChangeEvent::ConflictDetected(_))),
-        "expected ConflictDetected in {events:?}",
-    );
-}
-
-#[test]
-fn reconcile_atomic_on_failure() {
-    // Induce a failure by pointing reconcile at a non-existent kdbx
-    // path: the disk-read step fails before any SQLite mutation.
-    // SQLite state must be unchanged.
-    let mut f = fixture();
-    let before = f
-        .engine
-        .list_entries(None, keys_engine::Pagination::all())
-        .expect("list before");
-    let bogus = f.kdbx_path.with_file_name("does-not-exist.kdbx");
-    let result = f.engine.reconcile_with_disk(&bogus, &composite());
-    assert!(result.is_err(), "reconcile should fail on missing file");
-    let after = f
-        .engine
-        .list_entries(None, keys_engine::Pagination::all())
-        .expect("list after");
-    assert_eq!(
-        before.len(),
-        after.len(),
-        "no SQLite mutation on reconcile failure",
-    );
-}
-
-#[test]
-fn reconcile_updates_common_ancestor_after_success() {
-    let mut f = fixture();
-
-    // Make an external change so reconcile takes the apply path.
-    let mut external = reopen_kdbx(&f.kdbx_path);
-    let root = external.vault().root.id;
-    external
-        .add_entry(root, NewEntry::new("from-disk"))
-        .expect("add");
-    let bytes = external.save_to_bytes().expect("save");
-    std::fs::write(&f.kdbx_path, &bytes).expect("write");
-
-    f.engine
-        .reconcile_with_disk(&f.kdbx_path, &composite())
-        .expect("reconcile");
-
-    let stored = f
-        .engine
-        .last_saved_kdbx_bytes()
-        .expect("query")
-        .expect("ancestor stored");
-    let on_disk = std::fs::read(&f.kdbx_path).expect("read kdbx");
-    assert_eq!(
-        stored, on_disk,
-        "common ancestor must match disk bytes after Merged",
-    );
-}
 
 // ── Owner-rows park path (Phase 4) ──────────────────────────────────────
 //
@@ -692,8 +347,8 @@ fn park_two_sided_merge_needs_write_back() {
 fn reconcile_round_trip_with_file_watcher() {
     // End-to-end: real NotifyFileWatcher fires when the disk file is
     // mutated externally; the watcher's reconcile-trigger drives a
-    // call into `reconcile_with_disk`; the observer captures the
-    // resulting `ExternalChangeMerged` event.
+    // call into `reconcile_with_disk_park_conflicts`; the observer
+    // captures the resulting `ExternalChangeMerged` event.
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("keys.db");
     let kdbx_path = dir.path().join("vault.kdbx");
@@ -752,11 +407,11 @@ fn reconcile_round_trip_with_file_watcher() {
     while rx.try_recv().is_ok() {}
 
     let result = engine
-        .reconcile_with_disk(&kdbx_path, &composite())
+        .reconcile_with_disk_park_conflicts(&kdbx_path, &composite(), chrono::Utc::now())
         .expect("reconcile");
     assert!(
-        matches!(result, MergeResult::Merged { .. }),
-        "expected Merged from watcher-driven reconcile, got {result:?}",
+        matches!(result, ParkConflictsResult::Applied { .. }),
+        "expected Applied from watcher-driven reconcile, got {result:?}",
     );
     let events = observer.snapshot();
     assert!(
