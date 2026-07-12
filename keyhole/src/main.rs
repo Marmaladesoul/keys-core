@@ -33,8 +33,9 @@ use keys_ffi::{
     DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, Engine, EngineEntryUpdate,
     EntryAttachmentChoiceFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, IconRef,
     NewEntryFields, Page, ParkConflictsResultFfi, RecycleBinFilter, ResolutionFfi, SearchScope,
-    Vault, VaultIdentityVerdict, open_vault_self_healing, purge_vault_local_data,
-    rebuild_vault_local_data, verify_vault_identity,
+    VaultIdentityVerdict, create_vault as ffi_create_vault,
+    create_vault_deterministic as ffi_create_vault_deterministic, open_vault_self_healing,
+    purge_vault_local_data, rebuild_vault_local_data, verify_vault_identity,
 };
 
 use adapters::{FixedDbKey, FixedProtector, RecordingDbKey};
@@ -89,9 +90,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a fresh, empty test vault. Drives the same `Vault::create_empty`
-    /// the GUI apps use — so new-vault policy (e.g. recycle bin enabled by
-    /// default) is exercised here too.
+    /// Create a fresh, empty test vault. Drives the same
+    /// `keys_ffi::create_vault` the GUI apps use — so new-vault policy
+    /// (e.g. recycle bin enabled by default) is exercised here too.
     Create {
         /// Path to the .kdbx vault to create (must not already exist).
         vault: PathBuf,
@@ -655,7 +656,8 @@ async fn main() -> Result<()> {
                 clock_ms,
                 uuid_seed,
                 keyfile_path.as_deref(),
-            )?;
+            )
+            .await?;
         }
         Command::CreateEntry {
             vault,
@@ -2067,14 +2069,16 @@ fn resolution_choosing(
     ResolutionFfi::new(field_choices, attachment_choices, icon_choices, delete_edit)
 }
 
-/// Create a fresh empty vault via the same FFI entry point the GUI uses.
+/// Create a fresh empty vault via the same FFI entry point the GUI uses
+/// (`keys_ffi::create_vault`; no `Vault` handle — the new file opens
+/// through the same `Engine` path as any existing vault).
 ///
 /// With `--uuid-seed` + `--at` the root group + recycle-bin ids and
-/// creation timestamps are pinned (via `Vault::create_empty_deterministic`)
+/// creation timestamps are pinned (via `create_vault_deterministic`)
 /// so a fuzz run replays byte-for-byte; without them the production path
 /// mints random ids under the system clock. `--uuid-seed` requires `--at`,
-/// matching the engine-open contract.
-fn create_vault(
+/// matching the engine-open contract. `--keyfile` composes with both.
+async fn create_vault(
     vault: &Path,
     password: &str,
     clock_ms: Option<i64>,
@@ -2094,47 +2098,33 @@ fn create_vault(
         None => None,
     };
     let path = vault.to_string_lossy().into_owned();
-    match (clock_ms, uuid_seed, keyfile_bytes) {
-        (Some(ms), Some(seed), None) => {
-            Vault::create_empty_deterministic(
+    match (clock_ms, uuid_seed) {
+        (Some(ms), Some(seed)) => {
+            ffi_create_vault_deterministic(
                 path,
                 password.to_owned(),
+                keyfile_bytes,
                 "keyhole".to_owned(),
                 Some(Arc::new(FixedProtector)),
                 None,
                 seed,
                 ms,
             )
-            .map_err(|e| anyhow::anyhow!("create_empty_deterministic: {e:?}"))?;
+            .await
+            .map_err(|e| anyhow::anyhow!("create_vault_deterministic: {e:?}"))?;
         }
-        (Some(_), Some(_), Some(_)) => {
-            // No scenario needs deterministic + keyfile and the FFI has no
-            // deterministic keyfile constructor; reject explicitly.
-            anyhow::bail!(
-                "--keyfile with deterministic create (--at + --uuid-seed) is not supported"
-            );
-        }
-        (None, Some(_), _) => anyhow::bail!("--uuid-seed requires --at on create"),
-        (_, None, Some(kf)) => {
-            Vault::create_empty_with_keyfile(
+        (None, Some(_)) => anyhow::bail!("--uuid-seed requires --at on create"),
+        (_, None) => {
+            ffi_create_vault(
                 path,
                 password.to_owned(),
-                kf,
+                keyfile_bytes,
                 "keyhole".to_owned(),
                 Some(Arc::new(FixedProtector)),
                 None,
             )
-            .map_err(|e| anyhow::anyhow!("create_empty_with_keyfile: {e:?}"))?;
-        }
-        (_, None, None) => {
-            Vault::create_empty(
-                path,
-                password.to_owned(),
-                "keyhole".to_owned(),
-                Some(Arc::new(FixedProtector)),
-                None,
-            )
-            .map_err(|e| anyhow::anyhow!("create_empty: {e:?}"))?;
+            .await
+            .map_err(|e| anyhow::anyhow!("create_vault: {e:?}"))?;
         }
     }
     println!("created {}", vault.display());
