@@ -236,7 +236,7 @@ impl Engine {
     /// so it is not free on large vaults — a test/diagnostics surface,
     /// not a per-frame one.
     pub fn content_digest(&self) -> Result<String, EngineError> {
-        self.with_engine(|e| Ok(crate::merge::hex_encode(e.content_digest()?)))
+        self.with_engine(|e| Ok(hex_encode(e.content_digest()?)))
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1273,13 +1273,11 @@ impl Engine {
     /// consumes the matching context, at which point this returns
     /// `None` for that id.
     ///
-    /// Per-side parent group resolution mirrors the slice-7.5
-    /// [`MergeOutcome::entry_conflicts`](crate::merge::MergeOutcome)
-    /// surface: local-side wins on disagreement; either side fills in
-    /// if the other can't find the entry under a known parent
-    /// (in-flight group-tree change). When neither side can find the
-    /// entry — a contract violation we don't expect in practice — the
-    /// parent uuid falls back to the nil UUID.
+    /// Per-side parent group resolution: local-side wins on
+    /// disagreement; either side fills in if the other can't find the
+    /// entry under a known parent (in-flight group-tree change). When
+    /// neither side can find the entry — a contract violation we don't
+    /// expect in practice — the parent uuid falls back to the nil UUID.
     pub fn pending_conflict(&self, id: i64) -> Result<Option<ConflictPayloadFfi>, EngineError> {
         self.with_engine(|e| Ok(build_conflict_payload_ffi(e, id)))
     }
@@ -1450,8 +1448,8 @@ fn build_conflict_payload_ffi(engine: &eng::Engine, id: i64) -> Option<ConflictP
                     .map(|d| AttachmentDeltaFfi {
                         name: d.name.clone(),
                         kind: AttachmentDeltaKindFfi::from(d.kind),
-                        local_sha256_hex: d.local_sha256.map(hex_encode_32),
-                        remote_sha256_hex: d.remote_sha256.map(hex_encode_32),
+                        local_sha256_hex: d.local_sha256.map(hex_encode),
+                        remote_sha256_hex: d.remote_sha256.map(hex_encode),
                         local_size_bytes: d.local_size,
                         remote_size_bytes: d.remote_size,
                     })
@@ -1469,13 +1467,11 @@ fn build_conflict_payload_ffi(engine: &eng::Engine, id: i64) -> Option<ConflictP
         .iter()
         .map(|entry_id| DeleteEditConflictFfi {
             entry_uuid: entry_id.0.to_string(),
-            // The slice-7.5 [`MergeOutcome`] surface eagerly carries
-            // the local-side entry snapshot here; the engine path
-            // surfaces the uuid only and the frontend pulls the
-            // entry via [`Self::entry`] when it wants title context.
-            // Plumbing the snapshot through would require a third
-            // engine accessor; future work if the resolver UI flow
-            // turns out to need it inline.
+            // The engine path surfaces the uuid only; the frontend
+            // pulls the entry via `Self::entry` when it wants title
+            // context. Plumbing a local-side snapshot through inline
+            // would require a third engine accessor — future work if
+            // the resolver UI flow turns out to need it.
             local: None,
         })
         .collect();
@@ -1488,7 +1484,9 @@ fn build_conflict_payload_ffi(engine: &eng::Engine, id: i64) -> Option<ConflictP
     })
 }
 
-fn hex_encode_32(bytes: [u8; 32]) -> String {
+/// Lowercase-hex a 32-byte digest (content digest, attachment SHA-256).
+/// The single hex encoder for the crate's fixed-width digests.
+fn hex_encode(bytes: [u8; 32]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(64);
     for b in bytes {

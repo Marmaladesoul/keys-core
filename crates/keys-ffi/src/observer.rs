@@ -31,9 +31,9 @@ pub trait VaultObserver: Send + Sync {
 /// Coarse event variants. Each carries enough information for the
 /// frontend to know what to re-fetch.
 ///
-/// `BulkMerge` is defined for slice 7.5 (`merge_external`) but does
-/// not fire from any current method. The variant exists so binding
-/// regeneration doesn't break when merge lands.
+/// `BulkMerge` currently fires from no method — it is a reserved
+/// variant for a bulk-change event, kept so binding regeneration
+/// doesn't churn if one lands.
 #[derive(uniffi::Enum, Debug, Clone)]
 #[non_exhaustive]
 pub enum VaultChange {
@@ -48,8 +48,9 @@ pub enum VaultChange {
     /// A group's identity, contents, or relationship to the tree
     /// changed (create, update, delete, move, recycle, empty-bin).
     GroupChanged { uuid: String },
-    /// A bulk merge applied many changes. Fires from
-    /// `merge_external` (slice 7.5) instead of per-record events.
+    /// A bulk change applied many edits at once, so the frontend
+    /// should re-fetch broadly rather than react per-record.
+    /// Currently unfired (reserved).
     BulkMerge,
     /// A `save()` completed.
     Saved,
