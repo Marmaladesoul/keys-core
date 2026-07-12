@@ -24,6 +24,7 @@ mod portable;
 mod protector;
 mod totp;
 mod vault;
+mod vault_create;
 
 pub use db_key_provider::{VaultDbKeyProvider, VaultDbKeyProviderError};
 pub use dto::{
@@ -67,6 +68,7 @@ pub use totp::{
     totp_progress, totp_seconds_remaining,
 };
 pub use vault::Vault;
+pub use vault_create::{create_vault, create_vault_deterministic};
 
 uniffi::setup_scaffolding!();
 

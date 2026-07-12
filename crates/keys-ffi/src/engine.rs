@@ -111,15 +111,7 @@ impl Engine {
         field_protector: Arc<dyn VaultFieldProtector>,
         file_watcher: Option<Arc<dyn VaultFileWatcher>>,
     ) -> Result<Arc<Self>, EngineError> {
-        let path_buf = PathBuf::from(path);
-        let kp = BridgeDbKeyProvider::new(key_provider);
-        let fp: Arc<dyn keepass_core::protector::FieldProtector> =
-            Arc::new(BridgeProtector::new(field_protector));
-        let watcher = engine_file_watcher::bridge(file_watcher);
-        let inner = eng::Engine::open(&path_buf, &kp, fp, watcher)?;
-        Ok(Arc::new(Self {
-            inner: Mutex::new(Some(inner)),
-        }))
+        Self::open_inner(path, key_provider, field_protector, file_watcher, None)
     }
 
     /// Like [`Engine::open`] but pins the engine's clock to a fixed
@@ -146,29 +138,13 @@ impl Engine {
         file_watcher: Option<Arc<dyn VaultFileWatcher>>,
         clock_ms: i64,
     ) -> Result<Arc<Self>, EngineError> {
-        let fixed = chrono::DateTime::from_timestamp_millis(clock_ms).ok_or_else(|| {
-            EngineError::Internal(format!(
-                "clock_ms {clock_ms} is not a representable UTC instant"
-            ))
-        })?;
-        let path_buf = PathBuf::from(path);
-        let kp = BridgeDbKeyProvider::new(key_provider);
-        let fp: Arc<dyn keepass_core::protector::FieldProtector> =
-            Arc::new(BridgeProtector::new(field_protector));
-        let watcher = engine_file_watcher::bridge(file_watcher);
-        let clock: Arc<dyn keepass_core::model::Clock> =
-            Arc::new(keepass_core::model::FixedClock(fixed));
-        let inner = eng::Engine::open_with_clock(
-            &path_buf,
-            &kp,
-            fp,
-            watcher,
-            clock,
-            Arc::new(eng::uuid_source::RandomUuids),
-        )?;
-        Ok(Arc::new(Self {
-            inner: Mutex::new(Some(inner)),
-        }))
+        Self::open_inner(
+            path,
+            key_provider,
+            field_protector,
+            file_watcher,
+            Some((clock_ms, None)),
+        )
     }
 
     /// Like [`Engine::open_with_fixed_clock`] but *also* makes entity
@@ -195,29 +171,13 @@ impl Engine {
         clock_ms: i64,
         uuid_seed: u64,
     ) -> Result<Arc<Self>, EngineError> {
-        let fixed = chrono::DateTime::from_timestamp_millis(clock_ms).ok_or_else(|| {
-            EngineError::Internal(format!(
-                "clock_ms {clock_ms} is not a representable UTC instant"
-            ))
-        })?;
-        let path_buf = PathBuf::from(path);
-        let kp = BridgeDbKeyProvider::new(key_provider);
-        let fp: Arc<dyn keepass_core::protector::FieldProtector> =
-            Arc::new(BridgeProtector::new(field_protector));
-        let watcher = engine_file_watcher::bridge(file_watcher);
-        let clock: Arc<dyn keepass_core::model::Clock> =
-            Arc::new(keepass_core::model::FixedClock(fixed));
-        let inner = eng::Engine::open_with_clock(
-            &path_buf,
-            &kp,
-            fp,
-            watcher,
-            clock,
-            Arc::new(eng::uuid_source::SeededUuids::new(uuid_seed)),
-        )?;
-        Ok(Arc::new(Self {
-            inner: Mutex::new(Some(inner)),
-        }))
+        Self::open_inner(
+            path,
+            key_provider,
+            field_protector,
+            file_watcher,
+            Some((clock_ms, Some(uuid_seed))),
+        )
     }
 
     /// Close the engine; subsequent method calls return
@@ -1376,6 +1336,49 @@ impl Engine {
 }
 
 impl Engine {
+    /// Shared core of the three constructors: bridge the foreign
+    /// key-provider / protector / watcher, open the underlying engine,
+    /// and wrap it. `pinned` carries `(clock_ms, uuid_seed)` for the
+    /// test-scaffolding constructors — `uuid_seed: None` pins the clock
+    /// only (random ids), `Some` seeds ids too. `None` is the production
+    /// path (system clock, random ids).
+    ///
+    /// Lives outside the `#[uniffi::export]` impl block — uniffi only
+    /// supports exported methods/constructors there.
+    fn open_inner(
+        path: String,
+        key_provider: Arc<dyn VaultDbKeyProvider>,
+        field_protector: Arc<dyn VaultFieldProtector>,
+        file_watcher: Option<Arc<dyn VaultFileWatcher>>,
+        pinned: Option<(i64, Option<u64>)>,
+    ) -> Result<Arc<Self>, EngineError> {
+        let path_buf = PathBuf::from(path);
+        let kp = BridgeDbKeyProvider::new(key_provider);
+        let fp: Arc<dyn keepass_core::protector::FieldProtector> =
+            Arc::new(BridgeProtector::new(field_protector));
+        let watcher = engine_file_watcher::bridge(file_watcher);
+        let inner = match pinned {
+            None => eng::Engine::open(&path_buf, &kp, fp, watcher)?,
+            Some((clock_ms, uuid_seed)) => {
+                let fixed = chrono::DateTime::from_timestamp_millis(clock_ms).ok_or_else(|| {
+                    EngineError::Internal(format!(
+                        "clock_ms {clock_ms} is not a representable UTC instant"
+                    ))
+                })?;
+                let clock: Arc<dyn keepass_core::model::Clock> =
+                    Arc::new(keepass_core::model::FixedClock(fixed));
+                let uuids: Arc<dyn eng::uuid_source::UuidSource> = match uuid_seed {
+                    None => Arc::new(eng::uuid_source::RandomUuids),
+                    Some(seed) => Arc::new(eng::uuid_source::SeededUuids::new(seed)),
+                };
+                eng::Engine::open_with_clock(&path_buf, &kp, fp, watcher, clock, uuids)?
+            }
+        };
+        Ok(Arc::new(Self {
+            inner: Mutex::new(Some(inner)),
+        }))
+    }
+
     fn with_engine<R>(
         &self,
         f: impl FnOnce(&eng::Engine) -> Result<R, EngineError>,
