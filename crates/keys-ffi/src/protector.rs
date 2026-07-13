@@ -31,11 +31,13 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// Foreign-implemented session-key provider for protected-field wrap.
 ///
-/// Pass an `Arc<dyn VaultFieldProtector>` to [`crate::Vault::new`] or
-/// [`crate::Vault::create_empty`] to opt in. With a protector
-/// installed, the unlocked vault holds protected-field plaintext only
-/// as AES-GCM-wrapped bytes in an internal side table; reveal-side
-/// accessors unwrap on demand by re-fetching the key.
+/// [`crate::Engine::open`] takes one non-optionally (the engine always
+/// wraps protected fields); [`crate::create_vault`] takes an
+/// `Option<Arc<dyn VaultFieldProtector>>` — `Some` to install one at
+/// create time, `None` for the legacy unprotected path. With a protector
+/// installed, the engine holds protected-field plaintext only as
+/// AES-GCM-wrapped bytes in an internal side table; reveal-side accessors
+/// unwrap on demand by re-fetching the key.
 ///
 /// Without a protector (the legacy `None` path), behaviour is
 /// unchanged — protected plaintext lives in `String` fields exactly

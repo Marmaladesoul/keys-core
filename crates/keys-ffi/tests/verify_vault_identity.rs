@@ -9,10 +9,12 @@
 //! re-derives rather than hard-rejecting). Missing / not-a-KDBX surface as
 //! errors, not verdicts.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-use keys_ffi::{Vault, VaultError, VaultIdentityVerdict, generate_keyfile, verify_vault_identity};
+use keys_ffi::{
+    VaultError, VaultIdentityVerdict, create_vault, generate_keyfile, verify_vault_identity,
+};
 
 fn fresh_path(dir: &TempDir, name: &str) -> String {
     let mut path: PathBuf = dir.path().to_path_buf();
@@ -20,45 +22,62 @@ fn fresh_path(dir: &TempDir, name: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// The root group is the parentless node of the tree — the expected identity a
-/// caller would hold. Read it independently via `list_groups` so the verdict
-/// is pinned against the public group surface, not against itself.
-fn root_uuid(path: &str, password: &str) -> String {
-    let vault = Vault::new(path.to_owned(), password.to_owned(), None).expect("open");
-    vault
-        .list_groups()
-        .expect("list groups")
-        .into_iter()
-        .find(|g| g.parent_uuid.is_none())
-        .expect("a root group")
-        .uuid
-}
-
-#[test]
-fn same_vault_matches() {
-    let dir = TempDir::new().expect("tempdir");
-    let path = fresh_path(&dir, "vault.kdbx");
-    Vault::create_empty(
-        path.clone(),
+/// Mint a fresh password-only vault at `path` via the production creation
+/// entry point.
+async fn create(path: &str, database_name: &str) {
+    create_vault(
+        path.to_owned(),
         "pw".to_owned(),
-        "Vault".to_owned(),
+        None,
+        database_name.to_owned(),
         None,
         None,
     )
+    .await
     .expect("create");
+}
+
+/// The expected identity a caller would hold: the root group's UUID.
+///
+/// This opens the KDBX through `keepass-core` — the same layer
+/// `verify_vault_identity` reads its root through — so it is NOT a fully
+/// independent oracle (the old `Vault::list_groups` walk that provided
+/// that independence went with the façade). The load-bearing assertion is
+/// therefore `different_vault_mismatches`: two genuinely distinct vaults
+/// yield distinct roots, so a `Mismatch` verdict exercises the real
+/// compare-and-classify path end-to-end. `same_vault_matches` degrades to
+/// confirming the verdict plumbing rather than root extraction itself.
+fn root_uuid(path: &str, password: &str) -> String {
+    use keepass_core::CompositeKey;
+    use keepass_core::kdbx::Kdbx;
+    let composite = CompositeKey::from_password(password.as_bytes());
+    let kdbx = Kdbx::open(Path::new(path))
+        .expect("open")
+        .read_header()
+        .expect("header")
+        .unlock(&composite)
+        .expect("unlock");
+    kdbx.vault().root.id.0.to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_vault_matches() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = fresh_path(&dir, "vault.kdbx");
+    create(&path, "Vault").await;
     let expected = root_uuid(&path, "pw");
 
     let verdict = verify_vault_identity(path, "pw".to_owned(), None, expected).expect("verify");
     assert_eq!(verdict, VaultIdentityVerdict::Match);
 }
 
-#[test]
-fn different_vault_mismatches() {
+#[tokio::test(flavor = "multi_thread")]
+async fn different_vault_mismatches() {
     let dir = TempDir::new().expect("tempdir");
     let a = fresh_path(&dir, "a.kdbx");
     let b = fresh_path(&dir, "b.kdbx");
-    Vault::create_empty(a.clone(), "pw".to_owned(), "A".to_owned(), None, None).expect("create a");
-    Vault::create_empty(b.clone(), "pw".to_owned(), "B".to_owned(), None, None).expect("create b");
+    create(&a, "A").await;
+    create(&b, "B").await;
     let a_root = root_uuid(&a, "pw");
 
     // B decrypts under the same password but is a different vault — the
@@ -67,21 +86,14 @@ fn different_vault_mismatches() {
     assert_eq!(verdict, VaultIdentityVerdict::Mismatch);
 }
 
-#[test]
-fn identity_is_path_agnostic() {
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_is_path_agnostic() {
     // The whole point of recovery: the vault moved, so the path changed but the
     // identity did not. The same bytes at a new path still Match.
     let dir = TempDir::new().expect("tempdir");
     let original = fresh_path(&dir, "original.kdbx");
     let moved = fresh_path(&dir, "moved-elsewhere.kdbx");
-    Vault::create_empty(
-        original.clone(),
-        "pw".to_owned(),
-        "Vault".to_owned(),
-        None,
-        None,
-    )
-    .expect("create");
+    create(&original, "Vault").await;
     std::fs::copy(&original, &moved).expect("copy to new path");
     let expected = root_uuid(&original, "pw");
 
@@ -89,21 +101,23 @@ fn identity_is_path_agnostic() {
     assert_eq!(verdict, VaultIdentityVerdict::Match);
 }
 
-#[test]
-fn wrong_password_is_undecryptable_not_mismatch() {
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_password_is_undecryptable_not_mismatch() {
     // The load-bearing distinction (re-key contract): a credential that doesn't
     // fit yields Undecryptable, NOT Mismatch — so a consumer re-derives rather
     // than declaring the file a different vault. (A genuine vault re-keyed on
     // another device reaches exactly this arm under a stale cached credential.)
     let dir = TempDir::new().expect("tempdir");
     let path = fresh_path(&dir, "vault.kdbx");
-    Vault::create_empty(
+    create_vault(
         path.clone(),
         "correct".to_owned(),
+        None,
         "Vault".to_owned(),
         None,
         None,
     )
+    .await
     .expect("create");
     let expected = root_uuid(&path, "correct");
 
@@ -138,8 +152,8 @@ fn non_kdbx_file_errors_format() {
     assert!(matches!(result, Err(VaultError::Format)), "{result:?}");
 }
 
-#[test]
-fn keyfile_vault_without_its_keyfile_is_undecryptable() {
+#[tokio::test(flavor = "multi_thread")]
+async fn keyfile_vault_without_its_keyfile_is_undecryptable() {
     // A keyfile-keyed vault won't open password-only, nor under a wrong
     // keyfile, so it reports Undecryptable regardless of the expected UUID
     // (the credential is judged before any identity comparison). The keyfile
@@ -149,14 +163,15 @@ fn keyfile_vault_without_its_keyfile_is_undecryptable() {
     let dir = TempDir::new().expect("tempdir");
     let path = fresh_path(&dir, "keyed.kdbx");
     let keyfile = generate_keyfile().expect("mint keyfile");
-    Vault::create_empty_with_keyfile(
+    create_vault(
         path.clone(),
         "pw".to_owned(),
-        keyfile,
+        Some(keyfile),
         "Keyed".to_owned(),
         None,
         None,
     )
+    .await
     .expect("create keyed");
     let any = "11111111-1111-1111-1111-111111111111".to_owned();
 

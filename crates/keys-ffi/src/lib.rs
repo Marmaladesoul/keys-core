@@ -19,11 +19,8 @@ mod error;
 mod identity;
 mod keyfile;
 mod merge;
-mod observer;
-mod portable;
 mod protector;
 mod totp;
-mod vault;
 mod vault_create;
 
 pub use db_key_provider::{VaultDbKeyProvider, VaultDbKeyProviderError};
@@ -59,14 +56,11 @@ pub use merge::{
     EntryAttachmentChoiceFfi, EntryConflictFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi,
     FieldChoiceFfi, FieldDeltaFfi, FieldDeltaKindFfi, IconDeltaFfi, ResolutionFfi,
 };
-pub use observer::{VaultChange, VaultObserver};
-pub use portable::PortableEntry;
 pub use protector::{VaultFieldProtector, VaultProtectorError};
 pub use totp::{
     TotpAlgorithm, TotpParams, totp_base32_decode, totp_generate_code, totp_parse_uri,
     totp_progress, totp_seconds_remaining,
 };
-pub use vault::Vault;
 pub use vault_create::{create_vault, create_vault_deterministic};
 
 uniffi::setup_scaffolding!();

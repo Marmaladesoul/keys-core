@@ -42,9 +42,9 @@ pub enum VaultError {
     #[error("wrong key or corrupt vault")]
     WrongKey,
 
-    /// A method was called on a [`crate::Vault`] that has already been
-    /// locked. Lifecycle: a locked vault is permanently poisoned —
-    /// frontends reconstruct a new `Vault` to unlock again.
+    /// A method was called on a vault handle that has already been
+    /// locked. Lifecycle: a locked handle is permanently poisoned —
+    /// frontends reconstruct a new one to unlock again.
     #[error("vault is locked")]
     Locked,
 
@@ -83,12 +83,10 @@ pub enum VaultError {
     #[error("merge resolution invalid: {0}")]
     Merge(String),
 
-    /// A [`crate::VaultFieldProtector`] wrap or unwrap call failed.
-    /// Surfaced from [`crate::Vault::new`] (wrap at unlock), from
-    /// reveal-side accessors (`reveal_field`,
-    /// `reveal_history_field`), and from save (unwrap before
-    /// re-encrypt). The string carries the upstream protector's
-    /// supplied detail.
+    /// A [`crate::VaultFieldProtector`] wrap or unwrap call failed
+    /// (wrap at unlock, unwrap on a reveal-side accessor, or unwrap
+    /// before re-encrypt at save). The string carries the upstream
+    /// protector's supplied detail.
     ///
     /// Distinct from [`Self::WrongKey`] so frontends can distinguish
     /// "Secure Enclave unavailable" from "wrong password" without

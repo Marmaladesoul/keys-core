@@ -42,8 +42,8 @@
 //! being re-derived — and fumbled — per client.
 //!
 //! This is a pure read of the raw KDBX (decrypt + parse the inner XML), with
-//! no `Engine` / SQLCipher-mirror involvement — hence it lives beside
-//! [`crate::Vault`] (the raw-KDBX handle), not on `Engine`.
+//! no `Engine` / SQLCipher-mirror involvement — it opens the file directly
+//! through `keepass-core`, off the `Engine` path entirely.
 
 // The uniffi-exported function takes owned `String` / `Vec<u8>` even where it
 // only borrows — the natural FFI shape, matching the rest of this crate's
