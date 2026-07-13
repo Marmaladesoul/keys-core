@@ -1432,8 +1432,8 @@ fn build_conflict_payload_ffi(engine: &eng::Engine, id: i64) -> Option<ConflictP
             let remote_pid = p.and_then(|p| p.remote.or(p.local)).unwrap_or(nil_group);
             EntryConflictFfi {
                 entry_uuid: c.entry_id.0.to_string(),
-                local: crate::dto::Entry::from_entry(&c.local, local_pid),
-                remote: crate::dto::Entry::from_entry(&c.remote, remote_pid),
+                local: crate::merge::ConflictEntrySnapshotFfi::from_model(&c.local, local_pid),
+                remote: crate::merge::ConflictEntrySnapshotFfi::from_model(&c.remote, remote_pid),
                 field_deltas: c
                     .field_deltas
                     .iter()

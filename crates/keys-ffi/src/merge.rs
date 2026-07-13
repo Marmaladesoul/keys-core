@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use keepass_core::model::EntryId;
+use keepass_core::model::{Entry as KcEntry, EntryId, GroupId};
 use keepass_merge::{
     AttachmentChoice as KmAttachmentChoice, AttachmentDeltaKind as KmAttachmentDeltaKind,
     ConflictSide as KmConflictSide, DeleteEditChoice as KmDeleteEditChoice,
@@ -19,7 +19,6 @@ use keepass_merge::{
 };
 use uuid::Uuid;
 
-use crate::dto::Entry;
 use crate::error::VaultError;
 
 /// One entry-level conflict surfaced by the merge.
@@ -31,8 +30,8 @@ use crate::error::VaultError;
 #[non_exhaustive]
 pub struct EntryConflictFfi {
     pub entry_uuid: String,
-    pub local: Entry,
-    pub remote: Entry,
+    pub local: ConflictEntrySnapshotFfi,
+    pub remote: ConflictEntrySnapshotFfi,
     pub field_deltas: Vec<FieldDeltaFfi>,
     /// Attachment-level conflicts that need caller resolution. Each
     /// delta carries enough metadata (size + SHA-256 prefix per side)
@@ -178,7 +177,101 @@ impl From<KmFieldDeltaKind> for FieldDeltaKindFfi {
 #[non_exhaustive]
 pub struct DeleteEditConflictFfi {
     pub entry_uuid: String,
-    pub local: Option<Entry>,
+    pub local: Option<ConflictEntrySnapshotFfi>,
+}
+
+/// A pre-merge snapshot of one side of a conflicting entry — the display
+/// metadata the resolver UI renders while the user chooses a side.
+///
+/// Deliberately lean: it carries only what the resolver shows (identity,
+/// the visible text/appearance fields, and custom-field *names*), not the
+/// full engine read model. Protected values never cross here (custom
+/// fields with `is_protected` carry an empty `value`); the resolver fetches
+/// per-side plaintext on demand through the engine's
+/// `reveal_conflict_local_field` / `reveal_conflict_remote_field`. Built
+/// directly from the `keepass-core` model entry the merge crate hands back
+/// for each side.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct ConflictEntrySnapshotFfi {
+    pub uuid: String,
+    pub group_uuid: String,
+    pub title: String,
+    pub username: String,
+    pub url: String,
+    pub notes: String,
+    pub tags: Vec<String>,
+    /// User-defined custom fields in source declaration order. Protected
+    /// fields appear with `is_protected = true` and an empty `value`.
+    pub custom_fields: Vec<ConflictCustomFieldFfi>,
+    /// Built-in `KeePass` icon index (0–68); `custom_icon_uuid` overrides
+    /// it for rendering when set.
+    pub icon_id: u32,
+    /// Hyphenated-lowercase UUID into the vault's custom-icon pool, or
+    /// `None` for a built-in icon.
+    pub custom_icon_uuid: Option<String>,
+    /// `<ForegroundColor>` — `"#RRGGBB"`; empty string means default.
+    pub foreground_color: String,
+    /// `<BackgroundColor>` — `"#RRGGBB"`; empty string means default.
+    pub background_color: String,
+    /// `<OverrideURL>`; empty string means none.
+    pub override_url: String,
+    /// Whether the entry carries an expiry at all.
+    pub expires: bool,
+    /// `<ExpiryTime>` as Unix-epoch milliseconds; `None` when absent. Only
+    /// meaningful when `expires` is `true`.
+    pub expiry_time_ms: Option<i64>,
+}
+
+/// A custom field on a [`ConflictEntrySnapshotFfi`]. Protected fields carry
+/// their name with an empty `value` — plaintext is fetched on demand
+/// through the engine's per-side conflict reveal.
+#[derive(uniffi::Record, Debug, Clone)]
+#[non_exhaustive]
+pub struct ConflictCustomFieldFfi {
+    pub name: String,
+    /// Empty when `is_protected == true`; the on-disk value otherwise.
+    pub value: String,
+    pub is_protected: bool,
+}
+
+impl ConflictEntrySnapshotFfi {
+    /// Shape a `keepass-core` model entry (one side of a conflict, as the
+    /// merge crate hands it back) plus its resolved parent group into a
+    /// display snapshot. Protected custom-field values are blanked here —
+    /// they never cross the boundary at snapshot time.
+    pub(crate) fn from_model(entry: &KcEntry, group_uuid: GroupId) -> Self {
+        let custom_fields = entry
+            .custom_fields
+            .iter()
+            .map(|f| ConflictCustomFieldFfi {
+                name: f.key.clone(),
+                value: if f.protected {
+                    String::new()
+                } else {
+                    f.value.clone()
+                },
+                is_protected: f.protected,
+            })
+            .collect();
+        Self {
+            uuid: entry.id.0.to_string(),
+            group_uuid: group_uuid.0.to_string(),
+            title: entry.title.clone(),
+            username: entry.username.clone(),
+            url: entry.url.clone(),
+            notes: entry.notes.clone(),
+            tags: entry.tags.clone(),
+            custom_fields,
+            icon_id: entry.icon_id,
+            custom_icon_uuid: entry.custom_icon_uuid.map(|u| u.to_string()),
+            foreground_color: entry.foreground_color.clone(),
+            background_color: entry.background_color.clone(),
+            override_url: entry.override_url.clone(),
+            expires: entry.times.expires,
+            expiry_time_ms: entry.times.expiry_time.map(|t| t.timestamp_millis()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
