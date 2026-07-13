@@ -1,17 +1,25 @@
-//! FFI-safe data-transfer objects for the read surface.
+//! FFI-safe data-transfer objects.
 //!
-//! Mirrors [`keepass_core::model`] types onto uniffi `Record`s. Conversions
-//! live alongside their record so the read-method bodies in [`crate::vault`]
-//! stay focused on tree-walking and locking.
+//! Mirrors [`keepass_core::model`] types onto uniffi `Record`s. The only
+//! live consumer left is [`Entry::from_entry`], which the engine's
+//! conflict-payload builder uses to shape [`crate::EntryConflictFfi`]'s
+//! two pre-merge snapshots.
 //!
-//! ## Slice 3 invariants enforced here
-//!
-//! - **No protected-field plaintext crosses the boundary.** Conversions
-//!   mark every protected field as `revealed: false` with `value: None`.
-//!   Slice 4 will add the per-field reveal call; until then a `Some(...)`
-//!   on `ProtectedField.value` from a read path is a bug.
-//! - **UUIDs are hyphenated lowercase** at the boundary in every direction.
-//!   `uuid::Uuid::Display` already does this; we just call `to_string()`.
+//! **Transitional module.** The legacy read/write DTOs here
+//! (`EntrySummary`, `Group`, `HistoryRecord`, `AutoType`, …) lost their
+//! consumer when the `Vault` façade was retired, but `dto::Entry` is still
+//! load-bearing for the conflict payload. This whole module folds away in
+//! the conflict-payload reshape (X-4): once `EntryConflictFfi` carries
+//! engine-shaped snapshots, `dto::Entry` and the rest go with it. Until
+//! then the orphaned conversions are kept compiling — hence the
+//! module-scoped `dead_code` allow below, which is removed when the module
+//! is deleted.
+#![allow(dead_code)]
+// The orphaned conversions' doc comments still cross-reference the retired
+// `Vault` methods they used to mirror. Rewording throwaway text in a module
+// that the reshape slice deletes wholesale isn't worth it; silence the
+// broken intra-doc links here until the module goes.
+#![allow(rustdoc::broken_intra_doc_links)]
 
 use chrono::{DateTime, Utc};
 use keepass_core::model::{
@@ -677,7 +685,7 @@ impl HistoryRecord {
                 Some(EntryAttachment {
                     name: att.name.clone(),
                     size_bytes: bin.data.len() as u64,
-                    sha256_hex: crate::vault::sha256_hex(&bin.data),
+                    sha256_hex: sha256_hex(&bin.data),
                 })
             })
             .collect();
@@ -740,4 +748,17 @@ pub struct AttachmentPoolStats {
     pub count: u32,
     /// Sum of `data.len()` across every pool row, in bytes.
     pub total_bytes: u64,
+}
+
+/// Lowercase-hex SHA-256 of `bytes` — the content hash surfaced on each
+/// [`EntryAttachment`]. Kept next to its sole consumer.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
 }

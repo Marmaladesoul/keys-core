@@ -31,9 +31,9 @@ use crate::engine_error::EngineError;
 /// [`crate::Engine::export_entry`]; passed to
 /// [`crate::Engine::import_entry`] **exactly once**.
 ///
-/// Distinct from the legacy [`crate::PortableEntry`], which wraps the
-/// `keepass-core` Vault-side carrier. They cannot be substituted for
-/// each other; pick the engine carrier for SQLite-engine flows.
+/// The single portable-entry carrier: it round-trips an entry (history,
+/// attachments, referenced custom icons) between vaults over the
+/// SQLite-engine flows.
 #[derive(uniffi::Object)]
 pub struct EnginePortableEntry {
     pub(crate) inner: Mutex<Option<keys_engine::PortableEntry>>,
