@@ -39,8 +39,9 @@ pub use engine_types::{
     CustomFieldRef as EngineCustomFieldRef, EngineEntrySummary, EntryFull,
     EntryUpdate as EngineEntryUpdate, GroupNode, GroupUpdate as EngineGroupUpdate, HistoricEntry,
     IconRef, KdbxStateSignatureFfi, MergeStats, NewCustomField, NewEntryFields, NewGroupFields,
-    Page, ParkConflictsResultFfi, ParkedConflictsSummaryFfi, Predicate, RecycleBinFilter,
-    SearchScope, SmartFolder, Strength, StrengthBucket, TagUsageCount, VaultState,
+    Page, ParkConflictsResultFfi, ParkedConflictsSummaryFfi, PersistenceStateFfi, Predicate,
+    RecycleBinFilter, SearchScope, SmartFolder, Strength, StrengthBucket, TagUsageCount,
+    VaultState,
 };
 pub use error::VaultError;
 pub use identity::{VaultIdentityVerdict, verify_vault_identity};

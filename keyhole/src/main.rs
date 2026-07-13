@@ -258,6 +258,24 @@ enum Command {
         #[arg(long)]
         no_save: bool,
     },
+    /// Print the engine-owned persistence watermark: `mutation_seq`,
+    /// `persisted_seq`, and `dirty` (= the KDBX still owes a write).
+    /// The truth lives in the persistent mirror, so a mutation left
+    /// unsaved by an earlier invocation (or a crash) reads back dirty
+    /// here — the crash-recovery signal a save orchestrator flushes on.
+    PersistenceState {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+    },
+    /// Write the mirror back to the KDBX iff the engine says a write
+    /// is owed (`dirty`), else do nothing. Prints `flushed` or `clean`
+    /// — machine-greppable. This is the save-orchestrator primitive:
+    /// clients call this on lifecycle edges instead of deciding
+    /// per-call-site whether a save is due.
+    Flush {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+    },
     /// Ingest a peer's KDBX into this vault's mirror under a device
     /// owner id — the per-device-key sync transport path. Divergences
     /// park as held conflicts in the persistent mirror (never a modal);
@@ -772,6 +790,16 @@ async fn main() -> Result<()> {
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.recycle(uuid, !no_save).await?;
         }
+        Command::PersistenceState { vault } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.persistence_state()?;
+        }
+        Command::Flush { vault } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.flush().await?;
+        }
         Command::IngestPeer {
             vault,
             peer_kdbx,
@@ -1123,6 +1151,37 @@ impl Session {
         }
 
         Ok(session)
+    }
+
+    /// Print the engine-owned persistence watermark. Stdout is the
+    /// scenario contract: one line, `mutation_seq=<n> persisted_seq=<m>
+    /// dirty=<bool>`.
+    fn persistence_state(&self) -> Result<()> {
+        let st = self
+            .engine
+            .persistence_state()
+            .map_err(|e| anyhow::anyhow!("persistence_state: {e:?}"))?;
+        println!(
+            "mutation_seq={} persisted_seq={} dirty={}",
+            st.mutation_seq, st.persisted_seq, st.is_dirty
+        );
+        Ok(())
+    }
+
+    /// Save iff the engine says a write is owed — the orchestrator
+    /// primitive. Prints `flushed` or `clean` on stdout.
+    async fn flush(&self) -> Result<()> {
+        let st = self
+            .engine
+            .persistence_state()
+            .map_err(|e| anyhow::anyhow!("persistence_state: {e:?}"))?;
+        if st.is_dirty {
+            self.save().await?;
+            println!("flushed");
+        } else {
+            println!("clean");
+        }
+        Ok(())
     }
 
     /// Write the mirror back to the source KDBX — the shared persist

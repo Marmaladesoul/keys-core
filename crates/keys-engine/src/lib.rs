@@ -62,7 +62,7 @@ pub use reconcile::{MergeStats, ParkConflictsResult, ParkedConflictsSummary};
 pub use keepass_merge::{
     AttachmentChoice, ConflictSide, DeleteEditChoice, Resolution as ConflictResolution,
 };
-pub use save::{KdbxStateSignature, SelfWriteSignature};
+pub use save::{KdbxStateSignature, PersistenceState, SelfWriteSignature};
 pub use strength::{Strength, strength};
 pub use totp::{
     TotpAlgorithm, TotpParams, base32_decode as totp_base32_decode,

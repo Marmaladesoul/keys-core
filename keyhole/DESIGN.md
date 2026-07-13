@@ -168,6 +168,21 @@ happily carries unsaved state across processes (that's its job). The
 mirror cleans up with the scenario's temp dir; keyhole never deletes it
 itself.
 
+### The persistence watermark (`persistence-state` / `flush`)
+
+Since engine migration 0012 the mirror also carries the engine-owned
+answer to "does the KDBX still owe a write?": a monotonic
+`mutation_seq` (trigger-bumped inside every content-mutating
+transaction) against a `persisted_seq` recorded at each mirror↔disk
+correspondence point (save, ingest, rebuild). `keyhole
+persistence-state <vault>` prints the pair plus `dirty=`; `keyhole
+flush <vault>` saves iff dirty (`flushed`/`clean`) — the
+save-orchestrator primitive clients call on lifecycle edges instead of
+deciding per call site whether a save is due. Because the watermark
+persists in the mirror, a mutation left unsaved by a dead process reads
+back dirty on the next open — the crash-recovery flush signal.
+`scenarios/dirty-watermark.sh` pins the contract.
+
 ## The migration workflow (how keyhole grows)
 
 keyhole is fleshed out **one bug or feature at a time**, never up front.

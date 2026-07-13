@@ -90,6 +90,38 @@ pub struct KdbxStateSignature {
     pub byte_count: u64,
 }
 
+/// The engine's persistence watermark pair — the "does the KDBX still
+/// owe a write?" truth, owned below the seam (migration 0012).
+///
+/// `mutation_seq` advances (via `AFTER`-triggers, inside the mutating
+/// transaction) whenever any projected vault content changes.
+/// `persisted_seq` is the `mutation_seq` captured at the *start* of
+/// the last successful persist or mirror↔disk correspondence point
+/// (save, ingest, rebuild). A mutation landing while a persist is in
+/// flight therefore stays strictly greater than `persisted_seq` and
+/// can never be masked by that persist's completion.
+///
+/// Both values live in the `setting` table, so the answer survives
+/// close + reopen: a process that crashed after a mutation but before
+/// a save reopens visibly dirty, and the frontend's orchestrator
+/// flushes instead of the KDBX silently lagging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistenceState {
+    /// Monotonic content-change counter (trigger-maintained).
+    pub mutation_seq: i64,
+    /// `mutation_seq` at the start of the last successful persist.
+    pub persisted_seq: i64,
+}
+
+impl PersistenceState {
+    /// `true` when the mirror holds content the KDBX file has not been
+    /// handed yet — i.e. a `save_to_kdbx` is owed.
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.mutation_seq > self.persisted_seq
+    }
+}
+
 impl KdbxStateSignature {
     /// Stat `path` and build a signature from its `(mtime, size)`.
     pub(crate) fn from_path(path: &Path) -> Result<Self, EngineError> {
@@ -154,6 +186,12 @@ fn save_inner(
     temp_dir: Option<&Path>,
     rekey: Option<&CompositeKey>,
 ) -> Result<(), EngineError> {
+    // 0. Snapshot the mutation watermark BEFORE projecting. The bytes
+    //    we are about to write represent the mirror as of this instant;
+    //    any mutation that lands after this point (should the engine
+    //    ever admit one mid-save) must stay dirty past this persist.
+    let seq_at_start = engine.persistence_state()?.mutation_seq;
+
     // 1. Project the SQLite mirror back to a Vault. After migration
     //    0003, the projection reconstitutes the full `Meta` and
     //    `deleted_objects` — no live-handle splice required.
@@ -194,8 +232,11 @@ fn save_inner(
     //    Stored separately from the self-write signature because that
     //    one is consume-on-match (file-watcher suppression) — sharing
     //    would let an ingest's signature swallow a real subsequent
-    //    external-change event.
-    engine.record_kdbx_state_signature(path)?;
+    //    external-change event. The same call advances the persistence
+    //    watermark to the sequence snapshotted at step 0 — the file
+    //    just written corresponds to the mirror as of save start, not
+    //    as of now.
+    engine.record_kdbx_correspondence(path, seq_at_start)?;
 
     // 7. Sweep the mirror's attachment blob pool — the mirror-side twin
     //    of keepass-core's save-time `gc_binaries_pool` for the file
