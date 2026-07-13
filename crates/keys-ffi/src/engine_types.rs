@@ -75,6 +75,34 @@ impl From<eng::KdbxStateSignature> for KdbxStateSignatureFfi {
     }
 }
 
+/// The engine's persistence watermark — "does the KDBX file still owe
+/// a write?", answered below the seam instead of by per-call-site
+/// frontend convention. See [`crate::Engine::persistence_state`].
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistenceStateFfi {
+    /// Monotonic content-change counter; advances with every projected
+    /// vault-content change (trigger-maintained, transactional with
+    /// the mutation).
+    pub mutation_seq: i64,
+    /// `mutation_seq` captured at the start of the last successful
+    /// persist / mirror↔disk correspondence point (save, ingest,
+    /// rebuild).
+    pub persisted_seq: i64,
+    /// `mutation_seq > persisted_seq` — computed engine-side so no
+    /// client re-derives the comparison.
+    pub is_dirty: bool,
+}
+
+impl From<eng::PersistenceState> for PersistenceStateFfi {
+    fn from(s: eng::PersistenceState) -> Self {
+        Self {
+            mutation_seq: s.mutation_seq,
+            persisted_seq: s.persisted_seq,
+            is_dirty: s.is_dirty(),
+        }
+    }
+}
+
 /// Blob-pool stats returned by [`crate::Engine::attachment_blob_stats`].
 /// Uniffi can't return a tuple from a method elegantly, so this is the
 /// FFI carrier.

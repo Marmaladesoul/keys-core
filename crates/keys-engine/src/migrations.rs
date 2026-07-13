@@ -87,6 +87,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "group_location_changed",
         sql: include_str!("migrations/0011_group_location_changed.sql"),
     },
+    Migration {
+        version: 12,
+        name: "persistence_watermark",
+        sql: include_str!("migrations/0012_persistence_watermark.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.
@@ -185,6 +190,160 @@ mod tests {
                 pair[1],
             );
         }
+    }
+
+    /// Migration 0012's watermark triggers must cover every table whose
+    /// rows project into the KDBX — and must NOT cover the tables whose
+    /// writes are mirror-local (bumping on those would either re-dirty
+    /// every save, e.g. the save-time blob GC, or owe phantom writes).
+    ///
+    /// A future migration adding a projected table MUST add its three
+    /// `mutation_seq_*` triggers (and add the table to `PROJECTED`
+    /// here); adding a mirror-local table goes in `MIRROR_LOCAL`. A
+    /// table in neither list fails the test — the decision is forced,
+    /// never silently defaulted.
+    #[test]
+    fn watermark_trigger_coverage_is_complete() {
+        // Tables whose rows project into the KDBX. `setting` is special
+        // (only `meta.%` keys project) and asserted separately.
+        const PROJECTED: &[&str] = &[
+            "entry",
+            "entry_attachment",
+            "entry_custom_data",
+            "entry_custom_field",
+            "entry_history",
+            "entry_protected",
+            "entry_tag",
+            "group",
+            "meta_custom_data",
+            "meta_custom_icon",
+            "meta_deleted_object",
+            "tag",
+        ];
+        // Mirror-local tables: never projected, must not bump.
+        const MIRROR_LOCAL: &[&str] = &[
+            "attachment_blob", // content-addressed pool; save-time GC must not re-dirty
+            "conflict_entry",
+            "conflict_entry_attachment",
+            "conflict_entry_custom_field",
+            "conflict_entry_protected",
+            "smart_folder",   // engine-local sidebar state
+            "schema_version", // migration bookkeeping
+            "setting",        // handled by the conditional meta.% triggers
+        ];
+
+        let mut conn = fresh_conn();
+        apply_pending(&mut conn).expect("apply");
+
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+
+        let trigger_count = |table: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'trigger' AND tbl_name = ?1 AND name LIKE 'mutation_seq_%'",
+                params![table],
+                |r| r.get(0),
+            )
+            .expect("trigger count")
+        };
+
+        for table in &tables {
+            let table = table.as_str();
+            if PROJECTED.contains(&table) {
+                assert_eq!(
+                    trigger_count(table),
+                    3,
+                    "projected table `{table}` must carry INSERT/UPDATE/DELETE \
+                     mutation_seq triggers"
+                );
+            } else if MIRROR_LOCAL.contains(&table) {
+                // `setting` carries the three conditional meta.% triggers;
+                // every other mirror-local table carries none.
+                let want = if table == "setting" { 3 } else { 0 };
+                assert_eq!(
+                    trigger_count(table),
+                    want,
+                    "mirror-local table `{table}` has unexpected mutation_seq triggers"
+                );
+            } else {
+                panic!(
+                    "table `{table}` is in neither PROJECTED nor MIRROR_LOCAL — \
+                     decide whether its rows project into the KDBX and add it \
+                     (plus triggers in a new migration if projected)"
+                );
+            }
+        }
+    }
+
+    /// Migration 0012's watermark seeding is fail-safe asymmetric: a
+    /// database that already holds vault content when the migration
+    /// lands must come up DIRTY (its divergence from the KDBX is
+    /// unknowable, and false-clean loses an unsaved mutation), while a
+    /// brand-new database comes up settled.
+    #[test]
+    fn watermark_upgrade_seeds_existing_content_dirty() {
+        let read_seq = |conn: &Connection, key: &str| -> i64 {
+            conn.query_row(
+                "SELECT value FROM setting WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .expect("read watermark row")
+        };
+
+        // Fresh database: every migration applies in one pass, no
+        // content exists at 0012 time → settled 0/0.
+        let mut fresh = fresh_conn();
+        apply_pending(&mut fresh).expect("apply fresh");
+        assert_eq!(read_seq(&fresh, "persistence.mutation_seq"), 0);
+        assert_eq!(read_seq(&fresh, "persistence.persisted_seq"), 0);
+
+        // Upgrade: build a pre-0012 database (migrations v1..v11 only,
+        // replaying the applier's own steps), give it vault content,
+        // then run the real applier for the remainder → dirty 1/0.
+        let mut upgraded = fresh_conn();
+        upgraded
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (\
+                    version INTEGER NOT NULL PRIMARY KEY\
+                 )",
+            )
+            .expect("bootstrap schema_version");
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 11) {
+            upgraded
+                .execute_batch(migration.sql)
+                .expect("apply pre-watermark migration");
+            upgraded
+                .execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    params![migration.version],
+                )
+                .expect("record version");
+        }
+        upgraded
+            .execute(
+                "INSERT INTO \"group\" (uuid, parent_uuid, name, created_at, modified_at)
+                 VALUES ('root-uuid', NULL, 'Root', 0, 0)",
+                [],
+            )
+            .expect("seed root group");
+
+        apply_pending(&mut upgraded).expect("apply remainder");
+        assert_eq!(
+            read_seq(&upgraded, "persistence.mutation_seq"),
+            1,
+            "an upgraded mirror with existing content must read dirty"
+        );
+        assert_eq!(read_seq(&upgraded, "persistence.persisted_seq"), 0);
     }
 
     #[test]

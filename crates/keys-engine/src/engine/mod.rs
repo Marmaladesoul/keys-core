@@ -789,11 +789,17 @@ impl Engine {
     }
 
     /// Record the `(mtime, size)` of the KDBX file at `path` as the
-    /// signature corresponding to the engine's current `SQLite` state.
+    /// signature corresponding to the engine's current `SQLite` state,
+    /// and advance the persistence watermark
+    /// ([`Engine::persistence_state`]) to the current `mutation_seq` —
+    /// the two halves of one fact: "the mirror and this file now
+    /// correspond".
     ///
     /// Frontends should call this after a successful
-    /// [`Engine::ingest_from_kdbx`]. [`Engine::save_to_kdbx`] calls it
-    /// automatically (the save path already has the file path on hand).
+    /// [`Engine::ingest_from_kdbx`]. [`Engine::save_to_kdbx`] records
+    /// the same correspondence automatically, using the sequence
+    /// snapshotted at save *start* (via the crate-private
+    /// `record_kdbx_correspondence`).
     ///
     /// # Errors
     ///
@@ -803,6 +809,23 @@ impl Engine {
     pub fn record_kdbx_state_signature(
         &mut self,
         path: &std::path::Path,
+    ) -> Result<(), EngineError> {
+        let seq = self.persistence_state()?.mutation_seq;
+        self.record_kdbx_correspondence(path, seq)
+    }
+
+    /// [`Engine::record_kdbx_state_signature`] with an explicit
+    /// watermark: persist the signature of `path` and set
+    /// `persisted_seq = persisted_seq_value` in one transaction.
+    ///
+    /// The save path passes the `mutation_seq` it snapshotted *before*
+    /// projecting, so content mutated mid-save (should the engine ever
+    /// admit that) stays strictly newer than the persist and flushes
+    /// next round.
+    pub(crate) fn record_kdbx_correspondence(
+        &mut self,
+        path: &std::path::Path,
+        persisted_seq_value: i64,
     ) -> Result<(), EngineError> {
         let sig = crate::KdbxStateSignature::from_path(path)?;
         let tx = self.conn.transaction()?;
@@ -817,8 +840,38 @@ impl Engine {
             "INSERT OR REPLACE INTO setting(key, value) VALUES ('kdbx_state_signature_byte_count', ?1)",
             rusqlite::params![byte_count_i64],
         )?;
+        tx.execute(
+            "UPDATE setting SET value = ?1 WHERE key = 'persistence.persisted_seq'",
+            rusqlite::params![persisted_seq_value],
+        )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The persistence watermark pair — "does the KDBX still owe a
+    /// write?", answered by the engine instead of per-call-site
+    /// frontend convention. See [`crate::PersistenceState`] for the
+    /// semantics; maintained by the migration-0012 triggers
+    /// (`mutation_seq`) and the correspondence points — save / ingest /
+    /// rebuild (`persisted_seq`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn persistence_state(&self) -> Result<crate::PersistenceState, EngineError> {
+        let read = |key: &str| -> Result<i64, EngineError> {
+            self.conn
+                .query_row(
+                    "SELECT value FROM setting WHERE key = ?1",
+                    rusqlite::params![key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(EngineError::Sqlite)
+        };
+        Ok(crate::PersistenceState {
+            mutation_seq: read("persistence.mutation_seq")?,
+            persisted_seq: read("persistence.persisted_seq")?,
+        })
     }
 
     /// Reconcile the engine's `SQLite` state against the current

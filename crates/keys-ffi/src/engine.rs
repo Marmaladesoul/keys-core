@@ -64,8 +64,8 @@ use crate::engine_portable::EnginePortableEntry;
 use crate::engine_types::{
     AttachmentBlobStats, ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull,
     EntrySave, EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi,
-    NewEntryFields, NewGroupFields, Page, ParkConflictsResultFfi, Predicate, RecycleBinFilter,
-    SearchScope, SmartFolder, TagUsageCount, VaultState, parse_uuid,
+    NewEntryFields, NewGroupFields, Page, ParkConflictsResultFfi, PersistenceStateFfi, Predicate,
+    RecycleBinFilter, SearchScope, SmartFolder, TagUsageCount, VaultState, parse_uuid,
 };
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
@@ -215,6 +215,19 @@ impl Engine {
     /// (`* 1000` for ms) and `.fileSizeKey`.
     pub fn kdbx_state_signature(&self) -> Result<Option<KdbxStateSignatureFfi>, EngineError> {
         self.with_engine(|e| Ok(e.kdbx_state_signature()?.map(Into::into)))
+    }
+
+    /// The persistence watermark pair — "does the KDBX still owe a
+    /// write?". Dirty means the SQLite mirror holds content the KDBX
+    /// file has not been handed yet; a save orchestrator should flush
+    /// (debounced, plus on lifecycle edges like lock/quit). Computed
+    /// engine-side so no client re-derives the comparison; survives
+    /// close + reopen, so a frontend that crashed between a mutation
+    /// and its save sees `is_dirty == true` on the next open and can
+    /// flush immediately. See
+    /// [`keys_engine::Engine::persistence_state`].
+    pub fn persistence_state(&self) -> Result<PersistenceStateFfi, EngineError> {
+        self.with_engine(|e| Ok(e.persistence_state()?.into()))
     }
 
     /// Hex-encoded SHA-256 digest of the vault's user-visible content

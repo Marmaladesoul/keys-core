@@ -220,6 +220,22 @@ Generic KV. Reserved keys:
 - `fingerprint_key` — 32 random bytes, encrypted under SQLCipher (same
   key as the rest of the file; the protection is at rest). Used to
   HMAC password plaintexts for `entry.password_fingerprint`.
+- `kdbx_state_signature_mtime_ms` / `kdbx_state_signature_byte_count` —
+  `(mtime, size)` of the KDBX file the mirror currently corresponds
+  to. Written by `record_kdbx_state_signature` (post-ingest) and
+  `save_to_kdbx` (automatic); read on unlock to skip re-ingest when
+  the on-disk file hasn't changed.
+- `persistence.mutation_seq` / `persistence.persisted_seq` — the
+  persistence watermark (migration 0012). `mutation_seq` is a
+  monotonic counter bumped by AFTER-triggers inside every
+  projected-content mutation's transaction; `persisted_seq` is the
+  `mutation_seq` captured at the start of the last successful
+  mirror↔disk correspondence point (save / ingest+signature /
+  rebuild). Dirty = `mutation_seq > persisted_seq` — "the KDBX still
+  owes a write", surfaced as `Engine::persistence_state()`. Mirror-
+  local tables (`attachment_blob`, `conflict_*`, `smart_folder`) and
+  non-`meta.%` `setting` rows deliberately don't bump; the census
+  test in `migrations.rs` polices the trigger coverage.
 - `last_saved_kdbx_bytes` — **retired.** Previously held the raw KDBX
   bytes of the most recent [`Engine::save_to_kdbx`] write as the
   common-ancestor baseline for the pre-owner-rows eager-merge
