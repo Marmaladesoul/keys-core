@@ -8,7 +8,6 @@
 //! guarantee for external consumers; it is not published to crates.io.
 
 mod db_key_provider;
-mod dto;
 mod engine;
 mod engine_error;
 mod engine_file_watcher;
@@ -24,10 +23,6 @@ mod totp;
 mod vault_create;
 
 pub use db_key_provider::{VaultDbKeyProvider, VaultDbKeyProviderError};
-pub use dto::{
-    AutoType, AutoTypeAssociation, CustomField, Entry, EntryCreate, EntryPatch, EntrySummary,
-    Group, GroupPatch, HistoryRecord, ProtectedField,
-};
 pub use engine::{
     Engine, SelfHealingOpen, open_vault_self_healing, purge_vault_local_data,
     rebuild_vault_local_data,
@@ -52,9 +47,10 @@ pub use identity::{VaultIdentityVerdict, verify_vault_identity};
 pub use keyfile::generate_keyfile;
 pub use merge::{
     AttachmentChoiceFfi, AttachmentChoiceKindFfi, AttachmentDeltaFfi, AttachmentDeltaKindFfi,
-    ConflictSideFfi, DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, DeleteEditConflictFfi,
-    EntryAttachmentChoiceFfi, EntryConflictFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi,
-    FieldChoiceFfi, FieldDeltaFfi, FieldDeltaKindFfi, IconDeltaFfi, ResolutionFfi,
+    ConflictCustomFieldFfi, ConflictEntrySnapshotFfi, ConflictSideFfi, DeleteEditChoiceEntryFfi,
+    DeleteEditChoiceFfi, DeleteEditConflictFfi, EntryAttachmentChoiceFfi, EntryConflictFfi,
+    EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, FieldDeltaFfi, FieldDeltaKindFfi,
+    IconDeltaFfi, ResolutionFfi,
 };
 pub use protector::{VaultFieldProtector, VaultProtectorError};
 pub use totp::{
