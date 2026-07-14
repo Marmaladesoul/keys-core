@@ -68,9 +68,23 @@ recycled="$("$KEYHOLE" inspect "$VAULT" | awk '/^recycled:/ {print $2}')"
 out="$("$KEYHOLE" flush "$VAULT")"
 [ "$out" = "clean" ] || fail "expected 'clean' on an already-persisted vault, got: $out"
 
-# 5. A normal mutating verb (save tail included) leaves the vault clean.
+# 5. A normal mutating verb (teardown flush included) leaves the vault clean.
 "$KEYHOLE" create-entry "$VAULT" "Saved Normally" --username ok >/dev/null
 s="$(state)"
 [[ "$s" == *"dirty=false"* ]] || fail "expected clean after a saving verb, got: $s"
 
-echo "PASS: engine-owned dirty watermark — unsaved mutations read back dirty across processes, flush persists + settles, saves/ingests settle"
+# 6. Loop-safety: ingesting an IDENTICAL peer advances nothing, so the
+#    teardown writes nothing and the KDBX keeps its exact bytes+mtime —
+#    a no-op sync must never churn the file (fresh mtimes restart the
+#    reconcile ping-pong between two watching clients).
+PEER="$TMP/identical-peer.kdbx"
+cp "$VAULT" "$PEER"
+before_stat="$(stat -f '%m %z' "$VAULT" 2>/dev/null || stat -c '%Y %s' "$VAULT")"
+out="$("$KEYHOLE" ingest-peer "$VAULT" "$PEER" --owner twin)"
+[[ "$out" == *"no local advance — nothing to save"* ]] \
+    || fail "identical-peer ingest should report nothing to save, got: $out"
+after_stat="$(stat -f '%m %z' "$VAULT" 2>/dev/null || stat -c '%Y %s' "$VAULT")"
+[ "$before_stat" = "$after_stat" ] \
+    || fail "identical-peer ingest rewrote the KDBX ($before_stat -> $after_stat) — mtime churn is the sync ping-pong class"
+
+echo "PASS: engine-owned dirty watermark — unsaved mutations read back dirty across processes, flush persists + settles, saves/ingests settle, no-op peer ingest leaves the file untouched"

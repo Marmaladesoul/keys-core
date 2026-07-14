@@ -686,9 +686,8 @@ async fn main() -> Result<()> {
         } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session
-                .create_entry(title, username, entry_password, group)
-                .await?;
+            session.create_entry(title, username, entry_password, group)?;
+            session.finish().await?;
         }
         Command::UpdateEntry {
             vault,
@@ -718,12 +717,14 @@ async fn main() -> Result<()> {
             };
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.update_entry(uuid, update).await?;
+            session.update_entry(&uuid, update)?;
+            session.finish().await?;
         }
         Command::EnsureBin { vault } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.ensure_bin().await?;
+            session.ensure_bin()?;
+            session.finish().await?;
         }
         Command::SetBin {
             vault,
@@ -736,12 +737,14 @@ async fn main() -> Result<()> {
             );
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.set_bin(state == "on", delete_bin_contents).await?;
+            session.set_bin(state == "on", delete_bin_contents)?;
+            session.finish().await?;
         }
         Command::EmptyBin { vault } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.empty_bin().await?;
+            session.empty_bin()?;
+            session.finish().await?;
         }
         Command::Purge { vault } => {
             // Teardown, not a Session op: purge is path-based (no engine
@@ -788,7 +791,10 @@ async fn main() -> Result<()> {
         } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.recycle(uuid, !no_save).await?;
+            session.recycle(&uuid, !no_save)?;
+            if !no_save {
+                session.finish().await?;
+            }
         }
         Command::PersistenceState { vault } => {
             let session =
@@ -808,6 +814,7 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.ingest_peer(owner, &peer_kdbx).await?;
+            session.finish().await?;
         }
         Command::ListConflicts { vault } => {
             let session =
@@ -827,7 +834,8 @@ async fn main() -> Result<()> {
         Command::AddCustomIcon { vault, entry, data } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.add_custom_icon(entry, data).await?;
+            session.add_custom_icon(entry, data)?;
+            session.finish().await?;
         }
         Command::CustomIconBytes { vault, icon } => {
             let session =
@@ -842,12 +850,14 @@ async fn main() -> Result<()> {
         } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.set_field(entry, name, value).await?;
+            session.set_field(entry, &name, value)?;
+            session.finish().await?;
         }
         Command::SetTags { vault, entry, tags } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.set_tags(entry, tags).await?;
+            session.set_tags(entry, &tags)?;
+            session.finish().await?;
         }
         Command::Tags { vault, entry } => {
             let session =
@@ -866,12 +876,14 @@ async fn main() -> Result<()> {
         } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.delete_history(entry, index).await?;
+            session.delete_history(entry, index)?;
+            session.finish().await?;
         }
         Command::SetHistoryMax { vault, items } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.set_history_max(items).await?;
+            session.set_history_max(items)?;
+            session.finish().await?;
         }
         Command::Digest { vault } => {
             let session =
@@ -885,22 +897,26 @@ async fn main() -> Result<()> {
         } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.create_group(name, parent).await?;
+            session.create_group(name, parent)?;
+            session.finish().await?;
         }
         Command::RenameGroup { vault, uuid, name } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.rename_group(uuid, name).await?;
+            session.rename_group(&uuid, &name)?;
+            session.finish().await?;
         }
         Command::MoveGroup { vault, uuid, to } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.move_group(uuid, to).await?;
+            session.move_group(&uuid, &to)?;
+            session.finish().await?;
         }
         Command::DeleteGroup { vault, uuid } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.delete_group(uuid).await?;
+            session.delete_group(&uuid)?;
+            session.finish().await?;
         }
         Command::ListGroups { vault } => {
             let session =
@@ -910,17 +926,20 @@ async fn main() -> Result<()> {
         Command::MoveEntry { vault, uuid, to } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.move_entry(uuid, to).await?;
+            session.move_entry(&uuid, &to)?;
+            session.finish().await?;
         }
         Command::Restore { vault, uuid } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.restore(uuid).await?;
+            session.restore(&uuid)?;
+            session.finish().await?;
         }
         Command::DeleteEntry { vault, uuid } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.delete_entry(uuid).await?;
+            session.delete_entry(&uuid)?;
+            session.finish().await?;
         }
         Command::SetAttachment {
             vault,
@@ -930,9 +949,8 @@ async fn main() -> Result<()> {
         } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session
-                .set_attachment(uuid, name, text.into_bytes())
-                .await?;
+            session.set_attachment(&uuid, &name, text.into_bytes())?;
+            session.finish().await?;
         }
         Command::CatAttachment { vault, uuid, name } => {
             let session =
@@ -942,7 +960,8 @@ async fn main() -> Result<()> {
         Command::RemoveAttachment { vault, uuid, name } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.remove_attachment(uuid, name).await?;
+            session.remove_attachment(&uuid, &name)?;
+            session.finish().await?;
         }
         Command::Resolve {
             vault,
@@ -963,6 +982,7 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.resolve(entry, side, &overrides).await?;
+            session.finish().await?;
         }
         Command::Rekey {
             vault,
@@ -1171,11 +1191,7 @@ impl Session {
     /// Save iff the engine says a write is owed — the orchestrator
     /// primitive. Prints `flushed` or `clean` on stdout.
     async fn flush(&self) -> Result<()> {
-        let st = self
-            .engine
-            .persistence_state()
-            .map_err(|e| anyhow::anyhow!("persistence_state: {e:?}"))?;
-        if st.is_dirty {
+        if self.owes_write()? {
             self.save().await?;
             println!("flushed");
         } else {
@@ -1184,8 +1200,41 @@ impl Session {
         Ok(())
     }
 
-    /// Write the mirror back to the source KDBX — the shared persist
-    /// tail of every mutating verb.
+    /// Session teardown: write the mirror back iff the engine says a
+    /// write is owed ([`keys_ffi::Engine::persistence_state`]). The
+    /// single save-placement choke point — verbs only mutate; the
+    /// dispatch arm closes the session with this. Quiet on stdout
+    /// (that belongs to the verbs); the loud twin is the `flush` verb.
+    ///
+    /// Deliberately NOT called by read-only arms yet: after a
+    /// reconcile that adopted disk content (digest-equal,
+    /// `needs_write_back: false`) the watermark still reads dirty, and
+    /// flushing there would rewrite identical bytes — mtime churn, the
+    /// sync ping-pong class. The tri-state sync verb (ARC C slice 3)
+    /// settles the watermark at reconcile time, which is what makes
+    /// uniform teardown safe.
+    async fn finish(&self) -> Result<()> {
+        if self.owes_write()? {
+            self.save().await?;
+        }
+        Ok(())
+    }
+
+    /// Does the engine say the KDBX is owed a write? The one dirty
+    /// check, shared by [`Session::finish`], the `flush` verb, and the
+    /// verbs whose engine call can be a structural no-op (their stdout
+    /// must not claim a save the teardown won't perform).
+    fn owes_write(&self) -> Result<bool> {
+        Ok(self
+            .engine
+            .persistence_state()
+            .map_err(|e| anyhow::anyhow!("persistence_state: {e:?}"))?
+            .is_dirty)
+    }
+
+    /// Write the mirror back to the source KDBX — the raw persist used
+    /// by [`Session::finish`], the `flush` verb, and the reconcile
+    /// write-back in [`Session::open`].
     async fn save(&self) -> Result<()> {
         self.engine
             .save_to_kdbx_with_keyfile(
@@ -1312,7 +1361,7 @@ impl Session {
     }
 
     /// Create an entry under `group` (root if `None`) and persist it.
-    async fn create_entry(
+    fn create_entry(
         &self,
         title: String,
         username: String,
@@ -1339,31 +1388,34 @@ impl Session {
                 },
             )
             .map_err(|e| anyhow::anyhow!("create_entry: {e:?}"))?;
-        self.save().await?;
         println!("created entry {uuid}");
         Ok(())
     }
 
     /// Patch an entry and persist.
-    async fn update_entry(&self, uuid: String, update: EngineEntryUpdate) -> Result<()> {
+    fn update_entry(&self, uuid: &str, update: EngineEntryUpdate) -> Result<()> {
         self.engine
-            .update_entry(uuid.clone(), update)
+            .update_entry(uuid.to_owned(), update)
             .map_err(|e| anyhow::anyhow!("update_entry: {e:?}"))?;
-        self.save().await?;
         println!("updated {uuid} and saved to disk");
         Ok(())
     }
 
-    /// Ensure the recycle bin group exists, then persist if one was created.
-    async fn ensure_bin(&self) -> Result<()> {
+    /// Ensure the recycle bin group exists. `ensure_recycle_bin` is a
+    /// structural no-op when the bin already exists — the watermark
+    /// tells the two cases apart, so stdout never claims a save that
+    /// the teardown won't perform.
+    fn ensure_bin(&self) -> Result<()> {
         let bin = self
             .engine
             .ensure_recycle_bin()
             .map_err(|e| anyhow::anyhow!("ensure_recycle_bin: {e:?}"))?;
         match &bin {
-            Some(uuid) => {
-                self.save().await?;
+            Some(uuid) if self.owes_write()? => {
                 println!("recycle bin ensured: {uuid} (saved)");
+            }
+            Some(uuid) => {
+                println!("recycle bin ensured: {uuid} (already present — nothing to save)");
             }
             None => println!("recycle bin disabled — nothing to ensure"),
         }
@@ -1375,7 +1427,7 @@ impl Session {
     /// uses); disable = clear the designation, optionally hard-deleting
     /// the old bin group + contents first (tombstoned). The old group
     /// otherwise survives as an ordinary group.
-    async fn set_bin(&self, enable: bool, delete_contents: bool) -> Result<()> {
+    fn set_bin(&self, enable: bool, delete_contents: bool) -> Result<()> {
         if enable {
             self.engine
                 .set_recycle_bin(true, None)
@@ -1384,7 +1436,6 @@ impl Session {
                 .engine
                 .ensure_recycle_bin()
                 .map_err(|e| anyhow::anyhow!("ensure_recycle_bin: {e:?}"))?;
-            self.save().await?;
             match bin {
                 Some(uuid) => println!("recycle bin enabled (group {uuid}) and saved"),
                 None => anyhow::bail!("enable left no bin group — engine contract violated"),
@@ -1404,7 +1455,6 @@ impl Session {
             self.engine
                 .set_recycle_bin(false, None)
                 .map_err(|e| anyhow::anyhow!("set_recycle_bin: {e:?}"))?;
-            self.save().await?;
             match (&old, delete_contents) {
                 (Some(b), true) => {
                     println!("recycle bin disabled; old bin {b} deleted with contents; saved");
@@ -1423,30 +1473,35 @@ impl Session {
     /// group itself — emptying is not disabling. The proof that the purge
     /// hit disk and propagated lives in the scenario, across a mirror-nuked
     /// reopen and a cross-peer sync.
-    async fn empty_bin(&self) -> Result<()> {
+    fn empty_bin(&self) -> Result<()> {
         let before = self.recycled_count()?;
         self.engine
             .empty_recycle_bin()
             .map_err(|e| anyhow::anyhow!("empty_recycle_bin: {e:?}"))?;
-        self.save().await?;
-        println!(
-            "emptied recycle bin ({before} entr{} were directly in it) and saved to disk",
-            if before == 1 { "y" } else { "ies" }
-        );
+        // `empty_recycle_bin` is a structural no-op on an absent or
+        // already-empty bin — only claim a save the teardown will do.
+        if self.owes_write()? {
+            println!(
+                "emptied recycle bin ({before} entr{} were directly in it) and saved to disk",
+                if before == 1 { "y" } else { "ies" }
+            );
+        } else {
+            println!("recycle bin already empty — nothing to save");
+        }
         Ok(())
     }
 
-    /// Recycle an entry, then (unless `save` is false) write the result
-    /// back to the source KDBX. The reopen-from-disk check that proves
+    /// Recycle an entry. The write-back happens at session teardown
+    /// (`finish`, skipped under `--no-save`); `will_persist` only picks
+    /// the honest message. The reopen-from-disk check that proves
     /// persistence lives in the scenario script, not here — a fresh
     /// process is the only honest test of "did it hit the disk".
-    async fn recycle(&self, uuid: String, save: bool) -> Result<()> {
+    fn recycle(&self, uuid: &str, will_persist: bool) -> Result<()> {
         self.engine
-            .recycle_entry(uuid.clone())
+            .recycle_entry(uuid.to_owned())
             .map_err(|e| anyhow::anyhow!("recycle_entry: {e:?}"))?;
 
-        if save {
-            self.save().await?;
+        if will_persist {
             println!("recycled {uuid} and saved to disk");
         } else {
             println!("recycled {uuid} in mirror only — NOT saved (--no-save)");
@@ -1518,8 +1573,16 @@ impl Session {
             .await
             .map_err(|e| anyhow::anyhow!("ingest_peer_kdbx: {e:?}"))?;
         print_park_result(&format!("ingested peer '{owner}'"), &result);
-        self.save().await?;
-        println!("merged state saved to disk");
+        // A peer whose content is identical (or that only parked held
+        // conflicts — conflict rows are mirror-local) advances nothing:
+        // the watermark stays settled, the teardown writes nothing, and
+        // the KDBX keeps its mtime — the loop-safety win over the old
+        // unconditional rewrite. Only claim the save when it will happen.
+        if self.owes_write()? {
+            println!("merged state saved to disk");
+        } else {
+            println!("no local advance — nothing to save");
+        }
         Ok(())
     }
 
@@ -1561,18 +1624,17 @@ impl Session {
     }
 
     /// Set a non-protected custom (string) field on `entry`, then persist.
-    async fn set_field(&self, entry: String, name: String, value: String) -> Result<()> {
+    fn set_field(&self, entry: String, name: &str, value: String) -> Result<()> {
         self.engine
-            .set_non_protected_custom_field(entry, name.clone(), value)
+            .set_non_protected_custom_field(entry, name.to_owned(), value)
             .map_err(|e| anyhow::anyhow!("set_non_protected_custom_field: {e:?}"))?;
-        self.save().await?;
         println!("set field {name:?} and saved to disk");
         Ok(())
     }
 
     /// Replace `entry`'s tag set (comma-separated; empty string clears), then
     /// persist. Whitespace around each tag is trimmed; empty items dropped.
-    async fn set_tags(&self, entry: String, tags: String) -> Result<()> {
+    fn set_tags(&self, entry: String, tags: &str) -> Result<()> {
         let parsed: Vec<String> = tags
             .split(',')
             .map(|t| t.trim().to_string())
@@ -1581,7 +1643,6 @@ impl Session {
         self.engine
             .set_tags(entry, parsed)
             .map_err(|e| anyhow::anyhow!("set_tags: {e:?}"))?;
-        self.save().await?;
         println!("set tags and saved to disk");
         Ok(())
     }
@@ -1626,11 +1687,10 @@ impl Session {
     }
 
     /// Delete history snapshot `index` from `entry`, then persist.
-    async fn delete_history(&self, entry: String, index: u32) -> Result<()> {
+    fn delete_history(&self, entry: String, index: u32) -> Result<()> {
         self.engine
             .delete_history_at(entry, index)
             .map_err(|e| anyhow::anyhow!("delete_history_at: {e:?}"))?;
-        self.save().await?;
         println!("deleted history snapshot {index} and saved to disk");
         Ok(())
     }
@@ -1638,11 +1698,10 @@ impl Session {
     /// Set the vault-wide `<HistoryMaxItems>` cap, then persist. Subsequent
     /// edits trim each entry's history to this cap (oldest first); the Engine
     /// path must tombstone what it trims so a peer can't resurrect it.
-    async fn set_history_max(&self, items: i32) -> Result<()> {
+    fn set_history_max(&self, items: i32) -> Result<()> {
         self.engine
             .set_history_max_items(items)
             .map_err(|e| anyhow::anyhow!("set_history_max_items: {e:?}"))?;
-        self.save().await?;
         println!("set history_max_items = {items} and saved to disk");
         Ok(())
     }
@@ -1651,7 +1710,7 @@ impl Session {
     /// print the content-addressed icon UUID. The link itself doesn't bump
     /// `modified_at` (favicon semantics), so this is a one-sided cosmetic
     /// change for the cross-peer pool-union scenario.
-    async fn add_custom_icon(&self, entry: String, data: String) -> Result<()> {
+    fn add_custom_icon(&self, entry: String, data: String) -> Result<()> {
         let uuid = self
             .engine
             .add_custom_icon(data.into_bytes())
@@ -1659,7 +1718,6 @@ impl Session {
         self.engine
             .link_entry_custom_icon(entry, uuid.clone())
             .map_err(|e| anyhow::anyhow!("link_entry_custom_icon: {e:?}"))?;
-        self.save().await?;
         println!("{uuid}");
         Ok(())
     }
@@ -1699,7 +1757,7 @@ impl Session {
     }
 
     /// Create a group under `parent` (root if `None`) and persist.
-    async fn create_group(&self, name: String, parent: Option<String>) -> Result<()> {
+    fn create_group(&self, name: String, parent: Option<String>) -> Result<()> {
         let parent_uuid = match parent {
             Some(p) => p,
             None => self.root_uuid()?,
@@ -1715,45 +1773,41 @@ impl Session {
                 },
             )
             .map_err(|e| anyhow::anyhow!("create_group: {e:?}"))?;
-        self.save().await?;
         println!("created group {uuid}");
         Ok(())
     }
 
     /// Rename a group (its `name`), then persist.
-    async fn rename_group(&self, uuid: String, name: String) -> Result<()> {
+    fn rename_group(&self, uuid: &str, name: &str) -> Result<()> {
         self.engine
             .update_group(
-                uuid.clone(),
+                uuid.to_owned(),
                 keys_ffi::EngineGroupUpdate {
-                    name: Some(name.clone()),
+                    name: Some(name.to_owned()),
                     notes: None,
                     icon: None,
                     expires_at: None,
                 },
             )
             .map_err(|e| anyhow::anyhow!("update_group: {e:?}"))?;
-        self.save().await?;
         println!("renamed group {uuid} to {name:?} and saved to disk");
         Ok(())
     }
 
     /// Re-parent a group under `to`, then persist.
-    async fn move_group(&self, uuid: String, to: String) -> Result<()> {
+    fn move_group(&self, uuid: &str, to: &str) -> Result<()> {
         self.engine
-            .move_group(uuid.clone(), to.clone())
+            .move_group(uuid.to_owned(), to.to_owned())
             .map_err(|e| anyhow::anyhow!("move_group: {e:?}"))?;
-        self.save().await?;
         println!("moved group {uuid} under {to} and saved to disk");
         Ok(())
     }
 
     /// Delete a group (cascading), then persist.
-    async fn delete_group(&self, uuid: String) -> Result<()> {
+    fn delete_group(&self, uuid: &str) -> Result<()> {
         self.engine
-            .delete_group(uuid.clone())
+            .delete_group(uuid.to_owned())
             .map_err(|e| anyhow::anyhow!("delete_group: {e:?}"))?;
-        self.save().await?;
         println!("deleted group {uuid} and saved to disk");
         Ok(())
     }
@@ -1776,51 +1830,46 @@ impl Session {
     }
 
     /// Move an entry to `group_uuid` and persist.
-    async fn move_entry(&self, uuid: String, group_uuid: String) -> Result<()> {
+    fn move_entry(&self, uuid: &str, group_uuid: &str) -> Result<()> {
         self.engine
-            .move_entry(uuid.clone(), group_uuid.clone())
+            .move_entry(uuid.to_owned(), group_uuid.to_owned())
             .map_err(|e| anyhow::anyhow!("move_entry: {e:?}"))?;
-        self.save().await?;
         println!("moved {uuid} to {group_uuid} and saved to disk");
         Ok(())
     }
 
     /// Restore a recycled entry and persist.
-    async fn restore(&self, uuid: String) -> Result<()> {
+    fn restore(&self, uuid: &str) -> Result<()> {
         self.engine
-            .restore_entry(uuid.clone())
+            .restore_entry(uuid.to_owned())
             .map_err(|e| anyhow::anyhow!("restore_entry: {e:?}"))?;
-        self.save().await?;
         println!("restored {uuid} and saved to disk");
         Ok(())
     }
 
     /// Permanently delete an entry (tombstoned) and persist.
-    async fn delete_entry(&self, uuid: String) -> Result<()> {
+    fn delete_entry(&self, uuid: &str) -> Result<()> {
         self.engine
-            .delete_entry(uuid.clone())
+            .delete_entry(uuid.to_owned())
             .map_err(|e| anyhow::anyhow!("delete_entry: {e:?}"))?;
-        self.save().await?;
         println!("deleted {uuid} permanently (tombstoned) and saved to disk");
         Ok(())
     }
 
     /// Add or replace an attachment and persist.
-    async fn set_attachment(&self, uuid: String, name: String, bytes: Vec<u8>) -> Result<()> {
+    fn set_attachment(&self, uuid: &str, name: &str, bytes: Vec<u8>) -> Result<()> {
         self.engine
-            .set_attachment(uuid.clone(), name.clone(), bytes)
+            .set_attachment(uuid.to_owned(), name.to_owned(), bytes)
             .map_err(|e| anyhow::anyhow!("set_attachment: {e:?}"))?;
-        self.save().await?;
         println!("set attachment {name:?} on {uuid} and saved to disk");
         Ok(())
     }
 
     /// Remove an attachment by name and persist.
-    async fn remove_attachment(&self, uuid: String, name: String) -> Result<()> {
+    fn remove_attachment(&self, uuid: &str, name: &str) -> Result<()> {
         self.engine
-            .remove_attachment(uuid.clone(), name.clone())
+            .remove_attachment(uuid.to_owned(), name.to_owned())
             .map_err(|e| anyhow::anyhow!("remove_attachment: {e:?}"))?;
-        self.save().await?;
         println!("removed attachment {name:?} from {uuid} and saved to disk");
         Ok(())
     }
@@ -1889,7 +1938,6 @@ impl Session {
             .apply_conflict_resolution(payload.id, resolution)
             .await
             .map_err(|e| anyhow::anyhow!("apply_conflict_resolution: {e:?}"))?;
-        self.save().await?;
         println!("resolved {entry} choosing {side:?} and saved to disk");
         Ok(())
     }

@@ -183,6 +183,20 @@ persists in the mirror, a mutation left unsaved by a dead process reads
 back dirty on the next open — the crash-recovery flush signal.
 `scenarios/dirty-watermark.sh` pins the contract.
 
+**keyhole's save orchestrator is `Session::finish`.** Mutating verbs no
+longer carry a per-verb `save()` tail — they only mutate the mirror;
+each mutating dispatch arm closes its session with `finish()`
+(save-iff-dirty, quiet). The per-call-site "did this verb remember to
+save?" decision is gone: the engine answers it. `recycle --no-save`
+skips the teardown, which is what keeps the negative-control scenarios
+honest. Read-only arms deliberately do NOT finish yet: after a
+reconcile that adopted disk content (digest-equal,
+`needs_write_back: false`) the watermark still reads dirty, and
+flushing there would rewrite identical bytes — mtime churn, the sync
+ping-pong class. The tri-state sync verb (ARC C slice 3) settles the
+watermark at reconcile time; uniform teardown (and folding the
+`Session::open` write-back into the same primitive) lands with it.
+
 ## The migration workflow (how keyhole grows)
 
 keyhole is fleshed out **one bug or feature at a time**, never up front.
@@ -930,6 +944,23 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   — worth a look when `restore` is wired.
 
 ## Findings (surfaced by keyhole)
+
+- **[FIXED — keys-engine `reconcile_peer_meta` write-if-changed] A
+  content-identical peer ingest rewrote every scalar Meta `setting`
+  row, so under the migration-0012 persistence watermark a no-op merge
+  read as "the KDBX owes a write".** Surfaced the moment
+  `dirty-watermark.sh` pinned "an identical-peer ingest must leave the
+  file's bytes+mtime untouched": the save orchestrator (correctly)
+  trusted the watermark, the watermark (correctly) counted the row
+  writes, and the row writes were the lie — `reconcile_peer_meta`
+  upserted the full merged scalar set even when the merge changed
+  nothing, ~16 spurious trigger fires per ingest. Pre-watermark this
+  was invisible (the verb saved unconditionally anyway); the honest
+  primitive exposed it. Fixed by returning early when the merged Meta
+  equals local — a no-op merge is now a no-op write, which is
+  load-bearing for sync loop-safety: an orchestrator that flushed
+  after every no-op ingest would churn the file's mtime and restart
+  the reconcile ping-pong between two watching clients.
 
 - **[CHARACTERISED — inherent interop limit, data-safe at the seam] An
   entry-level last-writer-wins peer that folds a concurrent field edit into

@@ -1303,6 +1303,17 @@ fn reconcile_peer_meta(
     let mut merged = local_meta.clone();
     merge_meta_scalars(&mut merged, peer_meta);
 
+    // Nothing won over local → write nothing. Rewriting identical
+    // scalar rows would still advance the persistence watermark
+    // (migration 0012's triggers fire per row write, changed or not),
+    // making a content-identical peer ingest read as "KDBX owes a
+    // write" — and a save orchestrator would then rewrite an unchanged
+    // file, churning its mtime for every other watcher. A no-op merge
+    // must be a no-op write.
+    if merged == *local_meta {
+        return Ok(());
+    }
+
     // Scalar setting rows (name/description/default-username + their
     // `*_changed`, `recycle_bin_changed`, `settings_changed`, history caps,
     // colour, …). The scalar-only writer upserts these and never touches the
