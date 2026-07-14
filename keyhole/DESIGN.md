@@ -1013,6 +1013,26 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   converges to the peer's folded state, no conflict) pins the accepted limit so
   any future hardening trips it consciously.
 
+- **[FIXED] `SearchScope::AnyField` matched only the canonical columns
+  (title / username / url / notes) and tag names — never
+  `entry_custom_field`, so a token present only in a non-protected custom
+  field's value or name was invisible to an "any field" query.** These
+  fields are the extra attributes a client renders below the canonical
+  four; a value parked in one (an account number, a licence key) is
+  exactly what a user reaches for the search box to find, and "Any Field"
+  silently couldn't. The fix ORs an `EXISTS` over `entry_custom_field`
+  (both `field_name` and `value`, `COLLATE NOCASE`) into the AnyField
+  clause. Protected custom fields are unaffected: they live encrypted in
+  `entry_protected`, absent from `entry_custom_field` by construction, so
+  the clause can't leak ciphertext or match on it — the "protected fields
+  are never searched" invariant holds. `TitleOnly` / `NotesOnly` are
+  unchanged. Pinned by `scenarios/search-custom-fields.sh` (value + name
+  reachable, absent token still misses, survives a close+reopen — custom
+  fields are re-derived from the KDBX on ingest, so the cold arm proves
+  the round-trip) and the engine test
+  `search_anyfield_matches_non_protected_custom_field` (which also asserts
+  the value stays out of `TitleOnly`).
+
 - **[FIXED] `group_tree`'s per-group entry counts filtered on the per-entry
   `is_recycled` flag → the same vault counted differently warm vs cold, and
   entries buried under a recycled group counted NOWHERE after a fresh
