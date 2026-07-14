@@ -992,6 +992,42 @@ impl From<eng::ParkConflictsResult> for ParkConflictsResultFfi {
     }
 }
 
+/// Outcome of [`crate::Engine::sync_with_disk`] — the one verb owning
+/// "bring the mirror current against the vault file, and persist iff
+/// the merge advanced past disk".
+///
+/// The write-back/loop-safety decision (`needs_write_back`) never
+/// crosses the seam: the verb persists internally when (and only
+/// when) the merged mirror holds content the file lacks, and settles
+/// the persistence watermark when the digest proves convergence. A
+/// client switches on the outcome for diagnostics/refresh only —
+/// there is no save decision left to make.
+#[derive(uniffi::Enum, Debug, Clone)]
+pub enum SyncWithDiskFfi {
+    /// No recorded signature — a fresh mirror was built from the file
+    /// (`ingest_from_kdbx`) and the correspondence recorded.
+    FreshIngest,
+    /// The recorded signature matches the file's `(mtime_ms, size)` —
+    /// the mirror is already current; nothing was read or written.
+    UpToDate,
+    /// The file changed but the reconcile adopted nothing (a held
+    /// conflict parks without advancing; local-ahead edits stay
+    /// local). Nothing was written; any locally-owed write is still
+    /// visible via [`crate::Engine::persistence_state`].
+    NoChange,
+    /// The reconcile adopted content into the mirror.
+    Applied {
+        applied: MergeStats,
+        parked: ParkedConflictsSummaryFfi,
+        /// `true` ⇒ the merged mirror held content the file lacked, so
+        /// the verb wrote the projection back (and recorded the
+        /// correspondence). `false` ⇒ digest-proven convergence — the
+        /// file already held everything; the watermark was settled
+        /// without a write.
+        wrote_back: bool,
+    },
+}
+
 /// Wire-friendly mirror of [`keys_engine::ParkedConflictsSummary`].
 #[derive(uniffi::Record, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParkedConflictsSummaryFfi {

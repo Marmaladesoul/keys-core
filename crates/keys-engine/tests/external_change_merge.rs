@@ -421,3 +421,111 @@ fn reconcile_round_trip_with_file_watcher() {
         "expected ExternalChangeMerged event",
     );
 }
+
+/// ARC C watermark semantics, direction 1: adopting a one-sided disk
+/// edit into a CLEAN mirror is a digest-proven correspondence point —
+/// the engine settles the persistence watermark itself, so a
+/// save-iff-dirty orchestrator won't rewrite identical bytes (mtime
+/// churn, the reconcile ping-pong seed).
+#[test]
+fn digest_equal_adoption_settles_a_clean_mirror() {
+    let mut f = fixture();
+    f.engine
+        .record_kdbx_state_signature(&f.kdbx_path)
+        .expect("settle");
+    assert!(!f.engine.persistence_state().expect("state").is_dirty());
+    let seed_uuid = f
+        .engine
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list")[0]
+        .uuid;
+
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .edit_entry(
+            keepass_core::model::EntryId(seed_uuid),
+            keepass_core::model::HistoryPolicy::Snapshot,
+            |e| e.set_title("disk-rename"),
+        )
+        .expect("disk edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    let result = f
+        .engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile");
+    assert!(
+        matches!(
+            result,
+            ParkConflictsResult::Applied {
+                needs_write_back: false,
+                ..
+            }
+        ),
+        "one-sided adoption should be digest-equal, got {result:?}"
+    );
+    assert!(
+        !f.engine.persistence_state().expect("state").is_dirty(),
+        "a clean mirror adopting a one-sided disk edit must settle — \
+         flushing here would rewrite identical bytes"
+    );
+}
+
+/// ARC C watermark semantics, direction 2 (the data-loss guard): the
+/// content digest deliberately excludes history/timestamps, so
+/// digest-equality can NEVER prove a pending digest-invisible local
+/// change (here: a last-accessed touch) reached the file. A mirror
+/// that was dirty going into the reconcile must come out dirty, or the
+/// pending change silently dies at the next mirror rebuild.
+#[test]
+fn digest_equal_adoption_never_settles_over_pending_local_change() {
+    let mut f = fixture();
+    f.engine
+        .record_kdbx_state_signature(&f.kdbx_path)
+        .expect("settle");
+    let seed_uuid = f
+        .engine
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list")[0]
+        .uuid;
+
+    // Digest-invisible local change: accessed_at projects into the
+    // KDBX but is outside the digest's scope.
+    f.engine.touch_entry(seed_uuid).expect("touch");
+    assert!(
+        f.engine.persistence_state().expect("state").is_dirty(),
+        "the touch must owe a write"
+    );
+
+    let mut external = reopen_kdbx(&f.kdbx_path);
+    external
+        .edit_entry(
+            keepass_core::model::EntryId(seed_uuid),
+            keepass_core::model::HistoryPolicy::Snapshot,
+            |e| e.set_title("disk-rename"),
+        )
+        .expect("disk edit");
+    let bytes = external.save_to_bytes().expect("save");
+    std::fs::write(&f.kdbx_path, &bytes).expect("write");
+
+    let result = f
+        .engine
+        .reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now())
+        .expect("reconcile");
+    assert!(
+        matches!(
+            result,
+            ParkConflictsResult::Applied {
+                needs_write_back: false,
+                ..
+            }
+        ),
+        "the touch is digest-invisible, so this still reads digest-equal, got {result:?}"
+    );
+    assert!(
+        f.engine.persistence_state().expect("state").is_dirty(),
+        "a dirty mirror must stay dirty through a digest-equal adoption — \
+         settling would silently drop the pending change"
+    );
+}

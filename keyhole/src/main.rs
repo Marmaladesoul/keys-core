@@ -33,7 +33,7 @@ use keys_ffi::{
     DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, Engine, EngineEntryUpdate,
     EntryAttachmentChoiceFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, IconRef,
     NewEntryFields, Page, ParkConflictsResultFfi, RecycleBinFilter, ResolutionFfi, SearchScope,
-    VaultIdentityVerdict, create_vault as ffi_create_vault,
+    SyncWithDiskFfi, VaultIdentityVerdict, create_vault as ffi_create_vault,
     create_vault_deterministic as ffi_create_vault_deterministic, open_vault_self_healing,
     purge_vault_local_data, rebuild_vault_local_data, verify_vault_identity,
 };
@@ -763,26 +763,31 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.inspect()?;
+            session.finish().await?;
         }
         Command::LiveCount { vault } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.live_count()?;
+            session.finish().await?;
         }
         Command::List { vault, group } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.list(group)?;
+            session.finish().await?;
         }
         Command::Search { vault, query, bin } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.search(&query, &bin)?;
+            session.finish().await?;
         }
         Command::Service { vault, identifier } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.service(&identifier)?;
+            session.finish().await?;
         }
         Command::Recycle {
             vault,
@@ -820,16 +825,19 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.list_conflicts()?;
+            session.finish().await?;
         }
         Command::ShowConflict { vault, entry } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.show_conflict(entry).await?;
+            session.finish().await?;
         }
         Command::ConflictOwners { vault, entry } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.conflict_owners(entry)?;
+            session.finish().await?;
         }
         Command::AddCustomIcon { vault, entry, data } => {
             let session =
@@ -841,6 +849,7 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.custom_icon_bytes(icon)?;
+            session.finish().await?;
         }
         Command::SetField {
             vault,
@@ -863,11 +872,13 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.tags(entry)?;
+            session.finish().await?;
         }
         Command::History { vault, entry } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.history(entry)?;
+            session.finish().await?;
         }
         Command::DeleteHistory {
             vault,
@@ -889,6 +900,7 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.digest()?;
+            session.finish().await?;
         }
         Command::CreateGroup {
             vault,
@@ -922,6 +934,7 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.list_groups()?;
+            session.finish().await?;
         }
         Command::MoveEntry { vault, uuid, to } => {
             let session =
@@ -956,6 +969,7 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.cat_attachment(uuid, name)?;
+            session.finish().await?;
         }
         Command::RemoveAttachment { vault, uuid, name } => {
             let session =
@@ -1002,11 +1016,13 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.rekey(new_password, new_keyfile).await?;
+            session.finish().await?;
         }
         Command::RootUuid { vault } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             println!("{}", session.root_uuid()?);
+            session.finish().await?;
         }
         Command::VerifyIdentity { picked, expect } => {
             verify_identity(&picked, &expect, &password, keyfile.clone())?;
@@ -1118,54 +1134,30 @@ impl Session {
             keyfile,
         };
 
-        let recorded = session
+        // The whole "bring the mirror current" gate — fresh-ingest /
+        // signature-skip / reconcile / write-back — lives below the
+        // seam now: one verb, no save decision left up here. keyhole
+        // only narrates the outcome (stderr; scenarios parse stdout).
+        let outcome = session
             .engine
-            .kdbx_state_signature()
-            .map_err(|e| anyhow::anyhow!("kdbx_state_signature: {e:?}"))?;
-        match recorded {
-            None => {
-                session
-                    .engine
-                    .ingest_from_kdbx_with_keyfile(
-                        vault.to_string_lossy().into_owned(),
-                        password.to_owned(),
-                        session.keyfile.clone(),
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("ingest_from_kdbx: {e:?}"))?;
-            }
-            Some(sig) => {
-                let (mtime_ms, byte_count) = disk_signature(vault)?;
-                if sig.mtime_ms != mtime_ms || sig.byte_count != byte_count {
-                    let result = session
-                        .engine
-                        .reconcile_with_disk_park_conflicts_with_keyfile(
-                            vault.to_string_lossy().into_owned(),
-                            password.to_owned(),
-                            session.keyfile.clone(),
-                        )
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("reconcile_with_disk_park_conflicts: {e:?}")
-                        })?;
-                    // Diagnostics on stderr: scenarios parse stdout.
-                    eprintln!("note: KDBX changed on disk — reconciled");
-                    eprint_park_result(&result);
-                    // The reference-client write-back policy: persist the
-                    // advanced projection iff the reconcile says the disk
-                    // file lacks content we now hold. A digest-equal ingest
-                    // (a pure external edit, adopted) leaves the file
-                    // untouched — rewriting it would churn its mtime for
-                    // every other watcher and, between two rewrite-on-ingest
-                    // clients, ping-pong forever.
-                    if let ParkConflictsResultFfi::Applied {
-                        needs_write_back: true,
-                        ..
-                    } = result
-                    {
-                        session.save().await?;
-                        eprintln!("note: reconcile wrote back merged state");
-                    }
+            .sync_with_disk(
+                vault.to_string_lossy().into_owned(),
+                password.to_owned(),
+                session.keyfile.clone(),
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("sync_with_disk: {e:?}"))?;
+        match &outcome {
+            SyncWithDiskFfi::FreshIngest | SyncWithDiskFfi::UpToDate => {}
+            SyncWithDiskFfi::NoChange | SyncWithDiskFfi::Applied { .. } => {
+                eprintln!("note: KDBX changed on disk — reconciled");
+                eprint_sync_outcome(&outcome);
+                if let SyncWithDiskFfi::Applied {
+                    wrote_back: true, ..
+                } = outcome
+                {
+                    eprintln!("note: reconcile wrote back merged state");
                 }
             }
         }
@@ -1202,17 +1194,16 @@ impl Session {
 
     /// Session teardown: write the mirror back iff the engine says a
     /// write is owed ([`keys_ffi::Engine::persistence_state`]). The
-    /// single save-placement choke point — verbs only mutate; the
-    /// dispatch arm closes the session with this. Quiet on stdout
-    /// (that belongs to the verbs); the loud twin is the `flush` verb.
-    ///
-    /// Deliberately NOT called by read-only arms yet: after a
-    /// reconcile that adopted disk content (digest-equal,
-    /// `needs_write_back: false`) the watermark still reads dirty, and
-    /// flushing there would rewrite identical bytes — mtime churn, the
-    /// sync ping-pong class. The tri-state sync verb (ARC C slice 3)
-    /// settles the watermark at reconcile time, which is what makes
-    /// uniform teardown safe.
+    /// single save-placement choke point — verbs only mutate; every
+    /// session-opening dispatch arm closes with this, read verbs
+    /// included (leftover dirt from a crashed predecessor flushes on
+    /// the next session). Safe on read arms because the engine settles
+    /// the watermark itself when a reconcile's digest-equal adoption
+    /// proves the file already current — a flush after that is a
+    /// no-op, not byte churn. Exemptions: `persistence-state` (the
+    /// observer must not collapse what it reads) and
+    /// `recycle --no-save` (the negative-control lever). Quiet on
+    /// stdout (that belongs to the verbs); the loud twin is `flush`.
     async fn finish(&self) -> Result<()> {
         if self.owes_write()? {
             self.save().await?;
@@ -1965,20 +1956,6 @@ fn mirror_db_for(vault: &Path) -> PathBuf {
     mirror_dir_for(vault).join("mirror.sqlite")
 }
 
-/// `(mtime_ms, byte_count)` of the on-disk KDBX, computed with the
-/// exact formula `keys_engine::KdbxStateSignature::from_path` uses
-/// (truncating-millisecond i64, pre-1970 clamped negative) so the
-/// comparison against the recorded signature can never drift.
-fn disk_signature(vault: &Path) -> Result<(i64, u64)> {
-    let meta = std::fs::metadata(vault).with_context(|| format!("stat {}", vault.display()))?;
-    let mtime = meta.modified().context("kdbx mtime unavailable")?;
-    let mtime_ms = match mtime.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-        Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
-        Err(e) => -i64::try_from(e.duration().as_millis()).unwrap_or(i64::MAX),
-    };
-    Ok((mtime_ms, meta.len()))
-}
-
 /// Render a park-reconcile outcome. `label` names the operation; the
 /// parked-conflict UUIDs print one per line for scenario grep.
 /// Print entry summaries the way `list` and `search` present them: one
@@ -2049,13 +2026,14 @@ fn print_park_result(label: &str, r: &ParkConflictsResultFfi) {
 
 /// Stderr twin of [`print_park_result`] for open-time reconciles, so
 /// verb stdout stays parseable.
-fn eprint_park_result(r: &ParkConflictsResultFfi) {
-    match r {
-        ParkConflictsResultFfi::NoChange => eprintln!("note: reconcile found no change"),
-        ParkConflictsResultFfi::Applied {
+fn eprint_sync_outcome(o: &SyncWithDiskFfi) {
+    match o {
+        SyncWithDiskFfi::FreshIngest | SyncWithDiskFfi::UpToDate => {}
+        SyncWithDiskFfi::NoChange => eprintln!("note: reconcile found no change"),
+        SyncWithDiskFfi::Applied {
             applied,
             parked,
-            needs_write_back,
+            wrote_back,
         } => {
             eprintln!(
                 "note: reconcile applied entries +{} ~{} -{}; parked {} conflict(s); write-back {}",
@@ -2063,11 +2041,7 @@ fn eprint_park_result(r: &ParkConflictsResultFfi) {
                 applied.entries_updated,
                 applied.entries_deleted,
                 parked.entries_with_parked_conflict.len(),
-                if *needs_write_back {
-                    "needed"
-                } else {
-                    "not needed"
-                },
+                if *wrote_back { "needed" } else { "not needed" },
             );
         }
     }

@@ -65,7 +65,8 @@ use crate::engine_types::{
     AttachmentBlobStats, ConflictPayloadFfi, EngineDatabaseMetadata, EngineEntrySummary, EntryFull,
     EntrySave, EntryUpdate, GroupNode, GroupUpdate, HistoricEntry, IconRef, KdbxStateSignatureFfi,
     NewEntryFields, NewGroupFields, Page, ParkConflictsResultFfi, PersistenceStateFfi, Predicate,
-    RecycleBinFilter, SearchScope, SmartFolder, TagUsageCount, VaultState, parse_uuid,
+    RecycleBinFilter, SearchScope, SmartFolder, SyncWithDiskFfi, TagUsageCount, VaultState,
+    parse_uuid,
 };
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
@@ -1170,6 +1171,100 @@ impl Engine {
                     .into(),
             )
         })
+    }
+
+    /// Bring the mirror current against the vault file at `kdbx_path`,
+    /// and persist back iff the merge advanced past disk — the one verb
+    /// owning the open-time gate AND the sync write-back/loop-safety
+    /// policy that clients previously re-derived per call site:
+    ///
+    /// - no recorded signature → fresh mirror → ingest + record →
+    ///   [`SyncWithDiskFfi::FreshIngest`];
+    /// - signature matches the file's `(mtime_ms, size)` → skip →
+    ///   [`SyncWithDiskFfi::UpToDate`];
+    /// - signature differs → park-conflicts reconcile; on a merge that
+    ///   advanced past disk the verb saves the projection back itself
+    ///   ([`SyncWithDiskFfi::Applied`] `wrote_back: true`), on
+    ///   digest-proven convergence it settles the correspondence
+    ///   without writing (`wrote_back: false` — rewriting identical
+    ///   bytes would churn the file's mtime for every other watcher:
+    ///   the reconcile ping-pong seed), and on an adoption-free
+    ///   reconcile it writes nothing ([`SyncWithDiskFfi::NoChange`]).
+    ///
+    /// `needs_write_back` never crosses the seam — there is no save
+    /// decision left for the caller to make. `temp_dir` is threaded to
+    /// the atomic-write tempfile exactly as in [`Self::save_to_kdbx`].
+    pub async fn sync_with_disk(
+        &self,
+        kdbx_path: String,
+        password: String,
+        keyfile: Option<Vec<u8>>,
+        temp_dir: Option<String>,
+    ) -> Result<SyncWithDiskFfi, EngineError> {
+        let path = PathBuf::from(kdbx_path.clone());
+
+        // Fresh mirror → ingest is the correspondence point.
+        let recorded = self.with_engine(|e| Ok(e.kdbx_state_signature()?))?;
+        let Some(recorded) = recorded else {
+            self.ingest_from_kdbx_with_keyfile(kdbx_path, password, keyfile)
+                .await?;
+            return Ok(SyncWithDiskFfi::FreshIngest);
+        };
+
+        // Warm mirror, unchanged file → nothing to do.
+        let disk = eng::KdbxStateSignature::from_path(&path)?;
+        if recorded == disk {
+            return Ok(SyncWithDiskFfi::UpToDate);
+        }
+
+        // The file changed underneath the mirror → reconcile (merges,
+        // parks divergences, never blocks). The engine settles the
+        // watermark itself on digest-proven convergence.
+        let pw = SecretString::from(password);
+        let pw_for_composite = pw.clone();
+        let keyfile_for_composite = keyfile.clone();
+        let composite = tokio::task::spawn_blocking(move || {
+            crate::keyfile::composite_for_engine(
+                pw_for_composite.expose_secret().as_bytes(),
+                keyfile_for_composite.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
+        let outcome = self.with_engine_mut(|e| {
+            Ok(e.reconcile_with_disk_park_conflicts(&path, &composite, chrono::Utc::now())?)
+        })?;
+
+        match outcome {
+            eng::ParkConflictsResult::NoChange => Ok(SyncWithDiskFfi::NoChange),
+            eng::ParkConflictsResult::Applied {
+                applied,
+                parked,
+                needs_write_back,
+            } => {
+                if needs_write_back {
+                    // Merged mirror holds content the file lacks —
+                    // write the projection back. The save records the
+                    // correspondence (signature + watermark) itself.
+                    self.save_to_kdbx_with_keyfile(
+                        path.to_string_lossy().into_owned(),
+                        pw.expose_secret().to_owned(),
+                        keyfile,
+                        temp_dir,
+                    )
+                    .await?;
+                }
+                Ok(SyncWithDiskFfi::Applied {
+                    applied: applied.into(),
+                    parked: parked.into(),
+                    wrote_back: needs_write_back,
+                })
+            }
+            other => {
+                let _ = other;
+                Ok(SyncWithDiskFfi::NoChange)
+            }
+        }
     }
 
     /// Per-device-key sync transport: ingest a fetched peer KDBX blob (written
