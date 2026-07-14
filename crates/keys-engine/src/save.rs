@@ -123,8 +123,16 @@ impl PersistenceState {
 }
 
 impl KdbxStateSignature {
-    /// Stat `path` and build a signature from its `(mtime, size)`.
-    pub(crate) fn from_path(path: &Path) -> Result<Self, EngineError> {
+    /// Stat `path` and build a signature from its `(mtime, size)` —
+    /// the same truncating-millisecond formula
+    /// [`Engine::record_kdbx_state_signature`](crate::engine::Engine::record_kdbx_state_signature)
+    /// persists, so a caller-side comparison can never drift from the
+    /// recorded value.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Io`] if `path` can't be stat'd or its mtime read.
+    pub fn from_path(path: &Path) -> Result<Self, EngineError> {
         let meta = std::fs::metadata(path)?;
         let mtime = meta.modified()?;
         let mtime_ms = match mtime.duration_since(SystemTime::UNIX_EPOCH) {

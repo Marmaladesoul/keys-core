@@ -87,4 +87,28 @@ after_stat="$(stat -f '%m %z' "$VAULT" 2>/dev/null || stat -c '%Y %s' "$VAULT")"
 [ "$before_stat" = "$after_stat" ] \
     || fail "identical-peer ingest rewrote the KDBX ($before_stat -> $after_stat) — mtime churn is the sync ping-pong class"
 
-echo "PASS: engine-owned dirty watermark — unsaved mutations read back dirty across processes, flush persists + settles, saves/ingests settle, no-op peer ingest leaves the file untouched"
+# 7. A one-way EXTERNAL edit (file changed, no local divergence) is
+#    adopted by the open-time reconcile and — because the merged mirror
+#    is digest-equal to the file — SETTLES the watermark below the
+#    seam: the observer reads clean, and no teardown may rewrite the
+#    file (byte churn there is the reconcile ping-pong seed).
+EXT="$TMP/external-editor.kdbx"
+cp "$VAULT" "$EXT"
+uuid2="$("$KEYHOLE" list "$VAULT" | awk '/Saved Normally/ {print $1; exit}')"
+[ -n "$uuid2" ] || fail "could not find step-5 entry"
+"$KEYHOLE" update-entry "$EXT" "$uuid2" --title "Edited Elsewhere" >/dev/null
+rm -rf "$EXT.mirror"
+mv "$EXT" "$VAULT"
+s="$("$KEYHOLE" persistence-state "$VAULT" 2>"$TMP/sync.err")"
+grep -q "changed on disk" "$TMP/sync.err" || fail "expected an open-time reconcile of the external edit"
+grep -q "write-back not needed" "$TMP/sync.err" \
+    || fail "one-way external edit should be digest-equal after adoption: $(cat "$TMP/sync.err")"
+[[ "$s" == *"dirty=false"* ]] \
+    || fail "digest-equal adoption must settle the watermark below the seam, got: $s"
+adopted_stat="$(stat -f '%m %z' "$VAULT" 2>/dev/null || stat -c '%Y %s' "$VAULT")"
+"$KEYHOLE" list "$VAULT" >/dev/null 2>&1
+final_stat="$(stat -f '%m %z' "$VAULT" 2>/dev/null || stat -c '%Y %s' "$VAULT")"
+[ "$adopted_stat" = "$final_stat" ] \
+    || fail "a read verb rewrote the file after a digest-equal adoption ($adopted_stat -> $final_stat)"
+
+echo "PASS: engine-owned dirty watermark — unsaved mutations read back dirty across processes, flush persists + settles, saves/ingests settle, no-op peer ingest leaves the file untouched, digest-equal adoption settles below the seam"

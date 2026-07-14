@@ -903,7 +903,43 @@ impl Engine {
         composite_key: &CompositeKey,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<ParkConflictsResult, EngineError> {
-        reconcile::reconcile_with_disk_park_conflicts(self, kdbx_path, composite_key, now)
+        let was_dirty = self.persistence_state()?.is_dirty();
+        let result =
+            reconcile::reconcile_with_disk_park_conflicts(self, kdbx_path, composite_key, now)?;
+
+        // Digest-proven convergence is a mirror↔disk correspondence
+        // point — but only when the mirror was CLEAN going in. Then
+        // every watermark bump in this window is the reconcile's own
+        // adoption writes, and adopted content trivially exists in the
+        // file it came from, so recording the signature (skips the
+        // redundant re-reconcile next open) and settling the watermark
+        // is sound — a flush here would rewrite identical bytes and
+        // churn the file's mtime, the reconcile ping-pong class.
+        //
+        // A mirror that was dirty going in must STAY dirty: the digest
+        // deliberately excludes history/timestamps (see
+        // `keepass_merge::digest`), so digest-equality cannot prove a
+        // pending digest-invisible local change (e.g. a history-only
+        // snapshot) reached the file — settling over it would silently
+        // drop that change at the next mirror rebuild. The eventual
+        // flush is genuinely needed there, not churn. `NoChange` never
+        // settles for the same reason: it only proves nothing was
+        // adopted. Disk-path only: the peer-transport twin
+        // ([`Self::ingest_peer_from_kdbx`]) digests against a fetched
+        // peer blob, which says nothing about the vault file this
+        // engine corresponds to.
+        if !was_dirty
+            && matches!(
+                result,
+                ParkConflictsResult::Applied {
+                    needs_write_back: false,
+                    ..
+                }
+            )
+        {
+            self.record_kdbx_state_signature(kdbx_path)?;
+        }
+        Ok(result)
     }
 
     /// Per-device-key sync transport: ingest a fetched peer KDBX blob under the

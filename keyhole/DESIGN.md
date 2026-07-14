@@ -185,17 +185,28 @@ back dirty on the next open — the crash-recovery flush signal.
 
 **keyhole's save orchestrator is `Session::finish`.** Mutating verbs no
 longer carry a per-verb `save()` tail — they only mutate the mirror;
-each mutating dispatch arm closes its session with `finish()`
-(save-iff-dirty, quiet). The per-call-site "did this verb remember to
-save?" decision is gone: the engine answers it. `recycle --no-save`
-skips the teardown, which is what keeps the negative-control scenarios
-honest. Read-only arms deliberately do NOT finish yet: after a
-reconcile that adopted disk content (digest-equal,
-`needs_write_back: false`) the watermark still reads dirty, and
-flushing there would rewrite identical bytes — mtime churn, the sync
-ping-pong class. The tri-state sync verb (ARC C slice 3) settles the
-watermark at reconcile time; uniform teardown (and folding the
-`Session::open` write-back into the same primitive) lands with it.
+every session-opening dispatch arm closes its session with `finish()`
+(save-iff-dirty, quiet), read verbs included — leftover dirt from a
+crashed (or `--no-save`) predecessor flushes on the next session, the
+reference crash-recovery behaviour. The per-call-site "did this verb
+remember to save?" decision is gone: the engine answers it. Two
+exemptions: `persistence-state` (the observer — it must read the
+watermark without collapsing it) and `recycle --no-save` (the
+negative-control lever the persistence scenarios rely on).
+
+**The open gate is one verb: `sync_with_disk`.** `Session::open` no
+longer hand-rolls signature-compare / ingest / reconcile / write-back
+— it calls `Engine::sync_with_disk`, which owns the whole gate below
+the seam and returns what happened (`FreshIngest` / `UpToDate` /
+`NoChange` / `Applied { wrote_back }`); keyhole only narrates the
+outcome on stderr. Loop-safety lives in the engine now: a merge that
+advanced past disk is written back internally; a digest-equal adoption
+settles the watermark *without* a write (uniform teardown is safe
+precisely because of that settle — flushing identical bytes would
+churn the file's mtime, the reconcile ping-pong seed); an
+adoption-free reconcile writes nothing and leaves any locally-owed
+write visible in the watermark. `needs_write_back` no longer crosses
+the seam.
 
 ## The migration workflow (how keyhole grows)
 
