@@ -277,6 +277,72 @@ fn search_anyfield_matches_tag() {
 }
 
 #[test]
+fn search_anyfield_matches_non_protected_custom_field() {
+    // "Any Field" must reach the extra attributes a client shows below
+    // the canonical Title/Username/URL/Notes — an account number parked
+    // in a custom field is exactly the kind of thing a user searches
+    // for and expects to find. Both the field's value and its (user-
+    // visible) name are in scope.
+    let (mut engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(root, NewEntry::new("AWS console"))
+            .expect("add");
+        kdbx.add_entry(root, NewEntry::new("unrelated"))
+            .expect("add");
+    });
+
+    // The needle lives in NO canonical column and no other entry — its
+    // only home is the custom field, so a hit proves search reached it.
+    let target = engine
+        .list_entries(None, Pagination::all())
+        .expect("list")
+        .into_iter()
+        .find(|e| e.title == "AWS console")
+        .expect("seeded entry");
+    engine
+        .set_non_protected_custom_field(target.uuid, "Account ID", "synthetic-acct-778899")
+        .expect("set custom field");
+
+    // 1) the VALUE is reachable.
+    let by_value = engine
+        .search(
+            "synthetic-acct-778899",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
+        .expect("search value");
+    assert_eq!(titles(&by_value), vec!["AWS console"]);
+
+    // 2) the field NAME is reachable too.
+    let by_name = engine
+        .search(
+            "Account",
+            SearchScope::AnyField,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
+        .expect("search name");
+    assert_eq!(titles(&by_name), vec!["AWS console"]);
+
+    // 3) the widening is scoped to AnyField — TitleOnly still ignores
+    //    custom fields.
+    let title_only = engine
+        .search(
+            "synthetic-acct-778899",
+            SearchScope::TitleOnly,
+            RecycleBinFilter::ExcludeRecycled,
+            Pagination::all(),
+        )
+        .expect("search title-only");
+    assert!(
+        title_only.is_empty(),
+        "custom-field value leaked into TitleOnly: {:?}",
+        titles(&title_only)
+    );
+}
+
+#[test]
 fn search_title_only_excludes_other_fields() {
     let (engine, _dir) = engine_with(|kdbx| {
         let root = kdbx.vault().root.id;

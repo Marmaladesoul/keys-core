@@ -355,13 +355,15 @@ pub(crate) fn is_descendant_of(
 ///
 /// # Scope
 ///
-/// - [`SearchScope::AnyField`] — title, username, url, notes, and tag
-///   names.
+/// - [`SearchScope::AnyField`] — title, username, url, notes, tag
+///   names, and non-protected custom fields (both the field name and
+///   its value).
 /// - [`SearchScope::TitleOnly`] — title only.
 /// - [`SearchScope::NotesOnly`] — notes only.
 ///
 /// Protected fields (passwords, custom protected fields) are never
-/// searched.
+/// searched — they live encrypted in `entry_protected`, out of reach
+/// of a plaintext `LIKE`.
 ///
 /// # Recycle bin
 ///
@@ -436,6 +438,12 @@ pub(crate) fn search(
     // LIKE pattern; trailing two placeholders are limit/offset.
     let per_token_clause: &str = match scope {
         SearchScope::AnyField => {
+            // Non-protected custom fields (`entry_custom_field`) are the
+            // extra attributes a client shows below the canonical columns;
+            // matching both their name and value is what "Any Field" means
+            // to a user staring at one on the entry. Protected custom
+            // fields live encrypted in `entry_protected` and are absent
+            // here by construction, so this clause can't leak them.
             "(entry.title    LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
               OR entry.username LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
               OR entry.url      LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
@@ -445,6 +453,12 @@ pub(crate) fn search(
                   JOIN tag t ON t.id = et.tag_id \
                   WHERE et.entry_uuid = entry.uuid \
                     AND t.name LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
+              ) \
+              OR EXISTS ( \
+                  SELECT 1 FROM entry_custom_field ecf \
+                  WHERE ecf.entry_uuid = entry.uuid \
+                    AND (ecf.field_name LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
+                         OR ecf.value   LIKE ?{n} ESCAPE '\\' COLLATE NOCASE) \
               ))"
         }
         SearchScope::TitleOnly => "(entry.title LIKE ?{n} ESCAPE '\\' COLLATE NOCASE)",
