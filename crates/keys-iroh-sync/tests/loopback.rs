@@ -31,6 +31,19 @@ fn is_network_test_skipped() -> bool {
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Install the test log subscriber. Idempotent, and every test calls it —
+/// tests share a process, so relying on whichever ran first to install it
+/// leaves a test run alone (`--exact`) with no diagnostics for a hang.
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 async fn spin_up_node() -> (std::sync::Arc<IrohNode>, TempDir, TempDir) {
     let blob_dir = tempfile::tempdir().expect("blob tempdir");
     let doc_dir = tempfile::tempdir().expect("doc tempdir");
@@ -51,13 +64,7 @@ async fn publisher_subscriber_loopback() {
         return;
     }
 
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
+    init_tracing();
 
     // Cap the whole test at 90 s. The slow leg is DERP registration on
     // cold runners (~10-20 s). Anything beyond 90 s is a real hang.
@@ -119,4 +126,123 @@ async fn publisher_subscriber_loopback() {
     tokio::time::timeout(Duration::from_secs(90), body)
         .await
         .expect("loopback test exceeded 90s — likely a hang, not a slow DERP");
+}
+
+/// `fetch_blob` on content that does not exist yet at call time.
+///
+/// The test above fetches an entry the subscriber already synced during
+/// `join_doc`, so its blob is typically complete before `fetch_blob` is
+/// even called — it proves the read path, not the wait. Here the
+/// publisher writes the entry *after* the subscriber has joined, and
+/// the subscriber asks for the hash immediately, before the entry has
+/// reached it. In practice the first status read misses (propagation
+/// costs a network round-trip), so the fetch returns only by waiting
+/// for the doc to sync the entry in, queue the download, and signal
+/// completion. The wait is exercised rather than strictly asserted:
+/// there is no non-racy witness that the first read missed, so on an
+/// improbably fast path this would degrade to the already-complete
+/// read path that `publisher_subscriber_loopback` covers — acceptable,
+/// since the two together still pin both paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_blob_waits_for_content_written_after_join() {
+    if is_network_test_skipped() {
+        eprintln!("skipping: KEYS_IROH_SYNC_SKIP_NETWORK_TESTS set");
+        return;
+    }
+
+    init_tracing();
+
+    let body = async {
+        let (publisher, _pb, _pd) = spin_up_node().await;
+        let (subscriber, _sb, _sd) = spin_up_node().await;
+
+        // Subscriber joins while the doc is still empty, so nothing
+        // has been offered to it yet.
+        let doc_id = publisher.create_doc().await.expect("create_doc");
+        let ticket = publisher
+            .share_doc(doc_id.clone(), true)
+            .await
+            .expect("share_doc");
+        let sub_doc_id = subscriber
+            .join_doc(ticket, DownloadPolicy::Everything)
+            .await
+            .expect("join_doc");
+        assert!(
+            subscriber
+                .list_entries(sub_doc_id.clone())
+                .await
+                .expect("list_entries")
+                .is_empty(),
+            "doc should still be empty at join time"
+        );
+
+        // Only now does the content come into existence. The
+        // subscriber learns the hash out-of-band (the test plays the
+        // role of an upper layer that already knows what it wants),
+        // so it can ask for the blob before the entry syncs to it.
+        let payload = b"content that did not exist when the subscriber joined".to_vec();
+        let hash = publisher
+            .set_entry(doc_id.clone(), b"late-arrival".to_vec(), payload.clone())
+            .await
+            .expect("set_entry");
+
+        let fetched = subscriber
+            .fetch_blob(sub_doc_id, hash, 1024 * 1024)
+            .await
+            .expect("fetch_blob should wait for the late-written content");
+        assert_eq!(fetched, payload);
+
+        publisher.shutdown().await.expect("publisher shutdown");
+        subscriber.shutdown().await.expect("subscriber shutdown");
+    };
+
+    tokio::time::timeout(Duration::from_secs(90), body)
+        .await
+        .expect("late-arrival fetch exceeded 90s — likely a hang, not a slow DERP");
+}
+
+/// `max_size_bytes` refuses an over-cap blob rather than reading it in.
+///
+/// This is the crate's only defence against a publisher that ships more
+/// than the receiver agreed to hold in memory, so it gets a test that
+/// pins it. One node, no peer and no network: the blob is written
+/// locally, so it is already `Complete` when `fetch_blob` first reads
+/// status and the cap decision is reached with no waiting and no race.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_blob_rejects_blob_over_max_size() {
+    init_tracing();
+
+    let (node, _b, _d) = spin_up_node().await;
+    let doc_id = node.create_doc().await.expect("create_doc");
+    let payload = vec![b'x'; 4096];
+    let hash = node
+        .set_entry(doc_id.clone(), b"oversized".to_vec(), payload.clone())
+        .await
+        .expect("set_entry");
+
+    let err = node
+        .fetch_blob(doc_id.clone(), hash.clone(), 1024)
+        .await
+        .expect_err("a 4096-byte blob must not be returned under a 1024-byte cap");
+    // A locally-written blob is `Complete` the moment `set_entry`
+    // returns, so this must be the post-completion branch specifically —
+    // "completed at N bytes" — not the partial-size early reject. Assert
+    // on that phrase so a regression that rerouted through the Partial
+    // branch would be caught, not silently accepted.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("completed at") && msg.contains("exceeds max_size_bytes"),
+        "expected the Complete-branch size-cap rejection, got: {msg}"
+    );
+
+    // `0` means "no cap" — the same blob comes back whole. This pins the
+    // sentinel too, so a future tightening can't silently turn 0 into
+    // "reject everything".
+    let fetched = node
+        .fetch_blob(doc_id, hash, 0)
+        .await
+        .expect("max_size_bytes = 0 means no cap");
+    assert_eq!(fetched, payload);
+
+    node.shutdown().await.expect("shutdown");
 }
