@@ -69,11 +69,6 @@ pub enum VaultState {
         /// network unavailable for a cloud-backed vault, etc.
         reason: DisconnectReason,
     },
-    /// Engine has been deliberately demoted to read-only — e.g. the
-    /// user locked the vault but kept `SQLite` open for inspection.
-    /// Reserved for a future explicit lock path; transitions don't
-    /// wire in this PR.
-    ReadOnly,
     /// Engine encountered an unrecoverable error. Caller must close
     /// and reopen.
     Error,
@@ -244,7 +239,7 @@ struct EngineShared {
 
 /// Internal [`FileWatcherObserver`] installed by [`Engine::open`] when a
 /// `FileWatcher` is supplied. Translates file-watcher events into engine
-/// state transitions and (from task 4.6 onwards) reconcile calls.
+/// state transitions and reconcile calls.
 ///
 /// Self-write filtering happens here (engine-side filter, per the
 /// 2026-05-16 decision): on `ContentChanged`, we stat the file and
@@ -300,8 +295,8 @@ impl FileWatcherObserver for EngineFileWatcherObserver {
             }
             FileWatcherEvent::ConflictMarker { .. } => {
                 // Reserved for future cloud-provider impls. No-op for
-                // now — task 4.6's reconcile path will surface this via
-                // a dedicated ChangeEvent variant.
+                // now — the reconcile path will surface this via a
+                // dedicated ChangeEvent variant.
             }
         }
     }
@@ -696,12 +691,18 @@ impl Engine {
 
     /// Current lifecycle / health state of this engine.
     ///
-    /// In this PR the only transition wired in is
-    /// "`Engine::open` succeeded → [`VaultState::Active`]". The other
-    /// variants (`Disconnected`, `ReadOnly`, `Error`) are part of the
-    /// forward-design surface and start being driven from Phase 4
-    /// onwards (file-watcher events, explicit lock, unrecoverable
-    /// errors).
+    /// A freshly [`opened`](Engine::open) engine starts [`Active`]. If a
+    /// [`FileWatcher`] was supplied, the installed observer then drives
+    /// the live transitions: a `FileWatcherEvent::Unavailable` moves the
+    /// engine to [`Disconnected`] (the KDBX file became unreadable), and
+    /// a subsequent `FileWatcherEvent::Available` moves it back to
+    /// [`Active`]. [`Error`] is reserved for an unrecoverable condition
+    /// that forces a close-and-reopen; it is not driven from within the
+    /// engine today.
+    ///
+    /// [`Active`]: VaultState::Active
+    /// [`Disconnected`]: VaultState::Disconnected
+    /// [`Error`]: VaultState::Error
     ///
     /// # Panics
     ///

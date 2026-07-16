@@ -375,7 +375,7 @@ fn reconcile_round_trip_with_file_watcher() {
     let observer = Arc::new(CaptureObserver::default());
     engine.set_observer(observer.clone());
 
-    // We can't call `engine.reconcile_with_disk` directly from a
+    // We can't call `engine.reconcile_with_disk_park_conflicts` directly from a
     // ReconcileTrigger because the engine is owned outside the
     // trigger. Use a channel: the trigger pushes a "go" signal, the
     // test thread drains it and calls reconcile on the engine.
