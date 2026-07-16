@@ -475,6 +475,23 @@ enum Command {
         /// Path to the .kdbx vault.
         vault: PathBuf,
     },
+    /// Print every group UUID in the subtree rooted at `uuid` (root
+    /// included), one per line, then a count. Ancestry-derived, so it
+    /// reflects a warm group recycle before the `is_recycled` flag does.
+    GroupsInSubtree {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the subtree root group (see `list-groups`).
+        uuid: String,
+    },
+    /// Print every entry UUID anywhere in the subtree rooted at `uuid`
+    /// (root group included), one per line, then a count.
+    EntriesInSubtree {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the subtree root group (see `list-groups`).
+        uuid: String,
+    },
     /// Move an entry to another group, then persist.
     MoveEntry {
         /// Path to the .kdbx vault.
@@ -935,6 +952,18 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.list_groups()?;
+            session.finish().await?;
+        }
+        Command::GroupsInSubtree { vault, uuid } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.groups_in_subtree(&uuid)?;
+            session.finish().await?;
+        }
+        Command::EntriesInSubtree { vault, uuid } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.entries_in_subtree(&uuid)?;
             session.finish().await?;
         }
         Command::MoveEntry { vault, uuid, to } => {
@@ -1819,6 +1848,34 @@ impl Session {
             );
         }
         println!("\n{} group(s)", groups.len());
+        Ok(())
+    }
+
+    /// Print every group UUID in `root`'s subtree (root included), then
+    /// a count. Drives the engine's ancestry-derived subtree primitive.
+    fn groups_in_subtree(&self, root: &str) -> Result<()> {
+        let uuids = self
+            .engine
+            .group_uuids_in_subtree(root.to_owned())
+            .map_err(|e| anyhow::anyhow!("group_uuids_in_subtree: {e:?}"))?;
+        for u in &uuids {
+            println!("{u}");
+        }
+        println!("\n{} group(s) in subtree", uuids.len());
+        Ok(())
+    }
+
+    /// Print every entry UUID anywhere in `root`'s subtree (root
+    /// included), then a count.
+    fn entries_in_subtree(&self, root: &str) -> Result<()> {
+        let uuids = self
+            .engine
+            .entry_uuids_in_subtree(root.to_owned())
+            .map_err(|e| anyhow::anyhow!("entry_uuids_in_subtree: {e:?}"))?;
+        for u in &uuids {
+            println!("{u}");
+        }
+        println!("\n{} entry(ies) in subtree", uuids.len());
         Ok(())
     }
 

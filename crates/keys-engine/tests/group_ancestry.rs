@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
-use keepass_core::model::NewGroup;
+use keepass_core::model::{NewEntry, NewGroup};
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{DbKey, Engine, EngineError, KeyProvider, KeyProviderError};
 use uuid::Uuid;
@@ -281,5 +281,201 @@ fn is_descendant_of_root_under_anything_is_false() {
     assert!(
         !engine.is_descendant_of(t.root, t.a).expect("root vs A"),
         "root is not a descendant of any group"
+    );
+}
+
+// ── group_uuids_in_subtree ─────────────────────────────────────────────
+//
+// Inclusive counterpart to `is_descendant_of`: the whole subtree in one
+// call, root included.
+
+/// Convenience: subtree group UUIDs as a set (order-independent asserts).
+fn group_subtree_set(engine: &Engine, root: Uuid) -> std::collections::HashSet<Uuid> {
+    engine
+        .group_uuids_in_subtree(root)
+        .expect("group_uuids_in_subtree")
+        .into_iter()
+        .collect()
+}
+
+#[test]
+fn group_uuids_in_subtree_is_root_inclusive() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keys.db");
+    let (engine, t) = build_tree(&path);
+
+    // Whole vault from the root: root + A + A1 + A1A + B.
+    assert_eq!(
+        group_subtree_set(&engine, t.root),
+        [t.root, t.a, t.a1, t.a1a, t.b].into_iter().collect(),
+        "root's subtree is every group, including root itself"
+    );
+
+    // A's subtree is A and its two descendants — inclusive of A, and B
+    // (a sibling) is excluded.
+    assert_eq!(
+        group_subtree_set(&engine, t.a),
+        [t.a, t.a1, t.a1a].into_iter().collect(),
+        "A's subtree includes A and its descendants, not sibling B"
+    );
+}
+
+#[test]
+fn group_uuids_in_subtree_leaf_is_just_itself() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keys.db");
+    let (engine, t) = build_tree(&path);
+
+    assert_eq!(
+        engine.group_uuids_in_subtree(t.a1a).expect("leaf subtree"),
+        vec![t.a1a],
+        "a leaf group's subtree is exactly itself (inclusive)"
+    );
+    assert_eq!(
+        engine.group_uuids_in_subtree(t.b).expect("B subtree"),
+        vec![t.b],
+        "B has no children, so its subtree is just B"
+    );
+}
+
+#[test]
+fn group_uuids_in_subtree_unknown_root_is_not_found() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keys.db");
+    let (engine, _t) = build_tree(&path);
+
+    let bogus = Uuid::new_v4();
+    let err = engine
+        .group_uuids_in_subtree(bogus)
+        .expect_err("unknown root → NotFound");
+    assert!(
+        matches!(err, EngineError::NotFound { entity: "group" }),
+        "a missing root is NotFound, never an empty set: {err:?}"
+    );
+}
+
+// ── entry_uuids_in_subtree ─────────────────────────────────────────────
+
+/// A tree with entries seeded at three depths, for the entry-subtree
+/// tests:
+///
+/// ```text
+/// root (e_root)
+/// └── a (e_a)
+///     └── a1
+///         └── a1a (e_deep)
+/// b            (no entries)
+/// ```
+struct EntryTree {
+    root: Uuid,
+    a: Uuid,
+    a1a: Uuid,
+    b: Uuid,
+    e_root: Uuid,
+    e_a: Uuid,
+    e_deep: Uuid,
+}
+
+fn build_entry_tree(path: &std::path::Path) -> (Engine, EntryTree) {
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    let a = kdbx.add_group(root, NewGroup::new("A")).expect("add A");
+    let b = kdbx.add_group(root, NewGroup::new("B")).expect("add B");
+    let a1 = kdbx.add_group(a, NewGroup::new("A1")).expect("add A1");
+    let a1a = kdbx.add_group(a1, NewGroup::new("A1A")).expect("add A1A");
+
+    let e_root = kdbx
+        .add_entry(root, NewEntry::new("e_root"))
+        .expect("e_root")
+        .0;
+    let e_a = kdbx.add_entry(a, NewEntry::new("e_a")).expect("e_a").0;
+    let e_deep = kdbx
+        .add_entry(a1a, NewEntry::new("e_deep"))
+        .expect("e_deep")
+        .0;
+
+    let mut engine = open_engine(path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+    (
+        engine,
+        EntryTree {
+            root: root.0,
+            a: a.0,
+            a1a: a1a.0,
+            b: b.0,
+            e_root,
+            e_a,
+            e_deep,
+        },
+    )
+}
+
+fn entry_subtree_set(engine: &Engine, root: Uuid) -> std::collections::HashSet<Uuid> {
+    engine
+        .entry_uuids_in_subtree(root)
+        .expect("entry_uuids_in_subtree")
+        .into_iter()
+        .collect()
+}
+
+#[test]
+fn entry_uuids_in_subtree_collects_all_depths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keys.db");
+    let (engine, t) = build_entry_tree(&path);
+
+    // From the root: every entry at any depth.
+    assert_eq!(
+        entry_subtree_set(&engine, t.root),
+        [t.e_root, t.e_a, t.e_deep].into_iter().collect(),
+        "root's entry subtree collects entries at every depth"
+    );
+
+    // From A: A's own entry plus the one buried three levels down in
+    // A1A — but not the root-level entry.
+    assert_eq!(
+        entry_subtree_set(&engine, t.a),
+        [t.e_a, t.e_deep].into_iter().collect(),
+        "A's entry subtree reaches the deeply-buried entry, excludes root's"
+    );
+
+    // From the leaf A1A: just the deep entry.
+    assert_eq!(
+        engine.entry_uuids_in_subtree(t.a1a).expect("A1A entries"),
+        vec![t.e_deep],
+        "a leaf group reports only its own entries"
+    );
+}
+
+#[test]
+fn entry_uuids_in_subtree_empty_group_is_ok_not_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keys.db");
+    let (engine, t) = build_entry_tree(&path);
+
+    // B exists but holds no entries: an empty Vec is the honest answer,
+    // distinct from the NotFound a missing group returns.
+    assert!(
+        engine
+            .entry_uuids_in_subtree(t.b)
+            .expect("existing empty group → Ok(empty)")
+            .is_empty(),
+        "an existing group with no entries returns an empty set, not NotFound"
+    );
+}
+
+#[test]
+fn entry_uuids_in_subtree_unknown_root_is_not_found() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keys.db");
+    let (engine, _t) = build_entry_tree(&path);
+
+    let bogus = Uuid::new_v4();
+    let err = engine
+        .entry_uuids_in_subtree(bogus)
+        .expect_err("unknown root → NotFound");
+    assert!(
+        matches!(err, EngineError::NotFound { entity: "group" }),
+        "a missing root is NotFound: {err:?}"
     );
 }

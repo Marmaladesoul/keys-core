@@ -340,6 +340,101 @@ pub(crate) fn is_descendant_of(
     Ok(false)
 }
 
+/// Recursive CTE that expands a group's subtree from live `parent_uuid`
+/// edges — the single source of truth for "which groups sit under this
+/// root". `?1` binds the root UUID. Two projections consume it below:
+/// the group UUIDs directly, and the entries joined onto those groups.
+///
+/// `UNION` (not `UNION ALL`) is what keeps it cycle-safe: a malformed
+/// vault with a `parent_uuid` cycle can't spin, because a group already
+/// in `subtree` is never re-added. There are finitely many groups, so
+/// the recursion always terminates.
+const SUBTREE_GROUPS_CTE: &str = "WITH RECURSIVE subtree(uuid) AS ( \
+         SELECT uuid FROM \"group\" WHERE uuid = ?1 \
+         UNION \
+         SELECT g.uuid FROM \"group\" g \
+             JOIN subtree s ON g.parent_uuid = s.uuid \
+     )";
+
+/// `NotFound` unless a group row with `uuid` exists. Lets the subtree
+/// readers reject a missing root explicitly rather than folding it into
+/// an empty result — an empty set is a legitimate answer (a real group
+/// with no entries), so overloading it to also mean "no such group"
+/// would be an in-band sentinel a caller can't safely disambiguate.
+fn require_group_exists(conn: &Connection, uuid: Uuid) -> Result<(), EngineError> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM \"group\" WHERE uuid = ?1",
+            params![uuid.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(EngineError::NotFound { entity: "group" })
+    }
+}
+
+/// Return every group UUID inside the subtree rooted at `root_uuid`,
+/// **including `root_uuid` itself** (inclusive — the counterpart to the
+/// exclusive [`is_descendant_of`]). Ordered by UUID for a deterministic
+/// result.
+///
+/// Membership is derived purely from `parent_uuid` ancestry, so it is
+/// correct the instant a group is re-parented (e.g. a warm recycle that
+/// moves a group under the bin) — it never consults the per-entry
+/// `is_recycled` flag, which lags such a move until the next
+/// ingest/reconcile.
+///
+/// # Errors
+///
+/// - [`EngineError::NotFound`] (`entity = "group"`) if `root_uuid`
+///   doesn't match any group row.
+/// - [`EngineError::Sqlite`] on query failure.
+pub(crate) fn group_uuids_in_subtree(
+    conn: &Connection,
+    root_uuid: Uuid,
+) -> Result<Vec<Uuid>, EngineError> {
+    require_group_exists(conn, root_uuid)?;
+    let sql = format!("{SUBTREE_GROUPS_CTE} SELECT uuid FROM subtree ORDER BY uuid");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![root_uuid.to_string()], |r| parse_uuid_col(r, 0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Return every entry UUID located anywhere inside the subtree rooted at
+/// `root_uuid` (root group included), ordered by UUID.
+///
+/// Like [`group_uuids_in_subtree`], membership follows group ancestry
+/// alone, so an entry buried in a freshly-recycled subgroup is reported
+/// immediately — before its `is_recycled` flag catches up. A single
+/// query joins entries onto the subtree; no per-group round trip.
+///
+/// # Errors
+///
+/// - [`EngineError::NotFound`] (`entity = "group"`) if `root_uuid`
+///   doesn't match any group row.
+/// - [`EngineError::Sqlite`] on query failure.
+pub(crate) fn entry_uuids_in_subtree(
+    conn: &Connection,
+    root_uuid: Uuid,
+) -> Result<Vec<Uuid>, EngineError> {
+    require_group_exists(conn, root_uuid)?;
+    let sql = format!(
+        "{SUBTREE_GROUPS_CTE} \
+         SELECT e.uuid FROM entry e JOIN subtree s ON e.group_uuid = s.uuid \
+         ORDER BY e.uuid"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![root_uuid.to_string()], |r| parse_uuid_col(r, 0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Case-insensitive substring search across entry fields, scoped by
 /// [`SearchScope`].
 ///

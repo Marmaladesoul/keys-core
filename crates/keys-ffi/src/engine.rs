@@ -347,6 +347,42 @@ impl Engine {
         self.with_engine(|e| Ok(e.is_descendant_of(g, a)?))
     }
 
+    /// Every group UUID in the subtree rooted at `root_uuid`, **root
+    /// included** — the inclusive, whole-subtree counterpart to
+    /// `is_descendant_of`. UUIDs are engine-canonical (lowercase) and
+    /// ordered.
+    ///
+    /// Membership follows live group ancestry, so a group recycled into
+    /// the bin is reported at once, without waiting on the per-entry
+    /// `is_recycled` flag. `NotFound` (`entity = "group"`) if the root
+    /// doesn't exist — a caller scanning multiple vaults can treat that
+    /// as "not in this vault".
+    pub fn group_uuids_in_subtree(&self, root_uuid: String) -> Result<Vec<String>, EngineError> {
+        let root = parse_uuid(&root_uuid, "group")?;
+        self.with_engine(|e| {
+            Ok(e.group_uuids_in_subtree(root)?
+                .into_iter()
+                .map(|u| u.to_string())
+                .collect())
+        })
+    }
+
+    /// Every entry UUID anywhere in the subtree rooted at `root_uuid`
+    /// (root group included), engine-canonical and ordered.
+    ///
+    /// Ancestry-derived like `group_uuids_in_subtree`, so entries buried
+    /// in a freshly-recycled subgroup are included immediately. `NotFound`
+    /// (`entity = "group"`) if the root doesn't exist.
+    pub fn entry_uuids_in_subtree(&self, root_uuid: String) -> Result<Vec<String>, EngineError> {
+        let root = parse_uuid(&root_uuid, "group")?;
+        self.with_engine(|e| {
+            Ok(e.entry_uuids_in_subtree(root)?
+                .into_iter()
+                .map(|u| u.to_string())
+                .collect())
+        })
+    }
+
     pub fn list_tags(&self) -> Result<Vec<String>, EngineError> {
         self.with_engine(|e| Ok(e.list_tags()?))
     }
