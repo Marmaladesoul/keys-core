@@ -603,7 +603,7 @@ fn state_is_active_on_fresh_open() {
 
 #[test]
 fn state_enum_variants_match_design() {
-    // Sanity: confirm the four variants exist and the Disconnected
+    // Sanity: confirm the three variants exist and the Disconnected
     // payload carries a DisconnectReason. The match is exhaustive at
     // the surface we own; `#[non_exhaustive]` means callers see the
     // wildcard arm.
@@ -621,7 +621,6 @@ fn state_enum_variants_match_design() {
         VaultState::Disconnected {
             reason: DisconnectReason::Other("eg".into()),
         },
-        VaultState::ReadOnly,
         VaultState::Error,
     ];
     for s in &states {

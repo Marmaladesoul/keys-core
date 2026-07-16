@@ -9,7 +9,8 @@
 //! Detects external writes to the KDBX file (e.g. another KeePass-compatible
 //! client editing the same vault, an autofill extension committing a write,
 //! an iCloud / Dropbox / GDrive sync drop-in) and fires events so the engine
-//! can [`reconcile_with_disk()`](crate::Engine) (lands in task 4.6).
+//! can reconcile against the on-disk KDBX via
+//! [`Engine::reconcile_with_disk_park_conflicts`](crate::Engine::reconcile_with_disk_park_conflicts).
 //!
 //! ## Why pluggable?
 //!
