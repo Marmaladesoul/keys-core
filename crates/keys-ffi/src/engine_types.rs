@@ -282,7 +282,6 @@ pub enum VaultState {
     DisconnectedFileUnreadable { reason: String },
     DisconnectedNetworkUnavailable,
     DisconnectedOther { reason: String },
-    ReadOnly,
     Error,
 }
 
@@ -303,7 +302,6 @@ impl From<eng::VaultState> for VaultState {
             S::Disconnected {
                 reason: R::Other(r),
             } => Self::DisconnectedOther { reason: r },
-            S::ReadOnly => Self::ReadOnly,
             // `#[non_exhaustive]` — `Error` plus any future unknown
             // variant collapses to `Error` (the most conservative
             // "writes are not safe" signal).
