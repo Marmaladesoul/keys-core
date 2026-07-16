@@ -26,7 +26,8 @@ use crate::error::EngineError;
 use crate::events::{ConflictPayload, EntryParentGroups};
 use crate::save::SelfWriteSignature;
 
-use super::{Engine, find_entry_parent_group};
+use super::Engine;
+use crate::util::tree::find_entry_parent_group;
 
 impl Engine {
     /// Peek a stashed conflict payload by `id` without consuming it.

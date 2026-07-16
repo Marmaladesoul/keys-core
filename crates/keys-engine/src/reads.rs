@@ -43,6 +43,7 @@ use crate::model::{
     AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, GroupNode, HistoricEntry, IconRef,
     Pagination, RecycleBinFilter, SearchScope, StrengthBucket,
 };
+use crate::util::codec::hex_to_bytes;
 
 /// SQL fragment listing the columns `EntrySummary` needs, plus the
 /// correlated attachment-count subquery. Kept as a constant so the
@@ -992,33 +993,6 @@ pub(crate) fn history_attachment_bytes(
     bytes.ok_or(EngineError::NotFound {
         entity: "attachment",
     })
-}
-
-/// Decode a lowercase hex string into bytes. Returns `None` for any
-/// invalid input (odd length, non-hex chars). `pub(crate)`: shared by
-/// the history-attachment lookup here and the projection's history
-/// pool rebuild (a near-identical copy also lives in `mutations` —
-/// collapse them next time either changes).
-pub(crate) fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for chunk in s.as_bytes().chunks_exact(2) {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Deserialise side of the shape written by

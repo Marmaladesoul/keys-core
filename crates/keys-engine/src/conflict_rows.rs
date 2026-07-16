@@ -16,10 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::error::{EngineError, ProjectionError};
-
-/// Canonical KDBX field name for the password slot (mirrors
-/// [`crate::ingest`]'s constant; the seal lands under this `field_name`).
-const PASSWORD_FIELD: &str = "Password";
+use crate::util::PASSWORD_FIELD;
 
 /// Every entry UUID that has at least one stored peer conflict row — the
 /// owner-rows badge query, replacing the `held_conflicts` JSON-array kv.

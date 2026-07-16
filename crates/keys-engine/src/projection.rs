@@ -54,10 +54,8 @@ use uuid::Uuid;
 
 use crate::error::{EngineError, ProjectionError};
 use crate::meta;
-
-/// Canonical KDBX field name for an entry's password slot — must match
-/// [`crate::ingest`]'s constant of the same name.
-const PASSWORD_FIELD: &str = "Password";
+use crate::util::PASSWORD_FIELD;
+use crate::util::codec::hex_to_bytes;
 
 /// Top-level projection entry point. Runs every read inside a single
 /// immediate transaction so the snapshot is consistent.
@@ -796,7 +794,7 @@ fn snapshot_to_entry(
         if att.sha256_hex.is_empty() {
             continue;
         }
-        let Some(sha_vec) = crate::reads::hex_to_bytes(&att.sha256_hex) else {
+        let Some(sha_vec) = hex_to_bytes(&att.sha256_hex) else {
             continue;
         };
         let Ok(sha) = <[u8; 32]>::try_from(sha_vec.as_slice()) else {

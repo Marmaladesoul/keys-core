@@ -30,10 +30,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::{EngineError, RevealError};
-
-/// Canonical KDBX field name for an entry's password slot — kept in
-/// lock-step with [`crate::ingest`]'s constant of the same name.
-const PASSWORD_FIELD: &str = "Password";
+use crate::util::PASSWORD_FIELD;
+use crate::util::codec::b64_decode;
 
 /// Reveal the cleartext password for an entry.
 ///
@@ -156,16 +154,6 @@ pub(crate) fn reveal_history_field(
 enum FieldPayload {
     Wrapped(String),
     Plain(String),
-}
-
-/// Decode a standard-base64 string from the snapshot JSON. Wraps
-/// `base64::DecodeError` into a string so the caller can funnel it
-/// through [`RevealError::Unwrap`].
-fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(s)
-        .map_err(|e| format!("base64 decode: {e}"))
 }
 
 fn reveal_protected_field(

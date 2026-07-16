@@ -32,10 +32,9 @@ use crate::fingerprint;
 use crate::model::{EntrySave, EntryUpdate, GroupUpdate, IconRef, NewEntryFields, NewGroupFields};
 use crate::strength;
 use crate::totp;
-
-/// Canonical KDBX field name for the password slot. Must match
-/// [`crate::ingest`]'s `PASSWORD_FIELD`.
-const PASSWORD_FIELD: &str = "Password";
+use crate::util::PASSWORD_FIELD;
+use crate::util::codec::{b64_decode, b64_encode, bytes_to_hex, hex_to_bytes};
+use crate::util::sql::{entry_exists, group_exists, parse_host, upsert_tag};
 
 /// Outcome of [`delete_entry`] — carries the pre-delete group so the
 /// engine can populate an [`crate::events::EntryDeletionInfo`].
@@ -94,46 +93,11 @@ fn wrap(session: &SessionKey, plaintext: &[u8]) -> Result<Vec<u8>, EngineError> 
     seal_with_key(session, plaintext).map_err(|e| EngineError::Wrap(e.to_string()))
 }
 
-/// Parse the host out of a URL. Lowercased to match `idx_entry_url_host`.
-/// Mirror of `ingest::parse_host`.
-fn parse_host(url: &str) -> String {
-    if url.is_empty() {
-        return String::new();
-    }
-    match url::Url::parse(url) {
-        Ok(parsed) => parsed
-            .host_str()
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default(),
-        Err(_) => String::new(),
-    }
-}
-
 fn icon_parts(icon: &IconRef) -> (Option<i64>, Option<String>) {
     match icon {
         IconRef::Builtin(idx) => (Some(i64::from(*idx)), None),
         IconRef::Custom(uuid) => (None, Some(uuid.to_string())),
     }
-}
-
-/// `true` if a row exists in `entry` with the given uuid.
-fn entry_exists(tx: &Transaction<'_>, uuid: &str) -> Result<bool, EngineError> {
-    let n: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM entry WHERE uuid = ?1",
-        params![uuid],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
-}
-
-/// `true` if a row exists in `"group"` with the given uuid.
-fn group_exists(tx: &Transaction<'_>, uuid: &str) -> Result<bool, EngineError> {
-    let n: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM \"group\" WHERE uuid = ?1",
-        params![uuid],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
 }
 
 /// Look up the recycle bin group uuid, if one exists.
@@ -261,18 +225,6 @@ fn record_tombstone(tx: &Connection, uuid: &str, now: i64) -> Result<(), rusqlit
         params![uuid, now],
     )?;
     Ok(())
-}
-
-/// Insert (or no-op) a tag name and return its row id.
-fn upsert_tag(tx: &Transaction<'_>, name: &str) -> Result<i64, EngineError> {
-    tx.execute(
-        "INSERT OR IGNORE INTO tag (name) VALUES (?1)",
-        params![name],
-    )?;
-    let id: i64 = tx.query_row("SELECT id FROM tag WHERE name = ?1", params![name], |r| {
-        r.get(0)
-    })?;
-    Ok(id)
 }
 
 /// Push a snapshot of the **current live** state of `uuid_str` onto
@@ -2262,50 +2214,6 @@ struct HistoryCustomFieldIo {
     value: String,
     #[serde(default)]
     protected: bool,
-}
-
-fn b64_encode(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(s)
-        .map_err(|e| format!("base64 decode: {e}"))
-}
-
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-            let _ = write!(&mut acc, "{b:02x}");
-            acc
-        })
-}
-
-fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for chunk in s.as_bytes().chunks_exact(2) {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// Add or replace an attachment on an entry: the blob lands in the

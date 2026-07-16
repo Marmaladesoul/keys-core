@@ -32,12 +32,12 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::Kdbx;
-use keepass_core::model::EntryId;
 
 use crate::conflict_rows;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::events::{ChangeEvent, ConflictPayload};
+use crate::util::tree::contains_entry;
 
 /// Owner sentinel for the disk/iroh sync peer.
 ///
@@ -299,7 +299,7 @@ fn dissolve_decision(
 ) -> Result<DissolveDecision, EngineError> {
     // Entry deleted locally → no live side to conflict against; the
     // rows are orphans (Finding #11). Drop them all.
-    if !child_contains_entry(&local_vault.root, keepass_core::model::EntryId(uuid)) {
+    if !contains_entry(&local_vault.root, keepass_core::model::EntryId(uuid)) {
         return Ok(DissolveDecision::DropAll);
     }
     let mut dissolved = Vec::new();
@@ -468,17 +468,11 @@ fn swap_entry_in_tree(
     }
     for child in &mut group.groups {
         // Cheap to recurse; the entry lives in exactly one group.
-        if child_contains_entry(child, replacement.id) {
+        if contains_entry(child, replacement.id) {
             swap_entry_in_tree(child, replacement);
             return;
         }
     }
-}
-
-/// Whether `group` (or a descendant) holds an entry with `id`.
-fn child_contains_entry(group: &keepass_core::model::Group, id: EntryId) -> bool {
-    group.entries.iter().any(|e| e.id == id)
-        || group.groups.iter().any(|g| child_contains_entry(g, id))
 }
 
 /// The external-change reconcile — the live sync path, backed by the
