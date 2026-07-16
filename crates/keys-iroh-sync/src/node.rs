@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, Watcher, endpoint::presets, protocol::Router};
 use iroh_blobs::{ALPN as BLOBS_ALPN, BlobsProtocol, store::fs::FsStore};
 use iroh_docs::{
@@ -30,6 +30,35 @@ use crate::error::{Result, SyncError};
 use crate::events::DocEvent;
 use crate::identity::Identity;
 use crate::policy::DownloadPolicy;
+
+/// How long [`IrohNode::fetch_blob`] waits for content to arrive before
+/// giving up. Callers block on that future, so an unreachable publisher
+/// or a stalled transfer has to surface as an error rather than hang
+/// the caller forever. Chosen to outlast a slow first connection
+/// (relay registration + hole-punch) while still failing inside a
+/// human's patience for a stuck transfer.
+const FETCH_BLOB_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long [`IrohNode::fetch_blob`] will sit on the doc event stream
+/// before re-reading blob status regardless.
+///
+/// The blob store is the authority on "is this content here yet?";
+/// `ContentReady` is only a low-latency hint at it. Two gaps make this
+/// tick load-bearing rather than belt-and-braces:
+///
+/// - The doc stream carries no download-progress events, so between the
+///   entry arriving and the content completing, nothing wakes us. For
+///   any blob that takes longer than this tick, this — not the event —
+///   is what drives each re-check.
+/// - `ContentReady` reaches only the namespace that queued the download
+///   *first*: iroh-docs spawns one task per hash and that task captures
+///   one namespace, so content pulled in under another joined doc that
+///   references the same hash — or written locally — completes with no
+///   `ContentReady` on this doc at all.
+///
+/// Sized to cut the wake-up rate hard versus a tight poll while keeping
+/// a missed completion's worst-case latency well inside human patience.
+const FETCH_BLOB_STATUS_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Configuration for constructing an `IrohNode`. Caller-owned so the
 /// app (not the library) decides where on disk to keep state and which
@@ -309,17 +338,27 @@ impl IrohNode {
     /// the caller must have joined a doc that references this hash.
     /// `doc_id` selects which doc's peers to ask.
     ///
-    /// `max_size_bytes` is enforced both before download (rejecting
-    /// the fetch as soon as the size is known) and after, so a
-    /// malicious or compromised publisher cannot OOM the receiver by
-    /// announcing a tiny blob and shipping a huge one. Pass `0` for
-    /// "no cap" only when the caller has already inspected the
-    /// `EntryInfo.size_bytes` from `list_entries` and made a policy
-    /// decision.
+    /// `max_size_bytes` bounds what this call will read into **memory**:
+    /// the fetch is rejected as soon as the store has validated a size
+    /// over the cap, and again on completion, so a publisher that
+    /// announces a tiny blob and ships a huge one cannot OOM the
+    /// receiver. It does **not** bound what reaches **disk** — this call
+    /// neither starts nor cancels the transfer (see below), so an
+    /// over-cap blob still lands and is merely refused here. Only
+    /// [`DownloadPolicy`] governs what is pulled down in the first
+    /// place. Pass `0` for "no cap" only when the caller has already
+    /// inspected the `EntryInfo.size_bytes` from `list_entries` and made
+    /// a policy decision.
     ///
-    /// Caps the wait at 60s; raise the cap by polling `list_entries`
-    /// and `subscribe_doc_events` for `ContentReady` instead if you
-    /// need finer control.
+    /// Waits at most `FETCH_BLOB_DEADLINE` (60s) for the content to
+    /// land. This node never initiates the download itself — the
+    /// joined doc's live engine queues it under the doc's
+    /// [`DownloadPolicy`], and this call just waits for the result.
+    /// Content the policy excludes will therefore never arrive, and
+    /// the wait will time out. A caller that needs a different bound
+    /// can build its own wait from the public primitives — poll
+    /// [`Self::list_entries`] and watch [`Self::subscribe_doc_events`]
+    /// for `ContentReady` — rather than being held to this deadline.
     pub async fn fetch_blob(
         &self,
         doc_id: String,
@@ -329,16 +368,34 @@ impl IrohNode {
         use iroh_blobs::api::blobs::BlobStatus;
 
         // Doc id is required so we can fail fast on "you forgot to
-        // join" rather than silently waiting 60s for content that
-        // nobody is offering.
-        let _doc = self.get_doc(&doc_id).await?;
+        // join" rather than silently waiting out the deadline for
+        // content that nobody is offering.
+        let doc = self.get_doc(&doc_id).await?;
 
         let hash: iroh_blobs::Hash = hash_hex
             .parse()
             .context("parse blob hash")
             .map_err(SyncError::from)?;
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        // Subscribe BEFORE the first status read, so the two together
+        // cover every ordering: the subscription catches a completion
+        // that happens from here on, and the status read catches one
+        // that already happened. Checking first and subscribing second
+        // would drop a blob completing in the gap into a full-deadline
+        // wait for an event that had already fired.
+        //
+        // Events are only ever "go and look again" wake-ups — `status`
+        // stays the authority. See `FETCH_BLOB_STATUS_BACKSTOP` for the
+        // completions that reach this doc with no event at all; trusting
+        // the event as the sole signal would strand those until the
+        // deadline.
+        let mut events = doc
+            .subscribe()
+            .await
+            .context("subscribe doc events")
+            .map_err(SyncError::from)?;
+
+        let deadline = tokio::time::Instant::now() + FETCH_BLOB_DEADLINE;
         loop {
             let status = self
                 .blobs_store
@@ -346,16 +403,21 @@ impl IrohNode {
                 .await
                 .context("blob status")
                 .map_err(SyncError::from)?;
-            // Reject early as soon as the partial-download size
-            // exceeds the cap. The status' `size` is committed to by
-            // bao-tree, so a publisher can't lie about it without
-            // failing verification.
+            // Reject as soon as the true size is known, without reading
+            // the blob into memory. A partial entry carries a size only
+            // once its last chunk has landed and bao-tree has validated
+            // it — so this is "the size is now known and it's too big",
+            // not a running byte count, and on a sequential download it
+            // fires late rather than progressively. It is still worth
+            // having: the size it reports is bao-tree-committed, so a
+            // publisher cannot understate it without failing
+            // verification.
             match status {
                 BlobStatus::Partial {
-                    size: Some(size_so_far),
-                } if max_size_bytes > 0 && size_so_far > max_size_bytes => {
+                    size: Some(validated_size),
+                } if max_size_bytes > 0 && validated_size > max_size_bytes => {
                     return Err(SyncError::Generic(format!(
-                        "blob {hash_hex} partial download already at {size_so_far} bytes, exceeds max_size_bytes {max_size_bytes}"
+                        "blob {hash_hex} has validated size {validated_size} bytes, exceeds max_size_bytes {max_size_bytes}"
                     )));
                 }
                 BlobStatus::Complete { size } => {
@@ -369,12 +431,61 @@ impl IrohNode {
                 _ => {}
             }
             if tokio::time::Instant::now() >= deadline {
+                let secs = FETCH_BLOB_DEADLINE.as_secs();
                 return Err(SyncError::Generic(format!(
-                    "blob {hash_hex} did not complete within 60s (status={status:?})"
+                    "blob {hash_hex} did not complete within {secs}s (status={status:?})"
                 )));
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // Wait for the doc to tell us something changed, rather
+            // than spinning on `status`. Any event is a re-check
+            // trigger; the backstop bounds the wait when no event is
+            // coming, and the deadline caps the whole loop.
+            let wake_by = (tokio::time::Instant::now() + FETCH_BLOB_STATUS_BACKSTOP).min(deadline);
+            match tokio::time::timeout_at(wake_by, events.next()).await {
+                // An event landed, the backstop/deadline elapsed, or a
+                // single event failed to decode — all just mean "go and
+                // re-read status". A decode failure is not ours to
+                // escalate: iroh-docs keeps the subscription running
+                // past it, and `status` is what actually answers the
+                // question, so failing the fetch here would abandon a
+                // blob that may already be complete on disk.
+                Ok(Some(_)) | Err(_) => {}
+                // The doc's event stream is gone (the doc was dropped,
+                // or the node shut down), so nothing will queue this
+                // download now. Fail rather than idle to the deadline.
+                Ok(None) => {
+                    return Err(SyncError::Generic(format!(
+                        "doc {doc_id} event stream ended while waiting for blob {hash_hex}"
+                    )));
+                }
+            }
+
+            // Coalesce whatever else is already queued. Each event
+            // would otherwise cost a redundant `status` round-trip, and
+            // the doc hands each subscriber a bounded queue whose
+            // sender the live actor *awaits* — so draining one event
+            // per round-trip lets a busy sync back that actor up
+            // against us. Nothing is lost: `status` is re-read below
+            // regardless of how many events we collapse here.
+            //
+            // Terminates because the subscription is backed by an
+            // in-process channel: it yields buffered items, then
+            // `Pending` (drain stops) or a clean `None` (stream ended).
+            // A transport that surfaced a *persistent* per-item error
+            // as `Ready(Some(Err))` would spin here — not reachable
+            // while the docs engine is in-process, but the assumption
+            // to revisit if a remote docs client is ever introduced.
+            while events.next().now_or_never().flatten().is_some() {}
         }
+
+        // Stop subscribing before the read below. The doc hands each
+        // subscriber a bounded queue and the live actor *awaits* on a
+        // full one, so a subscriber that stops draining stalls the
+        // actor for every namespace it serves — and `get_bytes` on a
+        // large blob is exactly when we'd stop draining longest.
+        // Dropping the receiver retires us from the actor's list.
+        drop(events);
 
         let bytes = self
             .blobs_store
