@@ -1272,19 +1272,28 @@ impl Engine {
     /// peer divergences land in distinct owner rows. Sibling of
     /// [`Self::reconcile_with_disk_park_conflicts`], which uses the FILE_OWNER
     /// sentinel for the disk-watcher path.
+    ///
+    /// `password` plus `keyfile` are the *peer file's* key factors. Replicas of
+    /// one vault share its factors, so these are the same factors the local
+    /// mirror was opened under; they are named per-call rather than remembered
+    /// because this verb's input is a blob off the wire, not the local vault.
+    /// A keyfile-keyed replica is unreadable without its keyfile: an absent or
+    /// wrong `keyfile` fails closed at the unlock step, before any merge —
+    /// there is no password-only fallback.
     pub async fn ingest_peer_kdbx(
         &self,
         owner_id: String,
         kdbx_path: String,
         password: String,
+        keyfile: Option<Vec<u8>>,
     ) -> Result<ParkConflictsResultFfi, EngineError> {
         let path = PathBuf::from(kdbx_path);
         let pw = SecretString::from(password);
         let composite = tokio::task::spawn_blocking(move || {
-            CompositeKey::from_password(pw.expose_secret().as_bytes())
+            crate::keyfile::composite_for_engine(pw.expose_secret().as_bytes(), keyfile.as_deref())
         })
         .await
-        .map_err(|e| EngineError::Internal(format!("join: {e}")))?;
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
         self.with_engine_mut(|e| {
             Ok(e.ingest_peer_from_kdbx(&path, &composite, &owner_id)?
                 .into())
