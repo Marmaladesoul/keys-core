@@ -1520,22 +1520,6 @@ fn unlink_sidecar_files(base: &Path) -> (u32, Option<std::io::Error>) {
     (removed, first_err)
 }
 
-/// Walk `group` (and its descendants) looking for the parent
-/// [`GroupId`](keepass_core::model::GroupId) of `target`. `None` if
-/// the entry doesn't live anywhere in the subtree.
-pub(super) fn find_entry_parent_group(
-    group: &keepass_core::model::Group,
-    target: keepass_core::model::EntryId,
-) -> Option<keepass_core::model::GroupId> {
-    if group.entries.iter().any(|e| e.id == target) {
-        return Some(group.id);
-    }
-    group
-        .groups
-        .iter()
-        .find_map(|child| find_entry_parent_group(child, target))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -51,7 +51,7 @@
 
 use std::collections::HashSet;
 
-use keepass_core::model::{Group, Vault};
+use keepass_core::model::{EntryId, Vault};
 use keepass_merge::{ConflictKind, ConflictResolution, MergeOutcome, Resolution};
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -62,12 +62,8 @@ use crate::error::EngineError;
 use crate::events::{ChangeEvent, ConflictPayload};
 use crate::reconcile::MergeStats;
 
-/// Canonical KDBX field name for an entry's password slot.
-///
-/// Matched against `field_name` in [`reveal_conflict_field_from_vault`]
-/// to route password reveals through [`keepass_core::model::Entry::password`]
-/// rather than [`keepass_core::model::Entry::custom_fields`].
-const PASSWORD_FIELD: &str = "Password";
+use crate::util::PASSWORD_FIELD;
+use crate::util::tree::find_entry;
 
 /// Internal stash entry siblinged with a public [`ConflictPayload`].
 ///
@@ -336,7 +332,7 @@ fn reveal_conflict_field_from_vault(
     entry_uuid: Uuid,
     field_name: &str,
 ) -> Result<SecretString, EngineError> {
-    let entry = find_entry_in_group(&vault.root, entry_uuid)
+    let entry = find_entry(&vault.root, EntryId(entry_uuid))
         .ok_or(EngineError::NotFound { entity: "entry" })?;
     let value = if field_name == PASSWORD_FIELD {
         entry.password.clone()
@@ -351,17 +347,4 @@ fn reveal_conflict_field_from_vault(
             })?
     };
     Ok(SecretString::from(value))
-}
-
-/// Walk `group` (and its descendants) for an entry whose UUID matches
-/// `target`. Sibling of `engine::find_entry_parent_group` but returns
-/// the entry itself rather than its parent group.
-fn find_entry_in_group(group: &Group, target: Uuid) -> Option<&keepass_core::model::Entry> {
-    if let Some(e) = group.entries.iter().find(|e| e.id.0 == target) {
-        return Some(e);
-    }
-    group
-        .groups
-        .iter()
-        .find_map(|child| find_entry_in_group(child, target))
 }

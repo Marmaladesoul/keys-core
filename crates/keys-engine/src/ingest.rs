@@ -29,13 +29,10 @@ use crate::fingerprint;
 use crate::meta;
 use crate::strength;
 use crate::totp;
-
-/// Canonical KDBX field name for an entry's password slot.
-///
-/// Used both as the `field_name` value for `entry_protected` rows
-/// carrying the canonical password and as the historic-snapshot JSON
-/// key.
-const PASSWORD_FIELD: &str = "Password";
+use crate::util::PASSWORD_FIELD;
+use crate::util::codec::b64_encode;
+use crate::util::sql::{dt_to_ms, entry_exists, group_exists, parse_host, upsert_tag};
+use crate::util::tree::{collect_entries, collect_entries_with_parent};
 
 /// Outcome of an ingest pass. Captured uuids let the engine fire a
 /// single combined `GroupsAdded` + `EntriesAdded` pair of events after
@@ -367,9 +364,9 @@ fn insert_entry(
             .iter()
             .any(|cf| totp::is_totp_field(&cf.key));
 
-    let created_at = dt_to_ms_required(entry.times.creation_time);
-    let modified_at = dt_to_ms_required(entry.times.last_modification_time);
-    let accessed_at = dt_to_ms_required(entry.times.last_access_time);
+    let created_at = dt_to_ms(entry.times.creation_time);
+    let modified_at = dt_to_ms(entry.times.last_modification_time);
+    let accessed_at = dt_to_ms(entry.times.last_access_time);
     // `last_used_at` doesn't have a dedicated KDBX field. The
     // accessed-time on an entry is the closest proxy — clients update
     // it on AutoFill / copy-password — so we mirror that into
@@ -508,17 +505,6 @@ fn insert_entry(
     Ok(())
 }
 
-/// Insert (or no-op) a tag name and return its row id.
-fn upsert_tag(conn: &Connection, name: &str) -> Result<i64, rusqlite::Error> {
-    conn.execute(
-        "INSERT OR IGNORE INTO tag (name) VALUES (?1)",
-        params![name],
-    )?;
-    conn.query_row("SELECT id FROM tag WHERE name = ?1", params![name], |r| {
-        r.get::<_, i64>(0)
-    })
-}
-
 /// Like [`insert_attachment`], but the link row **upserts**: adopting a
 /// peer's replacement of an existing attachment re-points the link at
 /// the new blob (`INSERT OR IGNORE` would silently keep the old
@@ -588,32 +574,6 @@ fn insert_non_protected_custom_field(
         params![entry_uuid, field_name, value],
     )?;
     Ok(())
-}
-
-/// Parse the host out of a URL. Lowercased for the indexed
-/// `url_host` column (`AutoFill` lookups are case-insensitive).
-/// Returns the empty string when the input isn't a parseable URL or
-/// has no host — matching the schema's "NOT NULL DEFAULT ''"
-/// expectation rather than introducing a NULL.
-fn parse_host(url: &str) -> String {
-    if url.is_empty() {
-        return String::new();
-    }
-    match url::Url::parse(url) {
-        Ok(parsed) => parsed
-            .host_str()
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default(),
-        Err(_) => String::new(),
-    }
-}
-
-fn dt_to_ms(dt: Option<DateTime<Utc>>) -> i64 {
-    dt.map_or(0, |d| d.timestamp_millis())
-}
-
-fn dt_to_ms_required(dt: Option<DateTime<Utc>>) -> i64 {
-    dt_to_ms(dt)
 }
 
 fn expiry_ms(times: &keepass_core::model::Timestamps) -> Option<i64> {
@@ -786,9 +746,9 @@ impl<'a> HistorySnapshot<'a> {
             notes: &entry.notes,
             password: b64_encode(&wrapped_password),
             tags: &entry.tags,
-            created_at: dt_to_ms_required(entry.times.creation_time),
-            modified_at: dt_to_ms_required(entry.times.last_modification_time),
-            accessed_at: dt_to_ms_required(entry.times.last_access_time),
+            created_at: dt_to_ms(entry.times.creation_time),
+            modified_at: dt_to_ms(entry.times.last_modification_time),
+            accessed_at: dt_to_ms(entry.times.last_access_time),
             last_used_at: entry.times.last_access_time.map(|d| d.timestamp_millis()),
             expires_at: expiry_ms(&entry.times),
             icon_index: entry.icon_id,
@@ -808,14 +768,6 @@ impl<'a> HistorySnapshot<'a> {
                 .collect(),
         })
     }
-}
-
-/// Standard base64 with padding — matches what `reveal` and `projection`
-/// pass to the decoder. No URL-safe variant; the bytes live inside a JSON
-/// string, never in a URL.
-fn b64_encode(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -986,7 +938,7 @@ pub(crate) fn ingest_peer(
             // Insert under the peer's parent group if we hold it, else the local
             // root (group-structure reconciliation — renames / moves / recycle
             // bin — is Phase 5d).
-            let group_id = if group_exists(&tx, peer_parent)? {
+            let group_id = if group_exists(&tx, &peer_parent.0.to_string())? {
                 peer_parent
             } else {
                 local.root.id
@@ -1563,37 +1515,6 @@ fn group_alive(
     })
 }
 
-/// Depth-first collection of every entry under `root` (read-only — the
-/// write-side counterpart is [`walk_entries`]).
-fn collect_entries(root: &Group) -> Vec<&Entry> {
-    fn walk<'a>(group: &'a Group, out: &mut Vec<&'a Entry>) {
-        out.extend(group.entries.iter());
-        for child in &group.groups {
-            walk(child, out);
-        }
-    }
-    let mut out = Vec::new();
-    walk(root, &mut out);
-    out
-}
-
-/// Depth-first collection of every entry under `root` paired with its parent
-/// group id — the peer-side walk for `ingest_peer`, which needs the parent so
-/// a peer-only add lands under the right group.
-fn collect_entries_with_parent(root: &Group) -> Vec<(&Entry, GroupId)> {
-    fn walk<'a>(group: &'a Group, out: &mut Vec<(&'a Entry, GroupId)>) {
-        for entry in &group.entries {
-            out.push((entry, group.id));
-        }
-        for child in &group.groups {
-            walk(child, out);
-        }
-    }
-    let mut out = Vec::new();
-    walk(root, &mut out);
-    out
-}
-
 /// Latest `keys.conflict_resolutions.v1` `resolved_at` per entry, parsed from a
 /// vault Meta's `custom_data`. Used by `ingest_peer` for cross-peer adoption:
 /// a side that carries a resolution record for an entry has *decided* that
@@ -1676,7 +1597,7 @@ fn reconcile_peer_groups(
     // reconciliation is its own slice; a second minted bin would corrupt the
     // single-bin invariant.
     for (group, parent, sort_order) in &flat {
-        if parent.is_none() || group_exists(tx, group.id)? {
+        if parent.is_none() || group_exists(tx, &group.id.0.to_string())? {
             continue;
         }
         // Adopt unconditionally — even a group WE tombstoned. The
@@ -2025,7 +1946,7 @@ fn reconcile_entry_location(
     }
 
     // The destination must exist locally; otherwise defer to group adoption.
-    if !group_exists(tx, peer_parent)? {
+    if !group_exists(tx, &peer_group_str)? {
         return Ok(false);
     }
 
@@ -2288,17 +2209,6 @@ fn debug_adoption_decision(
     );
 }
 
-/// Does the local mirror already hold the group `group_id`?
-fn group_exists(tx: &Connection, group_id: GroupId) -> Result<bool, rusqlite::Error> {
-    tx.query_row(
-        "SELECT 1 FROM \"group\" WHERE uuid = ?1",
-        params![group_id.0.to_string()],
-        |_| Ok(()),
-    )
-    .optional()
-    .map(|row| row.is_some())
-}
-
 /// `entry-uuid → &Entry` index for the local side, so the per-peer walk can
 /// pair each peer entry with our own in O(1).
 fn index_entries(root: &Group) -> HashMap<Uuid, &Entry> {
@@ -2388,9 +2298,9 @@ fn insert_conflict_entry(
             entry.notes,
             i64::from(entry.icon_id),
             entry.custom_icon_uuid.map(|u| u.to_string()),
-            dt_to_ms_required(entry.times.creation_time),
-            dt_to_ms_required(entry.times.last_modification_time),
-            dt_to_ms_required(entry.times.last_access_time),
+            dt_to_ms(entry.times.creation_time),
+            dt_to_ms(entry.times.last_modification_time),
+            dt_to_ms(entry.times.last_access_time),
             expiry_ms(&entry.times),
         ],
     )?;
@@ -2523,15 +2433,6 @@ fn earliest(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTi
     }
 }
 
-/// Does the local mirror still hold a live entry `uuid`?
-fn entry_exists(tx: &Connection, uuid: &str) -> Result<bool, rusqlite::Error> {
-    tx.query_row("SELECT 1 FROM entry WHERE uuid = ?1", params![uuid], |_| {
-        Ok(())
-    })
-    .optional()
-    .map(|row| row.is_some())
-}
-
 /// Remove an entry from the local mirror (Phase 5b delete propagation). Child
 /// rows cascade off `entry(uuid) ON DELETE`; the orphan-tag sweep mirrors
 /// `mutations::delete_entry` so a tag whose last referencing entry just went
@@ -2599,27 +2500,6 @@ fn earliest_ms(a: Option<i64>, b: Option<i64>) -> Option<i64> {
         (Some(a), Some(b)) => Some(a.min(b)),
         (Some(a), None) => Some(a),
         (None, b) => b,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_host_lowercases() {
-        assert_eq!(
-            parse_host("https://Login.Example.COM/path"),
-            "login.example.com"
-        );
-    }
-
-    #[test]
-    fn parse_host_empty_for_unparseable() {
-        assert_eq!(parse_host(""), "");
-        assert_eq!(parse_host("not a url"), "");
-        // Schemeless input is not a URL per RFC 3986; url crate refuses.
-        assert_eq!(parse_host("example.com"), "");
     }
 }
 
