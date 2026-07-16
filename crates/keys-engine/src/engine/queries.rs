@@ -507,6 +507,43 @@ impl Engine {
         crate::reads::is_descendant_of(&self.conn, group_uuid, ancestor_uuid)
     }
 
+    /// Return every group UUID in the subtree rooted at `root_uuid`,
+    /// **including `root_uuid` itself** — the inclusive counterpart to
+    /// [`Engine::is_descendant_of`], answering "give me the whole
+    /// subtree" in one call instead of a per-node ancestry probe.
+    ///
+    /// Membership is computed from live `parent_uuid` edges, so a group
+    /// re-parented into (say) the recycle bin is reported immediately;
+    /// the result never depends on the per-entry `is_recycled` flag,
+    /// which lags a warm group recycle. Results are ordered by UUID.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`) if `root_uuid`
+    ///   matches no group row. A caller iterating candidate vaults can
+    ///   use this as an ownership probe.
+    /// - [`EngineError::Sqlite`] on query failure.
+    pub fn group_uuids_in_subtree(&self, root_uuid: Uuid) -> Result<Vec<Uuid>, EngineError> {
+        crate::reads::group_uuids_in_subtree(&self.conn, root_uuid)
+    }
+
+    /// Return every entry UUID located anywhere in the subtree rooted at
+    /// `root_uuid` (root group included), ordered by UUID.
+    ///
+    /// The subtree-membership half matches
+    /// [`Engine::group_uuids_in_subtree`] (ancestry-derived, so it leads
+    /// the `is_recycled` flag); a single join collects the entries, with
+    /// no per-group round trip.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::NotFound`] (`entity = "group"`) if `root_uuid`
+    ///   matches no group row.
+    /// - [`EngineError::Sqlite`] on query failure.
+    pub fn entry_uuids_in_subtree(&self, root_uuid: Uuid) -> Result<Vec<Uuid>, EngineError> {
+        crate::reads::entry_uuids_in_subtree(&self.conn, root_uuid)
+    }
+
     /// Full-text search across title / username / URL / notes, with
     /// a tag-substring fallback.
     ///
