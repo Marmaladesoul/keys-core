@@ -1405,9 +1405,8 @@ impl Engine {
         self.with_engine(|e| Ok(e.conflict_owners(u)?))
     }
 
-    /// Dismiss the held-conflict badge on `entry_uuid` locally (drop it from
-    /// the derived held set) and clean up any legacy `keys.field_conflict.v1`
-    /// history markers from older builds. Cross-peer convergence is driven by
+    /// Dismiss the held-conflict badge on `entry_uuid` locally by dropping its
+    /// stored `conflict_*` owner rows. Cross-peer convergence is driven by
     /// the resolution record [`Self::apply_conflict_resolution`] writes — not
     /// by this call. See
     /// [`keys_engine::Engine::clear_parked_conflict_marker`].

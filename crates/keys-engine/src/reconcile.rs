@@ -51,18 +51,6 @@ use crate::util::tree::contains_entry;
 /// Out of scope for the Phase-4 switch.
 const FILE_OWNER: &str = "file";
 
-/// Legacy `<CustomData>` key of the pre-redesign parked-conflict history
-/// marker. The hold-open redesign (keepass-merge #215, clean cut) deleted
-/// the marker entirely, and the Phase-4 owner-rows switch now badges
-/// conflicts from the `conflict_entry` rows
-/// ([`entries_with_parked_conflict`]) — never stored on history records.
-/// This const survives **only** to recognise and clean up markers left in
-/// vaults written by an older build:
-/// [`clear_parked_conflict_marker`] tombstones them, and the history
-/// quota-trim ([`crate::mutations`]) still pins them so a cleanup pass can
-/// find them. No code path writes it any more.
-pub(crate) const FIELD_CONFLICT_CUSTOM_DATA_KEY: &str = "keys.field_conflict.v1";
-
 /// Aggregate counts of merge mutations applied to `SQLite`.
 ///
 /// "Added" / "deleted" counts are exact — they mirror the merge

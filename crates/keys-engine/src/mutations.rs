@@ -241,13 +241,6 @@ fn record_tombstone(tx: &Connection, uuid: &str, now: i64) -> Result<(), rusqlit
 /// the entry" — that way the captured snapshot's `modified_at` is the
 /// pre-edit value, and the mutation that follows is free to bump
 /// `modified_at` to now via [`bump_modified`].
-///
-/// Pruning explicitly **skips** any existing snapshot whose JSON
-/// `custom_data` carries the [`FIELD_CONFLICT_CUSTOM_DATA_KEY`] marker
-/// — those records are pinned by the conflict-resolver UI and silently
-/// evicting them would recreate the original "lost ancestor" bug class.
-/// Concretely: with 11 marker-tagged snapshots and `history_max_items =
-/// 10`, all 11 markers stay and zero unmarked records remain.
 fn push_history_snapshot(
     tx: &Transaction<'_>,
     uuid: Uuid,
@@ -277,12 +270,7 @@ fn push_history_snapshot(
 }
 
 /// Prune `entry_history` for `uuid` to honour `meta.history_max_items`
-/// and `meta.history_max_size`. Records carrying the *legacy*
-/// parked-conflict marker
-/// ([`crate::reconcile::FIELD_CONFLICT_CUSTOM_DATA_KEY`]) are always
-/// retained so a cleanup pass can still find and tombstone them — the
-/// hold-open redesign no longer writes the marker, but old vaults may
-/// still hold one. See [`crate::reconcile::clear_parked_conflict_marker`].
+/// and `meta.history_max_size`, evicting the oldest snapshots first.
 ///
 /// Every snapshot this drops for quota is first tombstoned
 /// ([`tombstone_quota_trimmed_snapshots`], reason `quota_trim`) so the
@@ -307,7 +295,6 @@ fn prune_history(
     struct Row {
         history_index: i64,
         size_bytes: i64,
-        is_marker: bool,
         json: String,
     }
 
@@ -315,9 +302,9 @@ fn prune_history(
     let max_items = crate::meta::read_history_max_items(tx)?;
     let max_size = crate::meta::read_history_max_size(tx)?;
 
-    // Load all rows oldest-first with their byte size, marker flag, and the
-    // snapshot JSON (kept so a quota-dropped row can be reconstructed for its
-    // tombstone before we delete it).
+    // Load all rows oldest-first with their byte size and the snapshot JSON
+    // (kept so a quota-dropped row can be reconstructed for its tombstone
+    // before we delete it).
     let rows: Vec<Row> = {
         let mut stmt = tx.prepare(
             "SELECT history_index, length(snapshot_json), snapshot_json \
@@ -333,18 +320,9 @@ fn prune_history(
         let mut out = Vec::new();
         for r in mapped {
             let (idx, size, json) = r?;
-            // Parse just enough to detect the marker. A failed parse is
-            // treated as "no marker" — defensive: a pre-shape row or a
-            // corrupt blob shouldn't pin itself.
-            let is_marker = serde_json::from_str::<HistorySnapshotIo>(&json).is_ok_and(|s| {
-                s.custom_data
-                    .iter()
-                    .any(|cd| cd.key == crate::reconcile::FIELD_CONFLICT_CUSTOM_DATA_KEY)
-            });
             out.push(Row {
                 history_index: idx,
                 size_bytes: size,
-                is_marker,
                 json,
             });
         }
@@ -354,51 +332,34 @@ fn prune_history(
         return Ok(());
     }
 
-    // Identify which rows to drop. Strategy: walk the candidates
-    // (unmarked rows) oldest-first, evicting just enough to bring the
-    // surviving list under both budgets. Markers are never candidates.
-    let mut survive_marker: Vec<bool> = vec![true; rows.len()]; // initially keep all
-    let total_marker_size: i64 = rows
-        .iter()
-        .filter(|r| r.is_marker)
-        .map(|r| r.size_bytes)
-        .sum();
-    let marker_count: i32 =
-        i32::try_from(rows.iter().filter(|r| r.is_marker).count()).unwrap_or(i32::MAX);
+    // Identify which rows to drop. Strategy: walk newest-first, keeping just
+    // enough of the most-recent rows to bring the surviving list under both
+    // budgets and evicting the rest.
+    let mut keep: Vec<bool> = vec![true; rows.len()]; // initially keep all
 
-    // Items budget: count of surviving non-marker rows + marker_count
-    // must be <= max_items. Negative max_items disables the items
-    // budget (matches keepass-core convention).
+    // Items budget: surviving row count must be <= max_items. Negative
+    // max_items disables the items budget (matches keepass-core convention).
     let items_cap = if max_items < 0 {
         i32::MAX
     } else {
-        // Non-marker rows we may keep:
-        (max_items - marker_count).max(0)
+        max_items.max(0)
     };
-    // Size budget: surviving total bytes must be <= max_size.
-    // Negative max_size disables. If markers alone exceed the budget,
-    // we can't do anything about it — we still retain them.
-    let size_cap_remaining: i64 = if max_size < 0 {
-        i64::MAX
-    } else {
-        (max_size - total_marker_size).max(0)
-    };
+    // Size budget: surviving total bytes must be <= max_size. Negative
+    // max_size disables.
+    let size_cap = if max_size < 0 { i64::MAX } else { max_size };
 
-    // Walk newest-first picking unmarked rows to keep, evicting the
-    // rest. Keep at most `items_cap` unmarked rows, and keep adding
-    // their sizes only while we stay under `size_cap_remaining`.
-    let mut kept_unmarked: i32 = 0;
+    // Walk newest-first picking rows to keep, evicting the rest. Keep at most
+    // `items_cap` rows, and keep adding their sizes only while we stay under
+    // `size_cap`.
+    let mut kept: i32 = 0;
     let mut kept_size: i64 = 0;
     for i in (0..rows.len()).rev() {
-        if rows[i].is_marker {
-            continue;
-        }
         let next_kept_size = kept_size.saturating_add(rows[i].size_bytes);
-        if kept_unmarked < items_cap && next_kept_size <= size_cap_remaining {
-            kept_unmarked += 1;
+        if kept < items_cap && next_kept_size <= size_cap {
+            kept += 1;
             kept_size = next_kept_size;
         } else {
-            survive_marker[i] = false;
+            keep[i] = false;
         }
     }
 
@@ -406,7 +367,7 @@ fn prune_history(
     let to_delete: Vec<i64> = rows
         .iter()
         .enumerate()
-        .filter_map(|(i, r)| (!survive_marker[i]).then_some(r.history_index))
+        .filter_map(|(i, r)| (!keep[i]).then_some(r.history_index))
         .collect();
     if to_delete.is_empty() {
         return Ok(());
@@ -418,7 +379,7 @@ fn prune_history(
     let dropped_jsons: Vec<&str> = rows
         .iter()
         .enumerate()
-        .filter_map(|(i, r)| (!survive_marker[i]).then_some(r.json.as_str()))
+        .filter_map(|(i, r)| (!keep[i]).then_some(r.json.as_str()))
         .collect();
     tombstone_quota_trimmed_snapshots(tx, uuid, protector, &dropped_jsons, now)?;
     for idx in &to_delete {
@@ -439,7 +400,7 @@ fn prune_history(
     let survivor_indices: Vec<i64> = rows
         .iter()
         .enumerate()
-        .filter_map(|(i, r)| survive_marker[i].then_some(r.history_index + SHIFT))
+        .filter_map(|(i, r)| keep[i].then_some(r.history_index + SHIFT))
         .collect();
     for (new_idx, old_shifted) in survivor_indices.iter().enumerate() {
         let new_idx_i64 = i64::try_from(new_idx).unwrap_or(i64::MAX);
@@ -2787,14 +2748,16 @@ mod tests {
         .unwrap();
     }
 
-    /// CRITICAL invariant: pruning must NEVER evict a marker-tagged
-    /// snapshot, even when their count exceeds `history_max_items`. The
-    /// brief's worked example: 11 markers + 0 unmarked, cap = 10 →
-    /// retain all 11 markers, evict 0 unmarked.
+    /// A *legacy* parked-conflict marker snapshot is an ordinary eviction
+    /// candidate — nothing pins it. Pre-redesign builds pinned these forever
+    /// (a marker never counted against the quota and never got dropped), so an
+    /// old vault's marker lived on immortally; removing the pin lets it age out
+    /// through the normal quota trim. Here: 5 marker-tagged (oldest) + 2
+    /// unmarked (newest), cap = 3 → the three most-recent rows survive
+    /// regardless of the marker tag, and four of the five markers are evicted.
     #[test]
-    fn prune_history_keeps_all_markers_even_above_cap() {
+    fn prune_history_evicts_legacy_markers_like_any_other() {
         let (mut conn, entry) = bare_db_with_entry();
-        // 5 marker-tagged + 2 unmarked, cap = 3.
         crate::meta::write_history_max_items(&conn, 3).unwrap();
         crate::meta::write_history_max_size(&conn, -1).unwrap();
         for i in 0..5 {
@@ -2807,32 +2770,32 @@ mod tests {
         prune(&tx, &entry);
         tx.commit().unwrap();
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM entry_history WHERE entry_uuid = ?1",
-                params![entry],
-                |r| r.get(0),
-            )
-            .unwrap();
-        // All 5 markers retained; 0 unmarked (cap=3, markers consume 5
-        // — non-marker quota is max(3 - 5, 0) = 0).
-        assert_eq!(count, 5, "5 markers retained + 0 unmarked");
-
-        // Verify each surviving row carries the marker.
+        // Trimmed to the cap; markers carry no special protection.
         let mut stmt = conn
             .prepare("SELECT snapshot_json FROM entry_history WHERE entry_uuid = ?1")
             .unwrap();
-        let rows: Vec<String> = stmt
+        let survivors: Vec<String> = stmt
             .query_map(params![entry], |r| r.get::<_, String>(0))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        for json in &rows {
+        assert_eq!(survivors.len(), 3, "trimmed to cap regardless of markers");
+
+        // The survivors are the three most-recent rows (indices 4, 5, 6):
+        // one marker (`row-4`) plus the two unmarked rows. The four oldest
+        // markers (`row-0`..`row-3`) were evicted — proof the pin is gone.
+        for title in ["row-4", "row-5", "row-6"] {
             assert!(
-                json.contains("keys.field_conflict.v1"),
-                "surviving row must be a marker; got {json}",
+                survivors.iter().any(|json| json.contains(title)),
+                "expected recent row {title} to survive; got {survivors:?}",
             );
         }
+        assert!(
+            survivors
+                .iter()
+                .any(|json| json.contains("keys.field_conflict.v1")),
+            "the one recent marker (row-4) should survive on recency alone",
+        );
     }
 
     /// Pruning re-packs `history_index` into a dense `0..N` after
