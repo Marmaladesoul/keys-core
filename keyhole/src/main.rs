@@ -280,7 +280,8 @@ enum Command {
     /// owner id — the per-device-key sync transport path. Divergences
     /// park as held conflicts in the persistent mirror (never a modal);
     /// the merged result is saved back to the vault. The peer file must
-    /// decrypt under the same master password.
+    /// decrypt under the same factors as this vault — the master password
+    /// plus the global `--keyfile` when the vault is keyfile-keyed.
     IngestPeer {
         /// Path to the .kdbx vault receiving the merge.
         vault: PathBuf,
@@ -1560,6 +1561,7 @@ impl Session {
                 owner.clone(),
                 peer.to_string_lossy().into_owned(),
                 self.password.clone(),
+                self.keyfile.clone(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("ingest_peer_kdbx: {e:?}"))?;
