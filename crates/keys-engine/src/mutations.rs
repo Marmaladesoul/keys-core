@@ -22,13 +22,16 @@ use keepass_core::protector::{FieldProtector, SessionKey, open_with_key, seal_wi
 use keepass_merge::{TombstoneReason, add_history_tombstone};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::{EngineError, RevealError};
 use crate::fingerprint;
+use crate::history_snapshot::{
+    HistoryAttachmentIo, HistoryCustomDataItemIo, HistoryCustomFieldIo, HistorySnapshotIo,
+};
 use crate::model::{EntrySave, EntryUpdate, GroupUpdate, IconRef, NewEntryFields, NewGroupFields};
 use crate::strength;
 use crate::totp;
@@ -1942,9 +1945,10 @@ pub(crate) fn restore_entry_from_history(
     Ok(())
 }
 
-/// Build a `HistorySnapshotIo` from the **current live** state of an
-/// entry — mirrors `crate::ingest::HistorySnapshot::from_entry` but
-/// reads from SQL rather than an in-memory `Entry`. Used by
+/// Build a [`HistorySnapshotIo`] from the **current live** state of an
+/// entry — the SQL-sourced counterpart to
+/// [`HistorySnapshotIo::from_entry`], which builds the same shape from
+/// an in-memory `Entry`. Used by
 /// [`restore_entry_from_history`] to capture the pre-restore state as
 /// a brand new history row.
 ///
@@ -2102,13 +2106,13 @@ fn build_live_snapshot(
     // Per-entry CustomData rows (migration 0006). Captured so the
     // pushed snapshot can carry `keys.field_conflict.v1` markers and
     // other Keys-namespaced metadata round-trip through the history.
-    let custom_data: Vec<HistoryCustomDataIo> = {
+    let custom_data: Vec<HistoryCustomDataItemIo> = {
         let mut stmt = tx.prepare(
             "SELECT key, value, last_modified_at FROM entry_custom_data \
              WHERE entry_uuid = ?1 ORDER BY key ASC",
         )?;
         let rows = stmt.query_map(params![uuid_str], |r| {
-            Ok(HistoryCustomDataIo {
+            Ok(HistoryCustomDataItemIo {
                 key: r.get(0)?,
                 value: r.get(1)?,
                 last_modified_at: r.get(2)?,
@@ -2138,82 +2142,6 @@ fn build_live_snapshot(
         custom_fields,
         custom_data,
     })
-}
-
-/// Round-trip shape for `entry_history.snapshot_json`. Symmetric with
-/// the write-side `crate::ingest::HistorySnapshot` and the read-side
-/// `crate::reads::HistorySnapshotRead` — kept private here because
-/// [`restore_entry_from_history`] needs both ends in one place.
-#[derive(Serialize, Deserialize, Default)]
-struct HistoryCustomDataIo {
-    key: String,
-    value: String,
-    #[serde(default)]
-    last_modified_at: Option<i64>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct HistorySnapshotIo {
-    title: String,
-    username: String,
-    url: String,
-    #[serde(default)]
-    url_host: String,
-    #[serde(default)]
-    notes: String,
-    /// Base64 of the AES-GCM-sealed password under the engine's session
-    /// key. Empty string only for pre-widening snapshots that predated
-    /// the canonical password slot — restore copies verbatim into
-    /// `entry_protected`, so an empty value means "no password row",
-    /// not "empty-string password" (the seal of an empty string would
-    /// still be a non-empty base64 blob).
-    #[serde(default)]
-    password: String,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    created_at: i64,
-    #[serde(default)]
-    modified_at: i64,
-    #[serde(default)]
-    accessed_at: i64,
-    #[serde(default)]
-    last_used_at: Option<i64>,
-    #[serde(default)]
-    expires_at: Option<i64>,
-    #[serde(default)]
-    icon_index: Option<u32>,
-    #[serde(default)]
-    icon_custom_uuid: Option<String>,
-    #[serde(default)]
-    password_strength_bucket: Option<u8>,
-    #[serde(default)]
-    password_entropy: Option<f64>,
-    #[serde(default)]
-    attachments: Vec<HistoryAttachmentIo>,
-    #[serde(default)]
-    custom_fields: HashMap<String, HistoryCustomFieldIo>,
-    /// Per-record `<CustomData>` — round-trips the
-    /// `keys.field_conflict.v1` marker and any other history-pinned
-    /// metadata. See `crate::ingest::HistorySnapshot.custom_data`.
-    #[serde(default)]
-    custom_data: Vec<HistoryCustomDataIo>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct HistoryAttachmentIo {
-    name: String,
-    #[serde(default)]
-    size: u64,
-    #[serde(default)]
-    sha256_hex: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct HistoryCustomFieldIo {
-    value: String,
-    #[serde(default)]
-    protected: bool,
 }
 
 /// Add or replace an attachment on an entry: the blob lands in the

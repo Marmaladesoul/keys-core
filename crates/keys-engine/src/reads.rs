@@ -32,13 +32,11 @@
 //! [`Pagination::all()`]: crate::Pagination::all
 //! [`EntryFull::custom_fields`]: crate::EntryFull::custom_fields
 
-use std::collections::HashMap;
-
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::EngineError;
+use crate::history_snapshot::HistorySnapshotIo;
 use crate::model::{
     AttachmentRef, CustomFieldRef, EntryFull, EntrySummary, GroupNode, HistoricEntry, IconRef,
     Pagination, RecycleBinFilter, SearchScope, StrengthBucket,
@@ -825,7 +823,7 @@ pub(crate) fn history(conn: &Connection, uuid: Uuid) -> Result<Vec<HistoricEntry
 
     let mut out: Vec<HistoricEntry> = Vec::with_capacity(rows.len());
     for (idx, json) in rows {
-        let snap: HistorySnapshotRead = serde_json::from_str(&json)
+        let snap: HistorySnapshotIo = serde_json::from_str(&json)
             .map_err(|e| EngineError::Reveal(crate::error::RevealError::Json(e)))?;
         // Build CustomFieldRef list sorted by name for deterministic
         // ordering (matches EntryFull.custom_fields).
@@ -834,7 +832,7 @@ pub(crate) fn history(conn: &Connection, uuid: Uuid) -> Result<Vec<HistoricEntry
             .into_iter()
             .map(|(name, raw)| CustomFieldRef {
                 name,
-                is_protected: raw.protected.unwrap_or(false),
+                is_protected: raw.protected,
             })
             .collect();
         custom_fields.sort_by(|a, b| a.name.cmp(&b.name));
@@ -962,7 +960,7 @@ pub(crate) fn history_attachment_bytes(
             entity: "attachment",
         });
     };
-    let snap: HistorySnapshotRead = serde_json::from_str(&json)
+    let snap: HistorySnapshotIo = serde_json::from_str(&json)
         .map_err(|e| EngineError::Reveal(crate::error::RevealError::Json(e)))?;
     let Some(att) = snap
         .attachments
@@ -993,85 +991,6 @@ pub(crate) fn history_attachment_bytes(
     bytes.ok_or(EngineError::NotFound {
         entity: "attachment",
     })
-}
-
-/// Deserialise side of the shape written by
-/// `crate::ingest::HistorySnapshot`. Every field added after the
-/// initial shipped shape is `#[serde(default)]` so older JSON
-/// (pre-history-widening) deserialises cleanly: those snapshots simply
-/// surface zero/empty defaults for the newer fields, which is correct
-/// because the data genuinely wasn't recorded at write time. The
-/// protected/wrapped values stay in the JSON and are only touched by
-/// [`crate::reveal::reveal_history_field`].
-#[derive(Deserialize)]
-struct HistorySnapshotRead {
-    title: String,
-    username: String,
-    url: String,
-    #[serde(default)]
-    url_host: String,
-    #[serde(default)]
-    notes: String,
-    #[serde(default)]
-    created_at: i64,
-    modified_at: i64,
-    #[serde(default)]
-    accessed_at: i64,
-    #[serde(default)]
-    last_used_at: Option<i64>,
-    #[serde(default)]
-    expires_at: Option<i64>,
-    #[serde(default)]
-    icon_index: Option<u32>,
-    #[serde(default)]
-    icon_custom_uuid: Option<String>,
-    #[serde(default)]
-    password_strength_bucket: Option<u8>,
-    #[serde(default)]
-    password_entropy: Option<f64>,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    attachments: Vec<HistoryAttachmentRead>,
-    #[serde(default)]
-    custom_fields: HashMap<String, HistoryCustomFieldRead>,
-    /// Per-record `<CustomData>` (migration 0006 + history JSON
-    /// shape extension). Pre-shape rows surface an empty list.
-    #[serde(default)]
-    custom_data: Vec<HistoryCustomDataItemRead>,
-}
-
-#[derive(Deserialize)]
-struct HistoryCustomDataItemRead {
-    key: String,
-    value: String,
-    #[serde(default)]
-    last_modified_at: Option<i64>,
-}
-
-#[derive(Deserialize)]
-struct HistoryAttachmentRead {
-    name: String,
-    #[serde(default)]
-    size: u64,
-    /// Hex-encoded SHA-256 of the attachment bytes. Added after the
-    /// initial widening (PR #75) so older `snapshot_json` rows omit it —
-    /// `#[serde(default)]` surfaces an empty string in that case. The
-    /// list-side `history()` reader doesn't use this field; only the
-    /// per-snapshot byte fetch needs it.
-    #[serde(default)]
-    sha256_hex: String,
-}
-
-/// Mirrors the write-side `HistoryCustomField` but only carries the
-/// `protected` flag — value bytes stay opaque on this read path
-/// (`reveal_history_field` parses them separately). `protected` is
-/// `Option<bool>` to remain compatible with future shape changes; we
-/// default it to `false` if missing.
-#[derive(Deserialize)]
-struct HistoryCustomFieldRead {
-    #[serde(default)]
-    protected: Option<bool>,
 }
 
 // ────────────────────────── helpers ──────────────────────────
