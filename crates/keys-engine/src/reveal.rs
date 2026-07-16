@@ -20,16 +20,14 @@
 //! is one Keychain hit + one AES-GCM open, matching the client's
 //! reveal-on-select behaviour.
 
-use std::collections::HashMap;
-
 use keepass_core::protector::{FieldProtector, open_with_key};
 use rusqlite::{Connection, OptionalExtension, params};
 use secrecy::SecretString;
-use serde::Deserialize;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::{EngineError, RevealError};
+use crate::history_snapshot::HistorySnapshotIo;
 use crate::util::PASSWORD_FIELD;
 use crate::util::codec::b64_decode;
 
@@ -81,7 +79,7 @@ pub(crate) fn reveal_custom_field(
 /// the JSON and are returned without an unwrap; no session key is
 /// acquired in that case.
 ///
-/// `field_name == "Password"` reads `HistorySnapshot.password`; any
+/// `field_name == "Password"` reads `HistorySnapshotIo.password`; any
 /// other name reads the value out of the `custom_fields` map. Returns
 /// [`EngineError::NotFound`] if the snapshot doesn't exist or the
 /// named field isn't present in it.
@@ -107,7 +105,7 @@ pub(crate) fn reveal_history_field(
         });
     };
 
-    let snap: HistorySnapshot =
+    let snap: HistorySnapshotIo =
         serde_json::from_str(&json).map_err(|e| EngineError::Reveal(RevealError::Json(e)))?;
 
     // Decide what to do with the named field before touching the
@@ -197,24 +195,4 @@ fn reveal_protected_field(
         .to_owned();
 
     Ok(SecretString::from(plaintext_str))
-}
-
-// ───────────────────────── history shape ─────────────────────────
-
-/// Deserialise side of the shape written by
-/// `crate::ingest::HistorySnapshot`. Lives here rather than being
-/// shared with [`crate::projection`] because we only need a couple of
-/// fields and pulling in the full projection shape would couple this
-/// module to a moving target.
-#[derive(Deserialize)]
-struct HistorySnapshot {
-    password: String,
-    custom_fields: HashMap<String, HistoryCustomField>,
-}
-
-#[derive(Deserialize)]
-struct HistoryCustomField {
-    value: String,
-    #[serde(default)]
-    protected: bool,
 }

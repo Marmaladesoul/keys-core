@@ -47,6 +47,22 @@ pub(crate) fn dt_to_ms(dt: Option<DateTime<Utc>>) -> i64 {
     dt.map_or(0, |d| d.timestamp_millis())
 }
 
+/// The expiry timestamp of `times`, or `None` when the record doesn't
+/// expire.
+///
+/// KDBX carries `expires` and `expiry_time` independently, so a
+/// non-expiring record can still hold a stale expiry time. Reading the
+/// flag first drops that date rather than persisting one the record
+/// doesn't honour — which is why this isn't just `dt_to_ms` over
+/// `expiry_time`.
+pub(crate) fn expiry_ms(times: &keepass_core::model::Timestamps) -> Option<i64> {
+    if times.expires {
+        times.expiry_time.map(|d| d.timestamp_millis())
+    } else {
+        None
+    }
+}
+
 /// Insert (or no-op) a tag name and return its row id.
 pub(crate) fn upsert_tag(conn: &Connection, name: &str) -> Result<i64, rusqlite::Error> {
     conn.execute(

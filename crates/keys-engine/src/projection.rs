@@ -17,8 +17,8 @@
 //!   [`keepass_core::model::Entry::password`] (plaintext).
 //! * Other `entry_protected` rows become protected
 //!   [`keepass_core::model::CustomField`]s with `protected = true`.
-//! * `entry_history.snapshot_json` is the
-//!   `crate::ingest::HistorySnapshot` shape; protected fields inside the
+//! * `entry_history.snapshot_json` is the crate-internal
+//!   `history_snapshot` shape; protected fields inside the
 //!   JSON are base64-encoded AES-GCM-sealed bytes (same wire format as
 //!   `entry_protected.wrapped_blob`) and get unwrapped under the session
 //!   key on the way out, producing a plaintext [`Entry`] used as the
@@ -49,13 +49,13 @@ use keepass_core::model::{
 };
 use keepass_core::protector::{FieldProtector, SessionKey, open_with_key};
 use rusqlite::{Connection, OptionalExtension as _};
-use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::{EngineError, ProjectionError};
+use crate::history_snapshot::HistorySnapshotIo;
 use crate::meta;
 use crate::util::PASSWORD_FIELD;
-use crate::util::codec::hex_to_bytes;
+use crate::util::codec::{b64_decode, hex_to_bytes};
 
 /// Top-level projection entry point. Runs every read inside a single
 /// immediate transaction so the snapshot is consistent.
@@ -637,71 +637,21 @@ fn load_entry_custom_data(conn: &Connection) -> Result<EntryCustomDataRows, Engi
     Ok(out)
 }
 
-fn load_history(conn: &Connection) -> Result<HashMap<Uuid, Vec<HistorySnapshot>>, EngineError> {
+fn load_history(conn: &Connection) -> Result<HashMap<Uuid, Vec<HistorySnapshotIo>>, EngineError> {
     let mut stmt = conn.prepare(
         "SELECT entry_uuid, snapshot_json FROM entry_history ORDER BY entry_uuid, history_index",
     )?;
-    let mut out: HashMap<Uuid, Vec<HistorySnapshot>> = HashMap::new();
+    let mut out: HashMap<Uuid, Vec<HistorySnapshotIo>> = HashMap::new();
     let rows = stmt.query_map([], |row| {
         Ok((parse_uuid_col(row, 0)?, row.get::<_, String>(1)?))
     })?;
     for r in rows {
         let (uuid, json) = r?;
-        let snap: HistorySnapshot = serde_json::from_str(&json)
+        let snap: HistorySnapshotIo = serde_json::from_str(&json)
             .map_err(|e| EngineError::Projection(ProjectionError::Json(e)))?;
         out.entry(uuid).or_default().push(snap);
     }
     Ok(out)
-}
-
-// ───────────────────────── history shape ─────────────────────────
-
-/// Deserialise side of the shape written by
-/// `crate::ingest::HistorySnapshot`.
-#[derive(Deserialize)]
-struct HistorySnapshot {
-    title: String,
-    username: String,
-    url: String,
-    notes: String,
-    password: String,
-    tags: Vec<String>,
-    created_at: i64,
-    modified_at: i64,
-    accessed_at: i64,
-    expires_at: Option<i64>,
-    custom_fields: HashMap<String, HistoryCustomField>,
-    /// Per-record `<CustomData>`. Pre-shape rows (history JSON written
-    /// before migration 0006 shipped) deserialise as an empty list.
-    #[serde(default)]
-    custom_data: Vec<HistoryCustomDataItem>,
-    /// Snapshot attachments, content-addressed by SHA-256 into the
-    /// `attachment_blob` pool. Pre-shape rows deserialise empty.
-    #[serde(default)]
-    attachments: Vec<HistoryAttachmentRead>,
-}
-
-#[derive(Deserialize)]
-struct HistoryAttachmentRead {
-    name: String,
-    /// Hex SHA-256 of the payload; empty on pre-widening rows (those
-    /// snapshots' attachments are unresolvable and are skipped).
-    #[serde(default)]
-    sha256_hex: String,
-}
-
-#[derive(Deserialize)]
-struct HistoryCustomField {
-    value: String,
-    protected: bool,
-}
-
-#[derive(Deserialize)]
-struct HistoryCustomDataItem {
-    key: String,
-    value: String,
-    #[serde(default)]
-    last_modified_at: Option<i64>,
 }
 
 /// Reconstruct a single history snapshot from its stored
@@ -721,7 +671,7 @@ pub(crate) fn snapshot_json_to_entry(
     binary_pool: &mut Vec<Binary>,
     sha_to_ref: &mut HashMap<[u8; 32], u32>,
 ) -> Result<Entry, EngineError> {
-    let snap: HistorySnapshot = serde_json::from_str(snapshot_json)
+    let snap: HistorySnapshotIo = serde_json::from_str(snapshot_json)
         .map_err(|e| EngineError::Projection(ProjectionError::Json(e)))?;
     snapshot_to_entry(
         entry_uuid,
@@ -735,7 +685,7 @@ pub(crate) fn snapshot_json_to_entry(
 
 fn snapshot_to_entry(
     entry_uuid: Uuid,
-    snap: &HistorySnapshot,
+    snap: &HistorySnapshotIo,
     session_key: &SessionKey,
     conn: &Connection,
     binary_pool: &mut Vec<Binary>,
@@ -838,14 +788,11 @@ fn unwrap_b64_field(
     b64: &str,
     session_key: &SessionKey,
 ) -> Result<String, EngineError> {
-    use base64::Engine as _;
-    let wrapped = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| {
-            EngineError::Projection(ProjectionError::Unwrap(format!(
-                "entry {entry_uuid} history field {field_name}: base64 decode: {e}",
-            )))
-        })?;
+    let wrapped = b64_decode(b64).map_err(|e| {
+        EngineError::Projection(ProjectionError::Unwrap(format!(
+            "entry {entry_uuid} history field {field_name}: {e}",
+        )))
+    })?;
     let plaintext = open_with_key(session_key, &wrapped).map_err(|e| {
         EngineError::Projection(ProjectionError::Unwrap(format!(
             "entry {entry_uuid} history field {field_name}: {e}",

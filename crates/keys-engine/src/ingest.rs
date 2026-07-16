@@ -20,18 +20,17 @@ use keepass_merge::{
     Classification, Granularity, classify, merge_meta_scalars, parse_conflict_resolutions,
 };
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::{EngineError, IngestError};
 use crate::fingerprint;
+use crate::history_snapshot::HistorySnapshotIo;
 use crate::meta;
 use crate::strength;
 use crate::totp;
 use crate::util::PASSWORD_FIELD;
-use crate::util::codec::b64_encode;
-use crate::util::sql::{dt_to_ms, entry_exists, group_exists, parse_host, upsert_tag};
+use crate::util::sql::{dt_to_ms, entry_exists, expiry_ms, group_exists, parse_host, upsert_tag};
 use crate::util::tree::{collect_entries, collect_entries_with_parent};
 
 /// Outcome of an ingest pass. Captured uuids let the engine fire a
@@ -487,7 +486,7 @@ fn insert_entry(
     // (per the decoder doc); we use the slice index as
     // `history_index` directly.
     for (idx, hist) in entry.history.iter().enumerate() {
-        let snapshot = HistorySnapshot::from_entry(hist, session_key, binaries)?;
+        let snapshot = HistorySnapshotIo::from_entry(hist, session_key, binaries)?;
         let json = serde_json::to_string(&snapshot)
             .map_err(|e| EngineError::Ingest(IngestError::Json(e)))?;
         conn.execute(
@@ -574,200 +573,6 @@ fn insert_non_protected_custom_field(
         params![entry_uuid, field_name, value],
     )?;
     Ok(())
-}
-
-fn expiry_ms(times: &keepass_core::model::Timestamps) -> Option<i64> {
-    if times.expires {
-        times.expiry_time.map(|d| d.timestamp_millis())
-    } else {
-        None
-    }
-}
-
-/// JSON shape stored in `entry_history.snapshot_json`.
-///
-/// Protected fields (the canonical `password` slot and any custom field
-/// with `protected: true`) are AES-GCM-sealed under the same session
-/// key used for the live `entry_protected.wrapped_blob` rows, then
-/// base64-encoded so the bytes round-trip through `TEXT`. This keeps
-/// history symmetric with live entries — plaintext never appears in
-/// DB-stored JSON. Non-protected custom fields keep their plaintext in
-/// `value`; the `protected` flag tells the reveal/projection side
-/// which interpretation applies.
-///
-/// Wire shape (per snapshot):
-///
-/// ```json
-/// {
-///   "title": "...", "username": "...", "url": "...",
-///   "url_host": "...", "notes": "...",
-///   "password": "<base64(nonce|ct|tag)>",
-///   "tags": [...],
-///   "created_at": ..., "modified_at": ..., "accessed_at": ...,
-///   "last_used_at": ..., "expires_at": ...,
-///   "icon_index": 0, "icon_custom_uuid": null,
-///   "password_strength_bucket": 3, "password_entropy": 42.5,
-///   "attachments": [
-///     { "name": "doc.txt", "size": 1234, "sha256_hex": "<hex>" }
-///   ],
-///   "custom_fields": {
-///     "Token":   { "value": "<base64(nonce|ct|tag)>", "protected": true  },
-///     "Website": { "value": "example.com",            "protected": false }
-///   }
-/// }
-/// ```
-///
-/// Backwards compat: every field added after the initial shipped shape
-/// is `#[serde(default)]` on the read side ([`HistorySnapshotRead`]) so
-/// older JSON deserialises cleanly; on the write side every newly-
-/// snapshotted history row carries the full payload.
-#[derive(Serialize)]
-struct HistorySnapshot<'a> {
-    title: &'a str,
-    username: &'a str,
-    url: &'a str,
-    url_host: String,
-    notes: &'a str,
-    /// Base64 of `seal_with_key(session_key, password_plaintext)`.
-    password: String,
-    tags: &'a [String],
-    created_at: i64,
-    modified_at: i64,
-    accessed_at: i64,
-    last_used_at: Option<i64>,
-    expires_at: Option<i64>,
-    icon_index: u32,
-    icon_custom_uuid: Option<String>,
-    password_strength_bucket: Option<u8>,
-    password_entropy: Option<f64>,
-    attachments: Vec<HistoryAttachment<'a>>,
-    custom_fields: HashMap<&'a str, HistoryCustomField>,
-    /// Per-record `<CustomData>`. Round-trips the parked-conflict
-    /// marker (`keys.field_conflict.v1`) and any other client-specific
-    /// metadata attached to a history snapshot. Pre-shape rows
-    /// deserialise as an empty list via `#[serde(default)]` on the
-    /// read side.
-    custom_data: Vec<HistoryCustomDataItem<'a>>,
-}
-
-#[derive(Serialize)]
-struct HistoryAttachment<'a> {
-    name: &'a str,
-    size: u64,
-    /// Hex-encoded SHA-256 of the attachment bytes. Lets the read side
-    /// resolve a snapshot's attachment to the content-addressed blob in
-    /// `attachment_blob` without relying on the live `entry_attachment`
-    /// link row (which may have been overwritten by a later edit).
-    ///
-    /// Newly added field — older `snapshot_json` rows have no
-    /// `sha256_hex`, so the read-side mirror marks it `#[serde(default)]`.
-    /// Pre-widening rows surface an empty string here; lookups against
-    /// `attachment_blob` skip those, and the caller sees `NotFound`.
-    sha256_hex: String,
-}
-
-#[derive(Serialize)]
-struct HistoryCustomDataItem<'a> {
-    key: &'a str,
-    value: &'a str,
-    /// Milliseconds since the Unix epoch (UTC). `None` matches the
-    /// keepass-core model when KDBX3 writers omit `<LastModificationTime>`.
-    last_modified_at: Option<i64>,
-}
-
-#[derive(Serialize)]
-struct HistoryCustomField {
-    /// For `protected = true`, base64 of `seal_with_key(...)`; for
-    /// `protected = false`, the plaintext value.
-    value: String,
-    protected: bool,
-}
-
-impl<'a> HistorySnapshot<'a> {
-    fn from_entry(
-        entry: &'a Entry,
-        session_key: &SessionKey,
-        binaries: &[&[u8]],
-    ) -> Result<Self, EngineError> {
-        let mut custom_fields: HashMap<&'a str, HistoryCustomField> = HashMap::new();
-        for cf in &entry.custom_fields {
-            let value = if cf.protected {
-                let wrapped = seal_with_key(session_key, cf.value.as_bytes())
-                    .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
-                b64_encode(&wrapped)
-            } else {
-                cf.value.clone()
-            };
-            custom_fields.insert(
-                cf.key.as_str(),
-                HistoryCustomField {
-                    value,
-                    protected: cf.protected,
-                },
-            );
-        }
-        let wrapped_password = seal_with_key(session_key, entry.password.as_bytes())
-            .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
-        let strength_result = strength::strength(&entry.password);
-        let (bucket, entropy) = if entry.password.is_empty() {
-            (None, None)
-        } else {
-            (
-                Some(strength_result.bucket as u8),
-                Some(strength_result.entropy_bits),
-            )
-        };
-        let attachments: Vec<HistoryAttachment<'a>> = entry
-            .attachments
-            .iter()
-            .map(|att| {
-                let bytes = binaries.get(att.ref_id as usize).copied().unwrap_or(&[]);
-                let size = u64::try_from(bytes.len()).unwrap_or(0);
-                let mut hasher = Sha256::new();
-                hasher.update(bytes);
-                let sha = hasher.finalize();
-                let sha256_hex = sha.iter().fold(String::with_capacity(64), |mut acc, b| {
-                    use std::fmt::Write as _;
-                    let _ = write!(&mut acc, "{b:02x}");
-                    acc
-                });
-                HistoryAttachment {
-                    name: att.name.as_str(),
-                    size,
-                    sha256_hex,
-                }
-            })
-            .collect();
-        Ok(Self {
-            title: &entry.title,
-            username: &entry.username,
-            url: &entry.url,
-            url_host: parse_host(&entry.url),
-            notes: &entry.notes,
-            password: b64_encode(&wrapped_password),
-            tags: &entry.tags,
-            created_at: dt_to_ms(entry.times.creation_time),
-            modified_at: dt_to_ms(entry.times.last_modification_time),
-            accessed_at: dt_to_ms(entry.times.last_access_time),
-            last_used_at: entry.times.last_access_time.map(|d| d.timestamp_millis()),
-            expires_at: expiry_ms(&entry.times),
-            icon_index: entry.icon_id,
-            icon_custom_uuid: entry.custom_icon_uuid.map(|u| u.to_string()),
-            password_strength_bucket: bucket,
-            password_entropy: entropy,
-            attachments,
-            custom_fields,
-            custom_data: entry
-                .custom_data
-                .iter()
-                .map(|cd| HistoryCustomDataItem {
-                    key: cd.key.as_str(),
-                    value: cd.value.as_str(),
-                    last_modified_at: cd.last_modified.map(|d| d.timestamp_millis()),
-                })
-                .collect(),
-        })
-    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -2105,7 +1910,7 @@ fn rewrite_entry_history(
         params![uuid_str],
     )?;
     for (idx, hist) in history.iter().enumerate() {
-        let snapshot = HistorySnapshot::from_entry(hist, session_key, binaries)?;
+        let snapshot = HistorySnapshotIo::from_entry(hist, session_key, binaries)?;
         let json = serde_json::to_string(&snapshot)
             .map_err(|e| EngineError::Ingest(IngestError::Json(e)))?;
         tx.execute(
