@@ -42,6 +42,7 @@ use crate::model::{
     Pagination, RecycleBinFilter, SearchScope, StrengthBucket,
 };
 use crate::util::codec::hex_to_bytes;
+use crate::util::row::{builtin_icon_index, parse_optional_uuid_col, parse_uuid_col};
 
 /// SQL fragment listing the columns `EntrySummary` needs, plus the
 /// correlated attachment-count subquery. Kept as a constant so the
@@ -1259,13 +1260,6 @@ fn load_history_count_for(conn: &Connection, entry_uuid: &str) -> Result<u32, En
     Ok(u32_from_db_column(count, 0)?)
 }
 
-fn parse_uuid_col(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Uuid> {
-    let s: String = row.get(idx)?;
-    Uuid::parse_str(&s).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
-    })
-}
-
 /// Decode an `i64` column value as `u32`, surfacing out-of-range as a
 /// `rusqlite::Error::IntegralValueOutOfRange` so the caller's `?`
 /// converts it (via the workspace's `From<rusqlite::Error> for EngineError`
@@ -1285,16 +1279,6 @@ pub(crate) fn u64_from_db_column(value: i64, column: usize) -> rusqlite::Result<
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))
 }
 
-fn parse_optional_uuid_col(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<Uuid>> {
-    let s: Option<String> = row.get(idx)?;
-    s.map(|s| {
-        Uuid::parse_str(&s).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
-        })
-    })
-    .transpose()
-}
-
 fn strength_bucket_from_i64(v: i64) -> Option<StrengthBucket> {
     match v {
         0 => Some(StrengthBucket::VeryWeak),
@@ -1312,21 +1296,12 @@ fn icon_ref_from(icon_index: Option<i64>, icon_custom_uuid: Option<Uuid>) -> Ico
     // to the built-in index, defaulting to 0 (the standard "key" icon)
     // when both columns are NULL.
     //
-    // Out-of-range `icon_index` values are *not* corruption-class — the
-    // KDBX builtin set is small (currently 0–68) and ingest already
-    // bounded the value into `u32` at write time, so this saturate
-    // models "we got something weird, fall back to the default icon"
-    // rather than masking a data-loss bug. `debug_assert!` so anything
-    // that does smuggle a negative value past ingest trips CI.
+    // The built-in index saturates via `builtin_icon_index` (out-of-range
+    // is an ingest invariant violation, not corruption — see there).
     if let Some(uuid) = icon_custom_uuid {
         IconRef::Custom(uuid)
     } else {
-        let idx = icon_index.unwrap_or(0);
-        debug_assert!(
-            (0..=i64::from(u32::MAX)).contains(&idx),
-            "icon_index {idx} out of u32 range — ingest invariant violated",
-        );
-        IconRef::Builtin(u32::try_from(idx).unwrap_or(0))
+        IconRef::Builtin(builtin_icon_index(icon_index))
     }
 }
 

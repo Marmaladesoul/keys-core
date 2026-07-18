@@ -17,6 +17,7 @@
 //! codecs, existence checks, and tree walks.
 
 pub(crate) mod codec;
+pub(crate) mod row;
 pub(crate) mod sql;
 pub(crate) mod tree;
 
