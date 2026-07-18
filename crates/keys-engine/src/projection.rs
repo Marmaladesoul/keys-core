@@ -56,6 +56,7 @@ use crate::history_snapshot::HistorySnapshotIo;
 use crate::meta;
 use crate::util::PASSWORD_FIELD;
 use crate::util::codec::{b64_decode, hex_to_bytes};
+use crate::util::row::{builtin_icon_index, parse_optional_uuid_col, parse_uuid_col};
 
 /// Top-level projection entry point. Runs every read inside a single
 /// immediate transaction so the snapshot is consistent.
@@ -285,30 +286,10 @@ fn load_group_rows(conn: &Connection) -> Result<Vec<GroupRow>, EngineError> {
             let sort_order_i64: i64 = row.get(10)?;
             Ok(GroupRow {
                 uuid: parse_uuid_col(row, 0)?,
-                parent_uuid: row
-                    .get::<_, Option<String>>(1)?
-                    .map(|s| Uuid::parse_str(&s))
-                    .transpose()
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?,
+                parent_uuid: parse_optional_uuid_col(row, 1)?,
                 name: row.get(2)?,
                 icon_index: row.get(3)?,
-                icon_custom_uuid: row
-                    .get::<_, Option<String>>(4)?
-                    .map(|s| Uuid::parse_str(&s))
-                    .transpose()
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            4,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?,
+                icon_custom_uuid: parse_optional_uuid_col(row, 4)?,
                 notes: row.get(5)?,
                 created_at: row.get(6)?,
                 modified_at: row.get(7)?,
@@ -373,17 +354,7 @@ fn build_subtree(
     let mut group = Group::empty(GroupId(row.uuid));
     group.name = row.name;
     group.notes = row.notes;
-    // Saturating, not corruption-class: ingest bounded `icon_index` into
-    // `u32` at write time, so a value outside that range here would be
-    // an ingest invariant violation. `debug_assert!` so CI catches it;
-    // production falls back to the default icon rather than aborting a
-    // projection.
-    let icon_idx = row.icon_index.unwrap_or(0);
-    debug_assert!(
-        (0..=i64::from(u32::MAX)).contains(&icon_idx),
-        "group icon_index {icon_idx} out of u32 range — ingest invariant violated",
-    );
-    group.icon_id = u32::try_from(icon_idx).unwrap_or(0);
+    group.icon_id = builtin_icon_index(row.icon_index);
     group.custom_icon_uuid = row.icon_custom_uuid;
     group.times = build_times(
         row.created_at,
@@ -450,32 +421,12 @@ fn load_entry_rows(conn: &Connection) -> Result<Vec<EntryRow>, EngineError> {
                 url: row.get(4)?,
                 notes: row.get(5)?,
                 icon_index: row.get(6)?,
-                icon_custom_uuid: row
-                    .get::<_, Option<String>>(7)?
-                    .map(|s| Uuid::parse_str(&s))
-                    .transpose()
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            7,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?,
+                icon_custom_uuid: parse_optional_uuid_col(row, 7)?,
                 created_at: row.get(8)?,
                 modified_at: row.get(9)?,
                 accessed_at: row.get(10)?,
                 expires_at: row.get(11)?,
-                previous_parent_uuid: row
-                    .get::<_, Option<String>>(12)?
-                    .map(|s| Uuid::parse_str(&s))
-                    .transpose()
-                    .map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            12,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?,
+                previous_parent_uuid: parse_optional_uuid_col(row, 12)?,
                 location_changed_at: row.get(13)?,
             })
         })?
@@ -489,15 +440,7 @@ fn build_entry_from_row(row: &EntryRow) -> Entry {
     entry.username.clone_from(&row.username);
     entry.url.clone_from(&row.url);
     entry.notes.clone_from(&row.notes);
-    // See group-side note in `build_subtree` — saturating with a
-    // `debug_assert!` rather than surfacing a typed error, because
-    // ingest bounded this into `u32` at write time.
-    let icon_idx = row.icon_index.unwrap_or(0);
-    debug_assert!(
-        (0..=i64::from(u32::MAX)).contains(&icon_idx),
-        "entry icon_index {icon_idx} out of u32 range — ingest invariant violated",
-    );
-    entry.icon_id = u32::try_from(icon_idx).unwrap_or(0);
+    entry.icon_id = builtin_icon_index(row.icon_index);
     entry.custom_icon_uuid = row.icon_custom_uuid;
     entry.previous_parent_group = row.previous_parent_uuid.map(GroupId);
     entry.times = build_times(
@@ -806,13 +749,6 @@ fn unwrap_b64_field(
 }
 
 // ───────────────────────── helpers ─────────────────────────
-
-fn parse_uuid_col(row: &rusqlite::Row<'_>, idx: usize) -> Result<Uuid, rusqlite::Error> {
-    let s: String = row.get(idx)?;
-    Uuid::parse_str(&s).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, Box::new(e))
-    })
-}
 
 /// Millisecond column → `DateTime`, **floored to whole seconds**.
 ///

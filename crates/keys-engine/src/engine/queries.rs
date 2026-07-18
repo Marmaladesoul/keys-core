@@ -823,14 +823,7 @@ impl Engine {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(compiled.params), |r| {
-                let s: String = r.get(0)?;
-                Uuid::parse_str(&s).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })
+                crate::util::row::parse_uuid_col(r, 0)
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
