@@ -246,3 +246,90 @@ async fn fetch_blob_rejects_blob_over_max_size() {
 
     node.shutdown().await.expect("shutdown");
 }
+
+/// The caller-supplied deadline actually bounds the wait: a fetch for a
+/// hash that never arrives fails with the "did not complete" error
+/// inside our tiny deadline, not the 60s default. One node, no peer, so
+/// nothing will ever queue the download — the only way out is the
+/// deadline elapsing.
+///
+/// This is the branch a compile-time `const` deadline left untestable:
+/// asserting it meant a 60s wall-clock wait. With the deadline
+/// injectable it is deterministic and sub-second. No network — the store
+/// simply never holds this hash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_blob_with_deadline_times_out_on_missing_content() {
+    init_tracing();
+
+    let (node, _b, _d) = spin_up_node().await;
+    let doc_id = node.create_doc().await.expect("create_doc");
+
+    // A valid hash for content no node holds or will ever offer.
+    let never_hash = iroh_blobs::Hash::new(b"content that never arrives").to_string();
+
+    let deadline = Duration::from_millis(200);
+    let started = tokio::time::Instant::now();
+    let err = node
+        .fetch_blob_with_deadline(doc_id, never_hash, 0, deadline)
+        .await
+        .expect_err("a hash that never arrives must time out, not resolve");
+    let waited = started.elapsed();
+
+    assert!(
+        err.to_string().contains("did not complete within"),
+        "expected the deadline-timeout error, got: {err}"
+    );
+    // The point of the injectable deadline: the wait is bounded by *our*
+    // 200 ms, nowhere near the 60 s const. A generous ceiling keeps this
+    // non-flaky on a loaded runner while still proving it isn't the const
+    // path — which would sit here for a full minute.
+    assert!(
+        waited < Duration::from_secs(10),
+        "fetch should return near the 200ms deadline, waited {waited:?}"
+    );
+
+    node.shutdown().await.expect("shutdown");
+}
+
+/// Shutting the node down mid-fetch ends the doc event stream, and the
+/// parked `fetch_blob_with_deadline` fails fast on that rather than
+/// idling to its deadline. This is the `Ok(None)` fast-fail branch:
+/// reachable in practice only by racing shutdown against an in-flight
+/// fetch, so the deadline is set long (30 s) to guarantee the
+/// stream-ended branch is what returns — a deadline-timeout here would
+/// be a test bug, not the path under test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_blob_fails_when_event_stream_ends_on_shutdown() {
+    init_tracing();
+
+    let (node, _b, _d) = spin_up_node().await;
+    let doc_id = node.create_doc().await.expect("create_doc");
+    let never_hash = iroh_blobs::Hash::new(b"awaited but never delivered").to_string();
+
+    // Park the fetch on a hash that will never arrive. Long deadline and
+    // `0` size cap so it genuinely waits — the only exits are the
+    // 30 s deadline (which we won't reach) or the event stream ending.
+    let fetch_node = node.clone();
+    let fetch = tokio::spawn(async move {
+        fetch_node
+            .fetch_blob_with_deadline(doc_id, never_hash, 0, Duration::from_secs(30))
+            .await
+    });
+
+    // Let the fetch subscribe and settle onto the event stream before we
+    // pull the node out from under it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    node.shutdown().await.expect("shutdown");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), fetch)
+        .await
+        .expect("fetch should return promptly once its stream ends, not hang")
+        .expect("fetch task panicked");
+
+    let err = result.expect_err("fetch must fail once its event stream ends");
+    assert!(
+        err.to_string().contains("event stream ended"),
+        "expected the stream-ended error, got: {err}"
+    );
+}
