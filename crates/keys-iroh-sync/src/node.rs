@@ -31,12 +31,13 @@ use crate::events::DocEvent;
 use crate::identity::Identity;
 use crate::policy::DownloadPolicy;
 
-/// How long [`IrohNode::fetch_blob`] waits for content to arrive before
-/// giving up. Callers block on that future, so an unreachable publisher
-/// or a stalled transfer has to surface as an error rather than hang
-/// the caller forever. Chosen to outlast a slow first connection
-/// (relay registration + hole-punch) while still failing inside a
-/// human's patience for a stuck transfer.
+/// The default deadline [`IrohNode::fetch_blob`] waits for content to
+/// arrive before giving up; [`IrohNode::fetch_blob_with_deadline`] lets
+/// a caller pick another bound per call. Callers block on that future,
+/// so an unreachable publisher or a stalled transfer has to surface as
+/// an error rather than hang the caller forever. Chosen to outlast a
+/// slow first connection (relay registration + hole-punch) while still
+/// failing inside a human's patience for a stuck transfer.
 const FETCH_BLOB_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long [`IrohNode::fetch_blob`] will sit on the doc event stream
@@ -334,6 +335,34 @@ impl IrohNode {
     }
 
     /// Ensure a blob's content is downloaded locally, then return its
+    /// bytes, waiting at most `FETCH_BLOB_DEADLINE` (60s) for the
+    /// content to land. This is the fixed-deadline convenience form of
+    /// [`Self::fetch_blob_with_deadline`]; see that method for the full
+    /// semantics of `max_size_bytes`, the wait model, and the failure
+    /// modes. A caller that needs a different bound — a longer wait for
+    /// a large attachment on a slow link, or a shorter one to fail fast
+    /// — calls [`Self::fetch_blob_with_deadline`] directly.
+    pub async fn fetch_blob(
+        &self,
+        doc_id: String,
+        hash_hex: String,
+        max_size_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        self.fetch_blob_with_deadline(doc_id, hash_hex, max_size_bytes, FETCH_BLOB_DEADLINE)
+            .await
+    }
+}
+
+// Deliberately not `#[uniffi::export]`: the `Duration` deadline is a
+// native-Rust escape hatch for embedders that need a non-default wait
+// bound. Keeping it off the uniffi surface holds the generated
+// Swift/xcframework bindings — a separate FFI surface regenerated
+// out-of-band with no CI — byte-stable, so `fetch_blob` above stays the
+// exported 60s-default entry point. Promoting the deadline across the
+// seam is a deliberate follow-up: add `#[uniffi::export]` here and
+// regenerate the bindings with a Swift-harness test that proves it.
+impl IrohNode {
+    /// Ensure a blob's content is downloaded locally, then return its
     /// bytes. Blob discovery rides through the joined doc's swarm —
     /// the caller must have joined a doc that references this hash.
     /// `doc_id` selects which doc's peers to ask.
@@ -350,20 +379,27 @@ impl IrohNode {
     /// inspected the `EntryInfo.size_bytes` from `list_entries` and made
     /// a policy decision.
     ///
-    /// Waits at most `FETCH_BLOB_DEADLINE` (60s) for the content to
-    /// land. This node never initiates the download itself — the
-    /// joined doc's live engine queues it under the doc's
-    /// [`DownloadPolicy`], and this call just waits for the result.
-    /// Content the policy excludes will therefore never arrive, and
-    /// the wait will time out. A caller that needs a different bound
-    /// can build its own wait from the public primitives — poll
-    /// [`Self::list_entries`] and watch [`Self::subscribe_doc_events`]
-    /// for `ContentReady` — rather than being held to this deadline.
-    pub async fn fetch_blob(
+    /// Waits at most `deadline` for the content to land, then fails with
+    /// a "did not complete within …" error. The deadline is a per-call
+    /// property so an embedder can widen it for a large attachment on a
+    /// slow link, or narrow it to fail fast, without a node-global
+    /// setting; [`Self::fetch_blob`] is the 60s-default convenience form.
+    /// This node never initiates the download itself — the joined doc's
+    /// live engine queues it under the doc's [`DownloadPolicy`], and this
+    /// call just waits for the result. Content the policy excludes will
+    /// therefore never arrive, and the wait will time out.
+    ///
+    /// `FETCH_BLOB_STATUS_BACKSTOP` bounds the wait between status
+    /// re-reads independently of `deadline`: the blob store, not the doc
+    /// event stream, is the authority on completion (see that constant),
+    /// so a completion that reaches this doc with no event still surfaces
+    /// within a backstop tick rather than idling to the deadline.
+    pub async fn fetch_blob_with_deadline(
         &self,
         doc_id: String,
         hash_hex: String,
         max_size_bytes: u64,
+        deadline: std::time::Duration,
     ) -> Result<Vec<u8>> {
         use iroh_blobs::api::blobs::BlobStatus;
 
@@ -395,7 +431,7 @@ impl IrohNode {
             .context("subscribe doc events")
             .map_err(SyncError::from)?;
 
-        let deadline = tokio::time::Instant::now() + FETCH_BLOB_DEADLINE;
+        let deadline_at = tokio::time::Instant::now() + deadline;
         loop {
             let status = self
                 .blobs_store
@@ -430,10 +466,9 @@ impl IrohNode {
                 }
                 _ => {}
             }
-            if tokio::time::Instant::now() >= deadline {
-                let secs = FETCH_BLOB_DEADLINE.as_secs();
+            if tokio::time::Instant::now() >= deadline_at {
                 return Err(SyncError::Generic(format!(
-                    "blob {hash_hex} did not complete within {secs}s (status={status:?})"
+                    "blob {hash_hex} did not complete within {deadline:?} (status={status:?})"
                 )));
             }
 
@@ -441,7 +476,8 @@ impl IrohNode {
             // than spinning on `status`. Any event is a re-check
             // trigger; the backstop bounds the wait when no event is
             // coming, and the deadline caps the whole loop.
-            let wake_by = (tokio::time::Instant::now() + FETCH_BLOB_STATUS_BACKSTOP).min(deadline);
+            let wake_by =
+                (tokio::time::Instant::now() + FETCH_BLOB_STATUS_BACKSTOP).min(deadline_at);
             match tokio::time::timeout_at(wake_by, events.next()).await {
                 // An event landed, the backstop/deadline elapsed, or a
                 // single event failed to decode — all just mean "go and
@@ -495,7 +531,10 @@ impl IrohNode {
             .map_err(SyncError::from)?;
         Ok(bytes.to_vec())
     }
+}
 
+#[uniffi::export(async_runtime = "tokio")]
+impl IrohNode {
     /// Subscribe an FFI listener to events from one doc. Returns
     /// immediately after spawning the bridge task; the listener fires
     /// from a tokio worker until the doc is left or the node is shut
