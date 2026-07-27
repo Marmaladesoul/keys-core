@@ -386,37 +386,47 @@ pub struct DatabaseMetadata {
     pub attachment_total_bytes: u64,
 }
 
-/// Persist the three outer-header facts needed for cipher / KDF
-/// display. Caller is responsible for clearing stale rows first
+/// The KDF facts an outer header carries, mirroring
+/// [`keepass_core::format::VersionFields`]: KDBX3 states its AES-KDF
+/// round count directly in the outer header, KDBX4 carries an encoded
+/// KDF-parameter `VarDictionary` instead. Never both — modelling it as
+/// an enum keeps the illegal mix unrepresentable on this side of the
+/// seam too, and makes "write one row, clear the other" structural.
+pub(crate) enum KdfFacts {
+    /// KDBX3: AES-KDF round count.
+    TransformRounds(u64),
+    /// KDBX4: raw KDF-parameter `VarDictionary` bytes.
+    Parameters(Vec<u8>),
+}
+
+/// Persist the outer-header facts needed for cipher / KDF display.
+/// Caller is responsible for clearing stale rows first
 /// (`clear_meta_tables` does this via the `meta.%` wildcard).
 pub(crate) fn write_kdbx_outer_header_facts(
     conn: &Connection,
     cipher_id_bytes: [u8; 16],
-    kdf_parameters: Option<&[u8]>,
-    transform_rounds: Option<u64>,
+    kdf: &KdfFacts,
 ) -> Result<(), rusqlite::Error> {
     set_blob(conn, KEY_KDBX_CIPHER_OID, &cipher_id_bytes)?;
-    if let Some(blob) = kdf_parameters {
-        set_blob(conn, KEY_KDBX_KDF_PARAMETERS, blob)?;
-    } else {
-        conn.execute(
-            "DELETE FROM setting WHERE key = ?1",
-            params![KEY_KDBX_KDF_PARAMETERS],
-        )?;
-    }
-    if let Some(rounds) = transform_rounds {
-        // Store as i64 little-endian. `transform_rounds` is u64 in
-        // keepass-core; reinterpret bits — round counts that actually
-        // fit a u64 but not an i64 are far beyond anything practical
-        // and would just round-trip the bit pattern unchanged.
-        #[allow(clippy::cast_possible_wrap)]
-        set_i64(conn, KEY_KDBX_TRANSFORM_ROUNDS, rounds as i64)?;
-    } else {
-        conn.execute(
-            "DELETE FROM setting WHERE key = ?1",
-            params![KEY_KDBX_TRANSFORM_ROUNDS],
-        )?;
-    }
+    // Whichever row this header shape doesn't populate is cleared, so a
+    // re-ingest of a converted vault can't leave the other version's
+    // stale row behind for `read_kdf_display` to prefer.
+    let stale_key = match kdf {
+        KdfFacts::Parameters(blob) => {
+            set_blob(conn, KEY_KDBX_KDF_PARAMETERS, blob)?;
+            KEY_KDBX_TRANSFORM_ROUNDS
+        }
+        KdfFacts::TransformRounds(rounds) => {
+            // Store as i64. `transform_rounds` is u64 in keepass-core;
+            // reinterpret bits — round counts that actually fit a u64
+            // but not an i64 are far beyond anything practical and
+            // would just round-trip the bit pattern unchanged.
+            #[allow(clippy::cast_possible_wrap)]
+            set_i64(conn, KEY_KDBX_TRANSFORM_ROUNDS, *rounds as i64)?;
+            KEY_KDBX_KDF_PARAMETERS
+        }
+    };
+    conn.execute("DELETE FROM setting WHERE key = ?1", params![stale_key])?;
     Ok(())
 }
 
