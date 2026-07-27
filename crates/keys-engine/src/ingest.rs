@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
+use keepass_core::format::VersionFields;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{CustomIcon, Entry, Group, GroupId, Meta, Vault};
 use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
@@ -27,6 +28,7 @@ use crate::error::{EngineError, IngestError};
 use crate::fingerprint;
 use crate::history_snapshot::HistorySnapshotIo;
 use crate::meta;
+use crate::meta::KdfFacts;
 use crate::strength;
 use crate::totp;
 use crate::util::PASSWORD_FIELD;
@@ -59,18 +61,18 @@ pub(crate) fn ingest(
         .map_err(|e| EngineError::Ingest(IngestError::Kdbx(e.to_string())))?;
     let header = kdbx.outer_header();
     let cipher_id = *header.cipher_id.0.as_bytes();
-    let kdf_params = header.kdf_parameters.as_deref().map(<[u8]>::to_vec);
-    let transform_rounds = header.transform_rounds;
+    let kdf = match &header.version_fields {
+        VersionFields::V3 {
+            transform_rounds, ..
+        } => KdfFacts::TransformRounds(*transform_rounds),
+        VersionFields::V4 { kdf_parameters, .. } => KdfFacts::Parameters(kdf_parameters.clone()),
+    };
     ingest_vault_with_header(
         conn,
         fingerprint_key,
         protector,
         &vault,
-        Some(&HeaderFacts {
-            cipher_id,
-            kdf_params,
-            transform_rounds,
-        }),
+        Some(&HeaderFacts { cipher_id, kdf }),
     )
 }
 
@@ -79,8 +81,7 @@ pub(crate) fn ingest(
 /// via [`crate::Engine::database_metadata`].
 struct HeaderFacts {
     cipher_id: [u8; 16],
-    kdf_params: Option<Vec<u8>>,
-    transform_rounds: Option<u64>,
+    kdf: KdfFacts,
 }
 
 /// Re-ingest a pre-unwrapped [`Vault`] without going through a
@@ -140,12 +141,7 @@ fn ingest_vault_with_header(
     // envelope, so the existing rows (written by the originating
     // ingest call) remain accurate.
     if let Some(facts) = header_facts {
-        meta::write_kdbx_outer_header_facts(
-            &tx,
-            facts.cipher_id,
-            facts.kdf_params.as_deref(),
-            facts.transform_rounds,
-        )?;
+        meta::write_kdbx_outer_header_facts(&tx, facts.cipher_id, &facts.kdf)?;
     }
 
     // Persist `Meta::recycle_bin_enabled` explicitly. The `is_recycle_bin`

@@ -50,6 +50,31 @@ fn fresh_kdbx(name: &str) -> Kdbx<Unlocked> {
     Kdbx::create_empty_v4_with_protector(&composite(), name, Some(protector())).expect("create")
 }
 
+/// keepass-core can only author KDBX4 (`create_empty_v4*`), so the one
+/// KDBX3 header in the workspace is the vendored fixture keyhole's
+/// `save-fidelity-kdbx3` scenario opens. Shared rather than duplicated —
+/// same repo, always checked out together.
+const KDBX3_FIXTURE: &str = "../../keyhole/scenarios/fixtures/kdbx3-minimal.kdbx";
+/// The fixture's password — a public test credential, not a secret.
+/// Mirrored in `save-fidelity-kdbx3.sh`; a shell script and a Rust test
+/// can't share a constant, so keep the two literals in step.
+const KDBX3_FIXTURE_PW: &[u8] = "tëst pässwörd 🔑/\\".as_bytes();
+/// The fixture's AES-KDF round count as `read_kdf_display` renders it.
+const KDBX3_FIXTURE_KDF_DISPLAY: &str = "AES-KDF (6,382,978 rounds)";
+
+fn open_kdbx3_fixture() -> Kdbx<Unlocked> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(KDBX3_FIXTURE);
+    Kdbx::open(&path)
+        .expect("open kdbx3 fixture")
+        .read_header()
+        .expect("read header")
+        .unlock_with_protector(
+            &CompositeKey::from_password(KDBX3_FIXTURE_PW),
+            Some(protector()),
+        )
+        .expect("unlock kdbx3 fixture")
+}
+
 fn db_key_hex() -> String {
     let mut s = String::with_capacity(64);
     for b in &DB_KEY_BYTES {
@@ -473,6 +498,23 @@ fn database_metadata_reports_argon2d_kdf_for_fresh_v4_vault() {
         md.kdf_display,
         "Argon2d (64 MB \u{00B7} 2 iter \u{00B7} 8 threads)"
     );
+}
+
+#[test]
+fn database_metadata_reports_aes_kdf_rounds_for_kdbx3_vault() {
+    // The other KDF-display tests all run on KDBX4 headers, which carry
+    // the KDF as an encoded VarDictionary. A KDBX3 header instead states
+    // an AES-KDF round count directly, so it's the only exercise of that
+    // half of `VersionFields` — and of the `meta.kdbx_transform_rounds`
+    // row the ingest writes for it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("engine.sqlite");
+    let kdbx = open_kdbx3_fixture();
+    let mut engine = open_engine(&path);
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+
+    let md = engine.database_metadata().expect("read");
+    assert_eq!(md.kdf_display, KDBX3_FIXTURE_KDF_DISPLAY);
 }
 
 #[test]
