@@ -33,7 +33,7 @@ jobs:
     name: build + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The vault integration tests read KDBX fixtures from a keepass-core
       # checkout, located at runtime via KEYS_TEST_FIXTURES_DIR (set on the
@@ -44,7 +44,7 @@ jobs:
       # commit, decoupled from the Cargo.lock library rev — that rev can point
       # at a rewritten/orphaned commit that won't stay fetchable.)
       - name: Check out keepass-core test fixtures
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Marmaladesoul/keepass-core
           ref: 44aa5d9b15edbac84e451f89e465c3907da6db14
@@ -91,7 +91,7 @@ jobs:
     # in any transitive dependency. Fast, and a no-brainer for a workspace
     # that handles credentials and owns the iroh transport layer.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -108,8 +108,8 @@ jobs:
     # allowlist (crates.io + the keepass-core git repo), a banned-crates list
     # (native-tls), and surfaces duplicate versions. Config in deny.toml.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
           arguments: --all-features
