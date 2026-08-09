@@ -15,7 +15,13 @@ import PackageDescription
 
 let package = Package(
     name: "KeysCoreFFI",
-    platforms: [.macOS(.v13)],
+    // `KeysCoreFFI.xcframework` ships ios-arm64 and
+    // ios-arm64_x86_64-simulator slices alongside the macOS one (see
+    // ../bindgen/build-swift.sh), so the manifest declares iOS too —
+    // without it SwiftPM refuses to resolve the package for an iOS
+    // consumer regardless of what the binary contains. Kept in step
+    // with ../swift-harness-iroh-sync/Package.swift.
+    platforms: [.macOS(.v13), .iOS(.v17)],
     products: [
         .library(name: "KeysCoreFFI", targets: ["KeysCoreFFI"]),
     ],
