@@ -1440,7 +1440,16 @@ impl Engine {
     /// the body is currently sync — the validation pass + apply walk
     /// run in-thread. If a future refactor pushes the apply onto a
     /// blocking pool, this signature is already ready.
+    ///
+    /// Both allows are the same statement: the `async` here is part of
+    /// the *exported* signature, not an implementation detail, so the
+    /// lints' suggested `-> impl Future` rewrite is not available — it
+    /// would change what consumers see across the FFI boundary. The
+    /// `_trait_impl` variant is the newer toolchain's spelling of the
+    /// same lint for `#[uniffi::export]`-generated impls; keep both
+    /// while the supported toolchain range spans the rename.
     #[allow(clippy::unused_async)]
+    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     pub async fn apply_conflict_resolution(
         &self,
         id: i64,
