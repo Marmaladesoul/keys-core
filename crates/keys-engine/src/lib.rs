@@ -30,7 +30,7 @@ pub mod url_matcher;
 mod util;
 pub mod uuid_source;
 
-pub use engine::{DisconnectReason, Engine, ReconcileTrigger, VaultState};
+pub use engine::{DisconnectReason, Engine, ReconcileTrigger, SessionKeyStatus, VaultState};
 pub use error::{EngineError, IngestError, ProjectionError, RevealError};
 pub use events::{
     ChangeEvent, ConflictPayload, DataChangeObserver, EntryDeletionInfo, EntryMove,

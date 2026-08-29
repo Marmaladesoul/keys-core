@@ -1,33 +1,41 @@
 #!/usr/bin/env bash
 #
-# Scenario: the field-protection (session-key) arm of the sidecar
-# self-heal. The sidecar seals each protected field under a session key
-# the platform supplies separately from the SQLCipher mirror key (on a
-# real client, an SE-wrapped key). If that session key is rotated out
-# from under a populated sidecar, the SQLCipher mirror still OPENS fine —
-# but the first read that has to unwrap a protected field fails AES-GCM.
-# Unlike the db-key failure mode, this is NOT visible at open; it surfaces
-# later, on a projection / save / reveal. The remedy is the same: discard
-# the sidecar and re-ingest from the KDBX, which re-seals the protected
-# fields under the *current* session key.
+# Scenario: the explicit `rebuild` verb — the POST-OPEN arm of the sidecar
+# self-heal (`keys_ffi::rebuild_vault_local_data`).
 #
-# keyhole reproduces a rotated session key by reopening with a different
-# KEYHOLE_FIELD_KEY than the sidecar was sealed under, and drives the
-# remedy through the explicit `rebuild` verb (the headless analogue of a
-# client observing its SE-failure signal and rebuilding).
+# The sidecar seals each protected field under a session key the platform
+# supplies separately from the SQLCipher mirror key (on a real client, one
+# wrapped by a hardware keystore). Rotate that key and the mirror still
+# opens; only its sealed blobs stop opening. The remedy is to discard the
+# sidecar and re-ingest from the KDBX, which re-seals every protected
+# field under the *current* session key — keeping the mirror's DB key,
+# unlike `purge`.
+#
+# PREMISE CHANGE, worth stating because this scenario used to assert the
+# opposite: a rotation is now caught at OPEN. `open_vault_self_healing`
+# probes the sidecar's sealed blobs against the live session key before it
+# hands the engine back, so a vault that was closed across the rotation
+# repairs itself and a protected-field save no longer fails. That path is
+# covered by `se-session-key-recovery.sh`. What is left for THIS scenario
+# is the verb itself: the remedy a client drives when it observes the
+# failure mid-session, with the engine already open and the open-time
+# probe long since past.
 #
 # Asserts:
-#   1. with the session key rotated, a save (which must unwrap every
-#      protected field) FAILS — the stale-session-key symptom;
-#   2. `rebuild` discards the sidecar and re-ingests, reporting it;
-#   3. afterwards the same protected-field operation SUCCEEDS under the
-#      new session key, and the entry survived the rebuild.
+#   1. `rebuild` discards the sidecar and re-ingests, reporting both;
+#   2. afterwards a protected-field operation SUCCEEDS under the session
+#      key in force, and the entry survived the rebuild;
+#   3. `rebuild` is NOT an auth bypass — under a wrong master password it
+#      fails closed, because the re-ingest must unlock the KDBX first.
+#      A recovery verb that skipped that check would be a way to rebuild
+#      a vault's local data without ever proving you can open the vault.
 #
-# NOTE on data-loss surface (accepted): a session-key rebuild throws away
-# the sidecar, so any mutation made but not yet saved to the KDBX is
-# dropped. That is intrinsic to "re-ingest from the source of truth" and
-# acceptable for the mid-session SE-failure case — the session was
-# already unusable for protected fields.
+# NOTE on data-loss surface (accepted): a rebuild throws away the
+# sidecar, so any mutation made but not yet saved to the KDBX is dropped.
+# That is intrinsic to "re-ingest from the source of truth". A caller
+# should therefore flush what it owes the KDBX *before* driving this, not
+# after — the ordering is the caller's to get right, and the drop is
+# silent if it doesn't.
 
 set -uo pipefail
 
@@ -36,7 +44,7 @@ PW="keyhole-self-heal-session-pw"
 export KEYHOLE_PASSWORD="$PW"
 
 # A session key (64 hex / 32 bytes) distinct from the adapter default —
-# "the SE now yields a different key".
+# "the keystore now yields a different key".
 ALT_FIELD_KEY="$(printf 'c%.0s' {1..64})"
 
 TMP="$(mktemp -d)"
@@ -53,19 +61,7 @@ VAULT="$TMP/session-heal.kdbx"
 ENTRY="$("$KEYHOLE" list "$VAULT" 2>/dev/null | grep -i 'Secret' | grep -oE '[0-9a-fA-F-]{36}' | head -1)"
 [ -n "$ENTRY" ] || { echo "FAIL: could not resolve the seeded entry uuid"; exit 1; }
 
-# ── 1. rotated session key -> a save fails to unwrap protected fields ──
-#    `update-entry` mutates then saves; the save projects the whole vault,
-#    which must unwrap the protected password — sealed under the default
-#    session key, now being read under ALT_FIELD_KEY.
-broke_out="$(KEYHOLE_FIELD_KEY="$ALT_FIELD_KEY" "$KEYHOLE" update-entry "$VAULT" "$ENTRY" --username bob 2>&1)"
-broke_rc=$?
-if [ "$broke_rc" -eq 0 ]; then
-    echo "FAIL: a protected-field save succeeded under a rotated session key — the stale key was not detected"
-    exit 1
-fi
-echo "note: rotated session key broke the protected-field save (as expected)"
-
-# ── 2. rebuild discards the sidecar and re-ingests ────────────────────
+# ── 1. rebuild discards the sidecar and re-ingests ────────────────────
 rb_out="$(KEYHOLE_FIELD_KEY="$ALT_FIELD_KEY" "$KEYHOLE" rebuild "$VAULT" 2>&1)" \
     || { echo "FAIL: rebuild verb errored"; printf '%s\n' "$rb_out" | sed 's/^/    /'; exit 1; }
 printf '%s\n' "$rb_out" | grep -q '^rebuilt: true$' \
@@ -78,12 +74,27 @@ esac
     || { echo "FAIL: rebuild discarded $discarded sidecar files — expected >= 1"; exit 1; }
 echo "note: rebuild discarded $discarded stale sidecar file(s) and re-ingested"
 
-# ── 3. the same protected-field op now SUCCEEDS, and the entry survived
-#    Re-seal happened under ALT_FIELD_KEY, so a save that unwraps the
-#    protected field now works.
+# ── 2. the entry survived and protected-field ops work afterwards ─────
+#    `update-entry` mutates then saves; the save projects the whole vault,
+#    which must unwrap every protected field.
 fixed_out="$(KEYHOLE_FIELD_KEY="$ALT_FIELD_KEY" "$KEYHOLE" update-entry "$VAULT" "$ENTRY" --username bob 2>&1)" \
-    || { echo "FAIL: protected-field save still fails after rebuild"; printf '%s\n' "$fixed_out" | sed 's/^/    /'; exit 1; }
+    || { echo "FAIL: protected-field save fails after rebuild"; printf '%s\n' "$fixed_out" | sed 's/^/    /'; exit 1; }
 KEYHOLE_FIELD_KEY="$ALT_FIELD_KEY" "$KEYHOLE" list "$VAULT" 2>/dev/null | grep -q 'Secret' \
     || { echo "FAIL: the Secret entry did not survive the rebuild"; exit 1; }
+echo "note: the entry survived and protected-field access works under the current session key"
 
-echo "PASS: a rotated session key broke protected-field access; rebuild re-sealed from the KDBX and restored it"
+# ── 3. rebuild is not an auth bypass ──────────────────────────────────
+wrong_out="$(KEYHOLE_PASSWORD="definitely-not-the-master-password" \
+    KEYHOLE_FIELD_KEY="$ALT_FIELD_KEY" "$KEYHOLE" rebuild "$VAULT" 2>&1)"
+wrong_rc=$?
+if [ "$wrong_rc" -eq 0 ]; then
+    echo "FAIL: rebuild succeeded under a WRONG master password — the recovery verb is an auth bypass"
+    printf '%s\n' "$wrong_out" | sed 's/^/    /'
+    exit 1
+fi
+# And the vault is still intact under the real password.
+"$KEYHOLE" list "$VAULT" 2>/dev/null | grep -q 'Secret' \
+    || { echo "FAIL: the vault is no longer readable after a refused wrong-password rebuild"; exit 1; }
+echo "note: rebuild under a wrong master password failed closed and left the vault intact"
+
+echo "PASS: the post-open rebuild discards the sidecar, re-seals from the KDBX, and re-gates on the master password"

@@ -33,7 +33,7 @@ use keys_ffi::{
     DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, Engine, EngineEntryUpdate,
     EntryAttachmentChoiceFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, IconRef,
     NewEntryFields, Page, ParkConflictsResultFfi, RecycleBinFilter, ResolutionFfi, SearchScope,
-    SyncWithDiskFfi, VaultIdentityVerdict, create_vault as ffi_create_vault,
+    SidecarRebuildReason, SyncWithDiskFfi, VaultIdentityVerdict, create_vault as ffi_create_vault,
     create_vault_deterministic as ffi_create_vault_deterministic, open_vault_self_healing,
     purge_vault_local_data, rebuild_vault_local_data, verify_vault_identity,
 };
@@ -1149,9 +1149,23 @@ impl Session {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("engine open: {e:?}"))?;
-                if outcome.rebuilt {
-                    // Diagnostics on stderr; scenarios grep this marker.
-                    eprintln!("note: self-heal: rebuilt mirror from kdbx (stale sidecar key)");
+                // Diagnostics on stderr; scenarios grep these markers. The
+                // two reasons are printed distinctly because they are
+                // distinct facts: one is a mirror key that no longer opens
+                // the sidecar, the other a session key that no longer opens
+                // what the sidecar sealed.
+                match outcome.rebuilt {
+                    Some(SidecarRebuildReason::StaleDbKey) => {
+                        eprintln!(
+                            "note: self-heal: rebuilt mirror from kdbx (stale sidecar db key)"
+                        );
+                    }
+                    Some(SidecarRebuildReason::RotatedSessionKey) => {
+                        eprintln!(
+                            "note: self-heal: rebuilt mirror from kdbx (rotated session key)"
+                        );
+                    }
+                    None => {}
                 }
                 outcome.engine
             }

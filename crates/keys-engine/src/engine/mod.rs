@@ -302,6 +302,55 @@ impl FileWatcherObserver for EngineFileWatcherObserver {
     }
 }
 
+/// How many sealed blobs [`Engine::session_key_status`] opens before it
+/// concludes the sidecar and the live session key correspond. More than
+/// one so a sidecar left *mixed* by a mid-session key rotation is caught
+/// rather than sampled around; small enough that the probe stays a
+/// constant-time addition to open.
+const SESSION_KEY_PROBE_SAMPLE: i64 = 8;
+
+/// Whether the sidecar's sealed protected fields still open under the
+/// session key the [`FieldProtector`] hands out *right now*.
+///
+/// The sidecar's protected columns (`entry_protected.wrapped_blob`) are
+/// AES-GCM-sealed under a key the platform supplies out-of-band — on a
+/// desktop client, one wrapped by a hardware keystore. That key can be
+/// rotated out from under a populated sidecar (a keystore reset, a
+/// re-provisioned enclave key), and until now the mismatch was **not
+/// observable at open**: the `SQLCipher` mirror opened fine and the
+/// first failure landed much later, on a reveal, a merge or a save.
+///
+/// [`Engine::session_key_status`] makes it observable, and — critically
+/// — makes the three outcomes *distinguishable*, so a consumer can
+/// never answer an ambiguous signal with a destructive action:
+///
+/// * [`Matches`](SessionKeyStatus::Matches) — a sealed blob opened; the
+///   sidecar and the live key correspond.
+/// * [`Rotated`](SessionKeyStatus::Rotated) — a sealed blob failed to
+///   open under a key the protector *did* successfully produce. The
+///   sidecar's protected half is unreadable and only a rebuild from the
+///   KDBX can restore it.
+/// * [`NoProtectedData`](SessionKeyStatus::NoProtectedData) — the
+///   sidecar holds no sealed blob to test against, so there is nothing
+///   that could be stale.
+///
+/// A protector that cannot produce a key at all is NOT a variant here:
+/// it is an `Err`. "The keystore was momentarily unavailable" and "the
+/// key changed" are different facts, and collapsing them is what lets a
+/// transient failure masquerade as a rotation.
+/// Deliberately NOT `#[non_exhaustive]`: this enum gates a destructive
+/// remedy, so a new variant must break every consumer that acts on it
+/// rather than falling into someone's catch-all arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKeyStatus {
+    /// A sealed blob opened under the current session key.
+    Matches,
+    /// A sealed blob would not open under the current session key.
+    Rotated,
+    /// The sidecar has no sealed protected fields to test.
+    NoProtectedData,
+}
+
 impl Engine {
     /// Open (or create) a `SQLCipher`-encrypted `SQLite` database at `path`.
     ///
@@ -873,6 +922,61 @@ impl Engine {
             mutation_seq: read("persistence.mutation_seq")?,
             persisted_seq: read("persistence.persisted_seq")?,
         })
+    }
+
+    /// Probe whether this sidecar's sealed protected fields still open
+    /// under the session key the field protector hands out right now.
+    ///
+    /// Samples a small fixed number of rows from `entry_protected` and
+    /// attempts an AES-GCM open on each. All must
+    /// open for the answer to be [`SessionKeyStatus::Matches`]; a single
+    /// open failure is [`SessionKeyStatus::Rotated`], which also catches
+    /// the *mixed* sidecar a key rotated mid-session leaves behind (some
+    /// blobs under the old key, some under the new). An empty
+    /// `entry_protected` is [`SessionKeyStatus::NoProtectedData`] — no
+    /// witness, nothing to be stale.
+    ///
+    /// Costs exactly one `acquire_session_key` call, and only when there
+    /// is a witness to test, so a sidecar with no protected fields never
+    /// wakes the platform keystore.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Sqlite`] on query failure.
+    /// - [`EngineError::SessionKey`] if the protector cannot produce a
+    ///   key. This is the transient case and is deliberately an error
+    ///   rather than a status — and a deliberately *non*-recoverable one
+    ///   ([`EngineError::is_recoverable_sidecar_failure`] excludes it):
+    ///   a caller must not be able to reach a destructive remedy without
+    ///   first proving the key was available and the blob still failed.
+    pub fn session_key_status(&self) -> Result<SessionKeyStatus, EngineError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT wrapped_blob FROM entry_protected LIMIT ?1")?;
+        let witnesses: Vec<Vec<u8>> = stmt
+            .query_map(rusqlite::params![SESSION_KEY_PROBE_SAMPLE], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?
+            .collect::<Result<_, _>>()?;
+
+        if witnesses.is_empty() {
+            return Ok(SessionKeyStatus::NoProtectedData);
+        }
+
+        // Acquire once, use inside this scope, let the `SessionKey` drop
+        // (and zero) on the way out — the same discipline every other
+        // protected-field site follows.
+        let session_key = self
+            .field_protector
+            .acquire_session_key()
+            .map_err(|e| EngineError::SessionKey(e.to_string()))?;
+
+        for wrapped in &witnesses {
+            if keepass_core::protector::open_with_key(&session_key, wrapped).is_err() {
+                return Ok(SessionKeyStatus::Rotated);
+            }
+        }
+        Ok(SessionKeyStatus::Matches)
     }
 
     /// Reconcile the engine's `SQLite` state against the current

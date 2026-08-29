@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use keys_ffi::{
     ChangeEvent, Engine, EngineError, FileWatcherEvent, IconRef, NewEntryFields, NewGroupFields,
-    Page, Predicate, VaultDataChangeObserver, VaultDbKeyProvider, VaultDbKeyProviderError,
-    VaultFieldProtector, VaultFileWatcher, VaultFileWatcherObserver, VaultProtectorError,
+    Page, Predicate, SidecarRebuildReason, VaultDataChangeObserver, VaultDbKeyProvider,
+    VaultDbKeyProviderError, VaultFieldProtector, VaultFileWatcher, VaultFileWatcherObserver,
+    VaultProtectorError,
 };
 
 const DB_KEY: [u8; 32] = [0x42; 32];
@@ -82,6 +83,18 @@ struct FixedProtector;
 impl VaultFieldProtector for FixedProtector {
     fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
         Ok(SESSION_KEY.to_vec())
+    }
+}
+
+/// A protector that hands back a *different*, perfectly valid session
+/// key — the headless stand-in for a keystore that re-provisioned the
+/// key wrapping a populated sidecar. Distinct from [`FailingProtector`],
+/// which cannot produce a key at all: telling those two apart is the
+/// whole point of the open-time probe.
+struct RotatedProtector;
+impl VaultFieldProtector for RotatedProtector {
+    fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
+        Ok([0x11u8; 32].to_vec())
     }
 }
 
@@ -1138,7 +1151,11 @@ async fn open_vault_self_healing_rebuilds_a_stale_keyed_sidecar() {
     )
     .await
     .expect("self-healing open must succeed under a stale key");
-    assert!(healed.rebuilt, "a stale db key must trigger a rebuild");
+    assert_eq!(
+        healed.rebuilt,
+        Some(SidecarRebuildReason::StaleDbKey),
+        "a stale db key must trigger a rebuild, named as such"
+    );
     let entries = healed
         .engine
         .list_entries(
@@ -1168,9 +1185,180 @@ async fn open_vault_self_healing_rebuilds_a_stale_keyed_sidecar() {
     )
     .await
     .expect("second open ok");
-    assert!(
-        !second.rebuilt,
+    assert_eq!(
+        second.rebuilt, None,
         "a freshly-rebuilt sidecar must not re-heal"
+    );
+}
+
+/// A session key rotated out from under a populated sidecar is caught at
+/// OPEN, not five operations later on a reveal or a save. The sidecar's
+/// `SQLCipher` mirror key is fine, so the open itself succeeds and the
+/// recorded kdbx-state signature still matches — which is exactly why a
+/// caller's skip-ingest fast path would otherwise engage on a sidecar
+/// whose every protected field has become unreadable.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_vault_self_healing_rebuilds_a_rotated_session_key_sidecar() {
+    use keys_ffi::open_vault_self_healing;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    seed_kdbx(&kdbx_path);
+
+    // Seal the sidecar's protected fields under SESSION_KEY, then release.
+    let engine = open_fresh_engine(&db_path);
+    engine
+        .ingest_from_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("seed ingest");
+    engine.close().expect("close");
+
+    // Same db key (the mirror opens cleanly), DIFFERENT session key.
+    let healed = open_vault_self_healing(
+        db_path.to_string_lossy().into_owned(),
+        kdbx_path.to_string_lossy().into_owned(),
+        KDBX_PASSWORD.to_owned(),
+        None,
+        Arc::new(FixedDbKey),
+        Arc::new(RotatedProtector),
+        None,
+    )
+    .await
+    .expect("self-healing open must succeed under a rotated session key");
+    assert_eq!(
+        healed.rebuilt,
+        Some(SidecarRebuildReason::RotatedSessionKey),
+        "a rotated session key must heal, and be named as the reason"
+    );
+
+    // The rebuild re-sealed from the KDBX, so protected reads work again
+    // under the NEW key — the assertion the old "not observable at open"
+    // posture could not make.
+    let entries = healed
+        .engine
+        .list_entries(
+            None,
+            Page {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .expect("list");
+    let entry = entries.first().expect("re-ingested entry");
+    let revealed = healed
+        .engine
+        .reveal_password(entry.uuid.clone())
+        .expect("protected read must work after the heal");
+    assert_eq!(revealed, "Tr0ub4dor&3");
+    healed.engine.close().expect("close healed");
+
+    // Idempotent: the sidecar is now sealed under the rotated key, so a
+    // second open under that same key does NOT heal again.
+    let second = open_vault_self_healing(
+        db_path.to_string_lossy().into_owned(),
+        kdbx_path.to_string_lossy().into_owned(),
+        KDBX_PASSWORD.to_owned(),
+        None,
+        Arc::new(FixedDbKey),
+        Arc::new(RotatedProtector),
+        None,
+    )
+    .await
+    .expect("second open ok");
+    assert_eq!(
+        second.rebuilt, None,
+        "a freshly re-sealed sidecar must not re-heal"
+    );
+}
+
+/// The fail-open guard, stated as a test: a protector that cannot produce
+/// a key AT ALL is a transient condition, not evidence of rotation, and
+/// must never cost the caller its sidecar. The open fails closed and the
+/// sidecar survives byte-for-byte — proven by reopening it under the
+/// original key and finding the seeded row still there.
+///
+/// This is the one that matters. "The keystore was momentarily
+/// unavailable" and "the key changed" are indistinguishable to any
+/// consumer handed a bare failure, and answering the first with the
+/// remedy for the second destroys data no fault required.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_vault_self_healing_preserves_the_sidecar_when_the_protector_is_unavailable() {
+    use keys_ffi::open_vault_self_healing;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    seed_kdbx(&kdbx_path);
+
+    let engine = open_fresh_engine(&db_path);
+    engine
+        .ingest_from_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("seed ingest");
+    engine.close().expect("close");
+    let before = std::fs::metadata(&db_path).expect("sidecar exists").len();
+
+    let err = open_vault_self_healing(
+        db_path.to_string_lossy().into_owned(),
+        kdbx_path.to_string_lossy().into_owned(),
+        KDBX_PASSWORD.to_owned(),
+        None,
+        Arc::new(FixedDbKey),
+        Arc::new(FailingProtector),
+        None,
+    )
+    .await
+    .expect_err("an unavailable protector must fail the open, not heal it");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("session key") || msg.contains("SessionKey"),
+        "the error must name the unavailable session key, got: {msg}"
+    );
+
+    assert_eq!(
+        std::fs::metadata(&db_path)
+            .expect("sidecar still exists")
+            .len(),
+        before,
+        "the sidecar must not have been discarded"
+    );
+
+    // And it is still fully usable under the original key.
+    let reopened = open_vault_self_healing(
+        db_path.to_string_lossy().into_owned(),
+        kdbx_path.to_string_lossy().into_owned(),
+        KDBX_PASSWORD.to_owned(),
+        None,
+        Arc::new(FixedDbKey),
+        Arc::new(FixedProtector),
+        None,
+    )
+    .await
+    .expect("reopen under the original key");
+    assert_eq!(
+        reopened.rebuilt, None,
+        "a sidecar the transient never touched must not need healing"
+    );
+    let entries = reopened
+        .engine
+        .list_entries(
+            None,
+            Page {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .expect("list");
+    assert!(
+        !entries.is_empty(),
+        "the surviving sidecar must still hold the seeded entry"
     );
 }
 

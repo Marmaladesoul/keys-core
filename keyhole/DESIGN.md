@@ -956,6 +956,42 @@ GUI) instead of one — short-term effort bought for compounding payoff.
 
 ## Findings (surfaced by keyhole)
 
+- **[FIXED — `keys-ffi::open_vault_self_healing` now probes the session
+  key at open] A field-protection session key rotated out from under a
+  *closed* vault was invisible to every consumer, and the one signal a
+  consumer did get could not distinguish "the key changed" from "the
+  keystore didn't answer".** The sidecar's `SQLCipher` mirror key and its
+  field-protection session key are independent. Rotate only the latter
+  and the sidecar still opens, still carries a matching kdbx-state
+  signature, and still answers `list` — so a consumer's skip-ingest fast
+  path engages on a mirror whose every sealed blob has become
+  unreadable. The seam's own doc comment recorded this as a known limit
+  ("not observable at open"), pushing the detection to whatever surfaced
+  first — a reveal, a merge, or a save that `?`-propagates and aborts the
+  whole projection — and pushing the *remedy* onto the consumer, which
+  had only an undifferentiated failure to reason from. That is the
+  fail-open shape: the cheapest remedy a consumer can reach for is to
+  throw away key material, and it would reach for it on evidence that
+  does not distinguish a rotation from a momentarily-unreachable
+  keystore. Fixed at the seam instead: `Engine::session_key_status`
+  opens a sample of the sidecar's own sealed blobs under the live key and
+  returns `Matches` / `Rotated` / `NoProtectedData`, with a protector
+  that cannot produce a key at all surfacing as an `Err` rather than a
+  status — deliberately *not* one of `is_recoverable_sidecar_failure`'s
+  arms, so the transient can never route into a rebuild.
+  `open_vault_self_healing` heals on `Rotated` only, and now reports
+  *which* key went stale (`SidecarRebuildReason`). A vault therefore
+  repairs itself at its next open with no recovery verb driven from
+  above, which is what makes the consumer-side "remember to remediate
+  every registered vault" bookkeeping unnecessary rather than merely
+  correct. Pinned by `scenarios/se-session-key-recovery.sh` (rotation
+  caught at open on a closed vault; unsealed columns and tags survive the
+  repair; a conflict row sealed under the lost key is cleared rather than
+  left an inert badge; and an unavailable protector fails the open closed
+  with the mirror byte-identical afterwards) plus the `keys-ffi`
+  integration tests `open_vault_self_healing_rebuilds_a_rotated_session_key_sidecar`
+  and `open_vault_self_healing_preserves_the_sidecar_when_the_protector_is_unavailable`.
+
 - **[FIXED — keys-engine `reconcile_peer_meta` write-if-changed] A
   content-identical peer ingest rewrote every scalar Meta `setting`
   row, so under the migration-0012 persistence watermark a no-op merge

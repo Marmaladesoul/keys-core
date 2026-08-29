@@ -24,7 +24,7 @@ mod vault_create;
 
 pub use db_key_provider::{VaultDbKeyProvider, VaultDbKeyProviderError};
 pub use engine::{
-    Engine, SelfHealingOpen, open_vault_self_healing, purge_vault_local_data,
+    Engine, SelfHealingOpen, SidecarRebuildReason, open_vault_self_healing, purge_vault_local_data,
     rebuild_vault_local_data,
 };
 pub use engine_error::EngineError;
