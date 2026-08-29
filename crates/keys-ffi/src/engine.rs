@@ -1440,7 +1440,16 @@ impl Engine {
     /// the body is currently sync — the validation pass + apply walk
     /// run in-thread. If a future refactor pushes the apply onto a
     /// blocking pool, this signature is already ready.
+    ///
+    /// Both allows are the same statement: the `async` here is part of
+    /// the *exported* signature, not an implementation detail, so the
+    /// lints' suggested `-> impl Future` rewrite is not available — it
+    /// would change what consumers see across the FFI boundary. The
+    /// `_trait_impl` variant is the newer toolchain's spelling of the
+    /// same lint for `#[uniffi::export]`-generated impls; keep both
+    /// while the supported toolchain range spans the rename.
     #[allow(clippy::unused_async)]
+    #[allow(unknown_lints, clippy::unused_async_trait_impl)]
     pub async fn apply_conflict_resolution(
         &self,
         id: i64,
@@ -1734,20 +1743,38 @@ pub fn purge_vault_local_data(
     Ok(eng::Engine::purge_local_data(&PathBuf::from(db_path), &kp)?)
 }
 
+/// Why [`open_vault_self_healing`] had to discard the sidecar and rebuild
+/// it from the KDBX.
+///
+/// Both arms mean the same thing to the data — the sidecar is a
+/// disposable derived cache and the KDBX is authoritative — but they name
+/// *which* key went stale, which is what a client needs to say something
+/// truthful to its user.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarRebuildReason {
+    /// The sidecar's cached `SQLCipher` mirror key no longer decrypts it,
+    /// so the open itself failed. Observable at open by construction.
+    StaleDbKey,
+    /// The sidecar opened, but its sealed protected fields no longer open
+    /// under the session key the field protector produced — the key was
+    /// rotated out from under a populated sidecar.
+    RotatedSessionKey,
+}
+
 /// The outcome of [`open_vault_self_healing`]: the opened engine, plus
-/// whether the open had to self-heal a stale sidecar.
+/// why the open had to self-heal a stale sidecar, if it did.
 #[derive(uniffi::Record, Debug)]
 pub struct SelfHealingOpen {
     /// The opened, ready-to-use engine.
     pub engine: Arc<Engine>,
-    /// `true` iff the sidecar could not be opened under its cached key and
-    /// was discarded + rebuilt from the KDBX before this open succeeded.
+    /// `Some(reason)` iff the sidecar was discarded + rebuilt from the
+    /// KDBX before this open returned; `None` on an ordinary open.
     ///
     /// A client SHOULD log this loudly. A one-off is the expected recovery
     /// from a keystore reset; a *recurring* rebuild is a red flag that the
     /// key material is being lost repeatedly — a deeper problem the
     /// self-heal would otherwise paper over.
-    pub rebuilt: bool,
+    pub rebuilt: Option<SidecarRebuildReason>,
 }
 
 /// Open the vault's `SQLCipher` sidecar at `db_path`, self-healing a stale
@@ -1797,34 +1824,63 @@ pub async fn open_vault_self_healing(
         let bridged_protector = || -> Arc<dyn keepass_core::protector::FieldProtector> {
             Arc::new(BridgeProtector::new(Arc::clone(&field_protector)))
         };
+        // The rebuild half, shared by both stale-key arms: re-gate on the
+        // password by unlocking the KDBX first, so a wrong password /
+        // corrupt KDBX fails closed HERE and is surfaced as the genuine
+        // error, never masked as a heal.
+        let heal = |reason: SidecarRebuildReason| -> Result<SelfHealingOpen, EngineError> {
+            let unlocked = open_unlocked_kf(&kdbx, &pw, keyfile.as_deref())?;
+            let (mut inner, _discarded) = eng::Engine::rebuild_local_data(
+                &db,
+                &kp,
+                bridged_protector(),
+                engine_file_watcher::bridge(file_watcher.clone()),
+                &unlocked,
+            )?;
+            inner.record_kdbx_state_signature(&kdbx)?;
+            Ok(SelfHealingOpen {
+                engine: wrap_engine(inner),
+                rebuilt: Some(reason),
+            })
+        };
+
         match eng::Engine::open(
             &db,
             &kp,
             bridged_protector(),
             engine_file_watcher::bridge(file_watcher.clone()),
         ) {
-            Ok(inner) => Ok(SelfHealingOpen {
-                engine: wrap_engine(inner),
-                rebuilt: false,
-            }),
-            Err(e) if e.is_recoverable_sidecar_failure() => {
-                // Re-gate on the password by unlocking the KDBX first: a
-                // wrong password / corrupt KDBX fails closed HERE and is
-                // surfaced as the genuine error, never masked as a heal.
-                let unlocked = open_unlocked_kf(&kdbx, &pw, keyfile.as_deref())?;
-                let (mut inner, _discarded) = eng::Engine::rebuild_local_data(
-                    &db,
-                    &kp,
-                    bridged_protector(),
-                    engine_file_watcher::bridge(file_watcher.clone()),
-                    &unlocked,
-                )?;
-                inner.record_kdbx_state_signature(&kdbx)?;
-                Ok(SelfHealingOpen {
-                    engine: wrap_engine(inner),
-                    rebuilt: true,
-                })
+            Ok(inner) => {
+                // The sidecar opened, which only proves the `SQLCipher`
+                // mirror key is good. Probe the *session* key too, before
+                // handing the engine back: a rotated session key leaves
+                // every sealed protected field unreadable while the mirror
+                // still opens and still carries a matching kdbx-state
+                // signature, so a caller's skip-ingest fast path would
+                // happily engage on a sidecar it can no longer read. That
+                // is the seam where the failure has to be caught — the
+                // caller cannot see it, and by the time a reveal or a save
+                // surfaces it the caller has already told its user the
+                // vault is open.
+                //
+                // Only `Rotated` heals. A protector that could not produce
+                // a key at all is an `Err` here and is surfaced unchanged:
+                // "the keystore was momentarily unavailable" must never be
+                // answered by discarding the sidecar.
+                match inner.session_key_status()? {
+                    eng::SessionKeyStatus::Rotated => {
+                        drop(inner);
+                        heal(SidecarRebuildReason::RotatedSessionKey)
+                    }
+                    eng::SessionKeyStatus::Matches | eng::SessionKeyStatus::NoProtectedData => {
+                        Ok(SelfHealingOpen {
+                            engine: wrap_engine(inner),
+                            rebuilt: None,
+                        })
+                    }
+                }
             }
+            Err(e) if e.is_recoverable_sidecar_failure() => heal(SidecarRebuildReason::StaleDbKey),
             Err(e) => Err(e.into()),
         }
     })
