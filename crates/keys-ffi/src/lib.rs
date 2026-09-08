@@ -155,12 +155,25 @@ pub fn url_domain_candidates(service_identifier: &str) -> Vec<String> {
     keys_engine::url_matcher::domain_candidates(service_identifier)
 }
 
+/// The one domain a credential for `service_identifier` should be
+/// registered under — the registrable domain (eTLD+1), an IP literal or
+/// single-label host verbatim, or `None` when there is no host or the
+/// host is itself a multi-label public suffix (`github.io`). Always
+/// equal to the last of [`url_domain_candidates`] when both are
+/// non-empty, so a lookup that walks the candidates reaches whatever a
+/// client registered here.
+#[uniffi::export]
+#[must_use]
+pub fn url_credential_domain(service_identifier: &str) -> Option<String> {
+    keys_engine::url_matcher::credential_domain(service_identifier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         StrengthBucket, SyllableOptions, eff_random_word, eff_word_at, eff_word_count,
         password_strength, ping, syllable_estimate_entropy, syllable_generate,
-        url_domain_candidates,
+        url_credential_domain, url_domain_candidates,
     };
 
     #[test]
@@ -239,5 +252,14 @@ mod tests {
     #[test]
     fn url_domain_candidates_empty() {
         assert!(url_domain_candidates("").is_empty());
+    }
+
+    #[test]
+    fn url_credential_domain_smoke() {
+        assert_eq!(
+            url_credential_domain("https://dash.cloudflare.com/login").as_deref(),
+            Some("cloudflare.com")
+        );
+        assert_eq!(url_credential_domain("github.io"), None);
     }
 }
