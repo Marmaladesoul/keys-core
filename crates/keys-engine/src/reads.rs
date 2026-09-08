@@ -115,7 +115,7 @@ pub(crate) fn entry(conn: &Connection, uuid: Uuid) -> Result<Option<EntryFull>, 
         "SELECT uuid, group_uuid, title, username, url, url_host, notes, \
                 created_at, modified_at, accessed_at, last_used_at, expires_at, \
                 is_recycled, password_strength_bucket, password_entropy, \
-                icon_index, icon_custom_uuid \
+                icon_index, icon_custom_uuid, has_totp \
          FROM entry WHERE uuid = ?1",
     )?;
 
@@ -139,6 +139,7 @@ pub(crate) fn entry(conn: &Connection, uuid: Uuid) -> Result<Option<EntryFull>, 
                 password_entropy: r.get(14)?,
                 icon_index: r.get(15)?,
                 icon_custom_uuid: parse_optional_uuid_col(r, 16)?,
+                has_totp: r.get::<_, i64>(17)? != 0,
             })
         })
         .optional()?;
@@ -170,6 +171,7 @@ pub(crate) fn entry(conn: &Connection, uuid: Uuid) -> Result<Option<EntryFull>, 
             .and_then(strength_bucket_from_i64),
         password_entropy: row.password_entropy,
         icon: icon_ref_from(row.icon_index, row.icon_custom_uuid),
+        has_totp: row.has_totp,
         custom_fields,
         tags,
         attachments,
@@ -1109,6 +1111,7 @@ struct EntryFullRow {
     password_entropy: Option<f64>,
     icon_index: Option<i64>,
     icon_custom_uuid: Option<Uuid>,
+    has_totp: bool,
 }
 
 pub(crate) fn row_to_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySummary> {

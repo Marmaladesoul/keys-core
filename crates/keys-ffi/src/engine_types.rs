@@ -425,6 +425,11 @@ pub struct EntryFull {
     pub password_strength_bucket: Option<StrengthBucket>,
     pub password_entropy: Option<f64>,
     pub icon: IconRef,
+    /// `true` when the entry carries a TOTP secret — the same
+    /// engine-computed bit as [`EngineEntrySummary::has_totp`], so a
+    /// client holding only the full row need not re-derive the rule
+    /// from `url` + `custom_fields`.
+    pub has_totp: bool,
     pub custom_fields: Vec<CustomFieldRef>,
     pub tags: Vec<String>,
     pub attachments: Vec<AttachmentRef>,
@@ -471,6 +476,7 @@ impl From<eng::EntryFull> for EntryFull {
             password_strength_bucket: e.password_strength_bucket.map(Into::into),
             password_entropy: e.password_entropy,
             icon: e.icon.into(),
+            has_totp: e.has_totp,
             custom_fields: e.custom_fields.into_iter().map(Into::into).collect(),
             tags: e.tags,
             attachments: e.attachments.into_iter().map(Into::into).collect(),
@@ -511,8 +517,8 @@ impl From<eng::GroupNode> for GroupNode {
 ///
 /// Mirrors `EntryFull`'s structural shape minus things that don't
 /// exist in a snapshot (`uuid`, `group_uuid`, `is_recycled`,
-/// `history_count`) and minus protected-field plaintext (still
-/// fetched via `reveal_history_field`).
+/// `has_totp`, `history_count`) and minus protected-field plaintext
+/// (still fetched via `reveal_history_field`).
 #[derive(uniffi::Record, Debug, Clone)]
 pub struct HistoricEntry {
     pub history_index: u32,

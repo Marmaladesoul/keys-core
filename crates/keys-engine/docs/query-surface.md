@@ -75,6 +75,7 @@ Lightweight row for list / sidebar / AutoFill UIs:
 | `password_entropy` | `Option<f64>` bits | `entry.password_entropy` |
 | `attachment_count` | `u32` | `COUNT(entry_attachment)` |
 | `icon` | `IconRef` | `entry.icon_index` or `entry.icon_custom_uuid` |
+| `has_totp` | `bool` | `entry.has_totp` (precomputed at mutation time; see `totp.rs`) |
 
 ### `EntryFull`
 
@@ -88,6 +89,10 @@ Superset of `EntrySummary` plus:
 | `tags` | `Vec<String>` | joined through `entry_tag` |
 | `attachments` | `Vec<AttachmentRef>` | name + size; bytes via `attachment_bytes` |
 | `history_count` | `u32` | for paging the history view |
+| `custom_data` | `Vec<CustomDataItemRef>` | per-entry `<CustomData>` items, sorted by `key` |
+
+`has_totp` is carried on both rows from the same stored bit, so a
+client holding only an `EntryFull` need not re-derive the rule.
 
 Note: `EntryFull` does **not** repeat `attachment_count` from
 `EntrySummary`; callers either use `attachments.len()` or
@@ -117,8 +122,8 @@ through `ChangeEvent::GroupsMoved` via `move_group`.
 ### `HistoricEntry`
 
 Mirrors `EntryFull`'s structural shape minus things that don't exist
-in a snapshot (`uuid`, `group_uuid`, `is_recycled`, `history_count`)
-and minus protected-field plaintext. Protected values still come back
+in a snapshot (`uuid`, `group_uuid`, `is_recycled`, `has_totp`,
+`history_count`) and minus protected-field plaintext. Protected values still come back
 via `reveal_history_field(uuid, history_index, field_name)`.
 
 | field | type | notes |
