@@ -9,6 +9,9 @@
 //!   * `remove_custom_field` removing it
 //!   * `update_entry` flipping the bit via URL change
 //!   * All five `EntrySummary`-returning paths carry the flag
+//!   * The full-row read (`Engine::entry`) carries the same flag and
+//!     tracks it across mutations, so a client holding an `EntryFull`
+//!     never has to re-derive it from `url` + `custom_fields`
 //!   * Migration backfill against a pre-migration DB
 
 use std::sync::Arc;
@@ -326,6 +329,68 @@ fn all_summary_paths_carry_has_totp() {
         .expect("smart_folder_entries");
     assert!(find(&sf, a_uuid).has_totp);
     assert!(!find(&sf, b_uuid).has_totp);
+}
+
+// ── EntryFull carries the same flag ────────────────────────────────────
+
+fn full_has_totp(engine: &Engine, uuid: Uuid) -> bool {
+    engine
+        .entry(uuid)
+        .expect("entry")
+        .expect("entry exists")
+        .has_totp
+}
+
+#[test]
+fn entry_full_carries_has_totp_and_agrees_with_summary() {
+    let (mut engine, root, _dir) = engine_with_empty_vault();
+
+    // Created with a TOTP field → both reads say true.
+    let mut fields = new_entry("with-totp");
+    fields.custom_fields = vec![NewCustomField {
+        name: "TOTP Seed".into(),
+        value: SecretString::from("JBSWY3DPEHPK3PXP"),
+        protected: true,
+    }];
+    let with = engine.create_entry(root, fields).expect("create");
+    assert!(full_has_totp(&engine, with));
+    assert_eq!(
+        full_has_totp(&engine, with),
+        summary_has_totp(&engine, with)
+    );
+
+    // Created plain → both reads say false.
+    let plain = engine
+        .create_entry(root, new_entry("plain"))
+        .expect("create");
+    assert!(!full_has_totp(&engine, plain));
+    assert_eq!(
+        full_has_totp(&engine, plain),
+        summary_has_totp(&engine, plain)
+    );
+
+    // Flip on via an otpauth:// URL, then off by clearing it — the full
+    // row tracks the stored bit, not a stale copy.
+    let update = |url: &str| EntryUpdate {
+        url: Some(url.into()),
+        ..EntryUpdate::default()
+    };
+    engine
+        .update_entry(plain, update("otpauth://totp/x?secret=JBSW"))
+        .expect("update on");
+    assert!(full_has_totp(&engine, plain));
+    engine.update_entry(plain, update("")).expect("update off");
+    assert!(!full_has_totp(&engine, plain));
+
+    // Flip off via removing the field on the TOTP-bearing entry.
+    engine
+        .remove_custom_field(with, "TOTP Seed")
+        .expect("remove");
+    assert!(!full_has_totp(&engine, with));
+    assert_eq!(
+        full_has_totp(&engine, with),
+        summary_has_totp(&engine, with)
+    );
 }
 
 fn find(rows: &[keys_engine::EntrySummary], uuid: Uuid) -> &keys_engine::EntrySummary {

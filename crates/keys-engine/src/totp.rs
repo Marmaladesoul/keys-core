@@ -20,13 +20,12 @@
 //! Two surfaces live in this module:
 //!
 //! 1. **Presence detection** (`is_totp_field`, `url_is_otpauth`) for the
-//!    precomputed `entry.has_totp` column. The client mirrors these
-//!    checks on the Swift side. The set
-//!    of recognised field names and the URL-prefix rule must stay in
-//!    lock-step on both sides — drift means the engine's precomputed
-//!    flag disagrees with what the rest of the app considers a TOTP
-//!    entry. Migration 0005 also bakes the same list into its backfill;
-//!    see `crates/keys-engine/src/migrations/0005_entry_has_totp.sql`.
+//!    precomputed `entry.has_totp` column, surfaced on both
+//!    [`crate::EntrySummary::has_totp`] and [`crate::EntryFull::has_totp`]
+//!    so clients read the flag rather than mirroring the rule. Migration
+//!    0005 bakes the same list into its backfill and must stay in
+//!    lock-step with it; see
+//!    `crates/keys-engine/src/migrations/0005_entry_has_totp.sql`.
 //!
 //! 2. **Code generation** (`generate_code`, `parse_uri`, `base32_decode`,
 //!    …) implementing RFC 6238 on top of RFC 4226, validated against
@@ -41,7 +40,7 @@ use sha2::{Sha256, Sha512};
 // ────────────────────────────────────────────────────────────────────────
 
 /// Case-sensitive set of custom-field names that indicate a TOTP
-/// secret. Matches the Swift `Set<String>` exactly.
+/// secret. Duplicated verbatim in migration 0005's backfill.
 const TOTP_FIELD_NAMES: &[&str] = &["otp", "TOTP", "OTPAuth", "TOTP Seed"];
 
 /// `true` when the named custom field (protected or not) holds a TOTP

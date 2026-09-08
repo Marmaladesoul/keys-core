@@ -272,6 +272,11 @@ pub struct EntryFull {
     pub password_entropy: Option<f64>,
     /// Icon reference.
     pub icon: IconRef,
+    /// `true` when the entry carries a TOTP secret. Same engine-computed
+    /// bit as [`EntrySummary::has_totp`] — read straight from
+    /// `entry.has_totp`, so a client holding only the full row need not
+    /// re-derive the rule from `url` + `custom_fields`.
+    pub has_totp: bool,
     /// Custom-field metadata (values fetched via reveal API).
     pub custom_fields: Vec<CustomFieldRef>,
     /// Tags applied to the entry.
