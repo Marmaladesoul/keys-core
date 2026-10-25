@@ -18,7 +18,13 @@ use std::sync::Arc;
 use anyhow::Context;
 use futures_util::{FutureExt, StreamExt};
 use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, Watcher, endpoint::presets, protocol::Router};
-use iroh_blobs::{ALPN as BLOBS_ALPN, BlobsProtocol, store::fs::FsStore};
+use iroh_blobs::{
+    ALPN as BLOBS_ALPN, BlobsProtocol,
+    provider::events::{
+        ConnectMode, EventMask, EventSender, ObserveMode, RequestMode, ThrottleMode,
+    },
+    store::fs::FsStore,
+};
 use iroh_docs::{
     ALPN as DOCS_ALPN, DocTicket, NamespaceId, api::Doc, engine::LiveEvent, protocol::Docs,
 };
@@ -30,6 +36,44 @@ use crate::error::{Result, SyncError};
 use crate::events::DocEvent;
 use crate::identity::Identity;
 use crate::policy::DownloadPolicy;
+
+/// What the mounted blobs protocol will serve to a connecting peer:
+/// reads (`get`, `get_many`, `observe`) only. Inbound `push` is
+/// refused outright.
+///
+/// A push writes into our store on the peer's initiative, and any peer
+/// that can dial us could send one — no doc membership required — to
+/// fill the disk or plant content. The node has no use for it: blobs
+/// arrive by our own fetch of content named in a doc we joined, under
+/// that doc's [`DownloadPolicy`] (what a doc *writer* may name is a
+/// separate trust boundary, governed there). Reads stay open to any
+/// dialler, as before: they are content-addressed, so a peer must
+/// already know a hash, and vault payloads are ciphertext.
+///
+/// Upstream's default mask also disables push, but we pin our own so
+/// the posture is ours rather than inherited. A pinned mask is not the
+/// whole guard: `iroh-blobs` 0.101.0 (since yanked) checked every
+/// request kind against the `get` mode, so push was accepted whatever
+/// the mask said. The `blobs_protocol_serves_fetch_but_refuses_push`
+/// integration test is what catches that class on a dependency bump.
+///
+/// Written as a full struct literal (no `..` spread) on purpose: a
+/// request kind added upstream then fails to compile here until
+/// someone decides whether we serve it.
+///
+/// Every mode is `None` or `Disabled`, never an `Intercept*` variant.
+/// The tracing sink this mask rides on (see [`IrohNode::bind`]) answers
+/// every intercept with "allow", so switching a mode to intercept would
+/// silently approve everything; that change needs a real decision
+/// handler in place of the sink.
+const BLOBS_PROVIDER_MASK: EventMask = EventMask {
+    connected: ConnectMode::None,
+    get: RequestMode::None,
+    get_many: RequestMode::None,
+    push: RequestMode::Disabled,
+    observe: ObserveMode::None,
+    throttle: ThrottleMode::None,
+};
 
 /// The default deadline [`IrohNode::fetch_blob`] waits for content to
 /// arrive before giving up; [`IrohNode::fetch_blob_with_deadline`] lets
@@ -201,7 +245,17 @@ impl IrohNode {
             .map_err(SyncError::from)?;
 
         let router = Router::builder(endpoint.clone())
-            .accept(BLOBS_ALPN, BlobsProtocol::new(&blobs_store, None))
+            .accept(
+                BLOBS_ALPN,
+                BlobsProtocol::new(
+                    &blobs_store,
+                    // A custom mask can only ride on a sender with a sink
+                    // behind it. Every notification is off, so upstream's
+                    // tracing sink sees nothing but connection-closed
+                    // notices.
+                    Some(EventSender::DEFAULT.tracing(BLOBS_PROVIDER_MASK)),
+                ),
+            )
             .accept(GOSSIP_ALPN, gossip)
             .accept(DOCS_ALPN, docs.clone())
             .spawn();

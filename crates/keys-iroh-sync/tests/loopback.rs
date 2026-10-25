@@ -19,6 +19,20 @@
 //!   no persistent state survives. The library being persistent is
 //!   exercised by the bind path itself loading an empty store cleanly.
 
+use iroh::{
+    Endpoint,
+    endpoint::{Connection, presets},
+    protocol::Router,
+};
+use iroh_blobs::{
+    BlobsProtocol, Hash,
+    api::blobs::BlobStatus,
+    get::request::get_blob,
+    protocol::{ChunkRangesSeq, PushRequest},
+    provider::events::{EventMask, EventSender, RequestMode},
+    store::mem::MemStore,
+};
+use iroh_docs::DocTicket;
 use keys_iroh_sync::{DownloadPolicy, Identity, IrohNode, NodeConfig};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -332,4 +346,170 @@ async fn fetch_blob_fails_when_event_stream_ends_on_shutdown() {
         err.to_string().contains("event stream ended"),
         "expected the stream-ended error, got: {err}"
     );
+}
+
+/// How long the push-accepting control node gets to receive the pushed
+/// blob. Generous for a few bytes between endpoints on one machine; if
+/// it is ever exceeded the test fails loudly rather than mistaking a
+/// slow push for a refused one.
+const PUSH_LANDING_WINDOW: Duration = Duration::from_secs(10);
+
+/// How often to re-read the control node's store while waiting.
+const PUSH_LANDING_POLL: Duration = Duration::from_millis(50);
+
+/// Push `hash` from `store` over `conn`. The pusher never learns whether
+/// the receiver accepted, so the result says nothing and is dropped; the
+/// receiving store is the only witness.
+async fn push_blob(store: &MemStore, conn: &Connection, hash: Hash) {
+    let _ = store
+        .remote()
+        .execute_push(conn.clone(), PushRequest::new(hash, ChunkRangesSeq::root()))
+        .await;
+}
+
+/// A bare iroh-blobs node that *accepts* inbound pushes — the control
+/// that proves a push actually works, so its absence on our node means
+/// refusal.
+async fn spawn_push_accepting_control() -> (Router, MemStore) {
+    let store = MemStore::new();
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .expect("bind control");
+    endpoint.online().await;
+    let accepts_push = EventMask {
+        push: RequestMode::None,
+        ..EventMask::DEFAULT
+    };
+    let router = Router::builder(endpoint)
+        .accept(
+            iroh_blobs::ALPN,
+            BlobsProtocol::new(&store, Some(EventSender::DEFAULT.tracing(accepts_push))),
+        )
+        .spawn();
+    (router, store)
+}
+
+/// Wait until `store` holds `hash` in full, failing after
+/// [`PUSH_LANDING_WINDOW`].
+async fn wait_for_landed(store: &MemStore, hash: Hash) {
+    let deadline = tokio::time::Instant::now() + PUSH_LANDING_WINDOW;
+    loop {
+        let status = store.blobs().status(hash).await.expect("blob status");
+        if matches!(status, BlobStatus::Complete { .. }) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "push never landed on the push-accepting control within \
+             {PUSH_LANDING_WINDOW:?} (status={status:?}) — the test can't \
+             tell a refused push from one that never arrived"
+        );
+        tokio::time::sleep(PUSH_LANDING_POLL).await;
+    }
+}
+
+/// The node's blobs protocol serves reads to a dialling peer but refuses
+/// that peer's unsolicited push: the pushed blob never reaches the
+/// node's store. The peer is a bare endpoint speaking only the blobs
+/// ALPN — no doc membership — which is exactly the position of anyone
+/// who has learned the node's address.
+///
+/// The pushing side gets no verdict back, so the test carries two
+/// controls that keep it from passing vacuously:
+///
+/// - a fetch over the same connection proves the peer reached the
+///   node's blobs handler at all;
+/// - the same push, sent to a bare iroh-blobs node that *accepts*
+///   pushes, must land there — so the push itself demonstrably works,
+///   and by the time it has landed on the control, the node's earlier
+///   copy has had at least as long.
+///
+/// Doc-driven fetches between two nodes (both running the same mask) are
+/// covered by `publisher_subscriber_loopback`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blobs_protocol_serves_fetch_but_refuses_push() {
+    if is_network_test_skipped() {
+        eprintln!("skipping: KEYS_IROH_SYNC_SKIP_NETWORK_TESTS set");
+        return;
+    }
+
+    init_tracing();
+
+    let body = async {
+        let (node, _b, _d) = spin_up_node().await;
+        let doc_id = node.create_doc().await.expect("create_doc");
+        let served = b"content the node chose to hold".to_vec();
+        let served_hash: Hash = node
+            .set_entry(doc_id.clone(), b"served".to_vec(), served.clone())
+            .await
+            .expect("set_entry")
+            .parse()
+            .expect("parse served hash");
+        // The ticket is just a convenient carrier for the node's dialable
+        // address; the peer never joins the doc.
+        let ticket: DocTicket = node
+            .share_doc(doc_id.clone(), false)
+            .await
+            .expect("share_doc")
+            .parse()
+            .expect("parse ticket");
+        let node_addr = ticket
+            .nodes
+            .into_iter()
+            .next()
+            .expect("ticket carries the node's address");
+        let (control, control_store) = spawn_push_accepting_control().await;
+
+        let peer_store = MemStore::new();
+        let planted_hash = peer_store
+            .add_bytes(b"content the node never asked for".to_vec())
+            .await
+            .expect("add planted blob to peer store")
+            .hash;
+        let peer = Endpoint::builder(presets::N0)
+            .bind()
+            .await
+            .expect("bind peer");
+        let node_conn = peer
+            .connect(node_addr, iroh_blobs::ALPN)
+            .await
+            .expect("peer connects to node's blobs protocol");
+        let control_conn = peer
+            .connect(control.endpoint().addr(), iroh_blobs::ALPN)
+            .await
+            .expect("peer connects to control's blobs protocol");
+
+        let fetched = get_blob(node_conn.clone(), served_hash)
+            .bytes()
+            .await
+            .expect("node serves a blob it holds");
+        assert_eq!(fetched.as_ref(), served.as_slice());
+
+        // Node first, control second: once the control holds the blob,
+        // the node's copy has had at least as long to land.
+        push_blob(&peer_store, &node_conn, planted_hash).await;
+        push_blob(&peer_store, &control_conn, planted_hash).await;
+        wait_for_landed(&control_store, planted_hash).await;
+
+        // A zero deadline reads the node's store exactly once.
+        let err = node
+            .fetch_blob_with_deadline(doc_id, planted_hash.to_string(), 0, Duration::ZERO)
+            .await
+            .expect_err("a pushed blob must never land in the node's store");
+        assert!(
+            err.to_string().contains("status=NotFound"),
+            "pushed blob left a trace in the node's store: {err}"
+        );
+
+        drop(node_conn);
+        drop(control_conn);
+        peer.close().await;
+        control.shutdown().await.expect("control shutdown");
+        node.shutdown().await.expect("shutdown");
+    };
+
+    tokio::time::timeout(Duration::from_secs(90), body)
+        .await
+        .expect("push-refusal test exceeded 90s");
 }
