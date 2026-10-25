@@ -232,8 +232,12 @@ fn history_list_reads_an_aged_snapshot() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].title, "rotated");
     // Fields the row predates surface as defaults, not an error.
-    assert!(history[0].tags.is_empty());
-    assert!(history[0].custom_fields.is_empty());
+    assert!(history[0].tags.is_empty(), "got {:?}", history[0].tags);
+    assert!(
+        history[0].custom_fields.is_empty(),
+        "got {:?}",
+        history[0].custom_fields
+    );
 }
 
 #[test]

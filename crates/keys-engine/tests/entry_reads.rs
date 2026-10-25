@@ -236,7 +236,7 @@ fn list_entries_handles_empty() {
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
 
     let rows = engine.list_entries(None, Pagination::all()).expect("list");
-    assert!(rows.is_empty());
+    assert!(rows.is_empty(), "got {rows:?}");
 }
 
 #[test]

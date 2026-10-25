@@ -430,9 +430,9 @@ mod tests {
         assert_eq!(p.algorithm, TotpAlgorithm::Sha1);
         assert_eq!(p.digits, 6);
         assert_eq!(p.period, 30);
-        assert!(p.secret.is_empty());
-        assert!(p.issuer.is_empty());
-        assert!(p.account_name.is_empty());
+        assert!(p.secret.is_empty(), "got {:?}", p.secret);
+        assert!(p.issuer.is_empty(), "got {:?}", p.issuer);
+        assert!(p.account_name.is_empty(), "got {:?}", p.account_name);
     }
 
     // ── Base32 decoding (RFC 4648 §10) ───────────────────────────────
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn parse_uri_empty_secret_decodes_to_empty() {
         let p = parse_uri("otpauth://totp/test?secret=").expect("parse should succeed");
-        assert!(p.secret.is_empty());
+        assert!(p.secret.is_empty(), "got {:?}", p.secret);
     }
 
     #[test]

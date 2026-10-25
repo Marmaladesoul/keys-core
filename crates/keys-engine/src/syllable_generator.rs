@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn generate_returns_non_empty() {
         let s = generate(&SyllableOptions::default());
-        assert!(!s.is_empty());
+        assert!(!s.is_empty(), "generated an empty string");
     }
 
     #[test]
