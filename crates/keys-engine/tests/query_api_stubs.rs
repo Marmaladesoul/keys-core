@@ -50,7 +50,7 @@ fn list_entries_on_fresh_engine_returns_empty() {
     let rows = engine
         .list_entries(None, Pagination::all())
         .expect("list_entries");
-    assert!(rows.is_empty());
+    assert!(rows.is_empty(), "got {rows:?}");
 }
 
 #[test]

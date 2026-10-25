@@ -392,5 +392,5 @@ fn manual_portable(title: &str, icon: IconRef) -> PortableEntry {
 /// constant.
 #[test]
 fn other_png_constant_is_defined() {
-    assert!(!OTHER_PNG.is_empty());
+    assert!(!OTHER_PNG.is_empty(), "OTHER_PNG must hold image bytes");
 }

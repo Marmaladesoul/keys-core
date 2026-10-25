@@ -483,7 +483,10 @@ fn smart_folder_perf() {
         .entries_matching(&pred, Pagination::all())
         .expect("entries_matching");
     let elapsed = start.elapsed();
-    assert!(!rows.is_empty());
+    assert!(
+        !rows.is_empty(),
+        "expected at least one weak-password match"
+    );
     assert!(
         elapsed < Duration::from_millis(50),
         "evaluation took {elapsed:?}, expected < 50ms"

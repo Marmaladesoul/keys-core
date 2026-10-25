@@ -412,7 +412,8 @@ mod tests {
 
         // Owner-agnostic drop then clears the remainder.
         drop_conflict_rows(&conn, id).expect("drop all");
-        assert!(parked_conflict_uuids(&conn).unwrap().is_empty());
+        let got = parked_conflict_uuids(&conn).unwrap();
+        assert!(got.is_empty(), "got {got:?}");
     }
 
     #[test]
