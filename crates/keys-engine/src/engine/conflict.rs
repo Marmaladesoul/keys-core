@@ -390,16 +390,30 @@ impl Engine {
     /// local side changed (and so must be saved). As of Phase 4 this is the live
     /// sync reconcile's ingest path ([`Self::reconcile_with_disk_park_conflicts`]).
     ///
+    /// The peer must be a replica of **this** vault: its root-group UUID (the
+    /// vault's identity — see [`crate::identity`]) must equal the mirror's.
+    /// A different vault is refused before anything is written.
+    ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] if projecting the local vault fails, or if any
-    /// `SQLite` write / field-seal during the per-entry classification fails
-    /// (the whole pass runs in one transaction, so a failure rolls back).
+    /// Returns [`EngineError::VaultIdentityMismatch`] if `peer` is a different
+    /// vault (the mirror is untouched). Returns [`EngineError`] if projecting
+    /// the local vault fails, or if any `SQLite` write / field-seal during the
+    /// per-entry classification fails (the whole pass runs in one
+    /// transaction, so a failure rolls back).
     pub fn ingest_peer(
         &mut self,
         owner: &str,
         peer: &keepass_core::model::Vault,
     ) -> Result<crate::ingest::IngestPeerOutcome, EngineError> {
+        // Identity gate: a peer that is a different vault (a swapped or
+        // relinked file at the watched path, a stray blob) is refused here,
+        // before the ingest transaction opens — so the refusal writes nothing.
+        // Read straight from the mirror, ahead of the projection, so the
+        // verdict is definite even when projecting would fail (e.g. an
+        // unwrap under a rotated session key) and a refusal costs no
+        // whole-vault projection.
+        self.ensure_same_vault(peer.root.id.0)?;
         let local = self.project_to_vault()?;
         let outcome = crate::ingest::ingest_peer(
             &mut self.conn,
@@ -417,6 +431,40 @@ impl Engine {
         // resolver-open to lazily heal it.
         crate::reconcile::reconcile_all_conflict_rows(self)?;
         Ok(outcome)
+    }
+
+    /// The vault-identity gate: refuse unless `found` — the root-group UUID
+    /// of a vault on the other side of the mirror↔file boundary — is this
+    /// mirror's identity (see [`crate::identity`]).
+    ///
+    /// [`Self::ingest_peer`] runs it on every peer it is handed. A writer
+    /// that is about to overwrite the file at a path runs it on that file's
+    /// root first: [`Self::save_to_kdbx`] / [`Self::rekey_to_kdbx`] accept
+    /// any envelope template (its contents are replaced wholesale), so they
+    /// can't know which file the bytes land on — the caller that opened the
+    /// file at the path as its template can, and gates on it (keys-ffi's
+    /// save and re-key do).
+    ///
+    /// Reads the mirror's root straight from `SQLite` — no projection — so
+    /// the verdict is definite even when projecting would fail (e.g. an
+    /// unwrap under a rotated session key), and a refusal is cheap. Writes
+    /// nothing, so a caller that runs it first refuses all-or-nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::VaultIdentityMismatch`] on a different vault;
+    /// [`EngineError::Sqlite`] if the mirror's root can't be read.
+    pub fn ensure_same_vault(&self, found: Uuid) -> Result<(), EngineError> {
+        let expected = self.conn.query_row(
+            "SELECT uuid FROM \"group\" WHERE parent_uuid IS NULL LIMIT 1",
+            [],
+            |row| crate::util::row::parse_uuid_col(row, 0),
+        )?;
+        if crate::identity::is_same_vault(expected, found) {
+            Ok(())
+        } else {
+            Err(EngineError::VaultIdentityMismatch { expected, found })
+        }
     }
 
     /// Owner-rows badge query: every entry UUID that carries at least one

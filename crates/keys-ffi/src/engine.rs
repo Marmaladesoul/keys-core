@@ -1048,6 +1048,13 @@ impl Engine {
     /// template, so a keyfile-keyed vault is re-saved under the same factors —
     /// the keyfile requirement is preserved across the save, never silently
     /// dropped to password-only.
+    ///
+    /// The opened file must still be **this** vault: if the file at
+    /// `kdbx_path` is now a different vault (its root-group UUID differs from
+    /// the mirror's), the save is refused with
+    /// [`EngineError::VaultIdentityMismatch`] before anything is written, so
+    /// it can never overwrite another vault's file. Covers every save that
+    /// routes through here — including `sync_with_disk`'s write-back.
     pub async fn save_to_kdbx_with_keyfile(
         &self,
         kdbx_path: String,
@@ -1064,7 +1071,15 @@ impl Engine {
         })
         .await
         .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
-        self.with_engine_mut(|e| Ok(e.save_to_kdbx(&path, &mut kdbx, temp_dir.as_deref())?))
+        self.with_engine_mut(|e| {
+            // The template IS the file at `path` (as read above): refuse to
+            // overwrite it if it is a different vault. Checked under the same
+            // engine lock as the save, so no other engine op interleaves; a
+            // swap of the file itself between the read above and the rename
+            // is a residual window this gate does not close.
+            e.ensure_same_vault(kdbx.vault().root.id.0)?;
+            Ok(e.save_to_kdbx(&path, &mut kdbx, temp_dir.as_deref())?)
+        })
     }
 
     /// Rotate the vault's key material and re-encrypt the KDBX at
@@ -1123,6 +1138,10 @@ impl Engine {
     /// rotate to a fresh keyfile (`Some` → `Some`), or *remove* the keyfile
     /// requirement (`Some` → `None`) — the deliberate, authenticated downgrade
     /// (you must present the current keyfile to drop it).
+    ///
+    /// Refused with [`EngineError::VaultIdentityMismatch`], before anything is
+    /// written, if the file at `kdbx_path` is a different vault — exactly as
+    /// [`Self::save_to_kdbx_with_keyfile`].
     pub async fn rekey_to_kdbx_with_keyfile(
         &self,
         kdbx_path: String,
@@ -1154,6 +1173,9 @@ impl Engine {
             new_keyfile.as_deref(),
         )?;
         self.with_engine_mut(|e| {
+            // As for `save_to_kdbx_with_keyfile`: never re-key a different
+            // vault's file with this mirror's contents.
+            e.ensure_same_vault(kdbx.vault().root.id.0)?;
             Ok(e.rekey_to_kdbx(&path, &mut kdbx, &new_key, temp_dir.as_deref())?)
         })
     }
