@@ -78,6 +78,18 @@ pub enum EngineError {
     #[error("group move would create a cycle")]
     CycleDetected,
 
+    /// The vault's local mirror holds changes the vault file doesn't have
+    /// yet, so a full re-ingest from the file would destroy them; the
+    /// ingest was refused and the mirror left untouched.
+    ///
+    /// Contract: the ingest verbs return this only AFTER the file has
+    /// decrypted under the supplied key factors — a wrong password or
+    /// keyfile fails first, as itself. So a caller that receives it also
+    /// knows the key factors are correct. Bring the mirror current with a
+    /// reconcile, or persist it with a save, instead of re-ingesting.
+    #[error("mirror owes the vault file a write; refusing to re-ingest over it")]
+    MirrorOwesWrite,
+
     /// The [`crate::VaultDbKeyProvider`] failed to materialise the
     /// database key — e.g. Keychain auth was declined or the entry
     /// was missing. Distinct from [`Self::WrongKey`] (which is "key
@@ -110,6 +122,7 @@ impl From<keys_engine::EngineError> for EngineError {
             E::NotEvaluable => Self::NotEvaluable,
             E::ResolutionMismatch { reason } => Self::ResolutionMismatch { reason },
             E::CycleDetected => Self::CycleDetected,
+            E::MirrorOwesWrite { .. } => Self::MirrorOwesWrite,
             E::KeyProvider(e) => Self::KeyProvider(e.to_string()),
             E::Migration(ref _e) => {
                 // Migration's `SchemaTooNew` variant could be unpacked

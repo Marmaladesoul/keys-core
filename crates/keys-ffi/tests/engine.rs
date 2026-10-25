@@ -345,6 +345,151 @@ async fn engine_async_ingest_completes() {
     assert!(!entries.is_empty(), "ingest produced no entries");
 }
 
+/// Engine-side setup for the unsigned-owed-mirror test: ingest the seeded
+/// file WITHOUT recording its signature, then make an unsaved mutation —
+/// a state the FFI's own ingest (which always records) can't produce.
+fn build_unsigned_mirror_owing_a_write(
+    db_path: &std::path::Path,
+    kdbx_path: &std::path::Path,
+    unsaved_title: &str,
+) {
+    use keepass_core::CompositeKey;
+    use keepass_core::kdbx::Kdbx;
+    use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
+    use keys_engine::{DbKey, KeyProvider, KeyProviderError};
+    use secrecy::SecretString;
+
+    #[derive(Debug)]
+    struct EngineDbKey;
+    impl KeyProvider for EngineDbKey {
+        fn acquire_db_key(&self) -> Result<DbKey, KeyProviderError> {
+            Ok(DbKey::from_bytes(DB_KEY))
+        }
+    }
+    #[derive(Debug)]
+    struct EngineProtector;
+    impl FieldProtector for EngineProtector {
+        fn acquire_session_key(&self) -> Result<SessionKey, ProtectorError> {
+            Ok(SessionKey::from_bytes(SESSION_KEY))
+        }
+    }
+
+    {
+        let protector: Arc<dyn FieldProtector> = Arc::new(EngineProtector);
+        let kdbx = Kdbx::open(kdbx_path)
+            .expect("open")
+            .read_header()
+            .expect("header")
+            .unlock_with_protector(
+                &CompositeKey::from_password(KDBX_PASSWORD.as_bytes()),
+                Some(protector.clone()),
+            )
+            .expect("unlock");
+        let mut engine =
+            keys_engine::Engine::open(db_path, &EngineDbKey, protector, None).expect("open");
+        engine.ingest_from_kdbx(&kdbx).expect("ingest");
+        engine
+            .create_entry(
+                kdbx.vault().root.id.0,
+                keys_engine::NewEntryFields {
+                    title: unsaved_title.to_owned(),
+                    username: String::new(),
+                    url: String::new(),
+                    notes: String::new(),
+                    password: SecretString::from("pw"),
+                    icon: keys_engine::IconRef::Builtin(0),
+                    custom_fields: Vec::new(),
+                    tags: Vec::new(),
+                },
+            )
+            .expect("unsaved mutation");
+        assert!(engine.kdbx_state_signature().expect("sig").is_none());
+        assert!(engine.persistence_state().expect("state").is_dirty());
+    }
+}
+
+/// An unsigned mirror that owes the file a write is not "fresh":
+/// `sync_with_disk` must bring it current with the non-destructive
+/// reconcile, never by ingesting over it. The FFI ingest always records
+/// a signature, so this state is built engine-side and then opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_with_disk_reconciles_an_unsigned_mirror_that_owes_a_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("keys.db");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    seed_kdbx(&kdbx_path);
+
+    let unsaved_title = "only-in-the-mirror";
+    build_unsigned_mirror_owing_a_write(&db_path, &kdbx_path, unsaved_title);
+
+    let engine = open_fresh_engine(&db_path);
+    let outcome = engine
+        .sync_with_disk(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+            None,
+            None,
+        )
+        .await
+        .expect("sync_with_disk must bring the mirror current, not refuse");
+    assert!(
+        !matches!(outcome, keys_ffi::SyncWithDiskFfi::FreshIngest),
+        "an unsigned dirty mirror was treated as fresh: {outcome:?}"
+    );
+    let entries = engine
+        .list_entries(
+            None,
+            Page {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .expect("list");
+    assert!(
+        entries.iter().any(|e| e.title == unsaved_title),
+        "the unsaved mutation did not survive sync_with_disk"
+    );
+
+    // Contract: the owed write stays visible for the save orchestrator...
+    assert!(
+        engine.persistence_state().expect("state").is_dirty,
+        "the owed write must stay visible after sync_with_disk"
+    );
+    // ...and its flush persists the entry to the FILE and signs the mirror.
+    engine
+        .save_to_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+            None,
+        )
+        .await
+        .expect("flush the owed write");
+    assert!(!engine.persistence_state().expect("state").is_dirty);
+    assert!(engine.kdbx_state_signature().expect("sig").is_some());
+
+    let reader = open_fresh_engine(&dir.path().join("reader.db"));
+    reader
+        .ingest_from_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+        )
+        .await
+        .expect("fresh reader ingest");
+    let on_disk = reader
+        .list_entries(
+            None,
+            Page {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .expect("list");
+    assert!(
+        on_disk.iter().any(|e| e.title == unsaved_title),
+        "the owed write never reached the vault file"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn engine_list_entries_via_ffi() {
     let dir = tempfile::tempdir().unwrap();
