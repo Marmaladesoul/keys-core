@@ -86,7 +86,7 @@ fn search_empty_query_returns_empty() {
             Pagination::all(),
         )
         .expect("search");
-    assert!(rows.is_empty());
+    assert!(rows.is_empty(), "got {rows:?}");
     let rows = engine
         .search(
             "   ",
@@ -95,7 +95,7 @@ fn search_empty_query_returns_empty() {
             Pagination::all(),
         )
         .expect("search ws");
-    assert!(rows.is_empty());
+    assert!(rows.is_empty(), "got {rows:?}");
 }
 
 #[test]
@@ -550,7 +550,7 @@ fn search_returns_empty_for_no_matches() {
             Pagination::all(),
         )
         .expect("search");
-    assert!(rows.is_empty());
+    assert!(rows.is_empty(), "got {rows:?}");
 }
 
 #[test]
@@ -743,7 +743,8 @@ fn search_with_bin_disabled_treats_every_entry_as_live() {
         search_with(&engine, "banking", RecycleBinFilter::ExcludeRecycled),
         vec!["banking a", "banking b"]
     );
-    assert!(search_with(&engine, "banking", RecycleBinFilter::RecycledOnly).is_empty());
+    let got = search_with(&engine, "banking", RecycleBinFilter::RecycledOnly);
+    assert!(got.is_empty(), "got {got:?}");
     assert_eq!(
         search_with(&engine, "banking", RecycleBinFilter::IncludeRecycled),
         vec!["banking a", "banking b"]

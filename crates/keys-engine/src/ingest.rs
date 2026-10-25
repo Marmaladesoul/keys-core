@@ -2507,8 +2507,16 @@ mod ingest_peer_tests {
         let peer = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "p0"))]);
         let (conn, outcome) = run(&local, "peerB", &peer);
         assert_eq!(outcome.in_sync, 1);
-        assert!(outcome.conflicted.is_empty());
-        assert!(outcome.auto_merged.is_empty());
+        assert!(
+            outcome.conflicted.is_empty(),
+            "got {:?}",
+            outcome.conflicted
+        );
+        assert!(
+            outcome.auto_merged.is_empty(),
+            "got {:?}",
+            outcome.auto_merged
+        );
         assert_eq!(conflict_rows_for(&conn, id), 0);
     }
 
@@ -2520,7 +2528,11 @@ mod ingest_peer_tests {
         let peer = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T-PEER", "p0"))]);
         let (conn, outcome) = run(&local, "peerB", &peer);
         assert_eq!(outcome.auto_merged, vec![id]);
-        assert!(outcome.conflicted.is_empty());
+        assert!(
+            outcome.conflicted.is_empty(),
+            "got {:?}",
+            outcome.conflicted
+        );
         assert_eq!(
             local_title(&conn, id),
             "T-PEER",
@@ -2663,7 +2675,11 @@ mod ingest_peer_tests {
         // An add is unambiguous (present beats absent): taken locally, not a
         // conflict. Only deletes wait for the Phase-5 tombstone story.
         assert_eq!(outcome.added, vec![peer_only_id]);
-        assert!(outcome.conflicted.is_empty());
+        assert!(
+            outcome.conflicted.is_empty(),
+            "got {:?}",
+            outcome.conflicted
+        );
         assert_eq!(
             conflict_rows_for(&conn, peer_only_id),
             0,
@@ -2753,7 +2769,11 @@ mod ingest_peer_tests {
         );
         let (conn, outcome) = run(&local, "peerB", &peer);
         assert_eq!(outcome.auto_merged, vec![id], "peer's resolution adopted");
-        assert!(outcome.conflicted.is_empty());
+        assert!(
+            outcome.conflicted.is_empty(),
+            "got {:?}",
+            outcome.conflicted
+        );
         assert_eq!(conflict_rows_for(&conn, id), 0, "badge clears on adopt");
         assert_eq!(
             local_title(&conn, id),
@@ -2857,8 +2877,16 @@ mod ingest_peer_tests {
         let peer = vault_with_tombstones(vec![], vec![tombstone(id, 2000)]);
         let (conn, outcome) = run(&local, "peerB", &peer);
         assert_eq!(outcome.deleted, vec![id], "peer delete propagated");
-        assert!(outcome.auto_merged.is_empty());
-        assert!(outcome.conflicted.is_empty());
+        assert!(
+            outcome.auto_merged.is_empty(),
+            "got {:?}",
+            outcome.auto_merged
+        );
+        assert!(
+            outcome.conflicted.is_empty(),
+            "got {:?}",
+            outcome.conflicted
+        );
         assert!(!local_entry_exists(&conn, id), "entry removed locally");
         assert_eq!(
             tombstone_rows(&conn, id),
@@ -2905,9 +2933,13 @@ mod ingest_peer_tests {
         let local = vault_of(vec![]);
         let peer = vault_with_tombstones(vec![], vec![tombstone(absent, 4000)]);
         let (conn, outcome) = run(&local, "peerB", &peer);
-        assert!(outcome.deleted.is_empty());
-        assert!(outcome.added.is_empty());
-        assert!(outcome.auto_merged.is_empty());
+        assert!(outcome.deleted.is_empty(), "got {:?}", outcome.deleted);
+        assert!(outcome.added.is_empty(), "got {:?}", outcome.added);
+        assert!(
+            outcome.auto_merged.is_empty(),
+            "got {:?}",
+            outcome.auto_merged
+        );
         assert_eq!(tombstone_rows(&conn, absent), 1, "orphan tombstone unioned");
     }
 

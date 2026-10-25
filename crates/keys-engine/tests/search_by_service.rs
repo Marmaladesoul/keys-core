@@ -72,8 +72,10 @@ fn search_by_service_empty_identifier_returns_empty() {
             .expect("add");
     });
 
-    assert!(engine.search_by_service("", 10).expect("search").is_empty());
-    assert!(engine.search_by_service("   ", 10).expect("ws").is_empty());
+    let got = engine.search_by_service("", 10).expect("search");
+    assert!(got.is_empty(), "got {got:?}");
+    let got = engine.search_by_service("   ", 10).expect("ws");
+    assert!(got.is_empty(), "got {got:?}");
 }
 
 #[test]
@@ -84,12 +86,8 @@ fn search_by_service_zero_limit_returns_empty() {
             .expect("add");
     });
 
-    assert!(
-        engine
-            .search_by_service("google.com", 0)
-            .expect("search")
-            .is_empty()
-    );
+    let rows = engine.search_by_service("google.com", 0).expect("search");
+    assert!(rows.is_empty(), "got {rows:?}");
 }
 
 #[test]
@@ -426,7 +424,7 @@ fn search_by_service_no_match_returns_empty() {
     let rows = engine
         .search_by_service("unrelated.example", 10)
         .expect("search");
-    assert!(rows.is_empty());
+    assert!(rows.is_empty(), "got {rows:?}");
 }
 
 #[test]

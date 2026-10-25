@@ -185,5 +185,6 @@ fn delete_history_at_last_snapshot_leaves_empty_history() {
 
     assert_eq!(engine.history(id.0).expect("history").len(), 1);
     engine.delete_history_at(id.0, 0).expect("delete");
-    assert!(engine.history(id.0).expect("history").is_empty());
+    let got = engine.history(id.0).expect("history");
+    assert!(got.is_empty(), "got {got:?}");
 }

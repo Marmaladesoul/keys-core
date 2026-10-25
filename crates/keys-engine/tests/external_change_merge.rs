@@ -181,12 +181,8 @@ fn park_one_sided_password_edit_auto_merges_and_advances() {
     // The password landed locally, and nothing is badged.
     let revealed = f.engine.reveal_password(seed_uuid).expect("reveal");
     assert_eq!(revealed.expose_secret(), "disk-only-pw");
-    assert!(
-        f.engine
-            .entries_with_parked_conflict()
-            .expect("query")
-            .is_empty(),
-    );
+    let parked = f.engine.entries_with_parked_conflict().expect("query");
+    assert!(parked.is_empty(), "got {parked:?}");
 }
 
 /// A genuine concurrent edit (both sides moved the same entry off the shared

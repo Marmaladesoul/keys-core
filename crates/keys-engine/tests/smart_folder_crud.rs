@@ -155,7 +155,8 @@ fn delete_removes_row() {
 
     fx.engine.delete_smart_folder(id).expect("delete");
     assert!(fx.engine.smart_folder(id).expect("query").is_none());
-    assert!(fx.engine.list_smart_folders().expect("list").is_empty());
+    let got = fx.engine.list_smart_folders().expect("list");
+    assert!(got.is_empty(), "got {got:?}");
 }
 
 #[test]

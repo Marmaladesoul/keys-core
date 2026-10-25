@@ -213,12 +213,14 @@ mod tests {
 
     #[test]
     fn empty_input_returns_empty() {
-        assert!(domain_candidates("").is_empty());
+        let got = domain_candidates("");
+        assert!(got.is_empty(), "got {got:?}");
     }
 
     #[test]
     fn whitespace_only_returns_empty() {
-        assert!(domain_candidates("   ").is_empty());
+        let got = domain_candidates("   ");
+        assert!(got.is_empty(), "got {got:?}");
     }
 
     // ────────────────────────────────────────────────────────────
@@ -285,9 +287,12 @@ mod tests {
     /// lookup on them would yield `.com` or an empty string.
     #[test]
     fn empty_labels_are_not_a_host() {
-        assert!(domain_candidates("https://example..com").is_empty());
-        assert!(domain_candidates("www.").is_empty());
-        assert!(domain_candidates("https://www./login").is_empty());
+        let got = domain_candidates("https://example..com");
+        assert!(got.is_empty(), "got {got:?}");
+        let got = domain_candidates("www.");
+        assert!(got.is_empty(), "got {got:?}");
+        let got = domain_candidates("https://www./login");
+        assert!(got.is_empty(), "got {got:?}");
     }
 
     #[test]

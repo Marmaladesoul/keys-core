@@ -890,7 +890,11 @@ fn attach_then_remove_attachment_round_trips() {
 
     engine.remove_attachment(uuid, "logo.png").expect("remove");
     let entry2 = engine.entry(uuid).unwrap().unwrap();
-    assert!(entry2.attachments.is_empty());
+    assert!(
+        entry2.attachments.is_empty(),
+        "got {:?}",
+        entry2.attachments
+    );
 
     let path = dir.path().join("keys.db");
     engine.close().expect("close");

@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn eff_random_word_is_non_empty() {
-        assert!(!eff_random_word().is_empty());
+        assert!(!eff_random_word().is_empty(), "drew an empty word");
     }
 
     #[test]
@@ -226,7 +226,7 @@ mod tests {
             syllable_count: 4,
             capitalise_one: true,
         });
-        assert!(!s.is_empty());
+        assert!(!s.is_empty(), "generated an empty string");
     }
 
     #[test]
@@ -251,7 +251,8 @@ mod tests {
 
     #[test]
     fn url_domain_candidates_empty() {
-        assert!(url_domain_candidates("").is_empty());
+        let got = url_domain_candidates("");
+        assert!(got.is_empty(), "got {got:?}");
     }
 
     #[test]

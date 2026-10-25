@@ -68,9 +68,21 @@ fn project_empty_vault() {
     let kdbx = fresh_kdbx(protector());
     let projected = round_trip(&kdbx);
     assert_eq!(projected.root.id, kdbx.vault().root.id);
-    assert!(projected.root.groups.is_empty());
-    assert!(projected.root.entries.is_empty());
-    assert!(projected.binaries.is_empty());
+    assert!(
+        projected.root.groups.is_empty(),
+        "got {:?}",
+        projected.root.groups
+    );
+    assert!(
+        projected.root.entries.is_empty(),
+        "got {:?}",
+        projected.root.entries
+    );
+    assert!(
+        projected.binaries.is_empty(),
+        "got {:?}",
+        projected.binaries
+    );
 }
 
 #[test]
@@ -315,5 +327,5 @@ fn project_preserves_group_hierarchy() {
     assert_eq!(d2.groups.len(), 1);
     let d3 = &d2.groups[0];
     assert_eq!(d3.name, "d3");
-    assert!(d3.groups.is_empty());
+    assert!(d3.groups.is_empty(), "got {:?}", d3.groups);
 }

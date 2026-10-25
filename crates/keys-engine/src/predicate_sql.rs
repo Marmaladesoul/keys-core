@@ -400,7 +400,7 @@ mod tests {
         let c = compile(&Predicate::Duplicates, NOW).expect("compile");
         assert!(c.where_sql.contains("password_fingerprint IN"));
         assert!(c.where_sql.contains("COUNT(*) > 1"));
-        assert!(c.params.is_empty());
+        assert!(c.params.is_empty(), "got {:?}", c.params);
     }
 
     #[test]

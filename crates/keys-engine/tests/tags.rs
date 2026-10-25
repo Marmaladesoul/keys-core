@@ -202,7 +202,8 @@ fn set_tags_removes_orphan_tags() {
         raw_tag_names(&db_path).is_empty(),
         "expected tag table to be GC'd"
     );
-    assert!(engine.list_tags().expect("list_tags").is_empty());
+    let got = engine.list_tags().expect("list_tags");
+    assert!(got.is_empty(), "got {got:?}");
 }
 
 #[test]

@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(snap.icon_custom_uuid, None);
         assert_eq!(snap.password_strength_bucket, None);
         assert_eq!(snap.password_entropy, None);
-        assert!(snap.tags.is_empty());
+        assert!(snap.tags.is_empty(), "got {:?}", snap.tags);
         assert!(snap.attachments.is_empty());
         assert!(snap.custom_fields.is_empty());
         assert!(snap.custom_data.is_empty());
