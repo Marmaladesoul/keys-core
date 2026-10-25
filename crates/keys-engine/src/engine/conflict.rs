@@ -390,16 +390,36 @@ impl Engine {
     /// local side changed (and so must be saved). As of Phase 4 this is the live
     /// sync reconcile's ingest path ([`Self::reconcile_with_disk_park_conflicts`]).
     ///
+    /// The peer must be a replica of **this** vault: its root-group UUID (the
+    /// vault's identity — see [`crate::identity`]) must equal the mirror's.
+    /// A different vault is refused before anything is written.
+    ///
     /// # Errors
     ///
-    /// Returns [`EngineError`] if projecting the local vault fails, or if any
-    /// `SQLite` write / field-seal during the per-entry classification fails
-    /// (the whole pass runs in one transaction, so a failure rolls back).
+    /// Returns [`EngineError::VaultIdentityMismatch`] if `peer` is a different
+    /// vault (the mirror is untouched). Returns [`EngineError`] if projecting
+    /// the local vault fails, or if any `SQLite` write / field-seal during the
+    /// per-entry classification fails (the whole pass runs in one
+    /// transaction, so a failure rolls back).
     pub fn ingest_peer(
         &mut self,
         owner: &str,
         peer: &keepass_core::model::Vault,
     ) -> Result<crate::ingest::IngestPeerOutcome, EngineError> {
+        // Identity gate: a peer that is a different vault (a swapped or
+        // relinked file at the watched path, a stray blob) is refused here,
+        // before the ingest transaction opens — so the refusal writes nothing.
+        // Read straight from the mirror, ahead of the projection, so the
+        // verdict is definite even when projecting would fail (e.g. an
+        // unwrap under a rotated session key) and a refusal costs no
+        // whole-vault projection.
+        let mirror_root = self.mirror_root_uuid()?;
+        if !crate::identity::is_same_vault(mirror_root, peer.root.id.0) {
+            return Err(EngineError::VaultIdentityMismatch {
+                expected: mirror_root,
+                found: peer.root.id.0,
+            });
+        }
         let local = self.project_to_vault()?;
         let outcome = crate::ingest::ingest_peer(
             &mut self.conn,
@@ -417,6 +437,16 @@ impl Engine {
         // resolver-open to lazily heal it.
         crate::reconcile::reconcile_all_conflict_rows(self)?;
         Ok(outcome)
+    }
+
+    /// The mirror's root-group UUID — the identity of the vault it was
+    /// ingested from (see [`crate::identity`]).
+    fn mirror_root_uuid(&self) -> Result<Uuid, EngineError> {
+        Ok(self.conn.query_row(
+            "SELECT uuid FROM \"group\" WHERE parent_uuid IS NULL LIMIT 1",
+            [],
+            |row| crate::util::row::parse_uuid_col(row, 0),
+        )?)
     }
 
     /// Owner-rows badge query: every entry UUID that carries at least one

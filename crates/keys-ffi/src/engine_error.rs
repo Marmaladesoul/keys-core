@@ -102,6 +102,32 @@ pub enum EngineError {
     #[error("field protector error: {0}")]
     FieldProtector(String),
 
+    /// The KDBX file offered to a reconcile / peer ingest is a
+    /// **different vault** from the one this engine's mirror holds (its
+    /// root-group UUID — the vault's identity — differs). Nothing was
+    /// merged and the mirror is untouched; the file at the path was not
+    /// written either.
+    ///
+    /// Contract: returned only AFTER the file has decrypted under the
+    /// supplied key factors — a wrong password or keyfile fails first, as
+    /// itself. The actionable reading is "the file at this path is not
+    /// this vault any more": surface it, and let the user re-point the
+    /// vault (e.g. a Locate flow gated on `verify_vault_identity`) rather
+    /// than retrying the sync. Until then the consumer must also stop
+    /// **saving** this vault to that path: the save path does not check
+    /// identity, so a save would overwrite the other vault's file with
+    /// this one.
+    #[error(
+        "the vault file is a different vault (root group {found}, this vault \
+         is {expected}); refusing to reconcile"
+    )]
+    VaultIdentityMismatch {
+        /// This vault's root-group UUID (canonical hyphenated form).
+        expected: String,
+        /// The root-group UUID of the file (or peer blob) offered.
+        found: String,
+    },
+
     /// Catch-all for internal engine errors that aren't user-actionable.
     /// SQLite errors, migration runner failures, RNG failures, IO,
     /// projection, serialise, reveal-decode, file-watcher-init —
@@ -131,6 +157,10 @@ impl From<keys_engine::EngineError> for EngineError {
                 // still informative.
                 Self::Internal(err.to_string())
             }
+            E::VaultIdentityMismatch { expected, found } => Self::VaultIdentityMismatch {
+                expected: expected.to_string(),
+                found: found.to_string(),
+            },
             // Everything else — Sqlite, Io, Random, Ingest, Projection,
             // Reveal, Serialise, Wrap, SessionKey, FileWatcher —
             // collapses to Internal. Sealed by `#[non_exhaustive]` on

@@ -178,6 +178,27 @@ pub enum EngineError {
         /// The validation diagnostic from `keepass-merge`.
         reason: String,
     },
+
+    /// The KDBX a reconcile (or peer ingest) was handed is a **different
+    /// vault** from the one this mirror holds — its root-group UUID, the
+    /// vault's identity (see [`crate::identity`]), differs from the
+    /// mirror's. Merging it would fold a stranger's entries into this
+    /// vault (and, via write-back, this vault's entries into the
+    /// stranger's file), so the ingest is refused before anything is
+    /// written: the mirror is untouched.
+    ///
+    /// Raised only after the file has decrypted under the supplied key
+    /// factors — a wrong password or keyfile fails first, as itself.
+    #[error(
+        "the vault file is a different vault (root group {found}, mirror holds \
+         {expected}); refusing to reconcile"
+    )]
+    VaultIdentityMismatch {
+        /// The mirror's root-group UUID — the vault it was ingested from.
+        expected: uuid::Uuid,
+        /// The root-group UUID of the file (or peer vault) offered.
+        found: uuid::Uuid,
+    },
 }
 
 impl EngineError {

@@ -122,17 +122,19 @@ pub fn verify_vault_identity(
     }
 }
 
-/// Compare a decrypted picked root UUID against the expected identity string.
+/// Compare a decrypted picked root UUID against the expected identity string,
+/// under the engine's single identity rule
+/// ([`keys_engine::identity::is_same_vault`]) — the same rule the reconcile
+/// guard applies.
 ///
 /// A nil/all-zeros `picked` is never an identity (keepass-core defaults an
 /// absent `<UUID>` element to [`Uuid::nil`]), so it can never `Match` — even
 /// against a nil `expected`. A malformed `expected` likewise never matches.
 fn classify(picked: Uuid, expected_root_uuid: &str) -> VaultIdentityVerdict {
-    if picked.is_nil() {
-        return VaultIdentityVerdict::Mismatch;
-    }
     match Uuid::parse_str(expected_root_uuid) {
-        Ok(expected) if expected == picked => VaultIdentityVerdict::Match,
+        Ok(expected) if keys_engine::identity::is_same_vault(expected, picked) => {
+            VaultIdentityVerdict::Match
+        }
         _ => VaultIdentityVerdict::Mismatch,
     }
 }

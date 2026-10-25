@@ -999,9 +999,15 @@ impl Engine {
     /// it so the call stays a pure function — frontends typically
     /// pass `chrono::Utc::now()`.
     ///
+    /// The file must still be **this** vault: a file whose root-group UUID
+    /// differs from the mirror's (a different vault swapped or relinked in
+    /// at the path) is refused with [`EngineError::VaultIdentityMismatch`]
+    /// before anything is written — no merge, no signature recorded.
+    ///
     /// # Errors
     ///
-    /// IO, KDBX open/parse, merge, ingest. Per the upstream
+    /// [`EngineError::VaultIdentityMismatch`] for a different vault (mirror
+    /// untouched). IO, KDBX open/parse, merge, ingest. Per the upstream
     /// `apply_merge_park_conflicts` contract the synthesised
     /// resolution is valid by construction, so no resolution-class
     /// `MergeError` reaches the engine path.
@@ -1058,7 +1064,9 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Same shape as [`Self::reconcile_with_disk_park_conflicts`]: IO, KDBX
+    /// Same shape as [`Self::reconcile_with_disk_park_conflicts`]: a
+    /// different vault's blob is refused with
+    /// [`EngineError::VaultIdentityMismatch`] (mirror untouched); IO, KDBX
     /// open/parse/unlock, and ingest errors.
     pub fn ingest_peer_from_kdbx(
         &mut self,
