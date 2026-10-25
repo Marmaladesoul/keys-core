@@ -660,6 +660,14 @@ impl Engine {
     /// cross-volume atomic). Pass `None` for non-sandboxed callers to
     /// keep the historical sibling-tempfile behaviour.
     ///
+    /// ## Vault identity
+    ///
+    /// `kdbx` is only an envelope (its contents are replaced wholesale), so
+    /// this method can't tell which vault `path` holds. A caller that opened
+    /// the file at `path` as the template — i.e. is about to overwrite it —
+    /// must first gate on [`Self::ensure_same_vault`] with that file's root,
+    /// or it may overwrite a different vault (keys-ffi's save and re-key do).
+    ///
     /// # Errors
     ///
     /// - [`EngineError::Projection`] if projection fails.
@@ -716,6 +724,9 @@ impl Engine {
     /// protected fields are preserved exactly as [`Self::save_to_kdbx`]
     /// preserves them. Records the same post-write signatures as a plain
     /// save; emits [`ChangeEvent::SaveCompleted`].
+    ///
+    /// As for [`Self::save_to_kdbx`], a caller re-keying the file at `path`
+    /// in place gates on [`Self::ensure_same_vault`] first.
     ///
     /// # Errors
     ///
@@ -999,9 +1010,15 @@ impl Engine {
     /// it so the call stays a pure function — frontends typically
     /// pass `chrono::Utc::now()`.
     ///
+    /// The file must still be **this** vault: a file whose root-group UUID
+    /// differs from the mirror's (a different vault swapped or relinked in
+    /// at the path) is refused with [`EngineError::VaultIdentityMismatch`]
+    /// before anything is written — no merge, no signature recorded.
+    ///
     /// # Errors
     ///
-    /// IO, KDBX open/parse, merge, ingest. Per the upstream
+    /// [`EngineError::VaultIdentityMismatch`] for a different vault (mirror
+    /// untouched). IO, KDBX open/parse, merge, ingest. Per the upstream
     /// `apply_merge_park_conflicts` contract the synthesised
     /// resolution is valid by construction, so no resolution-class
     /// `MergeError` reaches the engine path.
@@ -1058,7 +1075,9 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Same shape as [`Self::reconcile_with_disk_park_conflicts`]: IO, KDBX
+    /// Same shape as [`Self::reconcile_with_disk_park_conflicts`]: a
+    /// different vault's blob is refused with
+    /// [`EngineError::VaultIdentityMismatch`] (mirror untouched); IO, KDBX
     /// open/parse/unlock, and ingest errors.
     pub fn ingest_peer_from_kdbx(
         &mut self,

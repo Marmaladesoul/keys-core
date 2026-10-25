@@ -54,8 +54,10 @@ KEYHOLE_PASSWORD="$P" "$KEYHOLE" create "$A" >/dev/null \
 # path (vector 1) and the reconcile path (vector 2).
 KEYHOLE_PASSWORD="$P" "$KEYHOLE" create-entry "$A" "Local" --username local >/dev/null \
     || { echo "FAIL: seed A entry"; exit 1; }
-KEYHOLE_PASSWORD="$P" "$KEYHOLE" create "$B" >/dev/null \
-    || { echo "FAIL: create peer B"; exit 1; }
+# B is a genuine replica of A (same vault identity) that diverged with its
+# own entry — not an independent vault, which the peer-ingest identity gate
+# would refuse regardless of the password and so mask a wrong-password slip.
+cp "$A" "$B"
 KEYHOLE_PASSWORD="$P" "$KEYHOLE" create-entry "$B" "Peer" --username peer >/dev/null \
     || { echo "FAIL: seed B entry"; exit 1; }
 

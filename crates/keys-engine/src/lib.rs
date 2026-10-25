@@ -7,6 +7,7 @@ pub mod events;
 pub mod file_watcher;
 pub mod fingerprint;
 mod history_snapshot;
+pub mod identity;
 pub mod ingest;
 pub mod key_provider;
 pub mod meta;

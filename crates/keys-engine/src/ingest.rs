@@ -1485,7 +1485,8 @@ fn reconcile_peer_groups(
 
     // The symmetric move-LWW above can leave a cyclic parent map (concurrent
     // mutual moves); break it deterministically so both replicas land the
-    // same acyclic tree. `peer.root.id` == the local root (shared uuid).
+    // same acyclic tree. `peer.root.id` == the local root: `Engine::ingest_peer`
+    // refuses a peer of a different vault before this runs.
     break_group_cycles(tx, peer.root.id.0, outcome)?;
     Ok(())
 }
@@ -1507,10 +1508,9 @@ fn reconcile_group_metadata(
     outcome: &mut IngestPeerOutcome,
 ) -> Result<(), EngineError> {
     let uuid_str = peer_group.id.0.to_string();
-    // No-op if the group isn't local (the root-metadata call passes
-    // `peer.root` unconditionally; in real sync both replicas share the
-    // root uuid, but a peer whose root id differs — or any absent group —
-    // simply has nothing to reconcile here).
+    // No-op if the group isn't local. (The root-metadata call passes
+    // `peer.root` unconditionally; that is always the local root, since
+    // `Engine::ingest_peer` refuses a peer whose root id differs.)
     let Some((local_name, local_notes, local_icon, local_custom, local_mod)): Option<(
         String,
         String,

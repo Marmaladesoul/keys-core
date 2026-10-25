@@ -40,6 +40,15 @@ use keys_ffi::{
 
 use adapters::{FixedDbKey, FixedProtector, RecordingDbKey};
 
+/// Env var that, when set to [`SKIP_OPEN_SYNC_ON`], makes [`Session::open`]
+/// skip its open-time `sync_with_disk` — models an engine that was already
+/// open when the vault file changed underneath it. Scenario-only; never set
+/// it to reach a real vault.
+const SKIP_OPEN_SYNC_ENV: &str = "KEYHOLE_SKIP_OPEN_SYNC";
+/// The one value of [`SKIP_OPEN_SYNC_ENV`] that enables the skip (so `=0` or
+/// an empty value leaves the open-time sync on).
+const SKIP_OPEN_SYNC_ON: &str = "1";
+
 #[derive(Parser)]
 #[command(
     name = "keyhole",
@@ -1194,6 +1203,16 @@ impl Session {
             password: password.to_owned(),
             keyfile,
         };
+
+        // Scenario hook: open over the mirror as it stands, skipping the
+        // open-time sync — the state of a client whose engine was already
+        // open when the file changed under it (before its watcher fires).
+        // Lets a scenario drive a save / re-key at a file the mirror never
+        // reconciled with.
+        if std::env::var(SKIP_OPEN_SYNC_ENV).is_ok_and(|v| v == SKIP_OPEN_SYNC_ON) {
+            eprintln!("note: open-time sync skipped ({SKIP_OPEN_SYNC_ENV})");
+            return Ok(session);
+        }
 
         // The whole "bring the mirror current" gate — fresh-ingest /
         // signature-skip / reconcile / write-back — lives below the
