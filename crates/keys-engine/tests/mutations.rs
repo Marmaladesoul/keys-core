@@ -6,7 +6,7 @@ use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
 use keys_engine::{
-    DbKey, Engine, EntryUpdate, GroupUpdate, IconRef, KeyProvider, KeyProviderError,
+    DbKey, Engine, EntrySave, EntryUpdate, GroupUpdate, IconRef, KeyProvider, KeyProviderError,
     NewCustomField, NewEntryFields, NewGroupFields, Pagination,
 };
 use rusqlite::{Connection, params};
@@ -263,6 +263,114 @@ fn recycle_then_restore_round_trip() {
     assert!(engine.entry(uuid).unwrap().unwrap().is_recycled);
     engine.restore_entry(uuid).expect("restore");
     assert!(!engine.entry(uuid).unwrap().unwrap().is_recycled);
+}
+
+/// Mutation and relocation are orthogonal: the editor's save funnel
+/// (`save_entry`) and attachment add (`attach_file`) on a recycled entry
+/// apply in place, leaving it in the bin with its recorded origin intact
+/// — in the mirror AND across a KDBX write + reopen into a fresh engine.
+/// Only `restore_entry` relocates.
+#[test]
+fn edits_to_a_recycled_entry_apply_in_place_in_the_bin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx_path = dir.path().join("vault.kdbx");
+    let mut kdbx = fresh_kdbx(protector());
+    let root = kdbx.vault().root.id.0;
+    let mut engine = Engine::open(
+        &dir.path().join("keys.db"),
+        &FixedKey(DB_KEY_BYTES),
+        protector(),
+        None,
+    )
+    .expect("open");
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
+    let group = |name: &str| NewGroupFields {
+        name: name.into(),
+        notes: String::new(),
+        icon: IconRef::Builtin(0),
+    };
+    let bin = engine
+        .create_group(root, group("Recycle Bin"))
+        .expect("bin");
+    engine.set_recycle_bin(true, Some(bin)).expect("set bin");
+    let home = engine.create_group(root, group("Home")).expect("home");
+    let uuid = engine
+        .create_entry(home, new_entry("binned", "p"))
+        .expect("create");
+    engine.recycle_entry(uuid).expect("recycle");
+
+    engine
+        .save_entry(
+            uuid,
+            EntrySave {
+                title: "binned".into(),
+                username: String::new(),
+                url: String::new(),
+                notes: "edited in the bin".into(),
+                password: SecretString::from("p"),
+                icon: IconRef::Builtin(0),
+                expires_at: None,
+                custom_fields: Vec::new(),
+                tags: Vec::new(),
+            },
+        )
+        .expect("save_entry");
+    engine
+        .attach_file(uuid, "probe.txt", b"in-bin".to_vec())
+        .expect("attach_file");
+
+    let row = engine.entry(uuid).unwrap().unwrap();
+    assert_eq!(row.group_uuid, bin, "an edit relocated the recycled entry");
+    assert!(row.is_recycled, "an edit cleared the recycled flag");
+
+    // Cold round-trip: write the KDBX, drop every warm handle, re-read the
+    // file, and re-ingest it into a brand-new engine.
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save_to_kdbx");
+    drop(engine);
+    drop(kdbx);
+    let reopened = Kdbx::open(&kdbx_path)
+        .expect("reopen")
+        .read_header()
+        .expect("read header")
+        .unlock_with_protector(&CompositeKey::from_password(b"pw"), Some(protector()))
+        .expect("unlock");
+    let on_disk = reopened
+        .vault()
+        .root
+        .groups
+        .iter()
+        .find(|g| g.id.0 == bin)
+        .and_then(|g| g.entries.iter().find(|e| e.id.0 == uuid))
+        .expect("edited entry must be written under the bin group");
+    assert_eq!(
+        on_disk.previous_parent_group.map(|g| g.0),
+        Some(home),
+        "an in-bin edit must not disturb the recorded origin"
+    );
+    assert_eq!(on_disk.notes, "edited in the bin");
+    assert!(
+        on_disk.attachments.iter().any(|a| a.name == "probe.txt"),
+        "the in-bin attachment add must reach the KDBX"
+    );
+
+    let mut fresh = Engine::open(
+        &dir.path().join("fresh.db"),
+        &FixedKey(DB_KEY_BYTES),
+        protector(),
+        None,
+    )
+    .expect("open fresh");
+    fresh.ingest_from_kdbx(&reopened).expect("re-ingest");
+    let row = fresh.entry(uuid).unwrap().unwrap();
+    assert_eq!(row.group_uuid, bin, "re-ingest relocated the entry");
+    assert!(row.is_recycled, "re-ingest cleared the recycled flag");
+
+    fresh.restore_entry(uuid).expect("restore");
+    let row = fresh.entry(uuid).unwrap().unwrap();
+    assert_eq!(row.group_uuid, home, "restore must return to the origin");
+    assert!(!row.is_recycled, "restore must clear the recycled flag");
 }
 
 #[test]
