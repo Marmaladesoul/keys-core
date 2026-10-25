@@ -514,10 +514,18 @@ impl Engine {
     /// distinct rows in `tag` / `entry_tag`. Content-addresses
     /// attachment bytes via SHA-256 into `attachment_blob`.
     ///
-    /// Idempotent: the pre-walk step `DELETE`s every vault row, so a
-    /// re-ingest produces the same final state regardless of what was
-    /// there before. Schema (tables, indices, triggers, settings) is
-    /// preserved.
+    /// Replaces the mirror: the pre-walk step `DELETE`s every vault row,
+    /// so re-ingesting the same vault yields the same final state. That
+    /// is only lossless while the mirror owes the file nothing, so an
+    /// ingest over a dirty mirror is refused (see Errors).
+    ///
+    /// `kdbx` must be the content of the vault file the mirror tracks:
+    /// the ingest is a correspondence point, settling the persistence
+    /// watermark ([`Engine::persistence_state`]) in its own transaction.
+    /// Recording the file's signature is separate — call
+    /// [`Engine::record_kdbx_state_signature`] afterwards so a later open
+    /// can skip the ingest. Schema (tables, indices, triggers, settings)
+    /// is preserved.
     ///
     /// Phase 2.4 / 2.5 will land the reverse direction (projection +
     /// serialise). Mutation semantics — adding / editing / deleting a
@@ -532,6 +540,11 @@ impl Engine {
     ///   [`crate::IngestError::Wrap`] /
     ///   [`crate::IngestError::SessionKey`] if the wrap pass fails.
     /// - [`EngineError::Sqlite`] for transaction / INSERT failures.
+    /// - [`EngineError::MirrorOwesWrite`] if the mirror's persistence
+    ///   watermark is dirty. An ingest *replaces* the mirror, which is
+    ///   lossless only when the mirror owes the file nothing; over a
+    ///   dirty mirror it would silently discard content the file has
+    ///   never seen. Nothing is touched when this is returned.
     pub fn ingest_from_kdbx(&mut self, kdbx: &Kdbx<Unlocked>) -> Result<(), EngineError> {
         let outcome = ingest::ingest(
             &mut self.conn,
@@ -846,7 +859,9 @@ impl Engine {
     /// correspond".
     ///
     /// Frontends should call this after a successful
-    /// [`Engine::ingest_from_kdbx`]. [`Engine::save_to_kdbx`] records
+    /// [`Engine::ingest_from_kdbx`] to arm the open-time fast path. The
+    /// ingest has already settled the watermark in its own transaction,
+    /// so the advance here is a no-op on that path. [`Engine::save_to_kdbx`] records
     /// the same correspondence automatically, using the sequence
     /// snapshotted at save *start* (via the crate-private
     /// `record_kdbx_correspondence`).
@@ -909,19 +924,7 @@ impl Engine {
     ///
     /// Returns [`EngineError::Sqlite`] on query failure.
     pub fn persistence_state(&self) -> Result<crate::PersistenceState, EngineError> {
-        let read = |key: &str| -> Result<i64, EngineError> {
-            self.conn
-                .query_row(
-                    "SELECT value FROM setting WHERE key = ?1",
-                    rusqlite::params![key],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(EngineError::Sqlite)
-        };
-        Ok(crate::PersistenceState {
-            mutation_seq: read("persistence.mutation_seq")?,
-            persisted_seq: read("persistence.persisted_seq")?,
-        })
+        crate::PersistenceState::read(&self.conn)
     }
 
     /// Probe whether this sidecar's sealed protected fields still open

@@ -73,7 +73,7 @@ cp "$A" "$PA"                                                             # fork
 sleep 1; cp "$PA" "$A"                                                    # external file lands on our path
 
 "$KEYHOLE" list "$A" >/dev/null 2>"$TMP/a.err"                            # any verb opens+reconciles
-grep -q "changed on disk" "$TMP/a.err" \
+grep -q "diverged — reconciled" "$TMP/a.err" \
     || { echo "FAIL(a): disk-reconcile path was not exercised:"; cat "$TMP/a.err"; exit 1; }
 "$KEYHOLE" list-conflicts "$A" 2>/dev/null | grep -q "no held conflicts" \
     || { echo "FAIL(a): a clean one-sided-per-field merge parked a conflict:"; "$KEYHOLE" list-conflicts "$A"; exit 1; }
@@ -103,7 +103,7 @@ cp "$B" "$PB"                                                             # fork
 sleep 1; cp "$PB" "$B"                                                    # folded file lands on our path
 
 "$KEYHOLE" list "$B" >/dev/null 2>"$TMP/b.err"
-grep -q "changed on disk" "$TMP/b.err" \
+grep -q "diverged — reconciled" "$TMP/b.err" \
     || { echo "FAIL(b): disk-reconcile path was not exercised:"; cat "$TMP/b.err"; exit 1; }
 # The fold reads as a deliberate revert, so it auto-merges with NO conflict.
 "$KEYHOLE" list-conflicts "$B" 2>/dev/null | grep -q "no held conflicts" \

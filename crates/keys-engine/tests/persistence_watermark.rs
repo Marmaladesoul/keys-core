@@ -4,8 +4,9 @@
 //!
 //! The watermark's contract: every projected-content mutation advances
 //! `mutation_seq` inside the mutating transaction (trigger-maintained);
-//! every mirror↔disk correspondence point — save, ingest-plus-signature
-//! — advances `persisted_seq`. Dirty = `mutation_seq > persisted_seq`,
+//! every mirror↔disk correspondence point — save, from-file ingest
+//! (settled inside its own transaction), rebuild — advances
+//! `persisted_seq`. A from-file ingest over a dirty mirror is refused. Dirty = `mutation_seq > persisted_seq`,
 //! and BOTH values persist in the mirror, so an unsaved mutation reads
 //! back dirty across close + reopen (the crash-recovery signal).
 //!
@@ -119,7 +120,7 @@ fn ingest_plus_signature_settles() {
     let st = engine.persistence_state().expect("state");
     assert!(
         !st.is_dirty(),
-        "post-ingest + signature the mirror corresponds to disk; got {st:?}"
+        "post-ingest the mirror corresponds to disk; got {st:?}"
     );
     // Ingest writes rows, so the census actually ran (the counter is
     // live, not stuck at zero).
@@ -190,6 +191,82 @@ fn unsaved_mutation_reads_back_dirty_after_reopen() {
         st.is_dirty(),
         "the owed write must survive close + reopen; got {st:?}"
     );
+}
+
+#[test]
+fn ingest_alone_settles_the_watermark_and_re_ingests_idempotently() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut engine = open_engine(&dir.path().join("keys.db"));
+    let kdbx = fresh_kdbx();
+
+    // No signature record: the ingest itself is the correspondence point,
+    // settled inside its own transaction.
+    engine.ingest_from_kdbx(&kdbx).expect("first ingest");
+    let st = engine.persistence_state().expect("state");
+    assert!(!st.is_dirty(), "a from-file ingest must settle; got {st:?}");
+    assert!(engine.kdbx_state_signature().expect("sig").is_none());
+
+    let count = engine.entry_count(None).expect("count");
+    engine
+        .ingest_from_kdbx(&kdbx)
+        .expect("re-ingest of the same vault");
+    assert_eq!(engine.entry_count(None).expect("count"), count);
+    assert!(!engine.persistence_state().expect("state").is_dirty());
+}
+
+#[test]
+fn ingest_refuses_a_dirty_mirror_and_touches_nothing() {
+    let (mut engine, root, kdbx, _dir) = settled_engine();
+
+    engine
+        .create_entry(root, new_entry_fields("unsaved"))
+        .expect("create entry");
+    let before = engine.persistence_state().expect("state");
+    assert!(before.is_dirty());
+    let count_before = engine.entry_count(None).expect("count");
+
+    // The file on hand predates the mutation — exactly the stale
+    // content an unguarded ingest would replace the mirror with.
+    let err = engine
+        .ingest_from_kdbx(&kdbx)
+        .expect_err("ingest over a dirty mirror must be refused");
+    assert!(
+        matches!(
+            err,
+            keys_engine::EngineError::MirrorOwesWrite { mutation_seq, persisted_seq }
+                if mutation_seq == before.mutation_seq && persisted_seq == before.persisted_seq
+        ),
+        "expected MirrorOwesWrite carrying the watermark, got {err:?}"
+    );
+
+    // Refusal is all-or-nothing: content and watermark untouched.
+    assert_eq!(engine.entry_count(None).expect("count"), count_before);
+    assert_eq!(engine.persistence_state().expect("state"), before);
+}
+
+#[test]
+fn ingest_proceeds_once_the_owed_write_is_saved() {
+    let (mut engine, root, mut kdbx, dir) = settled_engine();
+    let kdbx_path = dir.path().join("vault.kdbx");
+
+    engine
+        .create_entry(root, new_entry_fields("saved-then-reingested"))
+        .expect("create entry");
+    engine
+        .save_to_kdbx(&kdbx_path, &mut kdbx, None)
+        .expect("save");
+    let count_saved = engine.entry_count(None).expect("count");
+
+    // Clean mirror → the guard steps aside; re-ingesting the file just
+    // written loses nothing.
+    let saved = Kdbx::open(&kdbx_path)
+        .expect("open saved kdbx")
+        .read_header()
+        .expect("header")
+        .unlock_with_protector(&CompositeKey::from_password(b"pw"), Some(protector()))
+        .expect("unlock saved kdbx");
+    engine.ingest_from_kdbx(&saved).expect("clean re-ingest");
+    assert_eq!(engine.entry_count(None).expect("count"), count_saved);
 }
 
 #[test]
