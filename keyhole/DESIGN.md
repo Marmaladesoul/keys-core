@@ -1579,6 +1579,8 @@ GUI) instead of one — short-term effort bought for compounding payoff.
   recorded previous parent (root when absent/deleted, matching
   KeePassXC). Proven across reopen incl. the subfolder round-trip.
 
+- **[HELD — invariant pinned] mutation and relocation are orthogonal.** An edit to a recycled entry applies *in place* in the bin: the entry stays in the bin group and stays recycled, and its recorded `PreviousParentGroup` survives (restore still returns it to its origin). Only the explicit `restore` verb relocates. The seam already held this; these are guards. `scenarios/edit-recycled-stays-in-bin.sh` drives title / custom field / tags / attachment edits on both a cold (re-ingested) and a warm mirror and checks each from a fresh ingest of the KDBX; it goes red against the relocate-on-edit mutant recorded in its header. `keys-engine/tests/mutations.rs` (`edits_to_a_recycled_entry_apply_in_place_in_the_bin`) pins the same for the `save_entry` + `attach_file` funnel across a KDBX write, reopen and re-ingest into a fresh engine. Consumer contract: a frontend that wants "edit implies restore" must call `restore_entry` explicitly; no engine write verb does it implicitly. Interop: in KDBX the bin is an ordinary group, so an in-bin edit is format-legal, and a foreign client's in-bin edit round-trips with the origin intact.
+
 - **[FIXED] convergence divergence under rapid re-edit around a
   resolution — found by `scenarios/fuzz-convergence.sh`.** Two replicas
   under seeded concurrent entry create/edit/delete + park/resolve/sync
