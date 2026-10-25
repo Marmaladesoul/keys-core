@@ -350,7 +350,10 @@ fn edits_to_a_recycled_entry_apply_in_place_in_the_bin() {
         "an in-bin edit must not disturb the recorded origin"
     );
     assert_eq!(on_disk.notes, "edited in the bin");
-    assert!(on_disk.attachments.iter().any(|a| a.name == "probe.txt"));
+    assert!(
+        on_disk.attachments.iter().any(|a| a.name == "probe.txt"),
+        "the in-bin attachment add must reach the KDBX"
+    );
 
     let mut fresh = Engine::open(
         &dir.path().join("fresh.db"),
