@@ -100,7 +100,7 @@ uuid2="$("$KEYHOLE" list "$VAULT" | awk '/Saved Normally/ {print $1; exit}')"
 rm -rf "$EXT.mirror"
 mv "$EXT" "$VAULT"
 s="$("$KEYHOLE" persistence-state "$VAULT" 2>"$TMP/sync.err")"
-grep -q "changed on disk" "$TMP/sync.err" || fail "expected an open-time reconcile of the external edit"
+grep -q "diverged — reconciled" "$TMP/sync.err" || fail "expected an open-time reconcile of the external edit"
 grep -q "write-back not needed" "$TMP/sync.err" \
     || fail "one-way external edit should be digest-equal after adoption: $(cat "$TMP/sync.err")"
 [[ "$s" == *"dirty=false"* ]] \

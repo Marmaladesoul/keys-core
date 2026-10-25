@@ -1008,8 +1008,11 @@ impl From<eng::ParkConflictsResult> for ParkConflictsResultFfi {
 /// there is no save decision left to make.
 #[derive(uniffi::Enum, Debug, Clone)]
 pub enum SyncWithDiskFfi {
-    /// No recorded signature — a fresh mirror was built from the file
-    /// (`ingest_from_kdbx`) and the correspondence recorded.
+    /// No recorded signature and nothing owed — a fresh mirror was built
+    /// from the file (`ingest_from_kdbx`) and the correspondence
+    /// recorded. (An unsigned mirror that owes a write is reconciled
+    /// instead, never ingested over, and reports one of the reconcile
+    /// outcomes below.)
     FreshIngest,
     /// The recorded signature matches the file's `(mtime_ms, size)` —
     /// the mirror is already current; nothing was read or written.

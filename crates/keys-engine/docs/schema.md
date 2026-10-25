@@ -230,7 +230,7 @@ Generic KV. Reserved keys:
   monotonic counter bumped by AFTER-triggers inside every
   projected-content mutation's transaction; `persisted_seq` is the
   `mutation_seq` captured at the start of the last successful
-  mirror↔disk correspondence point (save / ingest+signature /
+  mirror↔disk correspondence point (save / from-file ingest /
   rebuild). Dirty = `mutation_seq > persisted_seq` — "the KDBX still
   owes a write", surfaced as `Engine::persistence_state()`. Mirror-
   local tables (`attachment_blob`, `conflict_*`, `smart_folder`) and

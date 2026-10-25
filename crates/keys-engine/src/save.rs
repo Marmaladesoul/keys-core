@@ -42,6 +42,7 @@ use std::time::SystemTime;
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
+use rusqlite::Connection;
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -119,6 +120,23 @@ impl PersistenceState {
     #[must_use]
     pub fn is_dirty(&self) -> bool {
         self.mutation_seq > self.persisted_seq
+    }
+
+    /// Read the watermark pair through `conn` — a plain connection or an
+    /// open transaction, so a caller can check and act under one lock.
+    pub(crate) fn read(conn: &Connection) -> Result<Self, EngineError> {
+        let read = |key: &str| -> Result<i64, EngineError> {
+            conn.query_row(
+                "SELECT value FROM setting WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(EngineError::Sqlite)
+        };
+        Ok(Self {
+            mutation_seq: read("persistence.mutation_seq")?,
+            persisted_seq: read("persistence.persisted_seq")?,
+        })
     }
 }
 

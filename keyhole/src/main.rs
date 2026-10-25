@@ -276,6 +276,15 @@ enum Command {
         /// Path to the .kdbx vault.
         vault: PathBuf,
     },
+    /// Re-ingest the KDBX over the mirror — the client unlock path that
+    /// decrypts the file to verify the password, then rebuilds the
+    /// mirror from it. Prints `reingested`. An ingest REPLACES the
+    /// mirror, so over a mirror that still owes the file a write it is
+    /// refused (non-zero exit) and the mirror is left untouched.
+    Reingest {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+    },
     /// Ingest a peer's KDBX into this vault's mirror under a device
     /// owner id — the per-device-key sync transport path. Divergences
     /// park as held conflicts in the persistent mirror (never a modal);
@@ -829,6 +838,12 @@ async fn main() -> Result<()> {
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.flush().await?;
         }
+        Command::Reingest { vault } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.reingest().await?;
+            session.finish().await?;
+        }
         Command::IngestPeer {
             vault,
             peer_kdbx,
@@ -1081,7 +1096,9 @@ impl Session {
     /// Open the engine over the vault's persistent mirror, then bring
     /// the mirror current the way a real client does on unlock:
     ///
-    /// - no recorded signature → fresh mirror → `ingest_from_kdbx`;
+    /// - no recorded signature, nothing owed → fresh mirror →
+    ///   `ingest_from_kdbx` (an unsigned mirror that owes a write is
+    ///   reconciled instead — never ingested over);
     /// - signature matches the on-disk `(mtime_ms, size)` → mirror is
     ///   current → skip ingest (held conflicts and all other mirror
     ///   state carry over untouched);
@@ -1195,7 +1212,7 @@ impl Session {
         match &outcome {
             SyncWithDiskFfi::FreshIngest | SyncWithDiskFfi::UpToDate => {}
             SyncWithDiskFfi::NoChange | SyncWithDiskFfi::Applied { .. } => {
-                eprintln!("note: KDBX changed on disk — reconciled");
+                eprintln!("note: mirror and KDBX diverged — reconciled");
                 eprint_sync_outcome(&outcome);
                 if let SyncWithDiskFfi::Applied {
                     wrote_back: true, ..
@@ -1233,6 +1250,22 @@ impl Session {
         } else {
             println!("clean");
         }
+        Ok(())
+    }
+
+    /// Re-ingest the vault file over the mirror (see the `reingest`
+    /// verb). A refusal propagates as the verb's error, so the session
+    /// teardown flush never runs over it.
+    async fn reingest(&self) -> Result<()> {
+        self.engine
+            .ingest_from_kdbx_with_keyfile(
+                self.vault_path.to_string_lossy().into_owned(),
+                self.password.clone(),
+                self.keyfile.clone(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("reingest: {e}"))?;
+        println!("reingested");
         Ok(())
     }
 
