@@ -56,6 +56,14 @@ ignore = [
     # picks it up.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # basic-toml unmaintained, no safe upgrade. Build-time only: pulled
+    # in by askama_derive (a proc-macro) <- uniffi_bindgen 0.28 / 0.29,
+    # where it parses askama's template config during bindings
+    # generation. Never linked into the runtime, never touches vault
+    # data or the network. Both uniffi lines in the tree pull it, so
+    # moving keys-ffi to 0.29 alone won't clear it: drop once every
+    # uniffi_bindgen here sits on an askama_derive without basic-toml.
+    "RUSTSEC-2026-0374",
 ]
 
 # ---------------------------------------------------------------------------
