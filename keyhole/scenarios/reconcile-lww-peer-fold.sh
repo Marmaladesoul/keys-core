@@ -75,7 +75,7 @@ sleep 1; cp "$PA" "$A"                                                    # exte
 "$KEYHOLE" list "$A" >/dev/null 2>"$TMP/a.err"                            # any verb opens+reconciles
 grep -q "changed on disk" "$TMP/a.err" \
     || { echo "FAIL(a): disk-reconcile path was not exercised:"; cat "$TMP/a.err"; exit 1; }
-"$KEYHOLE" list-conflicts "$A" 2>/dev/null | grep -q "no held conflicts" \
+grep -q "no held conflicts" <<<"$("$KEYHOLE" list-conflicts "$A" 2>/dev/null)" \
     || { echo "FAIL(a): a clean one-sided-per-field merge parked a conflict:"; "$KEYHOLE" list-conflicts "$A"; exit 1; }
 
 rm -rf "$A.mirror"                                                        # honest from-disk re-ingest
@@ -106,7 +106,7 @@ sleep 1; cp "$PB" "$B"                                                    # fold
 grep -q "changed on disk" "$TMP/b.err" \
     || { echo "FAIL(b): disk-reconcile path was not exercised:"; cat "$TMP/b.err"; exit 1; }
 # The fold reads as a deliberate revert, so it auto-merges with NO conflict.
-"$KEYHOLE" list-conflicts "$B" 2>/dev/null | grep -q "no held conflicts" \
+grep -q "no held conflicts" <<<"$("$KEYHOLE" list-conflicts "$B" 2>/dev/null)" \
     || { echo "FAIL(b): the folded lineage unexpectedly parked a conflict — behaviour changed, revisit the interop-limit call:"; "$KEYHOLE" list-conflicts "$B"; exit 1; }
 
 rm -rf "$B.mirror"

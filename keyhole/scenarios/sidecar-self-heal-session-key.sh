@@ -79,7 +79,7 @@ echo "note: rebuild discarded $discarded stale sidecar file(s) and re-ingested"
 #    which must unwrap every protected field.
 fixed_out="$(KEYHOLE_FIELD_KEY="$ALT_FIELD_KEY" "$KEYHOLE" update-entry "$VAULT" "$ENTRY" --username bob 2>&1)" \
     || { echo "FAIL: protected-field save fails after rebuild"; printf '%s\n' "$fixed_out" | sed 's/^/    /'; exit 1; }
-KEYHOLE_FIELD_KEY="$ALT_FIELD_KEY" "$KEYHOLE" list "$VAULT" 2>/dev/null | grep -q 'Secret' \
+grep -q 'Secret' <<<"$(KEYHOLE_FIELD_KEY="$ALT_FIELD_KEY" "$KEYHOLE" list "$VAULT" 2>/dev/null)" \
     || { echo "FAIL: the Secret entry did not survive the rebuild"; exit 1; }
 echo "note: the entry survived and protected-field access works under the current session key"
 
@@ -93,7 +93,7 @@ if [ "$wrong_rc" -eq 0 ]; then
     exit 1
 fi
 # And the vault is still intact under the real password.
-"$KEYHOLE" list "$VAULT" 2>/dev/null | grep -q 'Secret' \
+grep -q 'Secret' <<<"$("$KEYHOLE" list "$VAULT" 2>/dev/null)" \
     || { echo "FAIL: the vault is no longer readable after a refused wrong-password rebuild"; exit 1; }
 echo "note: rebuild under a wrong master password failed closed and left the vault intact"
 
