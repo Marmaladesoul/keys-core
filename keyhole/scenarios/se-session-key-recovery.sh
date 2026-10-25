@@ -110,7 +110,7 @@ if [ "$before_size" != "$after_size" ]; then
     echo "FAIL: the mirror was rewritten ($before_size -> $after_size bytes) by an open whose protector was merely UNAVAILABLE"
     exit 1
 fi
-"$KEYHOLE" list "$VAULT" 2>/dev/null | grep -q 'Bank' \
+grep -q 'Bank' <<<"$("$KEYHOLE" list "$VAULT" 2>/dev/null)" \
     || { echo "FAIL: the mirror is no longer usable under the real key after an unavailable-protector open"; exit 1; }
 [ "$(badge "$VAULT")" = 1 ] \
     || { echo "FAIL: the parked conflict did not survive an unavailable-protector open"; exit 1; }

@@ -44,8 +44,8 @@ sleep 1.1
 
 # No cycle on either side (a cyclic mirror would corrupt the projection;
 # list-groups must still enumerate all groups cleanly) and converged.
-"$KEYHOLE" list-groups "$A" | grep -q "$gx" || { echo "FAIL: A's group tree broke"; exit 1; }
-"$KEYHOLE" list-groups "$B" | grep -q "$gx" || { echo "FAIL: B's group tree broke"; exit 1; }
+grep -q "$gx" <<<"$("$KEYHOLE" list-groups "$A")" || { echo "FAIL: A's group tree broke"; exit 1; }
+grep -q "$gx" <<<"$("$KEYHOLE" list-groups "$B")" || { echo "FAIL: B's group tree broke"; exit 1; }
 converged || { echo "FAIL: mutual move did not converge (divergent cycle edge)"; exit 1; }
 
 # Survives reopen.
