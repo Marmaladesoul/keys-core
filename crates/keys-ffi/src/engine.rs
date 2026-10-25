@@ -984,10 +984,14 @@ impl Engine {
     // ────────────────────────────────────────────────────────────────────
 
     /// Ingest the KDBX file at `kdbx_path` (decrypted under `password`)
-    /// into SQLite.
+    /// into SQLite, replacing the mirror's contents.
     ///
     /// Slow: full vault walk + AES-GCM wrap per protected field. Runs
     /// on the tokio runtime; the FFI side `await`s.
+    ///
+    /// Returns [`EngineError::MirrorOwesWrite`] (touching nothing) when
+    /// the mirror holds changes the file doesn't have yet — only after
+    /// the file has decrypted, so that error also confirms the password.
     pub async fn ingest_from_kdbx(
         &self,
         kdbx_path: String,
@@ -1008,26 +1012,12 @@ impl Engine {
         password: String,
         keyfile: Option<Vec<u8>>,
     ) -> Result<(), EngineError> {
-        let path = PathBuf::from(kdbx_path);
-        let pw = SecretString::from(password);
-        let path_for_open = path.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            open_unlocked_kf(&path_for_open, &pw, keyfile.as_deref())
-        })
+        self.ingest_secret(
+            PathBuf::from(kdbx_path),
+            SecretString::from(password),
+            keyfile,
+        )
         .await
-        .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
-        self.with_engine_mut(|e| {
-            e.ingest_from_kdbx(&result)?;
-            // Record the post-ingest kdbx-state signature so the
-            // frontend can skip re-ingest on a later unlock when the
-            // on-disk KDBX hasn't changed. `save_to_kdbx` records the
-            // same signature internally; only `ingest_from_kdbx` needs
-            // the path threaded through here (the engine method
-            // doesn't take one — kept that way to avoid churning every
-            // existing call site).
-            e.record_kdbx_state_signature(&path)?;
-            Ok(())
-        })
     }
 
     /// Project SQLite state into a KDBX at `kdbx_path` (the file at
@@ -1214,10 +1204,14 @@ impl Engine {
     /// owning the open-time gate AND the sync write-back/loop-safety
     /// policy that clients previously re-derived per call site:
     ///
-    /// - no recorded signature → fresh mirror → ingest + record →
-    ///   [`SyncWithDiskFfi::FreshIngest`];
+    /// - no recorded signature and nothing owed → fresh mirror → ingest +
+    ///   record → [`SyncWithDiskFfi::FreshIngest`];
     /// - signature matches the file's `(mtime_ms, size)` → skip →
     ///   [`SyncWithDiskFfi::UpToDate`];
+    /// - no recorded signature but the mirror owes a write → NOT fresh:
+    ///   it holds content no file has seen, which an ingest would
+    ///   destroy. It takes the reconcile below instead, like a changed
+    ///   file;
     /// - signature differs → park-conflicts reconcile; on a merge that
     ///   advanced past disk the verb saves the projection back itself
     ///   ([`SyncWithDiskFfi::Applied`] `wrote_back: true`), on
@@ -1227,9 +1221,13 @@ impl Engine {
     ///   the reconcile ping-pong seed), and on an adoption-free
     ///   reconcile it writes nothing ([`SyncWithDiskFfi::NoChange`]).
     ///
-    /// `needs_write_back` never crosses the seam — there is no save
-    /// decision left for the caller to make. `temp_dir` is threaded to
-    /// the atomic-write tempfile exactly as in [`Self::save_to_kdbx`].
+    /// `needs_write_back` never crosses the seam — there is no merge
+    /// write-back decision left for the caller to make. A write the
+    /// mirror owed *before* the reconcile (local-ahead content) is not
+    /// part of that decision: it stays visible via
+    /// [`Self::persistence_state`] for the caller's save orchestrator to
+    /// flush, on every arm. `temp_dir` is threaded to the atomic-write
+    /// tempfile exactly as in [`Self::save_to_kdbx`].
     pub async fn sync_with_disk(
         &self,
         kdbx_path: String,
@@ -1237,26 +1235,42 @@ impl Engine {
         keyfile: Option<Vec<u8>>,
         temp_dir: Option<String>,
     ) -> Result<SyncWithDiskFfi, EngineError> {
-        let path = PathBuf::from(kdbx_path.clone());
+        let path = PathBuf::from(kdbx_path);
+        let pw = SecretString::from(password);
 
-        // Fresh mirror → ingest is the correspondence point.
-        let recorded = self.with_engine(|e| Ok(e.kdbx_state_signature()?))?;
-        let Some(recorded) = recorded else {
-            self.ingest_from_kdbx_with_keyfile(kdbx_path, password, keyfile)
-                .await?;
-            return Ok(SyncWithDiskFfi::FreshIngest);
-        };
-
-        // Warm mirror, unchanged file → nothing to do.
-        let disk = eng::KdbxStateSignature::from_path(&path)?;
-        if recorded == disk {
-            return Ok(SyncWithDiskFfi::UpToDate);
+        // Read as one pair under one lock: a mutation landing between two
+        // separate reads would skew the fresh-mirror decision.
+        let (recorded, owes_write) = self
+            .with_engine(|e| Ok((e.kdbx_state_signature()?, e.persistence_state()?.is_dirty())))?;
+        match recorded {
+            // Fresh mirror → ingest is the correspondence point. An
+            // unsigned mirror that owes a write is NOT fresh: it holds
+            // content no file has seen, which an ingest would replace —
+            // it falls through to the reconcile below instead.
+            None if !owes_write => {
+                match self
+                    .ingest_secret(path.clone(), pw.clone(), keyfile.clone())
+                    .await
+                {
+                    Ok(()) => return Ok(SyncWithDiskFfi::FreshIngest),
+                    // A mutation landed after the check above, so the
+                    // engine refused to wipe it: reconcile instead, as
+                    // for any unsigned mirror that owes a write.
+                    Err(EngineError::MirrorOwesWrite) => {}
+                    Err(other) => return Err(other),
+                }
+            }
+            // Warm mirror, unchanged file → nothing to do.
+            Some(recorded) if recorded == eng::KdbxStateSignature::from_path(&path)? => {
+                return Ok(SyncWithDiskFfi::UpToDate);
+            }
+            _ => {}
         }
 
-        // The file changed underneath the mirror → reconcile (merges,
-        // parks divergences, never blocks). The engine settles the
-        // watermark itself on digest-proven convergence.
-        let pw = SecretString::from(password);
+        // The file changed underneath the mirror (or an unsigned mirror
+        // owes a write) → reconcile (merges, parks divergences, never
+        // blocks). The engine settles the watermark itself on
+        // digest-proven convergence.
         let pw_for_composite = pw.clone();
         let keyfile_for_composite = keyfile.clone();
         let composite = tokio::task::spawn_blocking(move || {
@@ -1495,6 +1509,38 @@ impl Engine {
 }
 
 impl Engine {
+    /// [`Self::ingest_from_kdbx_with_keyfile`] over an already-wrapped
+    /// password, so a caller that may need it again (`sync_with_disk`)
+    /// lends a zeroising clone instead of copying the raw `String`.
+    ///
+    /// Lives outside the `#[uniffi::export]` impl block for the same
+    /// reason as [`Self::open_inner`].
+    async fn ingest_secret(
+        &self,
+        path: PathBuf,
+        pw: SecretString,
+        keyfile: Option<Vec<u8>>,
+    ) -> Result<(), EngineError> {
+        let path_for_open = path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            open_unlocked_kf(&path_for_open, &pw, keyfile.as_deref())
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
+        self.with_engine_mut(|e| {
+            e.ingest_from_kdbx(&result)?;
+            // Record the post-ingest kdbx-state signature so the
+            // frontend can skip re-ingest on a later unlock when the
+            // on-disk KDBX hasn't changed. `save_to_kdbx` records the
+            // same signature internally; only `ingest_from_kdbx` needs
+            // the path threaded through here (the engine method
+            // doesn't take one — kept that way to avoid churning every
+            // existing call site).
+            e.record_kdbx_state_signature(&path)?;
+            Ok(())
+        })
+    }
+
     /// Shared core of the three constructors: bridge the foreign
     /// key-provider / protector / watcher, open the underlying engine,
     /// and wrap it. `pinned` carries `(clock_ms, uuid_seed)` for the
@@ -1803,8 +1849,10 @@ pub struct SelfHealingOpen {
 /// signature so the caller's next open still takes the fast path. If that
 /// signature write fails *after* a successful rebuild, the call surfaces
 /// the error even though the rebuilt sidecar is durable on disk — a soft,
-/// self-correcting state: the caller's next open finds no signature and
-/// re-ingests (the same posture as the main `ingest_from_kdbx` path).
+/// self-correcting state: the rebuild's ingest settled the watermark in
+/// its own transaction, so the caller's next open finds a clean, unsigned
+/// mirror and re-ingests (the same posture as the main `ingest_from_kdbx`
+/// path).
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn open_vault_self_healing(
     db_path: String,

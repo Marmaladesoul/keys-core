@@ -65,7 +65,9 @@
 -- save at the next flush, while a false "clean" on a mirror holding
 -- a genuinely-unsaved mutation loses that mutation the next time the
 -- mirror is rebuilt from disk. The next real correspondence point
--- (save or ingest+signature) settles it.
+-- (save, digest-equal reconcile, or rebuild) settles it. A from-file
+-- ingest is refused while the mirror reads dirty, so a seeded-dirty
+-- mirror catches up through reconcile, not a wholesale re-ingest.
 INSERT OR IGNORE INTO setting(key, value)
 SELECT 'persistence.mutation_seq',
        CASE WHEN EXISTS(SELECT 1 FROM "group") THEN 1 ELSE 0 END;

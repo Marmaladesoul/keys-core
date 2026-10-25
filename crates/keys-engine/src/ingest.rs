@@ -20,10 +20,11 @@ use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
 use keepass_merge::{
     Classification, Granularity, classify, merge_meta_scalars, parse_conflict_resolutions,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::PersistenceState;
 use crate::error::{EngineError, IngestError};
 use crate::fingerprint;
 use crate::history_snapshot::HistorySnapshotIo;
@@ -72,7 +73,7 @@ pub(crate) fn ingest(
         fingerprint_key,
         protector,
         &vault,
-        Some(&HeaderFacts { cipher_id, kdf }),
+        Source::VaultFile(&HeaderFacts { cipher_id, kdf }),
     )
 }
 
@@ -100,7 +101,25 @@ pub(crate) fn ingest_vault(
     protector: &dyn FieldProtector,
     vault: &Vault,
 ) -> Result<IngestOutcome, EngineError> {
-    ingest_vault_with_header(conn, fingerprint_key, protector, vault, None)
+    ingest_vault_with_header(conn, fingerprint_key, protector, vault, Source::InMemory)
+}
+
+/// Where an ingested vault came from — which decides whether the ingest
+/// is a persistence correspondence point.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    /// The vault was read from its file, whose outer-header facts it
+    /// carries. Replacing the mirror with it is refused while the mirror
+    /// owes a write; once ingested the mirror owes that file nothing, so
+    /// the watermark settles. Check, replace and settle share the
+    /// ingest's own transaction.
+    VaultFile(&'a HeaderFacts),
+    /// The vault was rebuilt in memory from the mirror's own, possibly
+    /// modified, content — it may hold changes no file has seen, so the
+    /// watermark advances with the ingest's writes and stays owed. The
+    /// envelope is unchanged, so the header-fact rows are left as the
+    /// originating ingest wrote them.
+    InMemory,
 }
 
 fn ingest_vault_with_header(
@@ -108,7 +127,7 @@ fn ingest_vault_with_header(
     fingerprint_key: &[u8; 32],
     protector: &dyn FieldProtector,
     vault: &Vault,
-    header_facts: Option<&HeaderFacts>,
+    source: Source<'_>,
 ) -> Result<IngestOutcome, EngineError> {
     // One session-key fetch per ingest call. Same discipline as the
     // keepass-core wrap pass.
@@ -119,7 +138,19 @@ fn ingest_vault_with_header(
     let recycle_bin_uuid = vault.meta.recycle_bin_uuid;
     let recycle_bin_enabled = vault.meta.recycle_bin_enabled;
 
-    let tx = conn.transaction()?;
+    // IMMEDIATE: the write lock is held from the watermark check through
+    // the commit, so no other connection's mutation can land between
+    // "the mirror owes nothing" and the wipe that relies on it.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if matches!(source, Source::VaultFile(_)) {
+        let state = PersistenceState::read(&tx)?;
+        if state.is_dirty() {
+            return Err(EngineError::MirrorOwesWrite {
+                mutation_seq: state.mutation_seq,
+                persisted_seq: state.persisted_seq,
+            });
+        }
+    }
     clear_vault_tables(&tx)?;
     meta::clear_meta_tables(&tx)?;
 
@@ -140,7 +171,7 @@ fn ingest_vault_with_header(
     // that path mutates the in-memory vault without re-wrapping the
     // envelope, so the existing rows (written by the originating
     // ingest call) remain accurate.
-    if let Some(facts) = header_facts {
+    if let Source::VaultFile(facts) = source {
         meta::write_kdbx_outer_header_facts(&tx, facts.cipher_id, &facts.kdf)?;
     }
 
@@ -181,6 +212,16 @@ fn ingest_vault_with_header(
         &binaries,
         &mut outcome,
     )?;
+
+    if matches!(source, Source::VaultFile(_)) {
+        // After every row write above has advanced `mutation_seq`.
+        tx.execute(
+            "UPDATE setting SET value = \
+             (SELECT value FROM setting WHERE key = 'persistence.mutation_seq') \
+             WHERE key = 'persistence.persisted_seq'",
+            [],
+        )?;
+    }
 
     tx.commit()?;
     Ok(outcome)

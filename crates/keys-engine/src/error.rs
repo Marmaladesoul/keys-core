@@ -83,6 +83,24 @@ pub enum EngineError {
     #[error("ingest failed: {0}")]
     Ingest(#[from] IngestError),
 
+    /// The mirror holds content the KDBX file has not been handed yet —
+    /// its persistence watermark is dirty — so replacing it with the
+    /// file's contents would destroy that content. Returned by
+    /// [`crate::Engine::ingest_from_kdbx`], which refuses rather than
+    /// wipe it. Bring the mirror current non-destructively with a
+    /// reconcile, or persist it with a save; discarding local data
+    /// outright stays the explicit [`crate::Engine::rebuild_local_data`].
+    #[error(
+        "mirror owes the vault file a write (mutation_seq {mutation_seq} > \
+         persisted_seq {persisted_seq}); refusing to replace it from the file"
+    )]
+    MirrorOwesWrite {
+        /// The mirror's content-change counter.
+        mutation_seq: i64,
+        /// The counter's value at the last persist / correspondence point.
+        persisted_seq: i64,
+    },
+
     /// A projection-pass failure — see [`ProjectionError`] for the
     /// specific failure mode.
     #[error("projection failed: {0}")]
