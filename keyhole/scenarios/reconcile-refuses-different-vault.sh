@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# Scenario: RECONCILE REFUSES A DIFFERENT VAULT — when the file at a warm
-# mirror's path is replaced by a *different* vault (a swapped / relinked
-# file that happens to decrypt under the same password), the reconcile must
-# REFUSE rather than merge it in, and the refusal must touch neither the
-# mirror nor the file.
+# Scenario: REFUSE A DIFFERENT VAULT — when the file at a warm mirror's
+# path is replaced by a *different* vault (a swapped / relinked file that
+# happens to decrypt under the same password), every path that crosses the
+# mirror↔file boundary — reconcile, peer ingest, save, re-key — must REFUSE
+# rather than merge it in or write over it, touching neither the mirror nor
+# the file.
 #
 # A vault's identity is its root-group UUID (see `vault-identity-verify.sh`):
 # minted once, preserved across every save / sync / re-key. The mirror
@@ -33,9 +34,13 @@
 #   5. CONTROL → an externally edited copy of A (same vault, new content) at
 #      the path still reconciles, and the edit persists across a mirror
 #      nuke + fresh-process re-ingest. The guard must not over-refuse.
+#   6. SAVE / RE-KEY → with the engine already open when B is swapped in
+#      (no open-time sync), a save and a re-key are refused and B's bytes
+#      are untouched; the owed edit stays in the mirror and lands on A's
+#      own file once it is back (across a fresh re-ingest).
 #
 # Self-contained: keyhole's own create / create-entry / update-entry / list /
-# ingest-peer verbs, throwaway vaults only.
+# ingest-peer / rekey verbs (+ KEYHOLE_SKIP_OPEN_SYNC), throwaway vaults only.
 
 set -uo pipefail
 
@@ -139,4 +144,43 @@ rm -rf "$VAULT.mirror"
 grep -q "Alpha Edited Elsewhere" "$TMP/ctl-fresh.out" \
     || fail "the adopted edit did not persist across a fresh re-ingest"
 
-echo "PASS: reconcile refuses a different vault at the bound path (disk + peer-blob), touching neither mirror nor file, while a genuine external edit still reconciles"
+echo "note: an externally edited copy of the same vault still reconciles"
+
+# --- 6: SAVE / RE-KEY → refused over a different vault's file -----------
+# The window a reconcile can't cover: the engine is already open when the
+# file is swapped, so the next thing to touch the file is a WRITE.
+# KEYHOLE_SKIP_OPEN_SYNC opens over the mirror as it stands (no open-time
+# sync), modelling exactly that. The verb's mutation lands in the mirror,
+# then its save must be refused — B's bytes untouched — and a re-key too.
+cp "$VAULT" "$TMP/a-current.kdbx"
+swap_in "$B_COPY"
+if KEYHOLE_SKIP_OPEN_SYNC=1 "$KEYHOLE" create-entry "$VAULT" "Charlie Login" --username charlie \
+        >"$TMP/save.out" 2>"$TMP/save.err"; then
+    cat "$TMP/save.out"; cat "$TMP/save.err"
+    fail "a save over a DIFFERENT vault's file succeeded — it must be refused"
+fi
+grep -q "$REFUSAL" "$TMP/save.err" \
+    || { cat "$TMP/save.err"; fail "the save failed, but not with the identity-mismatch refusal"; }
+cmp -s "$B_COPY" "$VAULT" || fail "the refused save overwrote the other vault's file"
+
+if KEYHOLE_SKIP_OPEN_SYNC=1 KEYHOLE_NEW_PASSWORD="keyhole-reconcile-identity-new-pw" \
+        "$KEYHOLE" rekey "$VAULT" >"$TMP/rekey.out" 2>"$TMP/rekey.err"; then
+    cat "$TMP/rekey.out"; cat "$TMP/rekey.err"
+    fail "a re-key over a DIFFERENT vault's file succeeded — it must be refused"
+fi
+grep -q "$REFUSAL" "$TMP/rekey.err" \
+    || { cat "$TMP/rekey.err"; fail "the re-key failed, but not with the identity-mismatch refusal"; }
+cmp -s "$B_COPY" "$VAULT" || fail "the refused re-key rewrote the other vault's file"
+
+# The refused save kept the edit in the mirror (still owed), so once A's
+# own file is back the next open reconciles and lands it on the RIGHT file.
+swap_in "$TMP/a-current.kdbx"
+"$KEYHOLE" list "$VAULT" >"$TMP/back.out" 2>"$TMP/back.err" \
+    || { cat "$TMP/back.err"; fail "A's own file no longer opens after the refused save"; }
+grep -q "Charlie Login" "$TMP/back.out" || fail "the edit made while the stranger sat at the path was lost"
+rm -rf "$VAULT.mirror"
+"$KEYHOLE" list "$VAULT" >"$TMP/back-fresh.out" || fail "fresh re-ingest of A after the refused save"
+grep -q "Charlie Login" "$TMP/back-fresh.out" || fail "the owed edit never reached A's file"
+grep -q "Bravo Login" "$TMP/back-fresh.out" && fail "B's entry reached A's file"
+
+echo "PASS: a different vault at the bound path is refused by reconcile, peer-blob ingest, save and re-key — mirror and the other vault's file untouched — while a genuine external edit still reconciles and an owed edit lands on the right file"

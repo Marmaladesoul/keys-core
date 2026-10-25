@@ -1,8 +1,8 @@
-//! The reconcile vault-identity guard as the FFI surfaces it: a different
-//! vault at the bound path makes `sync_with_disk` (and the peer-blob
-//! `ingest_peer_kdbx`) fail with [`EngineError::VaultIdentityMismatch`],
-//! writing neither the mirror nor the file — while an externally edited copy
-//! of the same vault still syncs.
+//! The vault-identity guard as the FFI surfaces it: a different vault at the
+//! bound path makes `sync_with_disk`, the peer-blob `ingest_peer_kdbx`, and
+//! the write paths (`save_to_kdbx_with_keyfile`, `rekey_to_kdbx`) fail with
+//! [`EngineError::VaultIdentityMismatch`], writing neither the mirror nor the
+//! file — while an externally edited copy of the same vault still syncs.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -191,6 +191,69 @@ async fn ingest_peer_kdbx_refuses_a_different_vault() {
         std::fs::read(&kdbx_path).expect("read vault"),
         vault_before,
         "a refused peer ingest must not write the bound vault file"
+    );
+}
+
+/// The write paths are gated too: with the engine already open when a
+/// different vault lands at the bound path, a save is refused and the other
+/// vault's bytes are untouched — the save can't overwrite it.
+#[tokio::test(flavor = "multi_thread")]
+async fn save_refuses_to_overwrite_a_different_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, kdbx_path) = bound_engine(dir.path()).await;
+    let stranger = vault_bytes("bravo");
+    overwrite(&kdbx_path, &stranger);
+    let before = seam_state(&engine);
+
+    let result = engine
+        .save_to_kdbx_with_keyfile(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+            None,
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(EngineError::VaultIdentityMismatch { .. })),
+        "got {result:?}"
+    );
+    assert_eq!(seam_state(&engine), before);
+    assert_eq!(
+        std::fs::read(&kdbx_path).expect("read"),
+        stranger,
+        "a refused save must not write the other vault's file"
+    );
+}
+
+/// Re-key is gated the same way: it would otherwise re-encrypt this
+/// mirror's contents over the other vault's file.
+#[tokio::test(flavor = "multi_thread")]
+async fn rekey_refuses_to_overwrite_a_different_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, kdbx_path) = bound_engine(dir.path()).await;
+    let stranger = vault_bytes("bravo");
+    overwrite(&kdbx_path, &stranger);
+    let before = seam_state(&engine);
+
+    let result = engine
+        .rekey_to_kdbx(
+            kdbx_path.to_string_lossy().into_owned(),
+            KDBX_PASSWORD.to_owned(),
+            "rotated-password".to_owned(),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(EngineError::VaultIdentityMismatch { .. })),
+        "got {result:?}"
+    );
+    assert_eq!(seam_state(&engine), before);
+    assert_eq!(
+        std::fs::read(&kdbx_path).expect("read"),
+        stranger,
+        "a refused re-key must not write the other vault's file"
     );
 }
 

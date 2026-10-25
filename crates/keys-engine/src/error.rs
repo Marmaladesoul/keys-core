@@ -179,19 +179,20 @@ pub enum EngineError {
         reason: String,
     },
 
-    /// The KDBX a reconcile (or peer ingest) was handed is a **different
+    /// A vault offered across the mirror↔file boundary is a **different
     /// vault** from the one this mirror holds — its root-group UUID, the
     /// vault's identity (see [`crate::identity`]), differs from the
-    /// mirror's. Merging it would fold a stranger's entries into this
-    /// vault (and, via write-back, this vault's entries into the
-    /// stranger's file), so the ingest is refused before anything is
-    /// written: the mirror is untouched.
+    /// mirror's. Raised by [`crate::Engine::ensure_same_vault`]: on every
+    /// peer ingest (merging would fold a stranger's entries into this
+    /// vault) and by writers about to overwrite a file (saving would
+    /// replace the stranger's vault with this one). Refused before
+    /// anything is written: the mirror and the file are untouched.
     ///
     /// Raised only after the file has decrypted under the supplied key
     /// factors — a wrong password or keyfile fails first, as itself.
     #[error(
         "the vault file is a different vault (root group {found}, mirror holds \
-         {expected}); refusing to reconcile"
+         {expected}); refusing to touch it"
     )]
     VaultIdentityMismatch {
         /// The mirror's root-group UUID — the vault it was ingested from.

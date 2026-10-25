@@ -102,24 +102,25 @@ pub enum EngineError {
     #[error("field protector error: {0}")]
     FieldProtector(String),
 
-    /// The KDBX file offered to a reconcile / peer ingest is a
-    /// **different vault** from the one this engine's mirror holds (its
-    /// root-group UUID — the vault's identity — differs). Nothing was
-    /// merged and the mirror is untouched; the file at the path was not
-    /// written either.
+    /// The KDBX file a reconcile, peer ingest, save or re-key was pointed
+    /// at is a **different vault** from the one this engine's mirror holds
+    /// (its root-group UUID — the vault's identity — differs). The refused
+    /// step is all-or-nothing: it merged nothing and wrote no file. (A
+    /// `sync_with_disk` whose reconcile against the genuine file already
+    /// applied, and whose write-back then found a different vault swapped
+    /// in, keeps that reconcile — the mirror stays dirty, owing the right
+    /// file the write.)
     ///
     /// Contract: returned only AFTER the file has decrypted under the
     /// supplied key factors — a wrong password or keyfile fails first, as
     /// itself. The actionable reading is "the file at this path is not
-    /// this vault any more": surface it, and let the user re-point the
-    /// vault (e.g. a Locate flow gated on `verify_vault_identity`) rather
-    /// than retrying the sync. Until then the consumer must also stop
-    /// **saving** this vault to that path: the save path does not check
-    /// identity, so a save would overwrite the other vault's file with
-    /// this one.
+    /// this vault any more": surface it and let the user re-point the
+    /// vault (e.g. a Locate flow gated on `verify_vault_identity`); don't
+    /// retry. Saves to that path keep refusing until it is re-pointed, so
+    /// the other vault's file can't be overwritten.
     #[error(
         "the vault file is a different vault (root group {found}, this vault \
-         is {expected}); refusing to reconcile"
+         is {expected}); refusing to touch it"
     )]
     VaultIdentityMismatch {
         /// This vault's root-group UUID (canonical hyphenated form).

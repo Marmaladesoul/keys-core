@@ -660,6 +660,14 @@ impl Engine {
     /// cross-volume atomic). Pass `None` for non-sandboxed callers to
     /// keep the historical sibling-tempfile behaviour.
     ///
+    /// ## Vault identity
+    ///
+    /// `kdbx` is only an envelope (its contents are replaced wholesale), so
+    /// this method can't tell which vault `path` holds. A caller that opened
+    /// the file at `path` as the template — i.e. is about to overwrite it —
+    /// must first gate on [`Self::ensure_same_vault`] with that file's root,
+    /// or it may overwrite a different vault (keys-ffi's save and re-key do).
+    ///
     /// # Errors
     ///
     /// - [`EngineError::Projection`] if projection fails.
@@ -716,6 +724,9 @@ impl Engine {
     /// protected fields are preserved exactly as [`Self::save_to_kdbx`]
     /// preserves them. Records the same post-write signatures as a plain
     /// save; emits [`ChangeEvent::SaveCompleted`].
+    ///
+    /// As for [`Self::save_to_kdbx`], a caller re-keying the file at `path`
+    /// in place gates on [`Self::ensure_same_vault`] first.
     ///
     /// # Errors
     ///

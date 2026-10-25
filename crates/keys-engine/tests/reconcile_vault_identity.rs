@@ -1,6 +1,9 @@
-//! Reconcile's vault-identity guard: a mirror refuses to merge a KDBX that
-//! is a **different vault** (different root-group UUID), and the refusal is
-//! all-or-nothing — no mirror state moves.
+//! The vault-identity guard: a mirror refuses to merge a KDBX that is a
+//! **different vault** (different root-group UUID), and the refusal is
+//! all-or-nothing — no mirror state moves. (The write-side gate — save /
+//! re-key over a different vault's file — is exercised at the FFI seam,
+//! where the template is the file at the path; see keys-ffi
+//! `tests/sync_vault_identity.rs`.)
 //!
 //! Covers every peer-ingest entry point — the disk-watcher reconcile
 //! ([`Engine::reconcile_with_disk_park_conflicts`]), the per-device peer blob
@@ -308,4 +311,24 @@ fn identity_verdict_precedes_a_failing_projection() {
         engine.reconcile_with_disk_park_conflicts(&f.kdbx_path, &composite(), chrono::Utc::now());
 
     assert_identity_mismatch(result, f.root, stranger_root);
+}
+
+/// The public identity primitive writers gate on: it accepts this mirror's
+/// own root and refuses any other (naming both), writing nothing.
+#[test]
+fn ensure_same_vault_accepts_own_root_and_names_a_stranger() {
+    let f = fixture();
+    let before = mirror_state(&f.engine);
+    f.engine
+        .ensure_same_vault(f.root)
+        .expect("own root is this vault");
+
+    let stranger = uuid::Uuid::new_v4();
+    match f.engine.ensure_same_vault(stranger) {
+        Err(EngineError::VaultIdentityMismatch { expected, found }) => {
+            assert_eq!((expected, found), (f.root, stranger));
+        }
+        other => panic!("expected VaultIdentityMismatch, got {other:?}"),
+    }
+    assert_eq!(mirror_state(&f.engine), before);
 }
