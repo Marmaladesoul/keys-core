@@ -523,9 +523,14 @@ impl Engine {
     /// the ingest is a correspondence point, settling the persistence
     /// watermark ([`Engine::persistence_state`]) in its own transaction.
     /// Recording the file's signature is separate — call
-    /// [`Engine::record_kdbx_state_signature`] afterwards so a later open
-    /// can skip the ingest. Schema (tables, indices, triggers, settings)
+    /// [`Engine::record_ingested_kdbx_signature`] afterwards so a later
+    /// open can skip the ingest. Schema (tables, indices, triggers, settings)
     /// is preserved.
+    ///
+    /// A file whose root group has no UUID is given its stamped
+    /// identity ([`crate::identity::file_identity`]); the watermark is
+    /// then left owing a write, so the caller's next flush records that
+    /// identity in the file.
     ///
     /// Phase 2.4 / 2.5 will land the reverse direction (projection +
     /// serialise). Mutation semantics — adding / editing / deleting a
@@ -665,8 +670,9 @@ impl Engine {
     /// `kdbx` is only an envelope (its contents are replaced wholesale), so
     /// this method can't tell which vault `path` holds. A caller that opened
     /// the file at `path` as the template — i.e. is about to overwrite it —
-    /// must first gate on [`Self::ensure_same_vault`] with that file's root,
-    /// or it may overwrite a different vault (keys-ffi's save and re-key do).
+    /// must first gate on [`Self::ensure_same_vault`] with that file's
+    /// [`crate::identity::file_identity`], or it may overwrite a different
+    /// vault (keys-ffi's save and re-key do).
     ///
     /// # Errors
     ///
@@ -869,10 +875,9 @@ impl Engine {
     /// the two halves of one fact: "the mirror and this file now
     /// correspond".
     ///
-    /// Frontends should call this after a successful
-    /// [`Engine::ingest_from_kdbx`] to arm the open-time fast path. The
-    /// ingest has already settled the watermark in its own transaction,
-    /// so the advance here is a no-op on that path. [`Engine::save_to_kdbx`] records
+    /// After an [`Engine::ingest_from_kdbx`] call
+    /// [`Engine::record_ingested_kdbx_signature`] instead: the ingest
+    /// decides the watermark itself. [`Engine::save_to_kdbx`] records
     /// the same correspondence automatically, using the sequence
     /// snapshotted at save *start* (via the crate-private
     /// `record_kdbx_correspondence`).
@@ -905,21 +910,33 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let sig = crate::KdbxStateSignature::from_path(path)?;
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT OR REPLACE INTO setting(key, value) VALUES ('kdbx_state_signature_mtime_ms', ?1)",
-            rusqlite::params![sig.mtime_ms],
-        )?;
-        // Store as i64 — SQLite has no native u64. Sizes up to
-        // i64::MAX (8 exabytes) fit; KDBX files in practice are <100MB.
-        let byte_count_i64 = i64::try_from(sig.byte_count).unwrap_or(i64::MAX);
-        tx.execute(
-            "INSERT OR REPLACE INTO setting(key, value) VALUES ('kdbx_state_signature_byte_count', ?1)",
-            rusqlite::params![byte_count_i64],
-        )?;
+        write_kdbx_state_signature(&tx, &sig)?;
         tx.execute(
             "UPDATE setting SET value = ?1 WHERE key = 'persistence.persisted_seq'",
             rusqlite::params![persisted_seq_value],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record the `(mtime, size)` of the KDBX file at `path`, just
+    /// ingested by [`Engine::ingest_from_kdbx`], as the signature that
+    /// arms the open-time fast path — leaving the persistence watermark
+    /// as the ingest left it. That is settled, except when the ingest
+    /// stamped an identity the file lacks and so still owes it a write.
+    ///
+    /// # Errors
+    ///
+    /// - [`EngineError::Io`] if `path` can't be stat'd or its mtime
+    ///   can't be read.
+    /// - [`EngineError::Sqlite`] on persistence failure.
+    pub fn record_ingested_kdbx_signature(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), EngineError> {
+        let sig = crate::KdbxStateSignature::from_path(path)?;
+        let tx = self.conn.transaction()?;
+        write_kdbx_state_signature(&tx, &sig)?;
         tx.commit()?;
         Ok(())
     }
@@ -1645,6 +1662,25 @@ fn unlink_sidecar_files(base: &Path) -> (u32, Option<std::io::Error>) {
         }
     }
     (removed, first_err)
+}
+
+/// Persist `sig` as the mirror's recorded KDBX state signature.
+fn write_kdbx_state_signature(
+    tx: &rusqlite::Transaction<'_>,
+    sig: &crate::KdbxStateSignature,
+) -> Result<(), EngineError> {
+    tx.execute(
+        "INSERT OR REPLACE INTO setting(key, value) VALUES ('kdbx_state_signature_mtime_ms', ?1)",
+        rusqlite::params![sig.mtime_ms],
+    )?;
+    // Store as i64 — SQLite has no native u64. Sizes up to
+    // i64::MAX (8 exabytes) fit; KDBX files in practice are <100MB.
+    let byte_count_i64 = i64::try_from(sig.byte_count).unwrap_or(i64::MAX);
+    tx.execute(
+        "INSERT OR REPLACE INTO setting(key, value) VALUES ('kdbx_state_signature_byte_count', ?1)",
+        rusqlite::params![byte_count_i64],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

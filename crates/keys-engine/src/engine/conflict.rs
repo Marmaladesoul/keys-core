@@ -439,11 +439,11 @@ impl Engine {
     ///
     /// [`Self::ingest_peer`] runs it on every peer it is handed. A writer
     /// that is about to overwrite the file at a path runs it on that file's
-    /// root first: [`Self::save_to_kdbx`] / [`Self::rekey_to_kdbx`] accept
-    /// any envelope template (its contents are replaced wholesale), so they
-    /// can't know which file the bytes land on — the caller that opened the
-    /// file at the path as its template can, and gates on it (keys-ffi's
-    /// save and re-key do).
+    /// [`crate::identity::file_identity`] first: [`Self::save_to_kdbx`] /
+    /// [`Self::rekey_to_kdbx`] accept any envelope template (its contents are
+    /// replaced wholesale), so they can't know which file the bytes land on —
+    /// the caller that opened the file at the path as its template can, and
+    /// gates on it (keys-ffi's save and re-key do).
     ///
     /// Reads the mirror's root straight from `SQLite` — no projection — so
     /// the verdict is definite even when projecting would fail (e.g. an
@@ -455,16 +455,20 @@ impl Engine {
     /// [`EngineError::VaultIdentityMismatch`] on a different vault;
     /// [`EngineError::Sqlite`] if the mirror's root can't be read.
     pub fn ensure_same_vault(&self, found: Uuid) -> Result<(), EngineError> {
-        let expected = self.conn.query_row(
-            "SELECT uuid FROM \"group\" WHERE parent_uuid IS NULL LIMIT 1",
-            [],
-            |row| crate::util::row::parse_uuid_col(row, 0),
-        )?;
+        let expected = self.mirror_root_uuid()?;
         if crate::identity::is_same_vault(expected, found) {
             Ok(())
         } else {
             Err(EngineError::VaultIdentityMismatch { expected, found })
         }
+    }
+
+    fn mirror_root_uuid(&self) -> Result<Uuid, EngineError> {
+        Ok(self.conn.query_row(
+            "SELECT uuid FROM \"group\" WHERE parent_uuid IS NULL LIMIT 1",
+            [],
+            |row| crate::util::row::parse_uuid_col(row, 0),
+        )?)
     }
 
     /// Owner-rows badge query: every entry UUID that carries at least one

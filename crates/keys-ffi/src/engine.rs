@@ -1050,8 +1050,9 @@ impl Engine {
     /// dropped to password-only.
     ///
     /// The opened file must still be **this** vault: if the file at
-    /// `kdbx_path` is now a different vault (its root-group UUID differs from
-    /// the mirror's), the save is refused with
+    /// `kdbx_path` is now a different vault (its identity — root-group UUID,
+    /// stamped when nil: [`keys_engine::identity::file_identity`] — differs
+    /// from the mirror's), the save is refused with
     /// [`EngineError::VaultIdentityMismatch`] before anything is written, so
     /// it can never overwrite another vault's file. Covers every save that
     /// routes through here — including `sync_with_disk`'s write-back.
@@ -1077,7 +1078,7 @@ impl Engine {
             // engine lock as the save, so no other engine op interleaves; a
             // swap of the file itself between the read above and the rename
             // is a residual window this gate does not close.
-            e.ensure_same_vault(kdbx.vault().root.id.0)?;
+            e.ensure_same_vault(keys_engine::identity::file_identity(&kdbx))?;
             Ok(e.save_to_kdbx(&path, &mut kdbx, temp_dir.as_deref())?)
         })
     }
@@ -1175,7 +1176,7 @@ impl Engine {
         self.with_engine_mut(|e| {
             // As for `save_to_kdbx_with_keyfile`: never re-key a different
             // vault's file with this mirror's contents.
-            e.ensure_same_vault(kdbx.vault().root.id.0)?;
+            e.ensure_same_vault(keys_engine::identity::file_identity(&kdbx))?;
             Ok(e.rekey_to_kdbx(&path, &mut kdbx, &new_key, temp_dir.as_deref())?)
         })
     }
@@ -1558,7 +1559,7 @@ impl Engine {
             // the path threaded through here (the engine method
             // doesn't take one — kept that way to avoid churning every
             // existing call site).
-            e.record_kdbx_state_signature(&path)?;
+            e.record_ingested_kdbx_signature(&path)?;
             Ok(())
         })
     }
@@ -1874,7 +1875,9 @@ pub struct SelfHealingOpen {
 /// self-correcting state: the rebuild's ingest settled the watermark in
 /// its own transaction, so the caller's next open finds a clean, unsigned
 /// mirror and re-ingests (the same posture as the main `ingest_from_kdbx`
-/// path).
+/// path). A nil-root file's rebuild instead leaves the mirror owing its
+/// stamped identity, so that next open reconciles with the file — whose
+/// identity it already carries — and the owed write lands as usual.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn open_vault_self_healing(
     db_path: String,
@@ -1907,7 +1910,7 @@ pub async fn open_vault_self_healing(
                 engine_file_watcher::bridge(file_watcher.clone()),
                 &unlocked,
             )?;
-            inner.record_kdbx_state_signature(&kdbx)?;
+            inner.record_ingested_kdbx_signature(&kdbx)?;
             Ok(SelfHealingOpen {
                 engine: wrap_engine(inner),
                 rebuilt: Some(reason),
@@ -2001,7 +2004,7 @@ pub async fn rebuild_vault_local_data(
             engine_file_watcher::bridge(file_watcher),
             &unlocked,
         )?;
-        inner.record_kdbx_state_signature(&kdbx)?;
+        inner.record_ingested_kdbx_signature(&kdbx)?;
         drop(inner);
         Ok(discarded)
     })

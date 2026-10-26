@@ -111,7 +111,7 @@ pub fn verify_vault_identity(
     keyfile: Option<Vec<u8>>,
     expected_root_uuid: String,
 ) -> Result<VaultIdentityVerdict, VaultError> {
-    match read_root_uuid(&path, &password, keyfile.as_deref()) {
+    match read_file_identity(&path, &password, keyfile.as_deref()) {
         Ok(picked) => Ok(classify(picked, &expected_root_uuid)),
         // "Won't open under this credential" is a verdict, not an error — it
         // covers a genuine re-keyed vault as well as a wrong/corrupt file.
@@ -122,14 +122,14 @@ pub fn verify_vault_identity(
     }
 }
 
-/// Compare a decrypted picked root UUID against the expected identity string,
-/// under the engine's single identity rule
+/// Compare a decrypted picked file's identity against the expected identity
+/// string, under the engine's single identity rule
 /// ([`keys_engine::identity::is_same_vault`]) — the same rule the reconcile
 /// guard applies.
 ///
-/// A nil/all-zeros `picked` is never an identity (keepass-core defaults an
-/// absent `<UUID>` element to [`Uuid::nil`]), so it can never `Match` — even
-/// against a nil `expected`. A malformed `expected` likewise never matches.
+/// A nil/all-zeros `picked` is never an identity, so it can never `Match` —
+/// even against a nil `expected` (a file's identity is never nil: see
+/// [`read_file_identity`]). A malformed `expected` likewise never matches.
 fn classify(picked: Uuid, expected_root_uuid: &str) -> VaultIdentityVerdict {
     match Uuid::parse_str(expected_root_uuid) {
         Ok(expected) if keys_engine::identity::is_same_vault(expected, picked) => {
@@ -139,11 +139,17 @@ fn classify(picked: Uuid, expected_root_uuid: &str) -> VaultIdentityVerdict {
     }
 }
 
-/// Read the root-group UUID of the KDBX at `path`, decrypting with `password`
+/// Read the identity of the KDBX at `path` — its root-group UUID, or the
+/// stamped identity when the root has none
+/// ([`keys_engine::identity::file_identity`]) — decrypting with `password`
 /// plus an optional `keyfile`. The internal building block behind
 /// [`verify_vault_identity`]; not exported, so the verdict is the only seam a
 /// consumer can act on.
-fn read_root_uuid(path: &str, password: &str, keyfile: Option<&[u8]>) -> Result<Uuid, VaultError> {
+fn read_file_identity(
+    path: &str,
+    password: &str,
+    keyfile: Option<&[u8]>,
+) -> Result<Uuid, VaultError> {
     let secret = SecretString::from(password.to_owned());
     // Same composite construction as create / open / re-key, so a
     // keyfile-keyed vault verifies under exactly the key material that opens
@@ -158,7 +164,7 @@ fn read_root_uuid(path: &str, password: &str, keyfile: Option<&[u8]>) -> Result<
         .read_header()?
         .unlock_with_protector(&composite, crate::protector::bridge(None))?;
 
-    Ok(kdbx.vault().root.id.0)
+    Ok(keys_engine::identity::file_identity(&kdbx))
 }
 
 #[cfg(test)]

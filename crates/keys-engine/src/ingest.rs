@@ -57,9 +57,13 @@ pub(crate) fn ingest(
     // Vault carries plaintext in `password` and `custom_fields[i].value`
     // for the duration of the call. Drop it as soon as the walk is
     // done.
-    let vault = kdbx
+    let mut vault = kdbx
         .vault_with_unwrapped_protected()
         .map_err(|e| EngineError::Ingest(IngestError::Kdbx(e.to_string())))?;
+    // A nil root takes the file's stamped identity, which the file lacks
+    // until the mirror is next written back — so this ingest leaves the
+    // mirror owing that write.
+    let stamped = crate::identity::assign_file_identity(&mut vault, kdbx);
     let header = kdbx.outer_header();
     let cipher_id = *header.cipher_id.0.as_bytes();
     let kdf = match &header.version_fields {
@@ -73,7 +77,10 @@ pub(crate) fn ingest(
         fingerprint_key,
         protector,
         &vault,
-        Source::VaultFile(&HeaderFacts { cipher_id, kdf }),
+        Source::VaultFile {
+            facts: &HeaderFacts { cipher_id, kdf },
+            settles: !stamped,
+        },
     )
 }
 
@@ -110,10 +117,14 @@ pub(crate) fn ingest_vault(
 enum Source<'a> {
     /// The vault was read from its file, whose outer-header facts it
     /// carries. Replacing the mirror with it is refused while the mirror
-    /// owes a write; once ingested the mirror owes that file nothing, so
-    /// the watermark settles. Check, replace and settle share the
-    /// ingest's own transaction.
-    VaultFile(&'a HeaderFacts),
+    /// owes a write. Once ingested the mirror owes that file nothing, so
+    /// the watermark settles — unless `settles` is false because the
+    /// ingest stamped an identity the file lacks. Check, replace and
+    /// settle share the ingest's own transaction.
+    VaultFile {
+        facts: &'a HeaderFacts,
+        settles: bool,
+    },
     /// The vault was rebuilt in memory from the mirror's own, possibly
     /// modified, content — it may hold changes no file has seen, so the
     /// watermark advances with the ingest's writes and stays owed. The
@@ -142,7 +153,7 @@ fn ingest_vault_with_header(
     // the commit, so no other connection's mutation can land between
     // "the mirror owes nothing" and the wipe that relies on it.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if matches!(source, Source::VaultFile(_)) {
+    if matches!(source, Source::VaultFile { .. }) {
         let state = PersistenceState::read(&tx)?;
         if state.is_dirty() {
             return Err(EngineError::MirrorOwesWrite {
@@ -171,7 +182,7 @@ fn ingest_vault_with_header(
     // that path mutates the in-memory vault without re-wrapping the
     // envelope, so the existing rows (written by the originating
     // ingest call) remain accurate.
-    if let Source::VaultFile(facts) = source {
+    if let Source::VaultFile { facts, .. } = source {
         meta::write_kdbx_outer_header_facts(&tx, facts.cipher_id, &facts.kdf)?;
     }
 
@@ -213,7 +224,7 @@ fn ingest_vault_with_header(
         &mut outcome,
     )?;
 
-    if matches!(source, Source::VaultFile(_)) {
+    if matches!(source, Source::VaultFile { settles: true, .. }) {
         // After every row write above has advanced `mutation_seq`.
         tx.execute(
             "UPDATE setting SET value = \
