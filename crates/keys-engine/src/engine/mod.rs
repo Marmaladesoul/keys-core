@@ -523,15 +523,14 @@ impl Engine {
     /// the ingest is a correspondence point, settling the persistence
     /// watermark ([`Engine::persistence_state`]) in its own transaction.
     /// Recording the file's signature is separate — call
-    /// [`Engine::record_kdbx_state_signature`] afterwards so a later open
-    /// can skip the ingest. Schema (tables, indices, triggers, settings)
+    /// [`Engine::record_ingested_kdbx_signature`] afterwards so a later
+    /// open can skip the ingest. Schema (tables, indices, triggers, settings)
     /// is preserved.
     ///
-    /// A file whose root group has no UUID is given one
-    /// ([`crate::identity::stamped_root_uuid`]); the watermark is then
-    /// left owing a write, so the caller's next flush records that
-    /// identity in the file ([`Engine::ensure_may_overwrite`] lets that
-    /// one write through).
+    /// A file whose root group has no UUID is given its stamped
+    /// identity ([`crate::identity::file_identity`]); the watermark is
+    /// then left owing a write, so the caller's next flush records that
+    /// identity in the file.
     ///
     /// Phase 2.4 / 2.5 will land the reverse direction (projection +
     /// serialise). Mutation semantics — adding / editing / deleting a
@@ -671,8 +670,9 @@ impl Engine {
     /// `kdbx` is only an envelope (its contents are replaced wholesale), so
     /// this method can't tell which vault `path` holds. A caller that opened
     /// the file at `path` as the template — i.e. is about to overwrite it —
-    /// must first gate on [`Self::ensure_may_overwrite`] with that file, or
-    /// it may overwrite a different vault (keys-ffi's save and re-key do).
+    /// must first gate on [`Self::ensure_same_vault`] with that file's
+    /// [`crate::identity::file_identity`], or it may overwrite a different
+    /// vault (keys-ffi's save and re-key do).
     ///
     /// # Errors
     ///
@@ -732,7 +732,7 @@ impl Engine {
     /// save; emits [`ChangeEvent::SaveCompleted`].
     ///
     /// As for [`Self::save_to_kdbx`], a caller re-keying the file at `path`
-    /// in place gates on [`Self::ensure_may_overwrite`] first.
+    /// in place gates on [`Self::ensure_same_vault`] first.
     ///
     /// # Errors
     ///

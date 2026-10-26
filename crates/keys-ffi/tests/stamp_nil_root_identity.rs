@@ -5,6 +5,7 @@
 //! the identity was stamped from — never onto a different nil-root vault.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
@@ -12,13 +13,17 @@ use keepass_core::model::{GroupId, NewEntry};
 use keys_engine::identity::stamped_root_uuid;
 use keys_ffi::{
     Engine, EngineError, SyncWithDiskFfi, VaultDbKeyProvider, VaultDbKeyProviderError,
-    VaultFieldProtector, VaultProtectorError,
+    VaultFieldProtector, VaultIdentityVerdict, VaultProtectorError, verify_vault_identity,
 };
 use uuid::Uuid;
 
 const DB_KEY: [u8; 32] = [0x42; 32];
 const SESSION_KEY: [u8; 32] = [0x9c; 32];
 const KDBX_PASSWORD: &str = "test-password";
+
+/// How far past the recorded signature a touched file's mtime is pushed, so
+/// `sync_with_disk` sees a changed file.
+const MTIME_BUMP: Duration = Duration::from_secs(5);
 
 struct FixedDbKey;
 impl VaultDbKeyProvider for FixedDbKey {
@@ -198,4 +203,55 @@ async fn writers_refuse_a_different_nil_root_vault() {
         engine.persistence_state().expect("persistence").is_dirty,
         "the refused writes leave the stamp still owed"
     );
+}
+
+/// Before the stamp is flushed, the file the identity came from is still this
+/// vault to a reconcile: an mtime-only change (a re-download, a `touch`) syncs
+/// as the same vault, and the owed stamp still lands afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_touch_only_change_before_the_flush_reconciles_as_the_same_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = nil_root_vault_bytes("alpha");
+    let (engine, kdbx_path) = bound_to_nil_root(dir.path(), &bytes).await;
+    std::fs::File::options()
+        .write(true)
+        .open(&kdbx_path)
+        .expect("open for mtime")
+        .set_modified(SystemTime::now() + MTIME_BUMP)
+        .expect("bump mtime");
+
+    engine
+        .sync_with_disk(path_str(&kdbx_path), KDBX_PASSWORD.to_owned(), None, None)
+        .await
+        .expect("the stamped-from file reconciles as the same vault");
+    engine
+        .save_to_kdbx(path_str(&kdbx_path), KDBX_PASSWORD.to_owned(), None)
+        .await
+        .expect("the owed stamp lands");
+    assert_eq!(file_root(&kdbx_path), stamp_of(&bytes));
+}
+
+/// A relink verify reads a file's identity the way the ingest does, so the
+/// unflushed nil-root file matches the identity stamped from it, and a
+/// different nil-root vault doesn't.
+#[test]
+fn relink_verify_reads_a_nil_root_files_stamped_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = nil_root_vault_bytes("alpha");
+    let own = dir.path().join("own.kdbx");
+    let other = dir.path().join("other.kdbx");
+    std::fs::write(&own, &bytes).expect("write own");
+    std::fs::write(&other, nil_root_vault_bytes("bravo")).expect("write other");
+    let verify = |path: &std::path::Path| {
+        verify_vault_identity(
+            path_str(path),
+            KDBX_PASSWORD.to_owned(),
+            None,
+            stamp_of(&bytes).to_string(),
+        )
+        .expect("verify")
+    };
+
+    assert_eq!(verify(&own), VaultIdentityVerdict::Match);
+    assert_eq!(verify(&other), VaultIdentityVerdict::Mismatch);
 }

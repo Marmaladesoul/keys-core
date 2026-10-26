@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::protector::FieldProtector;
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -439,8 +438,12 @@ impl Engine {
     /// mirror's identity (see [`crate::identity`]).
     ///
     /// [`Self::ingest_peer`] runs it on every peer it is handed. A writer
-    /// about to overwrite the file at a path runs the writer's variant,
-    /// [`Self::ensure_may_overwrite`], on that file first.
+    /// that is about to overwrite the file at a path runs it on that file's
+    /// [`crate::identity::file_identity`] first: [`Self::save_to_kdbx`] /
+    /// [`Self::rekey_to_kdbx`] accept any envelope template (its contents are
+    /// replaced wholesale), so they can't know which file the bytes land on —
+    /// the caller that opened the file at the path as its template can, and
+    /// gates on it (keys-ffi's save and re-key do).
     ///
     /// Reads the mirror's root straight from `SQLite` — no projection — so
     /// the verdict is definite even when projecting would fail (e.g. an
@@ -454,33 +457,6 @@ impl Engine {
     pub fn ensure_same_vault(&self, found: Uuid) -> Result<(), EngineError> {
         let expected = self.mirror_root_uuid()?;
         if crate::identity::is_same_vault(expected, found) {
-            Ok(())
-        } else {
-            Err(EngineError::VaultIdentityMismatch { expected, found })
-        }
-    }
-
-    /// The writer's identity gate: refuse unless this mirror may overwrite
-    /// `file`, the file at the path a write is about to land on, opened as
-    /// its envelope template.
-    ///
-    /// [`Self::save_to_kdbx`] / [`Self::rekey_to_kdbx`] accept any envelope
-    /// template (its contents are replaced wholesale), so they can't know
-    /// which file the bytes land on — the caller that opened the file at the
-    /// path can, and gates on it (keys-ffi's save and re-key do). Same rule
-    /// as [`Self::ensure_same_vault`], plus the one write that gives a
-    /// nil-root file the identity the mirror stamped from it
-    /// ([`crate::identity::may_overwrite`]). Reads and writes as
-    /// [`Self::ensure_same_vault`] does.
-    ///
-    /// # Errors
-    ///
-    /// [`EngineError::VaultIdentityMismatch`] when `file` is a different
-    /// vault; [`EngineError::Sqlite`] if the mirror's root can't be read.
-    pub fn ensure_may_overwrite(&self, file: &Kdbx<Unlocked>) -> Result<(), EngineError> {
-        let expected = self.mirror_root_uuid()?;
-        let found = file.vault().root.id.0;
-        if crate::identity::may_overwrite(expected, found, &file.outer_header().master_seed.0) {
             Ok(())
         } else {
             Err(EngineError::VaultIdentityMismatch { expected, found })

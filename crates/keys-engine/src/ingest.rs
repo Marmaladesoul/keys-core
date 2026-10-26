@@ -60,14 +60,11 @@ pub(crate) fn ingest(
     let mut vault = kdbx
         .vault_with_unwrapped_protected()
         .map_err(|e| EngineError::Ingest(IngestError::Kdbx(e.to_string())))?;
+    // A nil root takes the file's stamped identity, which the file lacks
+    // until the mirror is next written back — so this ingest leaves the
+    // mirror owing that write.
+    let stamped = crate::identity::assign_file_identity(&mut vault, kdbx);
     let header = kdbx.outer_header();
-    // A file whose root has no UUID has no identity to guard: give it one
-    // (see `identity`). The file lacks it until the mirror is next written
-    // back, so this ingest leaves the mirror owing that write.
-    let stamped = vault.root.id.0.is_nil();
-    if stamped {
-        vault.root.id = GroupId(crate::identity::stamped_root_uuid(&header.master_seed.0));
-    }
     let cipher_id = *header.cipher_id.0.as_bytes();
     let kdf = match &header.version_fields {
         VersionFields::V3 {

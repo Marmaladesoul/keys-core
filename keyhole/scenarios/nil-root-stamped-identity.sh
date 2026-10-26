@@ -9,16 +9,22 @@
 # a vault could be opened but never saved or synced. The engine instead stamps
 # one on first ingest, derived from the file's master seed: deterministic, so
 # every device ingesting the same unstamped bytes mints the same identity.
-# The ingest leaves the mirror owing the file a write; that first write is let
-# through only onto the very file the stamp came from.
+# A file's identity is its root UUID or, when that is nil, its stamp — so every
+# reader (ingest, reconcile, the writers' gate, the relink verify) agrees on it,
+# and a different nil-root file (a different seed) is a different vault. The
+# ingest leaves the mirror owing the file a write that records the stamp.
 #
 # Assertions:
 #   1. A fresh ingest of a nil-root file leaves the mirror DIRTY (it owes the
 #      file its identity) and writes nothing.
 #   2. Every mirror ingesting the same bytes stamps the SAME identity, and the
-#      flush writes it into the file (an independent pure read now matches).
+#      flush writes it into the file.
 #   3. The stamped file then behaves as any identified vault: a fresh
-#      re-ingest keeps the identity and settles clean.
+#      re-ingest keeps the identity and settles clean (a nil-root file's
+#      ingest would read dirty).
+#   3a. Before the flush lands, a touch-only change to the file (mtime moves,
+#      bytes don't) reconciles as the same vault, and a relink verify of the
+#      unflushed file matches the stamp; the other fixture doesn't.
 #   4. A DIFFERENT nil-root vault swapped in at the path is refused by
 #      reconcile, save and re-key (VaultIdentityMismatch), its bytes untouched,
 #      and the original file still takes the owed stamp afterwards.
@@ -46,7 +52,8 @@ fail() { echo "FAIL: $*"; exit 1; }
 # A rewrite must land in a later mtime second than the recorded signature.
 swap_in() { sleep 1; cp "$1" "$2"; }
 
-# Pure read of the FILE's identity (no mirror): "match" iff it carries $2.
+# Pure read of the FILE's identity (no mirror): "match" iff it is $2 — its root
+# UUID, or its stamp when the root is nil.
 file_identity() { "$KEYHOLE" verify-identity "$1" --expect "$2" 2>/dev/null; }
 
 # --- 1 + 2: stamp on ingest, owed until flushed, deterministic -------------
@@ -64,9 +71,10 @@ STAMP="$("$KEYHOLE" root-uuid "$SIBLING")" || fail "stamp the sibling copy"
 [ "$STAMP" != "00000000-0000-0000-0000-000000000000" ] || fail "the stamped identity is nil"
 [ "$(file_identity "$SIBLING" "$STAMP")" = "match" ] || fail "the sibling's flush did not write its stamp"
 
-[ "$(file_identity "$VAULT" "$STAMP")" = "mismatch" ] || fail "the vault file carries an identity before any flush"
+cmp -s "$FIX_A" "$VAULT" || fail "the vault file changed before any flush"
 flushed="$("$KEYHOLE" flush "$VAULT")" || fail "flush the owed stamp"
 [ "$flushed" = "flushed" ] || fail "the owed stamp was not flushed (got: $flushed)"
+cmp -s "$FIX_A" "$VAULT" && fail "the flush did not rewrite the file"
 [ "$(file_identity "$VAULT" "$STAMP")" = "match" ] \
     || fail "the vault's mirror stamped a different identity than its sibling's (not deterministic)"
 
@@ -81,6 +89,22 @@ state="$("$KEYHOLE" persistence-state "$VAULT")" || fail "fresh re-ingest of the
 grep -q "Alpha Login" "$TMP/list.out" || fail "the vault's entry is missing after stamping"
 
 echo "note: the stamped file re-ingests with the same identity, clean"
+
+# --- 3a: the unflushed file is still this vault to every reader ------------
+TOUCHED="$TMP/touched.kdbx"
+cp "$FIX_A" "$TOUCHED"
+"$KEYHOLE" persistence-state "$TOUCHED" >/dev/null || fail "bind a mirror to vault A (stamp owed)"
+[ "$(file_identity "$TOUCHED" "$STAMP")" = "match" ] || fail "a relink verify refused the unflushed file the stamp came from"
+[ "$(file_identity "$FIX_B" "$STAMP")" = "mismatch" ] || fail "a relink verify accepted a different nil-root vault"
+sleep 1; touch "$TOUCHED"
+"$KEYHOLE" list "$TOUCHED" >"$TMP/touched.out" 2>"$TMP/touched.err" \
+    || { cat "$TMP/touched.err"; fail "a touch-only change to the stamped-from file was refused"; }
+grep -q "Alpha Login" "$TMP/touched.out" || fail "the vault's entry is missing after the touch-only reconcile"
+rm -rf "$TOUCHED.mirror"
+state="$("$KEYHOLE" persistence-state "$TOUCHED")" || fail "fresh re-ingest after the touch-only reconcile"
+[[ "$state" == *"dirty=false"* ]] || fail "the owed stamp did not land after the touch-only reconcile (got: $state)"
+
+echo "note: before the flush, a touch-only reconcile and a relink verify both see the same vault"
 
 # --- 4: a different nil-root vault is refused ------------------------------
 BOUND="$TMP/bound.kdbx"

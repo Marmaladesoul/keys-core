@@ -535,9 +535,12 @@ fn ingest_kdbx_as_owner(
         .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
         .map_err(|e| EngineError::Serialise(format!("unlock disk kdbx: {e}")))?;
 
-    let remote_vault = disk_kdbx
+    let mut remote_vault = disk_kdbx
         .vault_with_unwrapped_protected()
         .map_err(|e| EngineError::Serialise(format!("unwrap disk protected: {e}")))?;
+    // The file's identity, stamped if its root has none — the identity the
+    // ingest gave the mirror from the same file.
+    crate::identity::assign_file_identity(&mut remote_vault, &disk_kdbx);
 
     // Owner-rows ingest under `owner` (FILE_OWNER for the disk path, the peer's
     // device id for the per-device-key transport). `ingest_peer` advances local
