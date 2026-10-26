@@ -1127,12 +1127,10 @@ fn two_engine_history_delete_propagates() {
 /// With a cap of 2: A builds history [v0, v1] (live v2); B forks holding that
 /// at-cap history; A edits to v3, which pushes v2 onto history → [v0, v1, v2],
 /// over the cap, so the oldest (v0) is quota-trimmed and tombstoned. After a
-/// both-ways sync the trimmed v0 must live on NEITHER replica — the owner-rows
-/// ingest path PRUNES local history against the unioned tombstone set (it does
-/// not union the peer's history in, so depth may differ; the convergence digest
-/// excludes history for that reason). The guarantee under test is privacy:
-/// the quota-trimmed old secret is gone everywhere, and survives a fresh disk
-/// read on the receiving side.
+/// both-ways sync the trimmed v0 must live on NEITHER replica, and the replicas
+/// must agree: the lossless history fold unions A's post-fork v2 into B while
+/// the tombstone prunes v0. Both survive a fresh disk read on the receiving
+/// side.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn two_engine_history_quota_trim_propagates() {
@@ -1257,7 +1255,10 @@ fn two_engine_history_quota_trim_propagates() {
         "the quota-trimmed v0 must be purged from peer B (got {b_hist:?})",
     );
     assert_eq!(a_hist, vec!["v1", "v2"], "A keeps its post-trim set");
-    assert_eq!(b_hist, vec!["v1"], "B pruned the trimmed v0");
+    assert_eq!(
+        b_hist, a_hist,
+        "B pruned the trimmed v0 and folded in A's post-fork v2"
+    );
 
     // Honest disk read: a fresh engine opening B's saved KDBX must see v0 gone —
     // the tombstone really hit the file, not just B's warm mirror.
@@ -1269,8 +1270,137 @@ fn two_engine_history_quota_trim_propagates() {
         .expect("b2 ingest");
     assert_eq!(
         hist_usernames(&engine_b2, seed),
-        vec!["v1"],
-        "the quota trim survives a fresh disk read of B's KDBX",
+        vec!["v1", "v2"],
+        "the quota trim and the fold survive a fresh disk read of B's KDBX",
+    );
+}
+
+/// Engine twin of the keyhole `history-propagates-after-fork.sh` scenario:
+/// history born on one replica AFTER the fork must reach the other through
+/// `ingest_peer`. B forks holding the entry with no history; A edits twice
+/// (history [v0, v1], live v2). Adopting A's edit must bring A's snapshots with
+/// it — the history merge is lossless — so both replicas hold {v0, v1}, and a
+/// fresh disk read of B's KDBX agrees.
+///
+/// Then the history-only half: A gains a snapshot while the live values end
+/// where B already is (v2 → v3 → v2). B's pull classifies `InSync`, but the
+/// new snapshot is still a local change B must apply and save — not
+/// `NoChange` — or it never reaches B's file.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn two_engine_history_created_after_fork_propagates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id;
+    kdbx.add_entry(root, NewEntry::new("E").username("v0"))
+        .expect("seed entry");
+
+    let kdbx_a = dir.path().join("a.kdbx");
+    let kdbx_b = dir.path().join("b.kdbx");
+    let db_a = dir.path().join("a.db");
+    let mut engine_a =
+        Engine::open(&db_a, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open a");
+    engine_a.ingest_from_kdbx(&kdbx).expect("a ingest");
+    let seed = engine_a
+        .list_entries(None, keys_engine::Pagination::all())
+        .expect("list")[0]
+        .uuid;
+    engine_a
+        .save_to_kdbx(&kdbx_a, &mut kdbx, None)
+        .expect("a save");
+
+    // B forks: the entry (v0) with no history.
+    let db_b = dir.path().join("b.db");
+    let mut engine_b =
+        Engine::open(&db_b, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open b");
+    engine_b
+        .ingest_from_kdbx(&reopen_kdbx(&kdbx_a))
+        .expect("b ingest");
+    let mut handle_b = reopen_kdbx(&kdbx_a);
+    engine_b
+        .save_to_kdbx(&kdbx_b, &mut handle_b, None)
+        .expect("b save");
+
+    let hist_usernames = |e: &Engine, uuid| -> Vec<String> {
+        let mut us: Vec<String> = e
+            .history(uuid)
+            .expect("history")
+            .into_iter()
+            .map(|h| h.username)
+            .collect();
+        us.sort();
+        us
+    };
+    let edit_a = |e: &mut Engine, u: &str| {
+        e.update_entry(
+            seed,
+            keys_engine::EntryUpdate {
+                username: Some(u.to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("a edit");
+    };
+    let save = |e: &mut Engine, path: &std::path::Path| {
+        let mut handle = reopen_kdbx(path);
+        e.save_to_kdbx(path, &mut handle, None).expect("save");
+    };
+    let fresh_read = |name: &str, path: &std::path::Path| -> Engine {
+        let mut e = Engine::open(
+            &dir.path().join(name),
+            &FixedKey(DB_KEY_BYTES),
+            protector(),
+            None,
+        )
+        .expect("open fresh");
+        e.ingest_from_kdbx(&reopen_kdbx(path))
+            .expect("fresh ingest");
+        e
+    };
+
+    // A edits after the fork: history [v0, v1], live v2.
+    edit_a(&mut engine_a, "v1");
+    edit_a(&mut engine_a, "v2");
+    save(&mut engine_a, &kdbx_a);
+
+    engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest a");
+    save(&mut engine_b, &kdbx_b);
+    engine_a
+        .ingest_peer_from_kdbx(&kdbx_b, &composite(), "device-b")
+        .expect("a ingest b");
+
+    assert_eq!(hist_usernames(&engine_a, seed), vec!["v0", "v1"]);
+    assert_eq!(
+        hist_usernames(&engine_b, seed),
+        vec!["v0", "v1"],
+        "B adopted A's edit together with A's post-fork snapshots",
+    );
+    assert_eq!(
+        hist_usernames(&fresh_read("b2.db", &kdbx_b), seed),
+        vec!["v0", "v1"],
+        "the folded history survives a fresh disk read of B's KDBX",
+    );
+
+    // History-only change: the live value returns to v2, so B's pull is
+    // InSync on content, but A's history grew {v2, v3}.
+    edit_a(&mut engine_a, "v3");
+    edit_a(&mut engine_a, "v2");
+    save(&mut engine_a, &kdbx_a);
+    let applied = engine_b
+        .ingest_peer_from_kdbx(&kdbx_a, &composite(), "device-a")
+        .expect("b ingest a again");
+    assert!(
+        matches!(applied, ParkConflictsResult::Applied { .. }),
+        "a history-only change must apply (and so be saved), got {applied:?}",
+    );
+    save(&mut engine_b, &kdbx_b);
+    assert_eq!(
+        hist_usernames(&fresh_read("b3.db", &kdbx_b), seed),
+        hist_usernames(&engine_a, seed),
+        "B's file holds A's full history after a history-only pull",
     );
 }
 

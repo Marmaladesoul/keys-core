@@ -13,12 +13,11 @@
 # *user_delete* half on the Engine path; this pins the *quota_trim* half.
 #
 # What we assert: the trimmed snapshot (v0) is PURGED from the peer that held it
-# and never resurrects on the trimmer. NB the owner-rows ingest path PRUNES local
-# history against the unioned tombstone set — it doesn't union the peer's history
-# IN (replicas may legitimately differ in history depth; the convergence digest
-# excludes history for exactly that reason). So the guarantee under test is "the
-# trimmed secret is gone everywhere", not full depth equality. We read the
-# snapshot sets directly via the `history` verb across a fresh disk read.
+# and never resurrects on the trimmer, and the replicas then agree: the history
+# merge is lossless (it unions the peer's snapshots in, minus tombstones), so B
+# also receives the `v2` snapshot A grew after the fork. The convergence digest
+# excludes history, so we read the snapshot sets directly via the `history` verb
+# across a fresh disk read.
 
 set -euo pipefail
 
@@ -61,8 +60,9 @@ ha="$(hist_users "$A" "$uuid")"; hb="$(hist_users "$B" "$uuid")"
 # The privacy guarantee: the quota-trimmed v0 lives on NEITHER replica.
 case " $hb " in *" v0 "*) echo "FAIL: the quota-trimmed v0 still lives on peer B — B=[$hb] (the trim didn't propagate as a deletion)"; exit 1;; esac
 case " $ha " in *" v0 "*) echo "FAIL: the quota-trimmed v0 resurrected on the trimmer A — A=[$ha]"; exit 1;; esac
-# No over-purge: A keeps its post-trim set; B keeps everything except v0.
+# No over-purge: A keeps its post-trim set, and B converges on it (B's own
+# un-trimmed v1 plus A's post-fork v2, without v0).
 [ "$ha" = "v1 v2" ] || { echo "FAIL: A's post-trim history changed unexpectedly — A=[$ha] (expected v1 v2)"; exit 1; }
-[ "$hb" = "v1" ]    || { echo "FAIL: B did not converge to the de-v0'd set — B=[$hb] (expected v1)"; exit 1; }
+[ "$hb" = "$ha" ]   || { echo "FAIL: B did not converge on A's post-trim set — A=[$ha] B=[$hb]"; exit 1; }
 
-echo "PASS: a quota-trimmed snapshot propagates as a deletion (v0 purged from both replicas), survives a fresh disk read"
+echo "PASS: a quota-trimmed snapshot propagates as a deletion (v0 purged from both replicas) and the replicas converge on {v1,v2}, survives a fresh disk read"

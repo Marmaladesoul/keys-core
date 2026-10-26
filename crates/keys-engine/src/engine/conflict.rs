@@ -415,6 +415,7 @@ impl Engine {
         // whole-vault projection.
         self.ensure_same_vault(peer.root.id.0)?;
         let local = self.project_to_vault()?;
+        let now = self.now();
         let outcome = crate::ingest::ingest_peer(
             &mut self.conn,
             &self.fingerprint_key,
@@ -422,6 +423,7 @@ impl Engine {
             owner,
             &local,
             peer,
+            now,
         )?;
         // Post-ingest sweep (Finding #10): a sync can dissolve a parked
         // conflict with a DIFFERENT owner as a side effect of adopting

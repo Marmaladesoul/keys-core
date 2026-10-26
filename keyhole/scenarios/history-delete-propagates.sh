@@ -12,7 +12,7 @@
 # record that the lossless merge then prunes against. This scenario pins that.
 #
 # NB the convergence digest is NO oracle here — it deliberately EXCLUDES
-# history (replicas may legitimately differ in depth), so we compare the
+# history (it only covers live content), so we compare the
 # snapshot sets directly via the `history` verb across a fresh disk read.
 
 set -euo pipefail
