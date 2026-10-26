@@ -85,11 +85,12 @@ pub struct MergeStats {
     pub groups_deleted: usize,
     /// Groups that changed parent. Always `0` in v0.1.
     pub groups_moved: usize,
-    /// Entries whose history was pruned because a peer's
-    /// `keys.history_tombstones.v1` record propagated a history-snapshot
-    /// deletion (the privacy fix, part 2). Distinct bucket because the live
-    /// entry is typically `InSync` — only its history changed — so it would
-    /// otherwise be an invisible `Applied`-with-zero-counts.
+    /// Entries whose history changed: the peer's snapshots folded in, and/or
+    /// records pruned by a peer's `keys.history_tombstones.v1` record (a
+    /// propagated history-snapshot deletion or quota trim). Distinct bucket
+    /// because the live entry is often `InSync` — only its history changed —
+    /// so it would otherwise be an invisible `Applied`-with-zero-counts. (The
+    /// name predates the fold.)
     pub history_pruned: usize,
 }
 
@@ -553,12 +554,13 @@ fn ingest_kdbx_as_owner(
     // something to save. A held conflict advanced nothing → NoChange → no save
     // → no re-push → the loop never starts. The badge reads the owner rows
     // directly, so `conflicted` does NOT make this `Applied`. A propagated
-    // cross-peer delete (Phase 5b), location move (Phase 5d), or history-
-    // snapshot deletion (the privacy fix, part 2) is a real local change, so it
-    // does (mirrors the `added` bucket). Loop-safe: an adopted move takes the
-    // peer's verbatim `location_changed`, and a history-tombstone reconcile is
-    // idempotent once both sides agree, so the re-saved value matches what the
-    // peer holds → the peer's next pull sees nothing newer → the loop settles.
+    // cross-peer delete (Phase 5b), location move (Phase 5d), or history change
+    // (peer snapshots folded in, or a propagated snapshot deletion) is a real
+    // local change, so it does (mirrors the `added` bucket). Loop-safe: an
+    // adopted move takes the peer's verbatim `location_changed`, and the
+    // history fold is idempotent once both sides hold the same union, so the
+    // re-saved value matches what the peer holds → the peer's next pull sees
+    // nothing newer → the loop settles.
     if outcome.auto_merged.is_empty()
         && outcome.added.is_empty()
         && outcome.deleted.is_empty()

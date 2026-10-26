@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use keepass_core::format::VersionFields;
-use keepass_core::kdbx::{Kdbx, Unlocked};
-use keepass_core::model::{CustomIcon, Entry, Group, GroupId, Meta, Vault};
+use keepass_core::kdbx::{Kdbx, Unlocked, compute_history_drop_count};
+use keepass_core::model::{Binary, CustomIcon, Entry, Group, GroupId, Meta, Vault};
 use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
 use keepass_merge::{
     Classification, Granularity, classify, merge_meta_scalars, parse_conflict_resolutions,
@@ -534,14 +534,7 @@ fn insert_entry(
     // (per the decoder doc); we use the slice index as
     // `history_index` directly.
     for (idx, hist) in entry.history.iter().enumerate() {
-        let snapshot = HistorySnapshotIo::from_entry(hist, session_key, binaries)?;
-        let json = serde_json::to_string(&snapshot)
-            .map_err(|e| EngineError::Ingest(IngestError::Json(e)))?;
-        conn.execute(
-            "INSERT INTO entry_history (entry_uuid, history_index, snapshot_json) \
-             VALUES (?1, ?2, ?3)",
-            params![entry_uuid, i64::try_from(idx).unwrap_or(i64::MAX), json],
-        )?;
+        insert_history_snapshot(conn, &entry_uuid, idx, hist, session_key, binaries)?;
     }
 
     // Suppress unused warnings for vault when history snapshots don't
@@ -699,13 +692,14 @@ pub struct IngestPeerOutcome {
     /// empty locally, and we hadn't changed them since (cross-peer group
     /// delete, Phase 5d). The local side changed → the caller must persist.
     pub groups_deleted: Vec<Uuid>,
-    /// Shared entries whose history was pruned (and/or whose history-tombstone
-    /// list grew) because the peer carried a `keys.history_tombstones.v1`
-    /// record this side hadn't applied — a "scrub this old version" deletion
-    /// propagating cross-peer (the history-deletion privacy fix, part 2). The
-    /// classify verdict for these is typically `InSync` (the live entry is
-    /// identical; only the history differs), so this is reconciled out-of-band
-    /// like the location pass. The local side changed → the caller must persist.
+    /// Shared entries whose persisted history changed: the peer's snapshots
+    /// folded in (the lossless history merge), records pruned by a
+    /// `keys.history_tombstones.v1` record this side hadn't applied (a "scrub
+    /// this old version" deletion or a quota trim propagating cross-peer),
+    /// and/or the tombstone list grew. The classify verdict for these is often
+    /// `InSync` (the live entry is identical; only the history differs), so
+    /// this is reconciled out-of-band like the location pass. (The name
+    /// predates the fold.) The local side changed → the caller must persist.
     pub history_pruned: Vec<Uuid>,
     /// Count of entries the peer agreed on outright — nothing written.
     pub in_sync: usize,
@@ -717,7 +711,9 @@ pub struct IngestPeerOutcome {
 /// KDBX with protected fields unwrapped to plaintext for the call's duration.
 /// `owner` is an opaque peer/device identifier the sync layer supplies; it is
 /// the conflict-row key, so the same string must be used across that peer's
-/// pulls for the refresh-in-place semantics to hold.
+/// pulls for the refresh-in-place semantics to hold. `now` stamps the
+/// `quota_trim` history tombstones a history fold may write (see
+/// [`fold_entry_history_into_mirror`]).
 // Flat per-entry classification dispatch — one arm per verdict, same shape
 // (and same allow) as `insert_entry` above.
 #[allow(clippy::too_many_lines)]
@@ -728,6 +724,7 @@ pub(crate) fn ingest_peer(
     owner: &str,
     local: &Vault,
     peer: &Vault,
+    now: DateTime<Utc>,
 ) -> Result<IngestPeerOutcome, EngineError> {
     // One session-key fetch per call — same discipline as `ingest`.
     let session_key = protector
@@ -737,6 +734,24 @@ pub(crate) fn ingest_peer(
     let local_by_uuid = index_entries(&local.root);
     let local_bin_refs: Vec<&[u8]> = local.binaries.iter().map(|b| b.data.as_slice()).collect();
     let peer_bin_refs: Vec<&[u8]> = peer.binaries.iter().map(|b| b.data.as_slice()).collect();
+    // The pools the history folds index into: local's for a local-based fold,
+    // the peer's after an adopt-peer. A fold grows its pool in place
+    // (append-only, so existing `ref_id`s stay valid) when the other side's
+    // snapshots carry attachment bytes it lacks. Each is cloned at most once
+    // per pass, and only if some entry actually needs a fold.
+    let mut local_pool: Option<Vec<Binary>> = None;
+    let mut peer_pool: Option<Vec<Binary>> = None;
+    // The vault meta both replicas converge on after this pass. Its history
+    // caps bound every folded history, so both sides trim the same union the
+    // same way.
+    let mut merged_meta = local.meta.clone();
+    merge_meta_scalars(&mut merged_meta, &peer.meta);
+    let history_fold = HistoryFoldContext {
+        session_key: &session_key,
+        max_items: merged_meta.history_max_items,
+        max_size: merged_meta.history_max_size,
+        now,
+    };
 
     // Cross-peer resolution adoption (design §5.3): a side carrying a
     // `keys.conflict_resolutions.v1` record for an entry has decided that
@@ -809,13 +824,10 @@ pub(crate) fn ingest_peer(
             outcome.added.push(uuid);
             continue;
         };
-        // Did the verdict arm rebuild the live entry (history and all) from the
-        // PEER's copy? Only the conflict adopt-peer arm does (via
-        // `advance_local_entry(peer, &conflict.remote)`); every other arm leaves
-        // the persisted history equal to local's. The history-tombstone pass
-        // below must reconcile against whichever side is now on disk, or it
-        // would clobber the just-adopted peer history with a stale local one.
-        let mut adopted_peer_history = false;
+        // Which history the verdict arm leaves in the mirror, and so what the
+        // history pass below folds from. Held until an arm says otherwise —
+        // the conservative default for a verdict this code doesn't know.
+        let mut history_base = HistoryBase::Held;
         match classify(
             local_entry,
             peer_entry,
@@ -842,11 +854,18 @@ pub(crate) fn ingest_peer(
                 }
                 clear_conflict_rows(&tx, owner, &uuid_str)?;
                 outcome.in_sync += 1;
+                history_base = HistoryBase::Local;
             }
             Classification::AutoMerged {
                 merged,
                 attachment_changes,
             } => {
+                let merged = with_pre_merge_snapshot(
+                    *merged,
+                    !attachment_changes.is_empty(),
+                    (local_entry, &local.binaries),
+                    (peer_entry, &peer.binaries),
+                );
                 advance_local_entry(
                     &tx,
                     local,
@@ -883,6 +902,7 @@ pub(crate) fn ingest_peer(
                 }
                 clear_conflict_rows(&tx, owner, &uuid_str)?;
                 outcome.auto_merged.push(uuid);
+                history_base = HistoryBase::AutoMerged(Box::new(merged));
             }
             Classification::Conflict { conflict } => {
                 // Cross-peer resolution adoption (Phase 5a) before hold-open.
@@ -936,9 +956,9 @@ pub(crate) fn ingest_peer(
                         &peer_bin_refs,
                     )?;
                     // The live entry — history included — now holds the peer's
-                    // copy, so the history-tombstone pass must reconcile the
-                    // PEER's history, not our stale local one.
-                    adopted_peer_history = true;
+                    // copy, so the history pass must fold from the PEER's
+                    // history, not our stale local one.
+                    history_base = HistoryBase::Peer;
                     outcome.auto_merged.push(uuid);
                 } else {
                     // Genuine unresolved conflict (or our edit superseded the
@@ -989,70 +1009,65 @@ pub(crate) fn ingest_peer(
             outcome.moved.push(uuid);
         }
 
-        // History reconciliation, orthogonal to the content verdict. Two
-        // regimes, gated on whether a conflict RESOLUTION is in play for this
-        // entry (a `keys.conflict_resolutions.v1` record on either side):
+        // History convergence, orthogonal to the content verdict. The
+        // cross-peer history merge is LOSSLESS: once local's live entry
+        // incorporates the peer's current version (InSync, auto-merged, or
+        // adopted), the peer's snapshots are part of local's lineage, so fold
+        // them into the history the arm just persisted — a set union that
+        // honours both sides' `keys.history_tombstones.v1` lists, trimmed to
+        // the converged history caps with `quota_trim` tombstones. So:
         //
-        //   * Steady state (no resolution) — tombstone-only reconcile: union
-        //     both sides' history tombstones and prune the persisted entry's
-        //     matching records. Deleting a history snapshot (the "scrub this
-        //     old/leaked version" action) leaves the LIVE entry unchanged, so
-        //     classify verdicts it InSync and the deletion would otherwise
-        //     never reach this peer. Plain history DEPTH may legitimately
-        //     differ between replicas here (quota trim, one-sided scrub), so
-        //     this is deliberately NON-additive — it never folds the peer's
-        //     records in.
+        //   * a peer edit adopted here brings the peer's snapshots with it
+        //     (otherwise every device but the editor loses the old versions);
+        //   * an InSync entry still picks up snapshots the peer grew (e.g. the
+        //     loser a peer's conflict resolution recorded) — the live values
+        //     match, so only the fold can carry them;
+        //   * a deletion ("scrub this old version") or quota trim travels as a
+        //     tombstone and prunes the record here — a bare delete without one
+        //     is resurrected by design.
         //
-        //   * Post-resolution — lossless fold: a resolution
-        //     snapshots the LOSER (an old, scrubbed-but-recoverable secret)
-        //     into the resolver's history alone, and makes the live values
-        //     match so the next pull classifies InSync/AutoMerge and the
-        //     non-additive reconcile above would leave that snapshot — and each
-        //     side's pre-conflict unique snapshots — stranded on one replica.
-        //     Union the two histories (honouring tombstones) so both converge
-        //     on the same snapshot set.
+        // A HELD conflict is the exception: local has NOT incorporated the
+        // peer's version, and classify finds the ancestor by content in each
+        // side's history. Folding the peer's intermediate versions in would
+        // hand classify a later, false common ancestor, against which a peer
+        // edit to a non-clashing field reads as local's change — and would be
+        // silently reverted when the clash resolves. So a held conflict only
+        // reconciles tombstones (non-additive); its histories converge once
+        // the conflict does. That includes a conflict RESOLUTION: it records
+        // the loser in the resolver's history alone, and it makes the live
+        // values match, so the peer's next pull adopts or agrees — and folds.
         //
-        // Both run after the verdict arm so they survive `advance_local_entry`'s
-        // drop+reinsert; both touch only history rows + the tombstone
-        // custom_data item, never the live entry, so they're safe for held
-        // conflicts too. Loop-safe: idempotent once both sides agree. The base
-        // is whichever side's history the arm just persisted — the peer's when
-        // we adopted its resolved value, else local's (and an adopt always
-        // implies a peer resolution, so the non-fold branch is always local).
-        let resolution_in_play =
-            peer_resolved.contains_key(&uuid) || local_resolved.contains_key(&uuid);
-        let history_changed = if resolution_in_play {
-            if adopted_peer_history {
-                fold_resolved_entry_history(
-                    &tx,
-                    uuid,
-                    peer_entry,
-                    local_entry,
-                    &peer.binaries,
-                    &local.binaries,
-                    &session_key,
-                )?
-            } else {
-                fold_resolved_entry_history(
-                    &tx,
-                    uuid,
-                    local_entry,
-                    peer_entry,
-                    &local.binaries,
-                    &peer.binaries,
-                    &session_key,
-                )?
-            }
-        } else {
-            reconcile_entry_history_tombstones(
+        // Runs after the verdict arm so it survives `advance_local_entry`'s
+        // drop+reinsert; touches only history rows + the tombstone custom_data
+        // item, never the live entry. Loop-safe: idempotent once both sides
+        // agree.
+        let history_changed = match &history_base {
+            HistoryBase::Held => reconcile_entry_history_tombstones(
                 &tx,
-                uuid,
                 local_entry,
                 peer_entry,
                 &local.binaries,
                 &session_key,
                 &local_bin_refs,
-            )?
+            )?,
+            HistoryBase::Local => fold_entry_history_into_mirror(
+                &tx,
+                &history_fold,
+                (local_entry, &local.binaries, &mut local_pool),
+                (peer_entry, &peer.binaries),
+            )?,
+            HistoryBase::AutoMerged(merged) => fold_entry_history_into_mirror(
+                &tx,
+                &history_fold,
+                (merged.as_ref(), &local.binaries, &mut local_pool),
+                (peer_entry, &peer.binaries),
+            )?,
+            HistoryBase::Peer => fold_entry_history_into_mirror(
+                &tx,
+                &history_fold,
+                (peer_entry, &peer.binaries, &mut peer_pool),
+                (local_entry, &local.binaries),
+            )?,
         };
         if history_changed {
             outcome.history_pruned.push(uuid);
@@ -1078,7 +1093,7 @@ pub(crate) fn ingest_peer(
     // Vault-meta convergence: LWW the scalar Meta facets (recycle-bin config,
     // db name/description, history caps, …). Runs last so the recycle-bin
     // group pointer is resolved against the final, post-tombstone group tree.
-    reconcile_peer_meta(&tx, &local.meta, &peer.meta)?;
+    reconcile_peer_meta(&tx, &local.meta, &merged_meta)?;
 
     tx.commit()?;
     Ok(outcome)
@@ -1096,18 +1111,16 @@ pub(crate) fn ingest_peer(
 ///
 /// Shares the canonical LWW rules with the disk-reconcile path via
 /// [`merge_meta_scalars`] (one implementation, so the two ingest paths can't
-/// drift on the rules). Only the scalar subset runs here: the icon pool is
-/// unioned content-addressed by [`union_peer_custom_icons`] and resolution
-/// records ride the custom-data path, both above — so this deliberately does
-/// NOT touch them.
+/// drift on the rules); the caller runs it once up front, because the history
+/// fold needs the converged caps, and hands the result in as `merged`. Only
+/// the scalar subset runs here: the icon pool is unioned content-addressed by
+/// [`union_peer_custom_icons`] and resolution records ride the custom-data
+/// path, both above — so this deliberately does NOT touch them.
 fn reconcile_peer_meta(
     tx: &Connection,
     local_meta: &Meta,
-    peer_meta: &Meta,
+    merged: &Meta,
 ) -> Result<(), EngineError> {
-    let mut merged = local_meta.clone();
-    merge_meta_scalars(&mut merged, peer_meta);
-
     // Nothing won over local → write nothing. Rewriting identical
     // scalar rows would still advance the persistence watermark
     // (migration 0012's triggers fire per row write, changed or not),
@@ -1115,7 +1128,7 @@ fn reconcile_peer_meta(
     // write" — and a save orchestrator would then rewrite an unchanged
     // file, churning its mtime for every other watcher. A no-op merge
     // must be a no-op write.
-    if merged == *local_meta {
+    if *merged == *local_meta {
         return Ok(());
     }
 
@@ -1124,7 +1137,7 @@ fn reconcile_peer_meta(
     // colour, …). The scalar-only writer upserts these and never touches the
     // icon or custom-data list tables — `write_meta`'s list writes are plain
     // inserts that would duplicate the resolution-record rows mid-ingest.
-    meta::write_meta_scalars(tx, &merged)?;
+    meta::write_meta_scalars(tx, merged)?;
 
     // Recycle bin: the enabled flag (a 1-byte setting) plus the bin pointer,
     // which is the `is_recycle_bin` flag on a group row (derived, not a
@@ -1828,17 +1841,15 @@ fn has_history_tombstone(entry: &Entry) -> bool {
         .any(|c| c.key == keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY)
 }
 
-/// Reconcile history-snapshot deletions for a shared entry (the history-deletion
-/// privacy fix, part 2).
+/// Reconcile history-snapshot deletions for an entry held in conflict — the
+/// non-additive twin of [`fold_entry_history_into_mirror`], for the one case
+/// where folding the peer's snapshots in would be wrong (see the history pass
+/// in [`ingest_peer`]): the scrubs and quota trims still propagate, the peer's
+/// lineage stays out.
 ///
-/// `base` is the entry whose history the verdict arm just persisted to the
-/// mirror — local for the `InSync` / auto-merge / held-conflict arms, but the
-/// **peer** for the conflict adopt-peer arm (where `advance_local_entry`
-/// rebuilt the entry, history and all, from the peer's resolved copy). `other`
-/// is the opposite side; it contributes only its tombstone list to the union.
-/// Basing on the wrong side would clobber the just-persisted history with a
-/// stale one — so the caller picks `base`/`other`/`base_binaries`/`base_bin_refs`
-/// to match the arm that ran.
+/// `base` is local's entry (a held conflict leaves the mirror's history equal
+/// to local's); `other` is the peer's, and contributes only its tombstone
+/// list to the union.
 ///
 /// Delegates the CRDT to [`keepass_merge::reconcile_history_tombstones`] (the
 /// same OR-set the disk-reconcile path uses): it unions both sides'
@@ -1863,10 +1874,9 @@ fn has_history_tombstone(entry: &Entry) -> bool {
 /// the bytes prunes on its next reconcile — the scrub is delayed, never lost.
 fn reconcile_entry_history_tombstones(
     tx: &Connection,
-    uuid: Uuid,
     base: &Entry,
     other: &Entry,
-    base_binaries: &[keepass_core::model::Binary],
+    base_binaries: &[Binary],
     session_key: &SessionKey,
     base_bin_refs: &[&[u8]],
 ) -> Result<bool, EngineError> {
@@ -1881,65 +1891,245 @@ fn reconcile_entry_history_tombstones(
     if !changed {
         return Ok(false);
     }
-    let uuid_str = uuid.to_string();
-    rewrite_entry_history(tx, &uuid_str, &merged.history, session_key, base_bin_refs)?;
-    let tombstone_item = merged
-        .custom_data
-        .iter()
-        .find(|c| c.key == keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY);
-    write_entry_tombstone_custom_data(tx, &uuid_str, tombstone_item)?;
+    persist_entry_history(tx, &merged, session_key, base_bin_refs)?;
     Ok(true)
 }
 
-/// Post-resolution lossless history fold: make `base`'s persisted history the
-/// set-union of both sides' (minus tombstones) so a resolved entry's loser
-/// snapshot — and each side's pre-conflict unique snapshots — converge across
-/// replicas. The additive counterpart to
-/// [`reconcile_entry_history_tombstones`]; only invoked when a conflict
-/// resolution is in play for the entry, since plain in-sync histories are
-/// allowed to differ in depth.
+/// Which history a verdict arm of [`ingest_peer`] left in the mirror for an
+/// entry, and so how the history pass reconciles it.
+enum HistoryBase {
+    /// A held conflict (or a verdict this code doesn't know): local's history,
+    /// and the peer's lineage stays out — tombstones only.
+    Held,
+    /// `InSync`: local's history, unchanged by the arm.
+    Local,
+    /// Auto-merged: this entry (local's history plus, when the merge made a
+    /// new version, local's pre-merge snapshot).
+    AutoMerged(Box<Entry>),
+    /// The conflict adopt-peer arm rebuilt the entry from the peer's copy:
+    /// the peer's history.
+    Peer,
+}
+
+/// What every history fold in one [`ingest_peer`] pass shares: the session key
+/// the rewritten snapshots are sealed under, the converged history caps the
+/// union is trimmed to, and the instant that stamps any `quota_trim`
+/// tombstone the trim writes.
+struct HistoryFoldContext<'a> {
+    session_key: &'a SessionKey,
+    max_items: i32,
+    max_size: i64,
+    now: DateTime<Utc>,
+}
+
+/// `merged` (an auto-merge result, which carries local's history) with
+/// local's pre-merge live state appended as a history snapshot — the version
+/// the merge overwrites, history stripped (KDBX never nests history). Mirrors
+/// the loser snapshot keepass-merge's own apply path records.
+///
+/// Skipped when the merge doesn't move local to a new version — no field or
+/// tag change (see [`same_version`]) and no adopted attachment change
+/// (`attachments_changed`; those ride beside `merged`, which keeps local's
+/// attachments) — and when either side's history already holds local's
+/// version under another mtime (e.g. local only changed the icon since the
+/// peer snapshotted it): the fold dedups by `(second, content)`, so that
+/// would land as a second copy of the same version. The fold drops the
+/// snapshot if a tombstone covers it.
+fn with_pre_merge_snapshot(
+    mut merged: Entry,
+    attachments_changed: bool,
+    (local, local_binaries): (&Entry, &[Binary]),
+    (peer, peer_binaries): (&Entry, &[Binary]),
+) -> Entry {
+    let already_recorded = local
+        .history
+        .iter()
+        .any(|h| same_content((h, local_binaries), (local, local_binaries)))
+        || peer
+            .history
+            .iter()
+            .any(|h| same_content((h, peer_binaries), (local, local_binaries)));
+    if (attachments_changed || !same_version(local, &merged)) && !already_recorded {
+        let mut snapshot = local.clone();
+        snapshot.history.clear();
+        merged.history.push(snapshot);
+    }
+    merged
+}
+
+/// Are `a` and `b` the same *version* in what a history record's identity
+/// covers for classify's ancestor search: standard fields, custom fields and
+/// tags? (Attachments are the rest of that identity; see [`same_content`].)
+/// The icon is deliberately excluded, as it is from version identity.
+///
+/// An auto-merge can leave all of these equal: `merged` is `local` itself when
+/// only the peer is behind, and differs only in the icon when the peer set a
+/// favicon. Snapshotting local then would record a copy of the LIVE version as
+/// history; once that reached a peer, classify there would read this replica's
+/// current version as an ancestor and silently drop a genuine conflict with it.
+///
+/// This mirrors the scope of keepass-merge's (crate-private) content hash, so
+/// a facet added to that identity must be added here too.
+fn same_version(a: &Entry, b: &Entry) -> bool {
+    fn sorted_custom(e: &Entry) -> Vec<(&str, &str, bool)> {
+        let mut fields: Vec<(&str, &str, bool)> = e
+            .custom_fields
+            .iter()
+            .map(|f| (f.key.as_str(), f.value.as_str(), f.protected))
+            .collect();
+        fields.sort_unstable();
+        fields
+    }
+    fn sorted_tags(e: &Entry) -> Vec<&str> {
+        let mut tags: Vec<&str> = e.tags.iter().map(String::as_str).collect();
+        tags.sort_unstable();
+        tags
+    }
+    a.title == b.title
+        && a.username == b.username
+        && a.password == b.password
+        && a.url == b.url
+        && a.notes == b.notes
+        && sorted_custom(a) == sorted_custom(b)
+        && sorted_tags(a) == sorted_tags(b)
+}
+
+/// [`same_version`] plus equal attachments (name, bytes and protected flag,
+/// each side dereferencing its own pool). Conservative: an entry carrying a
+/// duplicate attachment name or a dangling `ref_id` compares unequal, which
+/// only ever costs a skipped shortcut.
+fn same_content(a: (&Entry, &[Binary]), b: (&Entry, &[Binary])) -> bool {
+    fn sorted_attachments<'e>(
+        e: &'e Entry,
+        binaries: &'e [Binary],
+    ) -> Option<Vec<(&'e str, &'e [u8], bool)>> {
+        let mut atts = e
+            .attachments
+            .iter()
+            .map(|att| {
+                binaries
+                    .get(att.ref_id as usize)
+                    .map(|bin| (att.name.as_str(), bin.data.as_slice(), bin.protected))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        atts.sort_unstable();
+        Some(atts)
+    }
+    same_version(a.0, b.0)
+        && matches!(
+            (sorted_attachments(a.0, a.1), sorted_attachments(b.0, b.1)),
+            (Some(x), Some(y)) if x == y
+        )
+}
+
+/// Lossless history fold for one shared entry: make the mirror's persisted
+/// history the set-union of `base`'s and `other`'s (minus both sides'
+/// `keys.history_tombstones.v1`), trimmed to the converged caps.
+///
+/// `base` is the entry whose history the verdict arm just persisted — local
+/// (plus its pre-merge snapshot after an auto-merge), or the **peer** after the
+/// conflict adopt-peer arm rebuilt the entry from the peer's resolved copy —
+/// with the pool its history references and the pass's growable copy of that
+/// pool. `other` is the opposite side with its pool. Basing on the wrong side
+/// would clobber the just-persisted history with a stale one.
 ///
 /// Delegates the union + tombstone CRDT to [`keepass_merge::fold_entry_history`]
-/// (so this can't drift from the auto-merge apply path), then persists exactly
-/// like the tombstone reconcile. `base_binaries` is cloned into an owned pool
-/// that the fold may GROW to import peer-only history-attachment bytes; the
-/// persisted snapshots are sealed against that grown pool so a folded peer
-/// record's attachment `ref_id`s stay valid.
-fn fold_resolved_entry_history(
+/// (so this can't drift from the disk-merge apply path), then the trim to
+/// [`keepass_merge::prune_history_with_tombstones`] (the same budget rule the
+/// save path applies), which tombstones every record it drops with reason
+/// `quota_trim`. Without those tombstones the union would re-add a record the
+/// save path's own truncation silently drops, every pass — a save loop. Both
+/// replicas trim the same union by the same converged caps, so they drop the
+/// same records.
+///
+/// The fold **grows** the pool copy to import the other side's history
+/// attachment bytes, and the rewritten snapshots are sealed against the grown
+/// pool so a folded record's attachment `ref_id`s stay valid. The copy is made
+/// on first use; the converged steady state (identical histories, no
+/// tombstones, within the caps) returns before touching it.
+///
+/// Persists by rewriting the entry's `entry_history` rows and its tombstone
+/// `entry_custom_data` item — the live `entry` row is never touched — and only
+/// when something changed. Returns `true` iff it wrote (the caller records it
+/// so the reconcile drives a save); `false` is the converged steady state.
+///
+/// Known limitation (eventually-consistent): a tombstone matches a record by
+/// its content hash, which for an attachment-bearing snapshot includes the
+/// attachment bytes. A side that doesn't hold those bytes hashes the same
+/// record *without* them, so the prune no-ops there until the bytes arrive.
+/// The tombstone still propagates, so the scrub is delayed, never lost.
+fn fold_entry_history_into_mirror(
     tx: &Connection,
-    uuid: Uuid,
-    base: &Entry,
-    other: &Entry,
-    base_binaries: &[keepass_core::model::Binary],
-    other_binaries: &[keepass_core::model::Binary],
-    session_key: &SessionKey,
+    ctx: &HistoryFoldContext<'_>,
+    (base, base_binaries, base_pool): (&Entry, &[Binary], &mut Option<Vec<Binary>>),
+    (other, other_binaries): (&Entry, &[Binary]),
 ) -> Result<bool, EngineError> {
-    // Cheap pre-check: with no peer history to fold in and no tombstone on
-    // either side, the union is base's own history — nothing to do, and no need
-    // to clone the entry or the binary pool. (A peer history equal to base's is
-    // handled by the idempotent `false` return below.)
-    if other.history.is_empty() && !has_history_tombstone(base) && !has_history_tombstone(other) {
+    if !has_history_tombstone(base)
+        && !has_history_tombstone(other)
+        && histories_identical((base, base_binaries), (other, other_binaries))
+        && compute_history_drop_count(&base.history, ctx.max_items, ctx.max_size) == 0
+    {
         return Ok(false);
     }
+    let pool = base_pool.get_or_insert_with(|| base_binaries.to_vec());
     let mut merged = base.clone();
-    let mut base_pool = base_binaries.to_vec();
-    let changed =
-        keepass_merge::fold_entry_history(&mut merged, other, &mut base_pool, other_binaries)
-            .map_err(|e| EngineError::Serialise(format!("fold_entry_history: {e}")))?;
+    let folded = keepass_merge::fold_entry_history(&mut merged, other, pool, other_binaries)
+        .map_err(|e| EngineError::Serialise(format!("fold_entry_history: {e}")))?;
+    let trimmed = keepass_merge::prune_history_with_tombstones(
+        &mut merged,
+        ctx.max_items,
+        ctx.max_size,
+        pool,
+        keepass_merge::TombstoneReason::QuotaTrim,
+        None,
+        ctx.now,
+    )
+    .map_err(|e| EngineError::Serialise(format!("prune_history_with_tombstones: {e}")))?;
+    // `fold_entry_history` compares snapshot *sets*, so a duplicate it
+    // collapsed inside `base` reads as unchanged; the length catches it.
+    let changed = folded || trimmed > 0 || merged.history.len() != base.history.len();
     if !changed {
         return Ok(false);
     }
-    let uuid_str = uuid.to_string();
-    // Refs into the (possibly grown) base pool — a folded peer record's
-    // attachment `ref_id` now indexes here, not the peer's pool.
-    let grown_refs: Vec<&[u8]> = base_pool.iter().map(|b| b.data.as_slice()).collect();
-    rewrite_entry_history(tx, &uuid_str, &merged.history, session_key, &grown_refs)?;
+    let pool_refs: Vec<&[u8]> = pool.iter().map(|b| b.data.as_slice()).collect();
+    persist_entry_history(tx, &merged, ctx.session_key, &pool_refs)?;
+    Ok(true)
+}
+
+/// Do the two sides hold the same history — equally many records, each with a
+/// twin on the other side (same whole-second mtime and [`same_content`])? The
+/// fold's cheap steady-state test: it never hashes, and it ignores order,
+/// because the fold keeps each side's own record first among same-second
+/// records. Any doubt reads as "different", which only costs running the fold.
+fn histories_identical(a: (&Entry, &[Binary]), b: (&Entry, &[Binary])) -> bool {
+    let has_twin = |x: &Entry, x_bins: &[Binary], side: (&Entry, &[Binary])| {
+        side.0.history.iter().any(|y| {
+            x.times.last_modification_time.map(floor_to_second)
+                == y.times.last_modification_time.map(floor_to_second)
+                && same_content((x, x_bins), (y, side.1))
+        })
+    };
+    a.0.history.len() == b.0.history.len()
+        && a.0.history.iter().all(|x| has_twin(x, a.1, b))
+        && b.0.history.iter().all(|y| has_twin(y, b.1, a))
+}
+
+/// Persist `merged`'s history to the mirror: its `entry_history` rows and its
+/// `keys.history_tombstones.v1` custom-data item. `binaries` is the pool its
+/// history's attachment `ref_id`s index.
+fn persist_entry_history(
+    tx: &Connection,
+    merged: &Entry,
+    session_key: &SessionKey,
+    binaries: &[&[u8]],
+) -> Result<(), EngineError> {
+    let uuid_str = merged.id.0.to_string();
+    rewrite_entry_history(tx, &uuid_str, &merged.history, session_key, binaries)?;
     let tombstone_item = merged
         .custom_data
         .iter()
         .find(|c| c.key == keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY);
-    write_entry_tombstone_custom_data(tx, &uuid_str, tombstone_item)?;
-    Ok(true)
+    write_entry_tombstone_custom_data(tx, &uuid_str, tombstone_item)
 }
 
 /// Replace an entry's `entry_history` rows with `history` (oldest-first),
@@ -1958,14 +2148,39 @@ fn rewrite_entry_history(
         params![uuid_str],
     )?;
     for (idx, hist) in history.iter().enumerate() {
-        let snapshot = HistorySnapshotIo::from_entry(hist, session_key, binaries)?;
-        let json = serde_json::to_string(&snapshot)
-            .map_err(|e| EngineError::Ingest(IngestError::Json(e)))?;
-        tx.execute(
-            "INSERT INTO entry_history (entry_uuid, history_index, snapshot_json) \
-             VALUES (?1, ?2, ?3)",
-            params![uuid_str, i64::try_from(idx).unwrap_or(i64::MAX), json],
-        )?;
+        insert_history_snapshot(tx, uuid_str, idx, hist, session_key, binaries)?;
+    }
+    Ok(())
+}
+
+/// Write one `entry_history` row (snapshot sealed, as JSON) at
+/// `history_index = idx`, and store the bytes of every attachment it
+/// references. The snapshot keeps only each attachment's SHA-256, and
+/// projection resolves that against `attachment_blob`, so a snapshot whose
+/// bytes no live attachment shares (a peer's history folded in, or a version
+/// whose attachment was since replaced or removed) would otherwise project
+/// without its attachment: it would no longer content-hash-match its twin on
+/// the peer, and the history fold would re-add it on every pull.
+fn insert_history_snapshot(
+    conn: &Connection,
+    uuid_str: &str,
+    idx: usize,
+    hist: &Entry,
+    session_key: &SessionKey,
+    binaries: &[&[u8]],
+) -> Result<(), EngineError> {
+    let snapshot = HistorySnapshotIo::from_entry(hist, session_key, binaries)?;
+    let json =
+        serde_json::to_string(&snapshot).map_err(|e| EngineError::Ingest(IngestError::Json(e)))?;
+    conn.execute(
+        "INSERT INTO entry_history (entry_uuid, history_index, snapshot_json) \
+         VALUES (?1, ?2, ?3)",
+        params![uuid_str, i64::try_from(idx).unwrap_or(i64::MAX), json],
+    )?;
+    for att in &hist.attachments {
+        if let Some(bytes) = binaries.get(att.ref_id as usize).copied() {
+            upsert_attachment_blob(conn, bytes)?;
+        }
     }
     Ok(())
 }
@@ -2501,7 +2716,21 @@ mod ingest_peer_tests {
         local: &Vault,
         peer: &Vault,
     ) -> IngestPeerOutcome {
-        ingest_peer(conn, &FP_KEY, &TestProtector, owner, local, peer).expect("ingest_peer")
+        ingest_peer(
+            conn,
+            &FP_KEY,
+            &TestProtector,
+            owner,
+            local,
+            peer,
+            ingest_now(),
+        )
+        .expect("ingest_peer")
+    }
+
+    /// The fixed "now" every test ingest stamps its `quota_trim` tombstones with.
+    fn ingest_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(10_000, 0).expect("ts")
     }
 
     /// Seed `local`, ingest one `peer` as `owner`, return (conn, outcome).
@@ -3027,6 +3256,255 @@ mod ingest_peer_tests {
             tombstone_rows(&conn, id),
             0,
             "tombstone scrubbed on resurrection (never live entry + tombstone)"
+        );
+    }
+
+    // ── Lossless history fold ────────────────────────────────────────────
+
+    /// A history snapshot `(title, password)` stamped `secs`.
+    fn snap(id: Uuid, title: &str, password: &str, secs: i64) -> Entry {
+        let mut e = Entry::empty(EntryId(id));
+        e.title = title.into();
+        e.password = password.into();
+        e.times = ts(secs);
+        e
+    }
+
+    /// A live entry `(title, password)` stamped `secs` carrying `history`.
+    fn live(id: Uuid, title: &str, password: &str, secs: i64, history: Vec<Entry>) -> Entry {
+        let mut e = snap(id, title, password, secs);
+        e.history = history;
+        e
+    }
+
+    fn history_rows(conn: &Connection, uuid: Uuid) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM entry_history WHERE entry_uuid = ?1",
+            params![uuid.to_string()],
+            |r| r.get(0),
+        )
+        .expect("count history rows")
+    }
+
+    fn has_history_tombstone_row(conn: &Connection, uuid: Uuid) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM entry_custom_data WHERE entry_uuid = ?1 AND key = ?2",
+            params![uuid.to_string(), keepass_merge::TOMBSTONE_CUSTOM_DATA_KEY],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("count tombstone rows")
+            > 0
+    }
+
+    #[test]
+    fn adopted_peer_edit_carries_peer_history() {
+        // Local forked before the peer's edits: live p0, no history. The peer
+        // edited twice (history [p0, p1], live p2).
+        let id = Uuid::new_v4();
+        let local = vault_of(vec![live(id, "T", "p0", 1000, vec![])]);
+        let peer = vault_of(vec![live(
+            id,
+            "T",
+            "p2",
+            3000,
+            vec![snap(id, "T", "p0", 1000), snap(id, "T", "p1", 2000)],
+        )]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.auto_merged, vec![id]);
+        assert_eq!(outcome.history_pruned, vec![id]);
+        // The peer's {p0, p1}; local's pre-merge snapshot (p0 @1000) is the
+        // same version as the peer's p0 and dedups into it.
+        assert_eq!(history_rows(&conn, id), 2);
+    }
+
+    #[test]
+    fn auto_merge_snapshots_local_pre_merge_state() {
+        // Different fields on each side: local retitled, the peer changed the
+        // password. The merge overwrites local's (TL, p0) version, so that
+        // version must land in history beside the shared base.
+        let id = Uuid::new_v4();
+        let base = snap(id, "T", "p0", 1000);
+        let local = vault_of(vec![live(id, "TL", "p0", 2000, vec![base.clone()])]);
+        let peer = vault_of(vec![live(id, "T", "p1", 3000, vec![base])]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.auto_merged, vec![id]);
+        assert_eq!(local_title(&conn, id), "TL");
+        assert_eq!(
+            history_rows(&conn, id),
+            2,
+            "base + local's pre-merge version"
+        );
+    }
+
+    #[test]
+    fn in_sync_entry_folds_peer_only_snapshot() {
+        // Same live value; the peer's history holds a snapshot local lacks.
+        // Content is InSync, but the snapshot is still folded in — and that
+        // is a local change the caller must save.
+        let id = Uuid::new_v4();
+        let base = snap(id, "T", "p0", 1000);
+        let local = vault_of(vec![live(id, "T", "p1", 3000, vec![base.clone()])]);
+        let peer = vault_of(vec![live(
+            id,
+            "T",
+            "p1",
+            3000,
+            vec![base, snap(id, "T", "px", 2000)],
+        )]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.in_sync, 1);
+        assert_eq!(outcome.history_pruned, vec![id]);
+        assert_eq!(history_rows(&conn, id), 2);
+    }
+
+    #[test]
+    fn identical_histories_write_nothing() {
+        let id = Uuid::new_v4();
+        let entry = live(id, "T", "p1", 3000, vec![snap(id, "T", "p0", 1000)]);
+        let local = vault_of(vec![entry.clone()]);
+        let peer = vault_of(vec![entry]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert!(
+            outcome.history_pruned.is_empty(),
+            "got {:?}",
+            outcome.history_pruned
+        );
+        assert_eq!(history_rows(&conn, id), 1);
+    }
+
+    #[test]
+    fn folded_history_is_trimmed_to_the_converged_cap_with_tombstones() {
+        // Each side holds a snapshot the other lacks; the union (3) exceeds the
+        // peer's cap of 2, which wins the min-of-caps meta merge. The oldest is
+        // trimmed AND tombstoned, so the next pull can't fold it back in.
+        let id = Uuid::new_v4();
+        let s1 = snap(id, "T", "s1", 1000);
+        let local = vault_of(vec![live(
+            id,
+            "T",
+            "p",
+            4000,
+            vec![s1.clone(), snap(id, "T", "s2", 2000)],
+        )]);
+        let mut peer = vault_of(vec![live(
+            id,
+            "T",
+            "p",
+            4000,
+            vec![s1, snap(id, "T", "s3", 3000)],
+        )]);
+        peer.meta.history_max_items = 2;
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.history_pruned, vec![id]);
+        assert_eq!(history_rows(&conn, id), 2);
+        assert!(
+            has_history_tombstone_row(&conn, id),
+            "the trimmed snapshot must leave a quota_trim tombstone"
+        );
+    }
+
+    #[test]
+    fn held_conflict_does_not_fold_peer_history() {
+        // Both sides changed the password → held. The peer's history carries
+        // an intermediate version local never incorporated; folding it in
+        // would hand classify a false, later common ancestor.
+        let id = Uuid::new_v4();
+        let base = snap(id, "T", "p0", 1000);
+        let local = vault_of(vec![live(id, "T", "pL", 3000, vec![base.clone()])]);
+        let peer = vault_of(vec![live(
+            id,
+            "T",
+            "pP",
+            3000,
+            vec![base, snap(id, "TP", "p0", 2000)],
+        )]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.conflicted, vec![id]);
+        assert!(
+            outcome.history_pruned.is_empty(),
+            "got {:?}",
+            outcome.history_pruned
+        );
+        assert_eq!(history_rows(&conn, id), 1, "only local's own base");
+    }
+
+    #[test]
+    fn auto_merge_with_peer_behind_records_no_snapshot() {
+        // Only the peer is behind (still at the base local moved off), so
+        // the merge leaves local's version as it is. A snapshot of it would
+        // be a copy of the live version in history.
+        let id = Uuid::new_v4();
+        let local = vault_of(vec![live(
+            id,
+            "T",
+            "p1",
+            2000,
+            vec![snap(id, "T", "p0", 1000)],
+        )]);
+        let peer = vault_of(vec![live(id, "T", "p0", 1000, vec![])]);
+        let (conn, _) = run(&local, "peerB", &peer);
+        assert_eq!(history_rows(&conn, id), 1, "no copy of the live version");
+    }
+
+    #[test]
+    fn icon_only_auto_merge_records_no_snapshot() {
+        // The peer only set an icon. The icon is no part of version identity,
+        // so local's pre-merge state is the same version as the merged one.
+        let id = Uuid::new_v4();
+        let base = snap(id, "T", "p0", 1000);
+        // Local's mtime differs from the peer's base record, so a snapshot
+        // would NOT dedup into it — the gate alone keeps it out.
+        let local = vault_of(vec![live(id, "T", "p0", 1500, vec![])]);
+        let mut peer_entry = live(id, "T", "p0", 2000, vec![base]);
+        peer_entry.custom_icon_uuid = Some(Uuid::new_v4());
+        let peer = vault_of(vec![peer_entry]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.auto_merged, vec![id], "the icon was adopted");
+        assert_eq!(
+            history_rows(&conn, id),
+            1,
+            "the peer's base only — no snapshot of local's (same) version"
+        );
+    }
+
+    #[test]
+    fn pre_merge_snapshot_skips_a_version_already_recorded() {
+        // Local only changed the icon since the base (a new mtime, same
+        // version); the peer changed the password and snapshotted the base.
+        // Snapshotting local would record the base version a second time.
+        let id = Uuid::new_v4();
+        let base = snap(id, "T", "p0", 1000);
+        let mut local_entry = live(id, "T", "p0", 1500, vec![]);
+        local_entry.custom_icon_uuid = Some(Uuid::new_v4());
+        let local = vault_of(vec![local_entry]);
+        let peer = vault_of(vec![live(id, "T", "p1", 3000, vec![base])]);
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.auto_merged, vec![id]);
+        assert_eq!(history_rows(&conn, id), 1, "the base version, once");
+    }
+
+    #[test]
+    fn attachment_only_auto_merge_snapshots_local_pre_merge_state() {
+        // Fields untouched on both sides; local added attachment `a`, the peer
+        // added `b`. The adopted `b` rides beside `merged`, so the version
+        // local held (with `a` only) is still overwritten and must be kept.
+        use keepass_core::model::{Attachment, Binary};
+        let id = Uuid::new_v4();
+        let base = snap(id, "T", "p0", 1000);
+        let mut local_entry = live(id, "T", "p0", 1500, vec![base.clone()]);
+        local_entry.attachments = vec![Attachment::new("a".to_string(), 0)];
+        let mut local = vault_of(vec![local_entry]);
+        local.binaries = vec![Binary::new(b"aaa".to_vec(), false)];
+        let mut peer_entry = live(id, "T", "p0", 2000, vec![base]);
+        peer_entry.attachments = vec![Attachment::new("b".to_string(), 0)];
+        let mut peer = vault_of(vec![peer_entry]);
+        peer.binaries = vec![Binary::new(b"bbb".to_vec(), false)];
+        let (conn, outcome) = run(&local, "peerB", &peer);
+        assert_eq!(outcome.auto_merged, vec![id]);
+        assert_eq!(
+            history_rows(&conn, id),
+            2,
+            "base + local's pre-merge version"
         );
     }
 }

@@ -1064,9 +1064,10 @@ pub struct MergeStats {
     pub groups_updated: u64,
     pub groups_deleted: u64,
     pub groups_moved: u64,
-    /// Entries whose history was pruned by a propagated history-snapshot
-    /// deletion (`keys.history_tombstones.v1`). Typically the live entry is
-    /// `InSync`, so this is the only non-zero count for a history scrub.
+    /// Entries whose history changed: the peer's snapshots folded in, and/or
+    /// records pruned by a propagated history-snapshot deletion or quota trim
+    /// (`keys.history_tombstones.v1`). Often the live entry is `InSync`, so
+    /// this is the only non-zero count for a history-only change.
     pub history_pruned: u64,
 }
 

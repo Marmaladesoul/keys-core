@@ -8,15 +8,14 @@
 # DIFFERENT history sets: a "removed" old password lingers on one and not the
 # other. That's the privacy gap this pins.
 #
-# Why the steady-state paths miss it: a resolution makes the live values
-# match, so the very next pull classifies the entry InSync (keep-theirs) or
-# AutoMerges one way then InSync on the bounce-back (keep-mine). The InSync
-# arm folds nothing additive — it only reconciles history TOMBSTONES (replicas
-# may legitimately differ in plain history DEPTH; see
-# history-quota-trim-propagates.sh). So a resolution's loser snapshot, and any
-# pre-conflict snapshot unique to one side, never reach the peer. The fold has
-# to be triggered by the resolution itself (a resolution record on either
-# side), which is exactly the gate the fix adds.
+# How it converges: a resolution makes the live values match, so the very next
+# pull classifies the entry InSync (keep-theirs) or adopts/AutoMerges one way
+# then InSync on the bounce-back (keep-mine). Once the live entries agree,
+# ingest folds the peer's history in losslessly (tombstones honoured), which
+# carries the loser and each side's pre-conflict snapshots across. While the
+# conflict is still HELD nothing folds (see
+# held-conflict-history-no-false-ancestor.sh), so it is the resolution that
+# unlocks the convergence.
 #
 # Teeth, per direction: each replica grows a history snapshot the other never
 # sees (`amid` on A, `bmid` on B) BEFORE the clash. After resolve+sync the two

@@ -403,8 +403,8 @@ enum Command {
     /// Print an entry's history snapshots — one line per snapshot
     /// (`<index>  <username>`), newest-index last, then a count. The read
     /// oracle for history convergence: the content digest deliberately
-    /// EXCLUDES history (replicas can legitimately differ in depth), so a
-    /// history scenario must compare the snapshots directly, not the digest.
+    /// EXCLUDES history, so a history scenario must compare the snapshots
+    /// directly, not the digest.
     History {
         /// Path to the .kdbx vault.
         vault: PathBuf,
