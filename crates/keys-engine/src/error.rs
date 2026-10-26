@@ -182,10 +182,11 @@ pub enum EngineError {
     /// A vault offered across the mirror↔file boundary is a **different
     /// vault** from the one this mirror holds — its root-group UUID, the
     /// vault's identity (see [`crate::identity`]), differs from the
-    /// mirror's. Raised by [`crate::Engine::ensure_same_vault`]: on every
+    /// mirror's. Raised by [`crate::Engine::ensure_same_vault`] on every
     /// peer ingest (merging would fold a stranger's entries into this
-    /// vault) and by writers about to overwrite a file (saving would
-    /// replace the stranger's vault with this one). Refused before
+    /// vault) and by [`crate::Engine::ensure_may_overwrite`] for writers
+    /// about to overwrite a file (saving would replace the stranger's vault
+    /// with this one). Refused before
     /// anything is written: the mirror and the file are untouched.
     ///
     /// Raised only after the file has decrypted under the supplied key

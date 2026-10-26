@@ -1077,7 +1077,7 @@ impl Engine {
             // engine lock as the save, so no other engine op interleaves; a
             // swap of the file itself between the read above and the rename
             // is a residual window this gate does not close.
-            e.ensure_same_vault(kdbx.vault().root.id.0)?;
+            e.ensure_may_overwrite(&kdbx)?;
             Ok(e.save_to_kdbx(&path, &mut kdbx, temp_dir.as_deref())?)
         })
     }
@@ -1175,7 +1175,7 @@ impl Engine {
         self.with_engine_mut(|e| {
             // As for `save_to_kdbx_with_keyfile`: never re-key a different
             // vault's file with this mirror's contents.
-            e.ensure_same_vault(kdbx.vault().root.id.0)?;
+            e.ensure_may_overwrite(&kdbx)?;
             Ok(e.rekey_to_kdbx(&path, &mut kdbx, &new_key, temp_dir.as_deref())?)
         })
     }
@@ -1558,7 +1558,7 @@ impl Engine {
             // the path threaded through here (the engine method
             // doesn't take one — kept that way to avoid churning every
             // existing call site).
-            e.record_kdbx_state_signature(&path)?;
+            e.record_ingested_kdbx_signature(&path)?;
             Ok(())
         })
     }
@@ -1907,7 +1907,7 @@ pub async fn open_vault_self_healing(
                 engine_file_watcher::bridge(file_watcher.clone()),
                 &unlocked,
             )?;
-            inner.record_kdbx_state_signature(&kdbx)?;
+            inner.record_ingested_kdbx_signature(&kdbx)?;
             Ok(SelfHealingOpen {
                 engine: wrap_engine(inner),
                 rebuilt: Some(reason),
@@ -2001,7 +2001,7 @@ pub async fn rebuild_vault_local_data(
             engine_file_watcher::bridge(file_watcher),
             &unlocked,
         )?;
-        inner.record_kdbx_state_signature(&kdbx)?;
+        inner.record_ingested_kdbx_signature(&kdbx)?;
         drop(inner);
         Ok(discarded)
     })

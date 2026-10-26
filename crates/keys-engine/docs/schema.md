@@ -222,8 +222,8 @@ Generic KV. Reserved keys:
   HMAC password plaintexts for `entry.password_fingerprint`.
 - `kdbx_state_signature_mtime_ms` / `kdbx_state_signature_byte_count` —
   `(mtime, size)` of the KDBX file the mirror currently corresponds
-  to. Written by `record_kdbx_state_signature` (post-ingest) and
-  `save_to_kdbx` (automatic); read on unlock to skip re-ingest when
+  to. Written by `record_ingested_kdbx_signature` (post-ingest),
+  `record_kdbx_state_signature` and `save_to_kdbx` (automatic); read on unlock to skip re-ingest when
   the on-disk file hasn't changed.
 - `persistence.mutation_seq` / `persistence.persisted_seq` — the
   persistence watermark (migration 0012). `mutation_seq` is a
