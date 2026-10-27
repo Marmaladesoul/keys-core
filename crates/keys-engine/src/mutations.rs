@@ -12,7 +12,7 @@
 //! for a deleted entry, the cascade list for a recursive group delete,
 //! etc.), and the engine fires events after the commit returns.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use std::collections::HashMap;
 
@@ -241,16 +241,32 @@ fn record_tombstone(tx: &Connection, uuid: &str, now: i64) -> Result<(), rusqlit
 /// the entry" — that way the captured snapshot's `modified_at` is the
 /// pre-edit value, and the mutation that follows is free to bump
 /// `modified_at` to now via [`bump_modified`].
+///
+/// A whole-entry save that may turn out to change nothing uses
+/// [`finish_entry_edit`] instead, which captures the same pre-edit
+/// snapshot up front but archives it only when the content changed.
 fn push_history_snapshot(
     tx: &Transaction<'_>,
     uuid: Uuid,
     now: i64,
     protector: &dyn FieldProtector,
 ) -> Result<(), EngineError> {
+    let snap = build_live_snapshot(tx, &uuid.to_string())?;
+    archive_snapshot(tx, uuid, &snap, now, protector)
+}
+
+/// Append `snap` to `uuid`'s `entry_history` at the next dense
+/// `history_index`, then prune against the vault's history budgets.
+fn archive_snapshot(
+    tx: &Transaction<'_>,
+    uuid: Uuid,
+    snap: &HistorySnapshotIo,
+    now: i64,
+    protector: &dyn FieldProtector,
+) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
-    let snap = build_live_snapshot(tx, &uuid_str)?;
     let json =
-        serde_json::to_string(&snap).map_err(|e| EngineError::Reveal(RevealError::Json(e)))?;
+        serde_json::to_string(snap).map_err(|e| EngineError::Reveal(RevealError::Json(e)))?;
     let max_idx: Option<i64> = tx
         .query_row(
             "SELECT MAX(history_index) FROM entry_history WHERE entry_uuid = ?1",
@@ -651,6 +667,8 @@ fn insert_tags(tx: &Transaction<'_>, entry_uuid: &str, tags: &[String]) -> Resul
     Ok(())
 }
 
+/// Patch an entry. Returns `false` when the patch changed nothing (see
+/// [`finish_entry_edit`]).
 pub(crate) fn update_entry(
     conn: &mut Connection,
     fingerprint_key: &[u8; 32],
@@ -658,17 +676,18 @@ pub(crate) fn update_entry(
     uuid: Uuid,
     update: EntryUpdate,
     now: i64,
-) -> Result<(), EngineError> {
+) -> Result<bool, EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
     if !entry_exists(&tx, &uuid_str)? {
         return Err(EngineError::NotFound { entity: "entry" });
     }
 
-    // One history snapshot per logical edit — capture pre-edit state
-    // before any field mutates. See [`push_history_snapshot`] for the
-    // invariant.
-    push_history_snapshot(&tx, uuid, now, protector)?;
+    // Capture pre-edit state before any field mutates; archived as ONE
+    // snapshot only if the patch changes something — see
+    // [`finish_entry_edit`].
+    let session = session_key(protector)?;
+    let start = begin_entry_edit(&tx, &uuid_str, &session)?;
 
     if let Some(title) = update.title {
         tx.execute(
@@ -712,7 +731,6 @@ pub(crate) fn update_entry(
     }
 
     if let Some(password) = update.password {
-        let session = session_key(protector)?;
         let plain = password.expose_secret();
         let (bucket, entropy, fp) = password_columns(plain, fingerprint_key);
         let fp_param: Option<&[u8]> = fp.as_ref().map(|b| &b[..]);
@@ -737,13 +755,11 @@ pub(crate) fn update_entry(
     if url_changed {
         recompute_has_totp(&tx, &uuid_str)?;
     }
-    bump_modified(&tx, &uuid_str, now)?;
-    tx.commit()?;
-    Ok(())
+    finish_entry_edit(tx, uuid, &start, &session, now, protector)
 }
 
 /// Apply the full desired state of an entry in ONE transaction with
-/// EXACTLY ONE history snapshot.
+/// AT MOST ONE history snapshot.
 ///
 /// This is the engine's single funnel for the entry editor's "Save".
 /// It replaces the old Swift-orchestrated sequence of per-field
@@ -754,9 +770,9 @@ pub(crate) fn update_entry(
 /// count.
 ///
 /// Behaviour:
-/// - Takes a single [`push_history_snapshot`] of the pre-save state up
-///   front, then writes the new columns directly. It does NOT call any
-///   of the per-field archiving mutations (they'd each re-archive).
+/// - Captures the pre-save state up front, then writes the new columns
+///   directly. It does NOT call any of the per-field archiving
+///   mutations (they'd each re-archive).
 /// - Standard fields (title/username/url/notes/password), icon, expiry,
 ///   strength/fingerprint columns and `url_host` are overwritten.
 /// - The canonical Password slot is always re-wrapped under a fresh
@@ -769,12 +785,14 @@ pub(crate) fn update_entry(
 /// - Tags are applied with set-semantics (delete-all + re-insert + GC).
 /// - `has_totp` is recomputed from the final URL + field set.
 ///
-/// **Idempotency.** Every call is treated as a user-initiated save: it
-/// unconditionally archives ONE snapshot and bumps `modified_at`. It
-/// does NOT diff against the current state, so re-saving identical
-/// state still archives exactly one snapshot. This is the deliberate
-/// "one snapshot per save" contract (chosen over a dedup heuristic) so
-/// the invariant stays simple and predictable across clients.
+/// **Idempotency.** A save whose resulting content equals the entry's
+/// current content is a no-op: nothing is archived, `modified_at` is
+/// not bumped and the transaction rolls back, so the vault owes no
+/// write. "Equal" is an exact comparison of the entry's content, not a
+/// heuristic — see [`finish_entry_edit`]. A save that changes anything
+/// archives exactly ONE snapshot of the pre-save state.
+///
+/// Returns whether the save changed the entry.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub(crate) fn save_entry(
     conn: &mut Connection,
@@ -783,7 +801,7 @@ pub(crate) fn save_entry(
     uuid: Uuid,
     save: EntrySave,
     now: i64,
-) -> Result<(), EngineError> {
+) -> Result<bool, EngineError> {
     let uuid_str = uuid.to_string();
     let session = session_key(protector)?;
     let tx = conn.transaction()?;
@@ -791,9 +809,9 @@ pub(crate) fn save_entry(
         return Err(EngineError::NotFound { entity: "entry" });
     }
 
-    // One snapshot of the pre-save state, captured before any field
-    // mutates — see [`push_history_snapshot`] for the invariant.
-    push_history_snapshot(&tx, uuid, now, protector)?;
+    // The pre-save state, captured before any field mutates; archived
+    // only if the save changes something — see [`finish_entry_edit`].
+    let start = begin_entry_edit(&tx, &uuid_str, &session)?;
 
     // ── Standard columns + derived password columns ──
     let url_host = parse_host(&save.url);
@@ -873,11 +891,192 @@ pub(crate) fn save_entry(
     insert_tags(&tx, &uuid_str, &save.tags)?;
     gc_orphan_tags(&tx)?;
 
-    // ── Derived bit + modified stamp ──
+    // ── Derived bit, then archive + stamp (or roll back a no-op) ──
     recompute_has_totp(&tx, &uuid_str)?;
+    finish_entry_edit(tx, uuid, &start, &session, now, protector)
+}
+
+/// An entry's state captured before an edit's writes: the snapshot an
+/// edit that changes something archives, and the content an edit that
+/// changes nothing must still equal.
+struct EditStart {
+    snapshot: HistorySnapshotIo,
+    content: EntryContent,
+}
+
+/// Capture `uuid_str`'s pre-edit state. Call inside the edit's
+/// transaction, before any write touches the entry.
+fn begin_entry_edit(
+    tx: &Transaction<'_>,
+    uuid_str: &str,
+    session: &SessionKey,
+) -> Result<EditStart, EngineError> {
+    Ok(EditStart {
+        snapshot: build_live_snapshot(tx, uuid_str)?,
+        content: read_entry_content(tx, uuid_str, session)?,
+    })
+}
+
+/// Close out an entry edit whose writes have been applied to `tx`, and
+/// report whether it changed anything.
+///
+/// If the entry's content now equals `start.content`, the edit is a
+/// no-op: the transaction rolls back, so nothing is archived,
+/// `modified_at` keeps its value and the persistence watermark is
+/// untouched (its triggers fire inside `tx`). Derived columns the writes
+/// recomputed roll back with it; every content-changing write and every
+/// ingest recomputes them. Otherwise `start.snapshot` is archived as ONE
+/// history snapshot, `modified_at` is bumped to `now`, and the edit
+/// commits.
+fn finish_entry_edit(
+    tx: Transaction<'_>,
+    uuid: Uuid,
+    start: &EditStart,
+    session: &SessionKey,
+    now: i64,
+    protector: &dyn FieldProtector,
+) -> Result<bool, EngineError> {
+    let uuid_str = uuid.to_string();
+    if read_entry_content(&tx, &uuid_str, session)? == start.content {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    archive_snapshot(&tx, uuid, &start.snapshot, now, protector)?;
     bump_modified(&tx, &uuid_str, now)?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
+}
+
+/// An entry's content as a KDBX `<Entry>` carries it, in a form two reads
+/// can be compared by: protected values as digests of their plaintext (a
+/// re-save re-seals them under a fresh nonce, so their stored bytes differ
+/// even when the value doesn't), protected and plain custom fields kept
+/// apart. Timestamps (an edit's own bookkeeping), the columns derived from
+/// these fields (`url_host`, strength, entropy, fingerprint, `has_totp`)
+/// and the entry's location are not content. A new content column must
+/// be added here, or an edit that changes only it reads as a no-op.
+#[derive(PartialEq)]
+struct EntryContent {
+    title: String,
+    username: String,
+    url: String,
+    notes: String,
+    icon_index: Option<i64>,
+    icon_custom_uuid: Option<String>,
+    expires_at: Option<i64>,
+    /// `None` when the entry has no Password row.
+    password: Option<SealedValue>,
+    protected: BTreeMap<String, SealedValue>,
+    plain: BTreeMap<String, String>,
+    tags: BTreeSet<String>,
+    /// `(name, blob sha256)`.
+    attachments: BTreeSet<(String, Vec<u8>)>,
+    /// `(key, value)`.
+    custom_data: BTreeSet<(String, String)>,
+}
+
+/// A protected value, reduced to what equality needs.
+enum SealedValue {
+    /// SHA-256 of the plaintext. Comparing digests keeps the comparison
+    /// independent of how many leading plaintext bytes two values share.
+    Digest([u8; 32]),
+    /// The blob doesn't open under the session key. Such a value can't be
+    /// shown equal to anything, so an edit touching it is never treated as
+    /// a no-op — a re-save is how a user replaces it.
+    Unreadable,
+}
+
+impl PartialEq for SealedValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Digest(a), Self::Digest(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl SealedValue {
+    fn of(blob: &[u8], session: &SessionKey) -> Self {
+        match open_with_key(session, blob) {
+            Ok(plain) => Self::Digest(Sha256::digest(Zeroizing::new(plain).as_slice()).into()),
+            Err(_) => Self::Unreadable,
+        }
+    }
+}
+
+/// Read `uuid_str`'s [`EntryContent`] from the mirror tables.
+fn read_entry_content(
+    tx: &Transaction<'_>,
+    uuid_str: &str,
+    session: &SessionKey,
+) -> Result<EntryContent, EngineError> {
+    let (title, username, url, notes, icon_index, icon_custom_uuid, expires_at) = tx.query_row(
+        "SELECT title, username, url, notes, icon_index, icon_custom_uuid, expires_at \
+         FROM entry WHERE uuid = ?1",
+        params![uuid_str],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        },
+    )?;
+    let mut password = None;
+    let mut protected = BTreeMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT field_name, wrapped_blob FROM entry_protected WHERE entry_uuid = ?1",
+        )?;
+        let mut rows = stmt.query(params![uuid_str])?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(0)?;
+            let value = SealedValue::of(&r.get::<_, Vec<u8>>(1)?, session);
+            if name == PASSWORD_FIELD {
+                password = Some(value);
+            } else {
+                protected.insert(name, value);
+            }
+        }
+    }
+    let plain = tx
+        .prepare("SELECT field_name, value FROM entry_custom_field WHERE entry_uuid = ?1")?
+        .query_map(params![uuid_str], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let tags = tx
+        .prepare(
+            "SELECT t.name FROM entry_tag et JOIN tag t ON t.id = et.tag_id \
+             WHERE et.entry_uuid = ?1",
+        )?
+        .query_map(params![uuid_str], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    let attachments = tx
+        .prepare("SELECT attachment_name, blob_sha256 FROM entry_attachment WHERE entry_uuid = ?1")?
+        .query_map(params![uuid_str], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let custom_data = tx
+        .prepare("SELECT key, value FROM entry_custom_data WHERE entry_uuid = ?1")?
+        .query_map(params![uuid_str], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(EntryContent {
+        title,
+        username,
+        url,
+        notes,
+        icon_index,
+        icon_custom_uuid,
+        expires_at,
+        password,
+        protected,
+        plain,
+        tags,
+        attachments,
+        custom_data,
+    })
 }
 
 fn bump_modified(tx: &Transaction<'_>, uuid: &str, now: i64) -> Result<(), EngineError> {
@@ -2893,5 +3092,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(orphan_left, 0, "the orphan is the one that went");
+    }
+
+    fn history_len(conn: &Connection, entry: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM entry_history WHERE entry_uuid = ?1",
+            params![entry],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn field(name: &str, value: &str, protected: bool) -> crate::model::NewCustomField {
+        crate::model::NewCustomField {
+            name: name.to_owned(),
+            value: SecretString::from(value.to_owned()),
+            protected,
+        }
+    }
+
+    fn save_with(conn: &mut Connection, entry: &str, fields: Vec<crate::model::NewCustomField>) {
+        let save = EntrySave {
+            title: String::new(),
+            username: String::new(),
+            url: String::new(),
+            notes: String::new(),
+            password: SecretString::from("pw".to_owned()),
+            icon: IconRef::Builtin(0),
+            expires_at: None,
+            custom_fields: fields,
+            tags: Vec::new(),
+        };
+        let uuid = Uuid::parse_str(entry).expect("valid uuid");
+        save_entry(conn, &[0; 32], &FixedProtector([0x9c; 32]), uuid, save, 1).unwrap();
+    }
+
+    #[test]
+    fn save_over_an_unreadable_secret_proceeds() {
+        // A Password blob that doesn't open under the session key (corrupt,
+        // or sealed under another key). Its value can't be shown equal to
+        // the new one, so the save must replace it (archiving one
+        // snapshot), not fail on the comparison.
+        let (mut conn, entry) = bare_db_with_entry();
+        conn.execute(
+            "UPDATE entry_protected SET wrapped_blob = X'DEADBEEFDEADBEEF' \
+             WHERE entry_uuid = ?1",
+            params![entry],
+        )
+        .unwrap();
+        // Everything else already matches the save, so only the secret
+        // decides the comparison.
+        conn.execute(
+            "UPDATE entry SET icon_index = 0 WHERE uuid = ?1",
+            params![entry],
+        )
+        .unwrap();
+        save_with(&mut conn, &entry, Vec::new());
+        assert_eq!(history_len(&conn, &entry), 1);
+    }
+
+    #[test]
+    fn protected_and_plain_fields_of_one_name_compare_apart() {
+        // A protected and a plain field may share a name (two tables). A
+        // change to the protected one alone is still a change.
+        let (mut conn, entry) = bare_db_with_entry();
+        save_with(
+            &mut conn,
+            &entry,
+            vec![field("X", "a", true), field("X", "b", false)],
+        );
+        let before = history_len(&conn, &entry);
+        save_with(
+            &mut conn,
+            &entry,
+            vec![field("X", "c", true), field("X", "b", false)],
+        );
+        assert_eq!(history_len(&conn, &entry), before + 1);
     }
 }

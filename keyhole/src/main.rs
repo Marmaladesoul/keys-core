@@ -31,11 +31,12 @@ use clap::{Parser, Subcommand};
 use keys_ffi::{
     AttachmentChoiceFfi, AttachmentChoiceKindFfi, ConflictPayloadFfi, ConflictSideFfi,
     DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, Engine, EngineEntryUpdate,
-    EntryAttachmentChoiceFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, IconRef,
-    NewEntryFields, Page, ParkConflictsResultFfi, RecycleBinFilter, ResolutionFfi, SearchScope,
-    SidecarRebuildReason, SyncWithDiskFfi, VaultIdentityVerdict, create_vault as ffi_create_vault,
-    create_vault_deterministic as ffi_create_vault_deterministic, open_vault_self_healing,
-    purge_vault_local_data, rebuild_vault_local_data, verify_vault_identity,
+    EntryAttachmentChoiceFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi, EntrySave, FieldChoiceFfi,
+    IconRef, NewCustomField, NewEntryFields, Page, ParkConflictsResultFfi, RecycleBinFilter,
+    ResolutionFfi, SearchScope, SidecarRebuildReason, SyncWithDiskFfi, VaultIdentityVerdict,
+    create_vault as ffi_create_vault, create_vault_deterministic as ffi_create_vault_deterministic,
+    open_vault_self_healing, purge_vault_local_data, rebuild_vault_local_data,
+    verify_vault_identity,
 };
 
 use adapters::{FixedDbKey, FixedProtector, RecordingDbKey};
@@ -143,6 +144,23 @@ enum Command {
         url: Option<String>,
         #[arg(long)]
         notes: Option<String>,
+    },
+    /// Save an entry the way a GUI editor's Save does: read its FULL current
+    /// state, apply the overrides you pass, and hand the whole state to
+    /// `save_entry` (replace-all), then persist. With no overrides it is
+    /// "Save without changing anything" — which must change nothing (no
+    /// history snapshot, no write).
+    SaveEntry {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry to save (see `list`).
+        uuid: String,
+        #[arg(long)]
+        username: Option<String>,
+        /// Set (add or replace) a PROTECTED custom field, as `NAME=VALUE`
+        /// (test data).
+        #[arg(long)]
+        set_protected: Option<String>,
     },
     /// Ensure the recycle bin group exists (create it if the bin is enabled
     /// but absent), then persist. Mirrors the hook the GUI should call when a
@@ -754,6 +772,24 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.update_entry(&uuid, update)?;
+            session.finish().await?;
+        }
+        Command::SaveEntry {
+            vault,
+            uuid,
+            username,
+            set_protected,
+        } => {
+            let protected = set_protected
+                .map(|kv| {
+                    kv.split_once('=')
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                        .context("--set-protected takes NAME=VALUE")
+                })
+                .transpose()?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.save_entry(&uuid, username, protected)?;
             session.finish().await?;
         }
         Command::EnsureBin { vault } => {
@@ -1485,6 +1521,73 @@ impl Session {
             .update_entry(uuid.to_owned(), update)
             .map_err(|e| anyhow::anyhow!("update_entry: {e:?}"))?;
         println!("updated {uuid} and saved to disk");
+        Ok(())
+    }
+
+    /// Re-state `uuid`'s full current state (revealing every secret, as an
+    /// editor does to populate its fields), apply the overrides, and
+    /// `save_entry` it. The watermark tells a real save from a no-op, so
+    /// stdout never claims a write the teardown won't perform.
+    fn save_entry(
+        &self,
+        uuid: &str,
+        username: Option<String>,
+        protected: Option<(String, String)>,
+    ) -> Result<()> {
+        let e = self
+            .engine
+            .entry(uuid.to_owned())
+            .map_err(|e| anyhow::anyhow!("entry: {e:?}"))?
+            .with_context(|| format!("no entry {uuid}"))?;
+        let password = self
+            .engine
+            .reveal_password(uuid.to_owned())
+            .map_err(|e| anyhow::anyhow!("reveal_password: {e:?}"))?;
+        let mut custom_fields = Vec::with_capacity(e.custom_fields.len());
+        for cf in &e.custom_fields {
+            let value = if cf.is_protected {
+                self.engine
+                    .reveal_custom_field(uuid.to_owned(), cf.name.clone())
+                    .map_err(|e| anyhow::anyhow!("reveal_custom_field: {e:?}"))?
+            } else {
+                self.engine
+                    .non_protected_custom_field(uuid.to_owned(), cf.name.clone())
+                    .map_err(|e| anyhow::anyhow!("non_protected_custom_field: {e:?}"))?
+                    .with_context(|| format!("custom field {} vanished", cf.name))?
+            };
+            custom_fields.push(NewCustomField {
+                name: cf.name.clone(),
+                value,
+                protected: cf.is_protected,
+            });
+        }
+        if let Some((name, value)) = protected {
+            custom_fields.retain(|cf| cf.name != name);
+            custom_fields.push(NewCustomField {
+                name,
+                value,
+                protected: true,
+            });
+        }
+        let save = EntrySave {
+            title: e.title,
+            username: username.unwrap_or(e.username),
+            url: e.url,
+            notes: e.notes,
+            password,
+            icon: e.icon,
+            expires_at: e.expires_at,
+            custom_fields,
+            tags: e.tags,
+        };
+        self.engine
+            .save_entry(uuid.to_owned(), save)
+            .map_err(|e| anyhow::anyhow!("save_entry: {e:?}"))?;
+        if self.owes_write()? {
+            println!("saved {uuid} (changed — saved to disk)");
+        } else {
+            println!("saved {uuid} (no change — nothing to save)");
+        }
         Ok(())
     }
 
