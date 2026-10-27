@@ -13,11 +13,15 @@
 //! a save of an entry with five custom fields must add exactly ONE
 //! history record, not one per field.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
+use keepass_core::model::Clock;
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
+use keys_engine::uuid_source::RandomUuids;
 use keys_engine::{
     ChangeEvent, DataChangeObserver, DbKey, Engine, EntrySave, IconRef, KeyProvider,
     KeyProviderError, NewCustomField, NewEntryFields, StrengthBucket,
@@ -485,35 +489,83 @@ fn save_applies_custom_icon() {
 // ─────────────────────── idempotency ───────────────────────
 
 #[test]
-fn resaving_identical_state_still_archives_exactly_one_snapshot() {
-    // Documented contract: `save_entry` does NOT diff — every call is a
-    // user-initiated save that unconditionally archives one snapshot.
-    let (mut engine, root, _dir) = engine_with_empty_vault();
+fn resaving_identical_state_is_a_no_op() {
+    // Contract: a save whose content equals the entry's current content
+    // archives nothing, keeps `modified_at`, and owes the KDBX no write —
+    // even though every protected value (the password, the protected
+    // custom field) is re-sealed under a fresh nonce. A save that
+    // changes something archives exactly one snapshot.
+    // A clock that moves on at every read, so a no-op save that still
+    // bumped `modified_at` would show a different value.
+    #[derive(Debug, Default)]
+    struct SteppingClock(AtomicI64);
+    impl Clock for SteppingClock {
+        fn now(&self) -> DateTime<Utc> {
+            let secs = 1_700_000_000 + self.0.fetch_add(1, Ordering::SeqCst);
+            DateTime::from_timestamp(secs, 0).expect("in range")
+        }
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let kdbx = fresh_kdbx();
+    let root = kdbx.vault().root.id.0;
+    let mut engine = Engine::open_with_clock(
+        &dir.path().join("engine.sqlite"),
+        &FixedKey(DB_KEY_BYTES),
+        protector(),
+        None,
+        Arc::new(SteppingClock::default()),
+        Arc::new(RandomUuids),
+    )
+    .expect("engine open");
+    engine.ingest_from_kdbx(&kdbx).expect("ingest");
     let entry = engine
         .create_entry(root, new_entry_with_custom_fields("idem", 2))
         .expect("create");
 
-    let build = || EntrySave {
+    let build = |username: &str| EntrySave {
         title: "idem".into(),
-        username: "alice".into(),
+        username: username.into(),
         url: String::new(),
         notes: String::new(),
         password: SecretString::from("pw"),
         icon: IconRef::Builtin(0),
         expires_at: None,
-        custom_fields: vec![plain("field-0", "value-0"), plain("field-1", "value-1")],
-        tags: Vec::new(),
+        custom_fields: vec![
+            plain("field-0", "value-0"),
+            plain("field-1", "value-1"),
+            protected("PIN", "2468"),
+        ],
+        tags: vec!["work".into()],
     };
 
-    engine.save_entry(entry, build()).expect("save 1");
-    assert_eq!(engine.entry(entry).expect("e").expect("s").history_count, 1);
-    // Re-save the byte-identical state.
-    engine.save_entry(entry, build()).expect("save 2");
+    engine
+        .save_entry(entry, build("bob"))
+        .expect("changing save");
+    let after_change = engine.entry(entry).expect("e").expect("s");
+    assert_eq!(after_change.history_count, 1, "a real change archives one");
+    let seq = engine.persistence_state().expect("state").mutation_seq;
+
+    // Re-save the identical state.
+    engine.save_entry(entry, build("bob")).expect("no-op save");
+    let after_noop = engine.entry(entry).expect("e").expect("s");
     assert_eq!(
-        engine.entry(entry).expect("e").expect("s").history_count,
-        2,
-        "each save archives one snapshot, even when nothing changed"
+        after_noop.history_count, 1,
+        "an unchanged save archives nothing"
     );
+    assert_eq!(after_noop.modified_at, after_change.modified_at);
+    assert_eq!(
+        engine.persistence_state().expect("state").mutation_seq,
+        seq,
+        "an unchanged save must not mark the vault as owing a write"
+    );
+
+    // A change to a protected value alone is still a change.
+    let mut pin_change = build("bob");
+    pin_change.custom_fields[2] = protected("PIN", "1357");
+    engine
+        .save_entry(entry, pin_change)
+        .expect("protected change");
+    assert_eq!(engine.entry(entry).expect("e").expect("s").history_count, 2);
 }
 
 // ─────────────────────── round-trip ───────────────────────

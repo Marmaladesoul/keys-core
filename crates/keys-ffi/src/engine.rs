@@ -795,11 +795,12 @@ impl Engine {
     }
 
     /// See [`keys_engine::Engine::save_entry`]. Applies the full desired
-    /// entry state in ONE transaction with EXACTLY ONE history snapshot
+    /// entry state in ONE transaction with AT MOST ONE history snapshot
     /// — the entry editor's single "Save" funnel, replacing the old
     /// sequence of per-field mutations that each archived their own
     /// snapshot. `custom_fields` is a replace-all set; `tags` is applied
-    /// with set-semantics.
+    /// with set-semantics. A save that changes nothing is a no-op: no
+    /// snapshot, no `modified_at` bump, and the vault owes no write.
     pub fn save_entry(&self, uuid: String, save: EntrySave) -> Result<(), EngineError> {
         let u = parse_uuid(&uuid, "entry")?;
         let s: eng::EntrySave = save.try_into()?;

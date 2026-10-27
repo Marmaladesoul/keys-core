@@ -36,7 +36,7 @@ pub use engine_observer::{
 pub use engine_portable::EnginePortableEntry;
 pub use engine_types::{
     AttachmentBlobStats, AttachmentRef as EngineAttachmentRef, ConflictPayloadFfi,
-    CustomFieldRef as EngineCustomFieldRef, EngineEntrySummary, EntryFull,
+    CustomFieldRef as EngineCustomFieldRef, EngineEntrySummary, EntryFull, EntrySave,
     EntryUpdate as EngineEntryUpdate, GroupNode, GroupUpdate as EngineGroupUpdate, HistoricEntry,
     IconRef, KdbxStateSignatureFfi, MergeStats, NewCustomField, NewEntryFields, NewGroupFields,
     Page, ParkConflictsResultFfi, ParkedConflictsSummaryFfi, PersistenceStateFfi, Predicate,

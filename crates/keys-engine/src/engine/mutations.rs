@@ -162,7 +162,10 @@ impl Engine {
     /// Setting `password` re-wraps the canonical Password slot and
     /// refreshes `password_strength_bucket`, `password_entropy`, and
     /// `password_fingerprint`. Setting `url` refreshes `url_host`.
-    /// `modified_at` is always bumped to now.
+    /// A patch that changes something archives ONE history snapshot and
+    /// bumps `modified_at`; a patch that changes nothing (every field it
+    /// sets already holds that value) is a no-op — no snapshot, no bump, no
+    /// event, and the vault owes no write.
     ///
     /// # Errors
     ///
@@ -172,7 +175,7 @@ impl Engine {
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn update_entry(&mut self, uuid: Uuid, update: EntryUpdate) -> Result<(), EngineError> {
         let now = self.now_ms();
-        mutations::update_entry(
+        let changed = mutations::update_entry(
             &mut self.conn,
             &self.fingerprint_key,
             &*self.field_protector,
@@ -180,13 +183,15 @@ impl Engine {
             update,
             now,
         )?;
-        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
-        self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
+        if changed {
+            crate::reconcile::reconcile_conflict_rows(self, uuid)?;
+            self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
+        }
         Ok(())
     }
 
     /// Save the full desired state of an entry in ONE transaction with
-    /// EXACTLY ONE history snapshot.
+    /// AT MOST ONE history snapshot.
     ///
     /// The single funnel for the entry editor's "Save": it replaces the
     /// old sequence of per-field engine mutations (each of which pushed
@@ -198,11 +203,14 @@ impl Engine {
     /// `password_entropy`, `password_fingerprint`, `url_host`, and
     /// `has_totp` are recomputed. `modified_at` is bumped.
     ///
-    /// Every call archives exactly one snapshot and bumps `modified_at`
-    /// — it does not diff against the current state. See
-    /// [`crate::EntrySave`] for the field contract.
+    /// A save that changes the entry archives exactly one snapshot of its
+    /// pre-save state and bumps `modified_at`. A save whose content equals
+    /// the entry's current content is a no-op: no snapshot, no bump, no
+    /// event, and the vault owes no write. See [`crate::EntrySave`] for the
+    /// field contract.
     ///
-    /// Emits [`ChangeEvent::EntriesUpdated`] for `uuid`.
+    /// Emits [`ChangeEvent::EntriesUpdated`] for `uuid` when the save
+    /// changed it.
     ///
     /// # Errors
     ///
@@ -212,7 +220,7 @@ impl Engine {
     /// - [`EngineError::Sqlite`] on storage failure.
     pub fn save_entry(&mut self, uuid: Uuid, save: EntrySave) -> Result<(), EngineError> {
         let now = self.now_ms();
-        mutations::save_entry(
+        let changed = mutations::save_entry(
             &mut self.conn,
             &self.fingerprint_key,
             &*self.field_protector,
@@ -220,8 +228,10 @@ impl Engine {
             save,
             now,
         )?;
-        crate::reconcile::reconcile_conflict_rows(self, uuid)?;
-        self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
+        if changed {
+            crate::reconcile::reconcile_conflict_rows(self, uuid)?;
+            self.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
+        }
         Ok(())
     }
 
