@@ -11,13 +11,17 @@
 //! - shutdown awaits in-flight router and endpoint shutdown rather
 //!   than the spike's `drop(guard.take())` shortcut.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use futures_util::{FutureExt, StreamExt};
-use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, Watcher, endpoint::presets, protocol::Router};
+use iroh::{
+    Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, Watcher, endpoint::presets,
+    protocol::Router,
+};
 use iroh_blobs::{
     ALPN as BLOBS_ALPN, BlobsProtocol,
     provider::events::{
@@ -26,10 +30,13 @@ use iroh_blobs::{
     store::fs::FsStore,
 };
 use iroh_docs::{
-    ALPN as DOCS_ALPN, DocTicket, NamespaceId, api::Doc, engine::LiveEvent, protocol::Docs,
+    ALPN as DOCS_ALPN, DocTicket, NamespaceId,
+    api::Doc,
+    engine::{LiveEvent, Origin},
+    protocol::Docs,
 };
 use iroh_gossip::{ALPN as GOSSIP_ALPN, net::Gossip};
-use n0_future::Stream;
+use n0_future::{Stream, task::AbortOnDropHandle};
 use tokio::sync::Mutex;
 
 use crate::error::{Result, SyncError};
@@ -105,6 +112,33 @@ const FETCH_BLOB_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 /// a missed completion's worst-case latency well inside human patience.
 const FETCH_BLOB_STATUS_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a joined doc waits, after a failed round with a peer it owes
+/// a sync round, before each re-dial in turn; once these are spent it
+/// waits [`REDIAL_STEADY_INTERVAL`]. See [`watch_redial`].
+///
+/// The first step is short because the commonest gap is brief (a
+/// relaunch, a network change, a lid opened); the steps then widen so a
+/// peer that is gone for hours costs a dial every few minutes, not a
+/// constant stream of them.
+const REDIAL_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+];
+
+/// The re-dial interval once [`REDIAL_BACKOFF`] is spent, for as long as
+/// the doc still owes a peer a round.
+const REDIAL_STEADY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// The delay before re-dial number `attempt` (counting from 0) of one
+/// owed stretch.
+fn redial_delay(attempt: usize) -> Duration {
+    REDIAL_BACKOFF
+        .get(attempt)
+        .copied()
+        .unwrap_or(REDIAL_STEADY_INTERVAL)
+}
+
 /// Configuration for constructing an `IrohNode`. Caller-owned so the
 /// app (not the library) decides where on disk to keep state and which
 /// DERP servers to prefer.
@@ -163,7 +197,7 @@ pub struct IrohNode {
     /// `Mutex<HashMap<...>>` not `RwLock<...>` because the contention
     /// shape is "occasional writes from join/leave, never-hot reads"
     /// and Mutex generates substantially less code through uniffi.
-    joined: Mutex<HashMap<NamespaceId, Doc>>,
+    joined: Mutex<HashMap<NamespaceId, JoinedDoc>>,
     /// `OnceCell::get_or_init` elects the first caller to run the
     /// teardown future; every concurrent or subsequent caller awaits
     /// the same init future and returns only after the work has
@@ -172,6 +206,133 @@ pub struct IrohNode {
     /// code paths and every caller's `await` must observe the
     /// shutdown as truly finished before the OS suspends the process.
     shutdown_cell: tokio::sync::OnceCell<()>,
+}
+
+/// A doc this node has joined, with the task that re-dials its peers
+/// while it owes one a sync round (see [`watch_redial`]). The task lives
+/// exactly as long as the entry: replacing or dropping the entry aborts
+/// it, and [`IrohNode::shutdown`] aborts it before tearing the node down.
+struct JoinedDoc {
+    doc: Doc,
+    redial: AbortOnDropHandle<()>,
+}
+
+impl JoinedDoc {
+    /// Start watching `doc` for owed rounds. Call it before the doc's
+    /// first `start_sync`, so the watch sees every round's outcome —
+    /// above all a resume's or a join's first rounds failing.
+    async fn watch(doc: Doc) -> Result<Self> {
+        let events = doc
+            .subscribe()
+            .await
+            .context("subscribe for re-dial watch")
+            .map_err(SyncError::from)?;
+        let redial = AbortOnDropHandle::new(tokio::spawn(watch_redial(doc.clone(), events)));
+        Ok(Self { doc, redial })
+    }
+}
+
+/// Keep re-dialling `doc`'s peers while the doc owes any of them a sync
+/// round, on the [`REDIAL_BACKOFF`] schedule.
+///
+/// iroh-docs dials a doc's peers only when told to (`start_sync`: a
+/// join, a resume, and — since every write calls it — a write). A round
+/// that fails because the peer is unreachable is not retried, and the
+/// gossip mesh has no neighbour to carry anything once the peer is back,
+/// so a write made while the peer was away would wait for the next local
+/// write or a restart. This task closes that gap without either peer
+/// doing anything.
+///
+/// A peer is *owed* a round from the moment a round we dialled to it
+/// fails until a round with it succeeds, in either direction. A failed
+/// round the peer dialled leaves nothing owed: the peer keeps the debt,
+/// and a remote cannot put itself on our dial list by failing a round.
+/// A `NeighborUp` clears nothing on its own either: it only prompts
+/// iroh-docs to run a round, whose outcome is what counts.
+///
+/// While any peer is owed, the doc re-runs `start_sync` with the owed
+/// peers. Owed peers are named explicitly because iroh-docs persists a
+/// peer only after a successful round, so a ticket peer unreachable at
+/// join would otherwise not be dialled again in this run. `start_sync`
+/// also re-joins the doc's persisted peers and runs a direct round with
+/// each — cheap for a peer with nothing new, and the only dial iroh-docs
+/// offers. A peer that never comes back (a retired device) costs one dial
+/// every [`REDIAL_STEADY_INTERVAL`] while the node runs.
+///
+/// Each delay runs from the latest failed round, not from the previous
+/// re-dial: a dial to an absent peer can take tens of seconds to fail,
+/// and iroh-docs drops a new dial to a peer while one is in flight, so a
+/// clock started at the re-dial would spend the short steps on no-ops.
+/// The re-dial also sets a timer of its own, so a re-dial that produces
+/// no outcome at all is still followed by another. The schedule starts
+/// over only once nothing is owed.
+///
+/// Driven by failed rounds, not by `NeighborDown`: an idle mesh closes
+/// while both peers are up, and re-dialling on that would rebuild a mesh
+/// that only closes again, for no delivery — a write already re-dials
+/// on its own (see [`IrohNode::set_entry`]).
+///
+/// Ends when the doc's event stream does (the node shut down), or when
+/// aborted; the in-flight re-dial is aborted with it.
+async fn watch_redial(doc: Doc, mut events: impl Stream<Item = anyhow::Result<LiveEvent>> + Unpin) {
+    let mut owed: HashSet<PublicKey> = HashSet::new();
+    let mut attempt = 0;
+    let mut next_redial: Option<tokio::time::Instant> = None;
+    // Held only for its drop: aborting this task aborts the re-dial too.
+    // Replacing it aborts the previous one, which by then has had at
+    // least one backoff step to finish a single RPC.
+    let mut _in_flight: Option<AbortOnDropHandle<()>> = None;
+    loop {
+        let redial_due = async {
+            match next_redial {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            event = events.next() => match event {
+                Some(Ok(LiveEvent::SyncFinished(sync))) => match (&sync.result, &sync.origin) {
+                    (Ok(_), _) => {
+                        owed.remove(&sync.peer);
+                    }
+                    (Err(_), Origin::Connect(_)) => {
+                        owed.insert(sync.peer);
+                        next_redial = Some(tokio::time::Instant::now() + redial_delay(attempt));
+                    }
+                    (Err(_), Origin::Accept) => {}
+                },
+                // Other events say nothing about whether a round got
+                // through; a decode failure is one lost event on a stream
+                // that carries on.
+                Some(Ok(_) | Err(_)) => {}
+                None => return,
+            },
+            () = redial_due => {
+                tracing::info!(
+                    doc = %doc.id(),
+                    owed = owed.len(),
+                    attempt,
+                    "re-dialling peers owed a sync round"
+                );
+                // Not awaited here: the live actor awaits room in this
+                // task's event queue, so waiting on its reply while not
+                // draining that queue could deadlock both.
+                let doc = doc.clone();
+                let peers = owed.iter().copied().map(EndpointAddr::new).collect();
+                _in_flight = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                    if let Err(e) = doc.start_sync(peers).await {
+                        tracing::warn!(error = ?e, "re-dial of peers owed a round failed to start");
+                    }
+                })));
+                attempt += 1;
+                next_redial = Some(tokio::time::Instant::now() + redial_delay(attempt));
+            },
+        }
+        if owed.is_empty() {
+            attempt = 0;
+            next_redial = None;
+        }
+    }
 }
 
 /// One entry in a joined doc — key, content hash, content size. Cheap:
@@ -300,19 +461,12 @@ impl IrohNode {
     /// id as a hex string — callers use this to refer back to the doc
     /// on subsequent `list_entries` / `fetch_blob` / `subscribe` calls.
     ///
-    /// Caveat: iroh-docs accepts a `DownloadPolicy` only AFTER
-    /// `import(ticket)` resolves, and its default policy is "download
-    /// everything". So between `import` and `set_download_policy`
-    /// there is a brief window (typically tens of milliseconds, but
-    /// up to the first network RTT) during which content matching
-    /// the default policy may begin downloading even if the caller
-    /// asked for `NothingExcept`. If you need a strict guarantee that
-    /// no content is fetched before policy lands, gate the join
-    /// behind whatever upper-layer flag you have and don't expose
-    /// the joined doc's entries to the rest of the app until your
-    /// first `list_entries` confirms the expected shape.
+    /// The namespace is imported without syncing, and the policy and
+    /// the event subscriptions are in place before the first round is
+    /// started: no content is fetched under iroh-docs' default "download
+    /// everything" policy, and no round finishes unobserved.
     pub async fn join_doc(&self, ticket: String, policy: DownloadPolicy) -> Result<String> {
-        let ticket: DocTicket = ticket
+        let DocTicket { capability, nodes } = ticket
             .parse()
             .context("parse doc ticket")
             .map_err(SyncError::from)?;
@@ -320,7 +474,7 @@ impl IrohNode {
         let doc = self
             .docs
             .api()
-            .import(ticket)
+            .import_namespace(capability)
             .await
             .context("import doc")
             .map_err(SyncError::from)?;
@@ -330,12 +484,17 @@ impl IrohNode {
             .context("set download policy")
             .map_err(SyncError::from)?;
 
+        let joined = JoinedDoc::watch(doc.clone()).await?;
         // Wait for the first sync round so the caller observes the
         // entry log on return, not 200ms later.
         let mut events = doc
             .subscribe()
             .await
             .context("subscribe for initial sync")
+            .map_err(SyncError::from)?;
+        doc.start_sync(nodes)
+            .await
+            .context("start sync on joined doc")
             .map_err(SyncError::from)?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -359,7 +518,7 @@ impl IrohNode {
         }
 
         let id = doc.id();
-        self.joined.lock().await.insert(id, doc);
+        self.joined.lock().await.insert(id, joined);
         Ok(id.to_string())
     }
 
@@ -638,7 +797,8 @@ impl IrohNode {
             .context("create doc")
             .map_err(SyncError::from)?;
         let id = doc.id();
-        self.joined.lock().await.insert(id, doc);
+        let joined = JoinedDoc::watch(doc).await?;
+        self.joined.lock().await.insert(id, joined);
         Ok(id.to_string())
     }
 
@@ -681,7 +841,9 @@ impl IrohNode {
     /// Does not wait for a sync round (peers may be unreachable at
     /// launch; we don't want to hang startup). The caller subscribes
     /// to events afterward and observes the first `SyncFinished` as a
-    /// connection signal.
+    /// connection signal. A peer the resume's rounds fail to reach is
+    /// re-dialled on a backoff schedule until a round with it succeeds
+    /// (see `watch_redial`).
     pub async fn open_existing_doc(&self, doc_id: String) -> Result<bool> {
         let namespace: NamespaceId = doc_id
             .parse()
@@ -701,6 +863,7 @@ impl IrohNode {
         else {
             return Ok(false);
         };
+        let joined = JoinedDoc::watch(doc.clone()).await?;
         // Enable live sync. Empty peer list — iroh-docs supplies the
         // persisted per-doc peers from its own store and handles
         // address rediscovery.
@@ -708,7 +871,7 @@ impl IrohNode {
             .await
             .context("start sync on resumed doc")
             .map_err(SyncError::from)?;
-        self.joined.lock().await.insert(namespace, doc);
+        self.joined.lock().await.insert(namespace, joined);
         Ok(true)
     }
 
@@ -745,7 +908,10 @@ impl IrohNode {
     /// delivered even when the live mesh has dropped its connections. That
     /// also makes a never-shared doc live (as sharing does). Delivery is
     /// best effort — an `Ok` means the entry is stored, not that a peer
-    /// has it; a failed re-dial is logged, not returned.
+    /// has it; a failed re-dial is logged, not returned. A peer the
+    /// write's round fails to reach is re-dialled on a backoff schedule
+    /// until a round with it succeeds (see `watch_redial`), so the
+    /// write still reaches it once it is back.
     pub async fn set_entry(&self, doc_id: String, key: Vec<u8>, value: Vec<u8>) -> Result<String> {
         let doc = self.get_doc(&doc_id).await?;
         let author = self
@@ -769,7 +935,8 @@ impl IrohNode {
         // `open_existing_doc`), which delivers this write and restores the
         // mesh. A peer already mid-sync just aborts the extra round. The
         // write is already stored, so a failed re-dial must not read as a
-        // failed write: the next write, or a resume, dials again.
+        // failed write. A round that fails to reach a peer is retried by
+        // the doc's re-dial watch.
         if let Err(e) = doc.start_sync(Vec::new()).await {
             tracing::warn!(error = ?e, "re-dial of known peers after a write failed");
         }
@@ -793,6 +960,11 @@ impl IrohNode {
         // `await` resolves only after the work has finished.
         self.shutdown_cell
             .get_or_init(|| async {
+                // Stop re-dialling before the transport goes away, so no
+                // re-dial races the teardown.
+                for joined in self.joined.lock().await.values() {
+                    joined.redial.abort();
+                }
                 // Best-effort: log but don't abort if any step fails.
                 // The caller can't usefully retry a partial shutdown,
                 // and returning lets them proceed to drop the handle.
@@ -838,9 +1010,11 @@ impl IrohNode {
             .context("parse doc id (NamespaceId)")
             .map_err(SyncError::from)?;
         let map = self.joined.lock().await;
-        map.get(&namespace).cloned().ok_or_else(|| {
-            SyncError::Generic(format!("doc {doc_id} not joined — call join_doc first"))
-        })
+        map.get(&namespace)
+            .map(|joined| joined.doc.clone())
+            .ok_or_else(|| {
+                SyncError::Generic(format!("doc {doc_id} not joined — call join_doc first"))
+            })
     }
 }
 
