@@ -37,6 +37,11 @@ updates:
       - dependency-name: "aes-gcm"
       - dependency-name: "rusqlite"
       - dependency-name: "notify"
+      # base64 decodes untrusted vault bytes. 0.23 is a breaking 0.x release
+      # that also turns on new unsafe SIMD decode engines by default
+      # (`simd-unsafe`); adopt it deliberately, with the feature decision
+      # made explicitly, rather than as a weekly auto-bump.
+      - dependency-name: "base64"
 
   - package-ecosystem: github-actions
     directory: "/"
