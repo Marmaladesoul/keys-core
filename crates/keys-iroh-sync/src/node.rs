@@ -739,6 +739,13 @@ impl IrohNode {
     /// Write a single entry under this node's default author. The
     /// payload becomes a blob in the local store; peers will fetch it
     /// via the normal doc-content-sync path. Returns the content hash.
+    ///
+    /// After the write, the doc's known peers are re-dialled: a direct
+    /// sync round with each, spawned in the background, so the write is
+    /// delivered even when the live mesh has dropped its connections. That
+    /// also makes a never-shared doc live (as sharing does). Delivery is
+    /// best effort — an `Ok` means the entry is stored, not that a peer
+    /// has it; a failed re-dial is logged, not returned.
     pub async fn set_entry(&self, doc_id: String, key: Vec<u8>, value: Vec<u8>) -> Result<String> {
         let doc = self.get_doc(&doc_id).await?;
         let author = self
@@ -753,6 +760,19 @@ impl IrohNode {
             .await
             .context("set_bytes")
             .map_err(SyncError::from)?;
+        // Deliver the write whatever state the live mesh is in. A local
+        // insert travels to the doc's gossip neighbours — and there may be
+        // none: an idle connection closes, both sides see `NeighborDown`,
+        // and nothing re-dials, so the write would sit here until something
+        // else restarted sync. `start_sync` on a live doc re-joins the doc's
+        // persisted peers and runs a direct sync round with each (see
+        // `open_existing_doc`), which delivers this write and restores the
+        // mesh. A peer already mid-sync just aborts the extra round. The
+        // write is already stored, so a failed re-dial must not read as a
+        // failed write: the next write, or a resume, dials again.
+        if let Err(e) = doc.start_sync(Vec::new()).await {
+            tracing::warn!(error = ?e, "re-dial of known peers after a write failed");
+        }
         Ok(hash.to_string())
     }
 

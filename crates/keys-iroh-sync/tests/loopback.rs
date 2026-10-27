@@ -19,6 +19,7 @@
 //!   no persistent state survives. The library being persistent is
 //!   exercised by the bind path itself loading an empty store cleanly.
 
+use futures_util::StreamExt;
 use iroh::{
     Endpoint,
     endpoint::{Connection, presets},
@@ -33,7 +34,7 @@ use iroh_blobs::{
     store::mem::MemStore,
 };
 use iroh_docs::DocTicket;
-use keys_iroh_sync::{DownloadPolicy, Identity, IrohNode, NodeConfig};
+use keys_iroh_sync::{DocEvent, DownloadPolicy, Identity, IrohNode, NodeConfig};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -512,4 +513,100 @@ async fn blobs_protocol_serves_fetch_but_refuses_push() {
     tokio::time::timeout(Duration::from_secs(90), body)
         .await
         .expect("push-refusal test exceeded 90s");
+}
+
+/// How long a sync event stream must stay silent before the join's own
+/// rounds count as finished.
+const QUIET_PERIOD: Duration = Duration::from_secs(2);
+/// How long a write may take to produce its sync round, and to reach the
+/// peer.
+const DELIVERY_WAIT: Duration = Duration::from_secs(30);
+
+/// Every write runs a direct sync round with the doc's known peers, so it
+/// is delivered whatever state the live gossip mesh is in. In the field
+/// the mesh drops an idle connection (both sides see `NeighborDown` and
+/// nothing re-dials), and a write that rode only the mesh stayed local
+/// until a manual reconnect. That drop doesn't happen between two local
+/// nodes, so this pins the recovery mechanism itself: once the join's own
+/// rounds have quiesced, a write must produce a fresh successful sync
+/// round on the writer, which a mesh-only write never does. The closing
+/// delivery check is a sanity check only (between connected local nodes
+/// the mesh would deliver the entry too).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_runs_a_sync_round_with_known_peers() {
+    if is_network_test_skipped() {
+        eprintln!("skipping: KEYS_IROH_SYNC_SKIP_NETWORK_TESTS set");
+        return;
+    }
+    init_tracing();
+
+    let body = async {
+        let (writer, _wb, _wd) = spin_up_node().await;
+        let (reader, _rb, _rd) = spin_up_node().await;
+        let doc_id = writer.create_doc().await.expect("create_doc");
+        writer
+            .set_entry(doc_id.clone(), b"before".to_vec(), b"1".to_vec())
+            .await
+            .expect("first write");
+        let mut events = writer.subscribe_doc_events(&doc_id).await.expect("events");
+        let ticket = writer.share_doc(doc_id.clone(), true).await.expect("share");
+        reader
+            .join_doc(ticket, DownloadPolicy::Everything)
+            .await
+            .expect("join");
+
+        // Let the join's rounds finish: the reader holds the first entry,
+        // then the writer's event stream goes quiet.
+        while !reader
+            .list_entries(doc_id.clone())
+            .await
+            .expect("list")
+            .iter()
+            .any(|e| e.key == b"before")
+        {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        while tokio::time::timeout(QUIET_PERIOD, events.next())
+            .await
+            .is_ok()
+        {}
+
+        writer
+            .set_entry(doc_id.clone(), b"after".to_vec(), b"2".to_vec())
+            .await
+            .expect("second write");
+        tokio::time::timeout(DELIVERY_WAIT, async {
+            while let Some(event) = events.next().await {
+                if matches!(
+                    event.expect("event"),
+                    DocEvent::SyncFinished { success: true }
+                ) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the write ran no sync round with the known peer");
+
+        tokio::time::timeout(DELIVERY_WAIT, async {
+            while !reader
+                .list_entries(doc_id.clone())
+                .await
+                .expect("list")
+                .iter()
+                .any(|e| e.key == b"after")
+            {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .expect("the write never reached the known peer");
+
+        writer.shutdown().await.expect("writer shutdown");
+        reader.shutdown().await.expect("reader shutdown");
+    };
+
+    tokio::time::timeout(Duration::from_secs(120), body)
+        .await
+        .expect("test exceeded 120s — likely a hang, not a slow DERP");
 }
