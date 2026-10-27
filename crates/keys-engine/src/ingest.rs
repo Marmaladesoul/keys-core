@@ -860,9 +860,15 @@ pub(crate) fn ingest_peer(
                 merged,
                 attachment_changes,
             } => {
+                // Does the merge move local to a new version — a field or tag
+                // taken from the peer, or an adopted attachment change? The
+                // icon is cosmetic (favicon semantics), as in version identity.
+                let moves_local =
+                    !attachment_changes.is_empty() || !same_version(local_entry, &merged);
+                let merged = with_advanced_mtime(*merged, moves_local, local_entry, peer_entry);
                 let merged = with_pre_merge_snapshot(
-                    *merged,
-                    !attachment_changes.is_empty(),
+                    merged,
+                    moves_local,
                     (local_entry, &local.binaries),
                     (peer_entry, &peer.binaries),
                 );
@@ -1922,22 +1928,58 @@ struct HistoryFoldContext<'a> {
     now: DateTime<Utc>,
 }
 
+/// How far past the later of two contributing versions a merge both sides
+/// contributed to is stamped: one tick of KDBX 4's whole-second time
+/// resolution, so the merged version is strictly newer than either input.
+const MERGED_VERSION_STEP_SECS: i64 = 1;
+
+/// `merged` (an auto-merge result) stamped with the version it now is.
+/// keepass-merge's auto-merge inherits local's timestamps unchanged; left
+/// so, a merge that moves local to a new version (`moves_local`) dates the
+/// new content to the version it replaced, and a time-based merge by another
+/// client (which keeps the newer `LastModificationTime`) can prefer a stale
+/// copy. So:
+///
+/// - only the peer is behind (`!moves_local`): local's time stays;
+/// - the merge adopts the peer's version (same fields and tags): the peer's
+///   time, so both replicas hold that version under the same time;
+/// - both sides contributed: one step past the later of the two times —
+///   newer than either input, and the same on both replicas (each computes
+///   it from the same pair), so the pair converges instead of each stamping
+///   its own merge. Saturates rather than overflow on a peer's extreme time.
+fn with_advanced_mtime(mut merged: Entry, moves_local: bool, local: &Entry, peer: &Entry) -> Entry {
+    if !moves_local {
+        return merged;
+    }
+    let local_time = local.times.last_modification_time;
+    let peer_time = peer.times.last_modification_time;
+    merged.times.last_modification_time = if same_version(&merged, peer) {
+        peer_time.or(local_time)
+    } else {
+        local_time.max(peer_time).map(|t| {
+            t.checked_add_signed(chrono::TimeDelta::seconds(MERGED_VERSION_STEP_SECS))
+                .unwrap_or(t)
+        })
+    };
+    merged
+}
+
 /// `merged` (an auto-merge result, which carries local's history) with
 /// local's pre-merge live state appended as a history snapshot — the version
 /// the merge overwrites, history stripped (KDBX never nests history). Mirrors
 /// the loser snapshot keepass-merge's own apply path records.
 ///
-/// Skipped when the merge doesn't move local to a new version — no field or
-/// tag change (see [`same_version`]) and no adopted attachment change
-/// (`attachments_changed`; those ride beside `merged`, which keeps local's
-/// attachments) — and when either side's history already holds local's
+/// Skipped when the merge doesn't move local to a new version (`moves_local`:
+/// no field or tag change, see [`same_version`], and no adopted attachment
+/// change — those ride beside `merged`, which keeps local's attachments) —
+/// and when either side's history already holds local's
 /// version under another mtime (e.g. local only changed the icon since the
 /// peer snapshotted it): the fold dedups by `(second, content)`, so that
 /// would land as a second copy of the same version. The fold drops the
 /// snapshot if a tombstone covers it.
 fn with_pre_merge_snapshot(
     mut merged: Entry,
-    attachments_changed: bool,
+    moves_local: bool,
     (local, local_binaries): (&Entry, &[Binary]),
     (peer, peer_binaries): (&Entry, &[Binary]),
 ) -> Entry {
@@ -1949,7 +1991,7 @@ fn with_pre_merge_snapshot(
             .history
             .iter()
             .any(|h| same_content((h, peer_binaries), (local, local_binaries)));
-    if (attachments_changed || !same_version(local, &merged)) && !already_recorded {
+    if moves_local && !already_recorded {
         let mut snapshot = local.clone();
         snapshot.history.clear();
         merged.history.push(snapshot);
@@ -3505,6 +3547,64 @@ mod ingest_peer_tests {
             history_rows(&conn, id),
             2,
             "base + local's pre-merge version"
+        );
+    }
+
+    fn mtime(e: &Entry) -> Option<chrono::DateTime<chrono::Utc>> {
+        e.times.last_modification_time
+    }
+
+    #[test]
+    fn advanced_mtime_keeps_local_when_only_the_peer_is_behind() {
+        let id = Uuid::new_v4();
+        let local = entry_at(id, "mine", 300);
+        let peer = entry_at(id, "old", 100);
+        let merged = super::with_advanced_mtime(local.clone(), false, &local, &peer);
+        assert_eq!(mtime(&merged), mtime(&local));
+    }
+
+    #[test]
+    fn advanced_mtime_takes_the_peers_time_when_adopting_its_version() {
+        let id = Uuid::new_v4();
+        let local = entry_at(id, "old", 100);
+        let peer = entry_at(id, "new", 300);
+        let mut merged = local.clone();
+        merged.title = "new".into();
+        let merged = super::with_advanced_mtime(merged, true, &local, &peer);
+        assert_eq!(mtime(&merged), mtime(&peer));
+    }
+
+    #[test]
+    fn advanced_mtime_steps_past_both_when_both_sides_contributed() {
+        let id = Uuid::new_v4();
+        let mut local = entry_at(id, "t", 300);
+        local.notes = "from local".into();
+        let mut peer = entry_at(id, "t", 200);
+        peer.username = "from peer".into();
+        let mut merged = local.clone();
+        merged.username = "from peer".into();
+        let merged = super::with_advanced_mtime(merged, true, &local, &peer);
+        assert_eq!(
+            mtime(&merged),
+            chrono::DateTime::<chrono::Utc>::from_timestamp(301, 0),
+            "strictly newer than both inputs, and the same on either replica"
+        );
+    }
+
+    #[test]
+    fn advanced_mtime_saturates_on_a_peers_extreme_time() {
+        let id = Uuid::new_v4();
+        let mut local = entry_at(id, "t", 100);
+        local.notes = "from local".into();
+        let mut peer = entry_at(id, "t", 0);
+        peer.times.last_modification_time = Some(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+        peer.username = "from peer".into();
+        let mut merged = local.clone();
+        merged.username = "from peer".into();
+        let merged = super::with_advanced_mtime(merged, true, &local, &peer);
+        assert_eq!(
+            mtime(&merged),
+            Some(chrono::DateTime::<chrono::Utc>::MAX_UTC)
         );
     }
 }
