@@ -418,6 +418,15 @@ enum Command {
         /// UUID of the entry whose tags to print.
         entry: String,
     },
+    /// Print an entry's live `modified_at` (ms since the epoch) as
+    /// `modified_at=<ms>` — the read side for timestamp-convergence
+    /// assertions (the content digest excludes timestamps). A pure read.
+    Times {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the entry whose times to print.
+        entry: String,
+    },
     /// Print an entry's history snapshots — one line per snapshot
     /// (`<index>  <username>`), newest-index last, then a count. The read
     /// oracle for history convergence: the content digest deliberately
@@ -950,6 +959,12 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.tags(entry)?;
+            session.finish().await?;
+        }
+        Command::Times { vault, entry } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.times(&entry)?;
             session.finish().await?;
         }
         Command::History { vault, entry } => {
@@ -1855,6 +1870,17 @@ impl Session {
         for t in &tags {
             println!("{t}");
         }
+        Ok(())
+    }
+
+    /// Print `entry`'s live `modified_at`. A pure read.
+    fn times(&self, entry: &str) -> Result<()> {
+        let e = self
+            .engine
+            .entry(entry.to_owned())
+            .map_err(|e| anyhow::anyhow!("entry: {e:?}"))?
+            .with_context(|| format!("no entry {entry}"))?;
+        println!("modified_at={}", e.modified_at);
         Ok(())
     }
 
