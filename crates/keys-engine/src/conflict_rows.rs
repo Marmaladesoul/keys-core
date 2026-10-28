@@ -502,7 +502,7 @@ mod tests {
 
         // Owner-agnostic drop then clears the remainder.
         drop_conflict_rows(&conn, id).expect("drop all");
-        assert!(parked_conflict_uuids(&conn).unwrap().is_empty());
+        assert_eq!(parked_conflict_uuids(&conn).unwrap(), Vec::<Uuid>::new());
         assert_eq!(blob_refs(&conn, "peerC", id), 0, "blob refs dropped too");
     }
 
