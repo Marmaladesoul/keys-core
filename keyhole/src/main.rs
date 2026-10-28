@@ -437,6 +437,11 @@ enum Command {
         vault: PathBuf,
         /// UUID of the entry whose history to print.
         entry: String,
+        /// Also print each snapshot's tag set, sorted, as a bracketed
+        /// comma-joined list (`[]` when it has none) — the read side for
+        /// tag fidelity in history.
+        #[arg(long)]
+        tags: bool,
     },
     /// Delete one history snapshot by index, then persist — the user
     /// "remove this old version" action (e.g. scrubbing a leaked password
@@ -967,10 +972,10 @@ async fn main() -> Result<()> {
             session.times(&entry)?;
             session.finish().await?;
         }
-        Command::History { vault, entry } => {
+        Command::History { vault, entry, tags } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.history(entry)?;
+            session.history(entry, tags)?;
             session.finish().await?;
         }
         Command::DeleteHistory {
@@ -1885,9 +1890,10 @@ impl Session {
     }
 
     /// Print `entry`'s history snapshots — `<index>  <username>` per line in
-    /// index order, then a count. The history-convergence read oracle (the
-    /// digest excludes history). A pure read.
-    fn history(&self, entry: String) -> Result<()> {
+    /// index order (plus `  [<tags>]` with `with_tags`), then a count. The
+    /// history-convergence read oracle (the digest excludes history). A pure
+    /// read.
+    fn history(&self, entry: String, with_tags: bool) -> Result<()> {
         let hist = self
             .engine
             .history(entry)
@@ -1897,7 +1903,13 @@ impl Session {
             return Ok(());
         }
         for h in &hist {
-            println!("{}  {}", h.history_index, h.username);
+            if with_tags {
+                let mut tags = h.tags.clone();
+                tags.sort();
+                println!("{}  {}  [{}]", h.history_index, h.username, tags.join(","));
+            } else {
+                println!("{}  {}", h.history_index, h.username);
+            }
         }
         println!("\n{} snapshot(s)", hist.len());
         Ok(())

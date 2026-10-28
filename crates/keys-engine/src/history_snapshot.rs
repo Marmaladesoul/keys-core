@@ -179,9 +179,11 @@ impl HistorySnapshotIo {
     /// password and every protected custom field under `session_key`.
     ///
     /// `binaries` is the KDBX binary pool the entry's attachment
-    /// `ref_id`s index into; an out-of-range ref contributes empty
-    /// bytes (and therefore the SHA-256 of the empty string), matching
-    /// the pool-resolution posture of the surrounding ingest walk.
+    /// `ref_id`s index into. An out-of-range ref is skipped, the posture
+    /// of every other attachment walk in ingest (and of the merge's
+    /// content hash): recording it as the SHA-256 of empty bytes would
+    /// let it resolve against any zero-byte blob in the pool and come
+    /// back as a present, empty attachment.
     pub(crate) fn from_entry(
         entry: &Entry,
         session_key: &SessionKey,
@@ -222,13 +224,13 @@ impl HistorySnapshotIo {
         let attachments = entry
             .attachments
             .iter()
-            .map(|att| {
-                let bytes = binaries.get(att.ref_id as usize).copied().unwrap_or(&[]);
-                HistoryAttachmentIo {
+            .filter_map(|att| {
+                let bytes = binaries.get(att.ref_id as usize).copied()?;
+                Some(HistoryAttachmentIo {
                     name: att.name.clone(),
                     size: u64::try_from(bytes.len()).unwrap_or(0),
                     sha256_hex: bytes_to_hex(&Sha256::digest(bytes)),
-                }
+                })
             })
             .collect();
 

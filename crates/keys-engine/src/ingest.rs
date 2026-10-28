@@ -25,6 +25,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::PersistenceState;
+use crate::conflict_rows;
 use crate::error::{EngineError, IngestError};
 use crate::fingerprint;
 use crate::history_snapshot::HistorySnapshotIo;
@@ -260,7 +261,7 @@ fn clear_vault_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
     // (INSERT OR IGNORE).
     conn.execute(
         "DELETE FROM attachment_blob WHERE sha256 NOT IN \
-             (SELECT blob_sha256 FROM conflict_entry_attachment)",
+             (SELECT blob_sha256 FROM conflict_entry_blob_ref)",
         [],
     )?;
     // Group goes last; entries FK to it.
@@ -586,7 +587,10 @@ fn insert_attachment(
 /// Content-address `bytes` into the shared `attachment_blob` pool
 /// (`INSERT OR IGNORE` — the pool rows are immutable by construction)
 /// and return the SHA-256 key.
-fn upsert_attachment_blob(conn: &Connection, bytes: &[u8]) -> Result<[u8; 32], rusqlite::Error> {
+pub(crate) fn upsert_attachment_blob(
+    conn: &Connection,
+    bytes: &[u8],
+) -> Result<[u8; 32], rusqlite::Error> {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let sha: [u8; 32] = hasher.finalize().into();
@@ -852,7 +856,7 @@ pub(crate) fn ingest_peer(
                         peer.binaries.len(),
                     );
                 }
-                clear_conflict_rows(&tx, owner, &uuid_str)?;
+                conflict_rows::drop_conflict_rows_for_owner(&tx, owner, uuid)?;
                 outcome.in_sync += 1;
                 history_base = HistoryBase::Local;
             }
@@ -906,7 +910,7 @@ pub(crate) fn ingest_peer(
                         }
                     }
                 }
-                clear_conflict_rows(&tx, owner, &uuid_str)?;
+                conflict_rows::drop_conflict_rows_for_owner(&tx, owner, uuid)?;
                 outcome.auto_merged.push(uuid);
                 history_base = HistoryBase::AutoMerged(Box::new(merged));
             }
@@ -941,7 +945,7 @@ pub(crate) fn ingest_peer(
                     local_resolution_holds,
                     local_supersedes_peer,
                 );
-                clear_conflict_rows(&tx, owner, &uuid_str)?;
+                conflict_rows::drop_conflict_rows_for_owner(&tx, owner, uuid)?;
                 if local_resolution_holds {
                     // We resolved this exact conflict and the peer hasn't edited
                     // since → keep our value and leave the badge clear; the peer
@@ -969,21 +973,16 @@ pub(crate) fn ingest_peer(
                 } else {
                     // Genuine unresolved conflict (or our edit superseded the
                     // peer's resolution) → hold open: leave the local entry
-                    // untouched and store the peer's value (the resolver's
-                    // "theirs"), refreshed in place.
+                    // untouched and store the peer's whole entry (the
+                    // resolver's "theirs"), refreshed in place.
                     //
-                    // KNOWN LIMITATION (deferred to Phase 5, by design —
-                    // classify's scope is standard + custom fields + icon): the
-                    // peer's NON-conflicting tags and group placement riding
-                    // alongside this held conflict are neither folded onto
-                    // local nor captured in the peer row. They are not lost
-                    // (the peer keeps them); they reach this side once the
-                    // conflict converges or Phase 5 (groups) lands. The
-                    // eager-merge path folded them immediately — the accepted
-                    // behavioural narrowing of the switch. Attachment state IS
-                    // captured since Finding #7 (the resolver's rebuilt
-                    // "theirs" must carry the peer's true attachment set).
-                    insert_conflict_entry(
+                    // The peer's NON-conflicting changes riding alongside the
+                    // held conflict (tags, non-clashing fields) are not folded
+                    // onto local while it is held — they are not lost: the
+                    // peer row carries the exact entry, history and tombstones
+                    // included, so resolving merges them 3-way against the
+                    // shared ancestor exactly as a clean pull would.
+                    conflict_rows::write_peer_entry(
                         &tx,
                         owner,
                         &conflict.remote,
@@ -2219,12 +2218,24 @@ fn insert_history_snapshot(
          VALUES (?1, ?2, ?3)",
         params![uuid_str, i64::try_from(idx).unwrap_or(i64::MAX), json],
     )?;
-    for att in &hist.attachments {
-        if let Some(bytes) = binaries.get(att.ref_id as usize).copied() {
-            upsert_attachment_blob(conn, bytes)?;
-        }
-    }
+    store_attachment_blobs(conn, &hist.attachments, binaries)?;
     Ok(())
+}
+
+/// Store the bytes of each of `attachments` in the shared `attachment_blob`
+/// pool and return their shas. `binaries` is the pool the attachments'
+/// `ref_id`s index; a dangling ref stores nothing, matching the snapshot
+/// shape, which skips it too.
+pub(crate) fn store_attachment_blobs<'a>(
+    conn: &Connection,
+    attachments: impl IntoIterator<Item = &'a keepass_core::model::Attachment>,
+    binaries: &[&[u8]],
+) -> Result<Vec<[u8; 32]>, rusqlite::Error> {
+    attachments
+        .into_iter()
+        .filter_map(|att| binaries.get(att.ref_id as usize).copied())
+        .map(|bytes| upsert_attachment_blob(conn, bytes))
+        .collect()
 }
 
 /// Upsert (or, when `tombstone_item` is `None`, clear) an entry's
@@ -2372,127 +2383,6 @@ fn advance_local_entry(
     Ok(())
 }
 
-/// Write the peer's value as an `owner`-keyed `conflict_*` row set (the
-/// resolver's "theirs"). Mirrors [`insert_entry`]'s field walk but targets
-/// the parallel conflict tables and omits the engine-internal derived
-/// columns / history / tags (out of scope). Protected fields are sealed
-/// under the same session key the live rows use — never stored as
-/// plaintext.
-///
-/// Attachment state IS captured (Finding #7): names as
-/// `conflict_entry_attachment` rows, bytes content-addressed into the
-/// shared `attachment_blob` pool via `binaries` (the peer vault's pool).
-/// Without it the resolver's rebuilt "theirs" carried no attachments and a
-/// choose-remote resolution wiped the local links.
-fn insert_conflict_entry(
-    tx: &Connection,
-    owner: &str,
-    entry: &Entry,
-    session_key: &SessionKey,
-    binaries: &[&[u8]],
-) -> Result<(), EngineError> {
-    let uuid = entry.id.0.to_string();
-    tx.execute(
-        "INSERT INTO conflict_entry (\
-            owner, entry_uuid, group_uuid, title, username, url, notes, \
-            icon_index, icon_custom_uuid, created_at, modified_at, accessed_at, expires_at\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![
-            owner,
-            uuid,
-            // group placement is Phase-5 group reconciliation.
-            Option::<String>::None,
-            entry.title,
-            entry.username,
-            entry.url,
-            entry.notes,
-            i64::from(entry.icon_id),
-            entry.custom_icon_uuid.map(|u| u.to_string()),
-            dt_to_ms(entry.times.creation_time),
-            dt_to_ms(entry.times.last_modification_time),
-            dt_to_ms(entry.times.last_access_time),
-            expiry_ms(&entry.times),
-        ],
-    )?;
-
-    // Canonical Password slot, always sealed (even empty) for symmetry with
-    // the live `entry_protected` row.
-    let wrapped_password = seal_with_key(session_key, entry.password.as_bytes())
-        .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
-    tx.execute(
-        "INSERT INTO conflict_entry_protected (owner, entry_uuid, field_name, wrapped_blob) \
-         VALUES (?1, ?2, ?3, ?4)",
-        params![owner, uuid, PASSWORD_FIELD, wrapped_password],
-    )?;
-
-    for cf in &entry.custom_fields {
-        if cf.protected {
-            // Mirror `insert_entry`: a custom field named "Password" would
-            // collide with the canonical slot, so skip it.
-            if cf.key == PASSWORD_FIELD {
-                continue;
-            }
-            let wrapped = seal_with_key(session_key, cf.value.as_bytes())
-                .map_err(|e| EngineError::Ingest(IngestError::Wrap(e.to_string())))?;
-            tx.execute(
-                "INSERT INTO conflict_entry_protected (owner, entry_uuid, field_name, wrapped_blob) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![owner, uuid, cf.key, wrapped],
-            )?;
-        } else {
-            tx.execute(
-                "INSERT INTO conflict_entry_custom_field (owner, entry_uuid, field_name, value) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![owner, uuid, cf.key, cf.value],
-            )?;
-        }
-    }
-
-    // Attachments: resolve ref_id → bytes via the peer's binary pool,
-    // content-address into the shared blob pool, link by sha. Dangling
-    // ref_ids skip, matching `insert_entry`'s posture.
-    for att in &entry.attachments {
-        let Some(bytes) = binaries.get(att.ref_id as usize).copied() else {
-            continue;
-        };
-        let sha = upsert_attachment_blob(tx, bytes)?;
-        tx.execute(
-            "INSERT INTO conflict_entry_attachment \
-                 (owner, entry_uuid, attachment_name, blob_sha256) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![owner, uuid, att.name, sha.as_slice()],
-        )?;
-    }
-
-    Ok(())
-}
-
-/// Drop the `conflict_*` rows for one `(owner, entry)`. Explicit child
-/// deletes (don't rely on the FK-cascade pragma being on), parent last.
-fn clear_conflict_rows(
-    tx: &Connection,
-    owner: &str,
-    entry_uuid: &str,
-) -> Result<(), rusqlite::Error> {
-    tx.execute(
-        "DELETE FROM conflict_entry_protected WHERE owner = ?1 AND entry_uuid = ?2",
-        params![owner, entry_uuid],
-    )?;
-    tx.execute(
-        "DELETE FROM conflict_entry_custom_field WHERE owner = ?1 AND entry_uuid = ?2",
-        params![owner, entry_uuid],
-    )?;
-    tx.execute(
-        "DELETE FROM conflict_entry_attachment WHERE owner = ?1 AND entry_uuid = ?2",
-        params![owner, entry_uuid],
-    )?;
-    tx.execute(
-        "DELETE FROM conflict_entry WHERE owner = ?1 AND entry_uuid = ?2",
-        params![owner, entry_uuid],
-    )?;
-    Ok(())
-}
-
 // ── Phase 5b: cross-peer delete / tombstone helpers ─────────────────────────
 
 /// Does a live edit beat a tombstone? The single rule behind both directions of
@@ -2622,11 +2512,12 @@ mod ingest_peer_tests {
     //! history-identity soak is the Phase-4 gate.
 
     use super::{IngestPeerOutcome, ingest_peer, ingest_vault};
+    use crate::conflict_rows;
     use crate::migrations;
     use keepass_core::model::{
         CustomField, DeletedObject, Entry, EntryId, GroupId, Timestamps, Vault,
     };
-    use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey, open_with_key};
+    use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
     use keepass_merge::{ConflictKind, ConflictResolution, add_conflict_resolution};
     use rusqlite::{Connection, params};
     use uuid::Uuid;
@@ -2810,17 +2701,18 @@ mod ingest_peer_tests {
         .expect("local title")
     }
 
-    /// Decrypt a sealed `conflict_entry_protected` field for assertions.
-    fn peer_protected(conn: &Connection, owner: &str, uuid: Uuid, field: &str) -> Vec<u8> {
-        let wrapped: Vec<u8> = conn
-            .query_row(
-                "SELECT wrapped_blob FROM conflict_entry_protected \
-                 WHERE owner = ?1 AND entry_uuid = ?2 AND field_name = ?3",
-                params![owner, uuid.to_string(), field],
-                |r| r.get(0),
-            )
-            .expect("protected row");
-        open_with_key(&SessionKey::from_bytes(SK), &wrapped).expect("unseal")
+    /// Rebuild `owner`'s parked entry for `uuid` through the one reader,
+    /// protected values unsealed.
+    fn peer_entry(conn: &Connection, owner: &str, uuid: Uuid) -> Entry {
+        conflict_rows::reconstruct_peer_entry(
+            conn,
+            owner,
+            uuid,
+            &SessionKey::from_bytes(SK),
+            &mut Vec::new(),
+        )
+        .expect("reconstruct")
+        .expect("peer row")
     }
 
     #[test]
@@ -2883,7 +2775,7 @@ mod ingest_peer_tests {
         assert_eq!(conflict_rows_for(&conn, id), 1);
         // Local untouched; peer's password stored (sealed) as theirs.
         assert_eq!(local_title(&conn, id), "T");
-        assert_eq!(peer_protected(&conn, "peerB", id, "Password"), b"p-THEIRS");
+        assert_eq!(peer_entry(&conn, "peerB", id).password, "p-THEIRS");
     }
 
     #[test]
@@ -2913,23 +2805,24 @@ mod ingest_peer_tests {
         let local = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "mine"))]);
         let peer = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "theirs"))]);
         let (conn, _) = run(&local, "peerB", &peer);
-        let wrapped: Vec<u8> = conn
+        let json: String = conn
             .query_row(
-                "SELECT wrapped_blob FROM conflict_entry_protected \
-                 WHERE owner = 'peerB' AND entry_uuid = ?1 AND field_name = 'Password'",
+                "SELECT entry_json FROM conflict_entry \
+                 WHERE owner = 'peerB' AND entry_uuid = ?1",
                 params![id.to_string()],
                 |r| r.get(0),
             )
-            .expect("protected row");
-        assert_ne!(
-            wrapped.as_slice(),
-            b"theirs",
-            "stored sealed, not plaintext"
-        );
+            .expect("peer row");
+        assert!(!json.contains("theirs"), "stored sealed, not plaintext");
+        let record: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let wrapped = crate::util::codec::b64_decode(
+            record["entry"]["password"].as_str().expect("password slot"),
+        )
+        .expect("base64");
         // AES-GCM: 12-byte nonce + ciphertext(=plaintext len) + 16-byte tag.
         assert_eq!(wrapped.len(), 12 + "theirs".len() + 16);
         // ...and it round-trips back to the peer value under the session key.
-        assert_eq!(peer_protected(&conn, "peerB", id, "Password"), b"theirs");
+        assert_eq!(peer_entry(&conn, "peerB", id).password, "theirs");
     }
 
     #[test]
@@ -2940,7 +2833,7 @@ mod ingest_peer_tests {
 
         let peer_v1 = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "theirs-1"))]);
         peer_into(&mut conn, "peerB", &local, &peer_v1);
-        assert_eq!(peer_protected(&conn, "peerB", id, "Password"), b"theirs-1");
+        assert_eq!(peer_entry(&conn, "peerB", id).password, "theirs-1");
 
         // Same peer pulls again with a newer value → one row, refreshed.
         let peer_v2 = vault_of(vec![forked(id, ("T", "p0"), 1000, ("T", "theirs-2"))]);
@@ -2953,7 +2846,7 @@ mod ingest_peer_tests {
             )
             .expect("count");
         assert_eq!(owner_rows, 1, "refresh in place, no accumulation");
-        assert_eq!(peer_protected(&conn, "peerB", id, "Password"), b"theirs-2");
+        assert_eq!(peer_entry(&conn, "peerB", id).password, "theirs-2");
     }
 
     #[test]
@@ -2980,8 +2873,8 @@ mod ingest_peer_tests {
             2,
             "one row per peer — native multi-peer"
         );
-        assert_eq!(peer_protected(&conn, "peerB", id, "Password"), b"from-B");
-        assert_eq!(peer_protected(&conn, "peerC", id, "Password"), b"from-C");
+        assert_eq!(peer_entry(&conn, "peerB", id).password, "from-B");
+        assert_eq!(peer_entry(&conn, "peerC", id).password, "from-C");
     }
 
     #[test]
@@ -3051,16 +2944,15 @@ mod ingest_peer_tests {
         let peer = vault_of(vec![forked_note(id, "n0", 1000, "B")]);
         let (conn, outcome) = run(&local, "peerB", &peer);
         assert_eq!(outcome.conflicted, vec![id]);
-        let stored: String = conn
-            .query_row(
-                "SELECT value FROM conflict_entry_custom_field \
-                 WHERE owner = 'peerB' AND entry_uuid = ?1 AND field_name = 'note'",
-                params![id.to_string()],
-                |r| r.get(0),
-            )
-            .expect("custom field row");
+        let peer = peer_entry(&conn, "peerB", id);
+        let note = peer
+            .custom_fields
+            .iter()
+            .find(|f| f.key == "note")
+            .expect("note field");
         assert_eq!(
-            stored, "B",
+            (note.value.as_str(), note.protected),
+            ("B", false),
             "peer's non-protected custom field stored as theirs"
         );
     }

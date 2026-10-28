@@ -626,7 +626,14 @@ pub(crate) fn snapshot_json_to_entry(
     )
 }
 
-fn snapshot_to_entry(
+/// Rebuild one [`HistorySnapshotIo`] record into an [`Entry`] — the single
+/// inverse of [`HistorySnapshotIo::from_entry`]. Protected fields are
+/// unsealed under `session_key`; attachments resolve by sha through
+/// `attachment_blob` into `binary_pool` (deduplicated via `sha_to_ref`).
+/// The result carries no `<History>` and no location (a snapshot is a
+/// content revision, not a placement); a caller rebuilding a whole entry
+/// attaches those itself (see [`crate::conflict_rows`]).
+pub(crate) fn snapshot_to_entry(
     entry_uuid: Uuid,
     snap: &HistorySnapshotIo,
     session_key: &SessionKey,
@@ -644,6 +651,19 @@ fn snapshot_to_entry(
     e.notes.clone_from(&snap.notes);
     e.password = unwrap_b64_field(entry_uuid, "Password", &snap.password, session_key)?;
     e.tags.clone_from(&snap.tags);
+    // Icons: absent on rows older than the field, which read back as the
+    // default icon (what those rows always projected as).
+    e.icon_id = builtin_icon_index(snap.icon_index.map(i64::from));
+    e.custom_icon_uuid = snap
+        .icon_custom_uuid
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|err| {
+            EngineError::Projection(ProjectionError::SchemaInvariant(format!(
+                "entry {entry_uuid} snapshot icon_custom_uuid: {err}"
+            )))
+        })?;
     e.times = build_times(
         snap.created_at,
         snap.modified_at,

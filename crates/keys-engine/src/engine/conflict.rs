@@ -416,7 +416,7 @@ impl Engine {
         self.ensure_same_vault(peer.root.id.0)?;
         let local = self.project_to_vault()?;
         let now = self.now();
-        let outcome = crate::ingest::ingest_peer(
+        let mut outcome = crate::ingest::ingest_peer(
             &mut self.conn,
             &self.fingerprint_key,
             &*self.field_protector,
@@ -430,8 +430,14 @@ impl Engine {
         // this peer's value — the ingest arms only clear the ingested
         // owner (owner-scoped). Reconcile the whole parked set so the
         // badge is accurate after every sync, without waiting for a
-        // resolver-open to lazily heal it.
-        crate::reconcile::reconcile_all_conflict_rows(self)?;
+        // resolver-open to lazily heal it. A dissolve that lands the
+        // peer's remaining changes advanced local: report it as merged, so
+        // the caller saves.
+        for uuid in crate::reconcile::reconcile_all_conflict_rows(self)? {
+            if !outcome.auto_merged.contains(&uuid) {
+                outcome.auto_merged.push(uuid);
+            }
+        }
         Ok(outcome)
     }
 
