@@ -92,6 +92,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "persistence_watermark",
         sql: include_str!("migrations/0012_persistence_watermark.sql"),
     },
+    Migration {
+        version: 13,
+        name: "conflict_entry_whole",
+        sql: include_str!("migrations/0013_conflict_entry_whole.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.
@@ -178,6 +183,29 @@ mod tests {
         Connection::open_in_memory().expect("open in-memory db")
     }
 
+    /// A database at schema `version`: migrations v1..=`version` only,
+    /// replaying the applier's own steps, so a test can seed old-shape
+    /// rows and then run the real applier for the remainder.
+    fn migrated_through(version: u32) -> Connection {
+        let conn = fresh_conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (\
+                version INTEGER NOT NULL PRIMARY KEY\
+             )",
+        )
+        .expect("bootstrap schema_version");
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= version) {
+            conn.execute_batch(migration.sql)
+                .expect("apply earlier migration");
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![migration.version],
+            )
+            .expect("record version");
+        }
+        conn
+    }
+
     #[test]
     fn migrations_array_is_strictly_increasing_and_starts_at_one() {
         assert!(!MIGRATIONS.is_empty(), "must ship at least one migration");
@@ -224,9 +252,7 @@ mod tests {
         const MIRROR_LOCAL: &[&str] = &[
             "attachment_blob", // content-addressed pool; save-time GC must not re-dirty
             "conflict_entry",
-            "conflict_entry_attachment",
-            "conflict_entry_custom_field",
-            "conflict_entry_protected",
+            "conflict_entry_blob_ref",
             "smart_folder",   // engine-local sidebar state
             "schema_version", // migration bookkeeping
             "setting",        // handled by the conditional meta.% triggers
@@ -307,28 +333,9 @@ mod tests {
         assert_eq!(read_seq(&fresh, "persistence.mutation_seq"), 0);
         assert_eq!(read_seq(&fresh, "persistence.persisted_seq"), 0);
 
-        // Upgrade: build a pre-0012 database (migrations v1..v11 only,
-        // replaying the applier's own steps), give it vault content,
+        // Upgrade: build a pre-0012 database, give it vault content,
         // then run the real applier for the remainder → dirty 1/0.
-        let mut upgraded = fresh_conn();
-        upgraded
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_version (\
-                    version INTEGER NOT NULL PRIMARY KEY\
-                 )",
-            )
-            .expect("bootstrap schema_version");
-        for migration in MIGRATIONS.iter().filter(|m| m.version <= 11) {
-            upgraded
-                .execute_batch(migration.sql)
-                .expect("apply pre-watermark migration");
-            upgraded
-                .execute(
-                    "INSERT INTO schema_version (version) VALUES (?1)",
-                    params![migration.version],
-                )
-                .expect("record version");
-        }
+        let mut upgraded = migrated_through(11);
         upgraded
             .execute(
                 "INSERT INTO \"group\" (uuid, parent_uuid, name, created_at, modified_at)
@@ -344,6 +351,50 @@ mod tests {
             "an upgraded mirror with existing content must read dirty"
         );
         assert_eq!(read_seq(&upgraded, "persistence.persisted_seq"), 0);
+    }
+
+    /// Migration 0013 replaces the per-facet conflict tables with one
+    /// record per `(owner, entry)`. Rows parked under the old shape are
+    /// dropped (they can't be re-sealed in SQL; the migration's header
+    /// says what that costs), and their pool blobs stop being GC roots.
+    #[test]
+    fn whole_entry_upgrade_drops_old_parked_rows() {
+        let mut conn = migrated_through(12);
+        conn.execute_batch(
+            "INSERT INTO conflict_entry (owner, entry_uuid, title) VALUES ('peer', 'e', 't');
+             INSERT INTO conflict_entry_protected (owner, entry_uuid, field_name, wrapped_blob)
+                 VALUES ('peer', 'e', 'Password', x'00');
+             INSERT INTO conflict_entry_custom_field (owner, entry_uuid, field_name, value)
+                 VALUES ('peer', 'e', 'note', 'v');
+             INSERT INTO conflict_entry_attachment (owner, entry_uuid, attachment_name, blob_sha256)
+                 VALUES ('peer', 'e', 'doc.txt', x'aa');",
+        )
+        .expect("seed old-shape parked rows");
+
+        apply_pending(&mut conn).expect("apply 0013");
+
+        let parked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conflict_entry", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(parked, 0, "old-shape rows are dropped");
+        let old_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN \
+                     ('conflict_entry_protected', 'conflict_entry_custom_field', \
+                      'conflict_entry_attachment')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count tables");
+        assert_eq!(old_tables, 0, "per-facet tables are gone");
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('conflict_entry') ORDER BY cid")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+        assert_eq!(columns, ["owner", "entry_uuid", "entry_json"]);
     }
 
     #[test]

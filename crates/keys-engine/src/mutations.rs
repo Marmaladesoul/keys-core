@@ -139,9 +139,9 @@ fn gc_orphan_tags(tx: &Transaction<'_>) -> Result<(), EngineError> {
 ///
 /// Reference roots, all of which must survive:
 /// - live `entry_attachment` links;
-/// - `conflict_entry_attachment` rows — a parked conflict's divergent
-///   peer bytes exist ONLY in the pool until the conflict resolves
-///   (keyhole Finding #7);
+/// - `conflict_entry_blob_ref` rows — a parked conflict's divergent
+///   peer bytes (its live version's and its history's) exist ONLY in
+///   the pool until the conflict resolves (keyhole Finding #7);
 /// - history-snapshot attachments (`entry_history.snapshot_json`,
 ///   shas stored hex). Malformed JSON and pre-widening rows (empty
 ///   hex) skip, matching the read side's posture.
@@ -169,7 +169,7 @@ pub(crate) fn gc_attachment_blobs(conn: &mut Connection) -> Result<u64, EngineEr
     )?;
     tx.execute(
         "INSERT OR IGNORE INTO gc_attachment_roots \
-             SELECT blob_sha256 FROM conflict_entry_attachment",
+             SELECT blob_sha256 FROM conflict_entry_blob_ref",
         [],
     )?;
 
@@ -3065,15 +3065,15 @@ mod tests {
             params![entry, json],
         )
         .unwrap();
+        // The GC reads only the blob-ref root, never the record itself.
         conn.execute(
-            "INSERT INTO conflict_entry (owner, entry_uuid, title, username, url, notes, icon_index) \
-             VALUES ('peer', ?1, '', '', '', '', 0)",
+            "INSERT INTO conflict_entry (owner, entry_uuid, entry_json) VALUES ('peer', ?1, '{}')",
             params![entry],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO conflict_entry_attachment (owner, entry_uuid, attachment_name, blob_sha256) \
-             VALUES ('peer', ?1, 'parked.txt', ?2)",
+            "INSERT INTO conflict_entry_blob_ref (owner, entry_uuid, blob_sha256) \
+             VALUES ('peer', ?1, ?2)",
             params![entry, parked.as_slice()],
         )
         .unwrap();

@@ -472,36 +472,31 @@ fn held_divergent_attachment_survives_resolving_another_entry() {
         )
         .expect("apply seed");
 
-    // `other`'s rebuilt "theirs" must STILL carry the divergent attachment.
+    // `other` is still held on its title. The peer's attachment is a
+    // one-sided add since the fork, so against the shared ancestor it merges
+    // without a delta — only the title clashes.
     let payload = engine_a
         .held_conflict_payload(&kdbx_path, &composite(), Some(other_uuid))
         .expect("derive other")
         .expect("other still held");
     assert_eq!(payload.entry_conflicts.len(), 1);
-    assert_eq!(
-        payload.entry_conflicts[0]
-            .attachment_deltas
-            .iter()
-            .map(|d| d.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["doc2.txt"],
-        "the divergent peer attachment survives the re-ingest",
+    assert!(
+        payload.entry_conflicts[0].attachment_deltas.is_empty(),
+        "a one-sided peer add is not a conflict",
     );
 
-    // Resolve `other` to remote, attachment included — the bytes land.
-    let mut resolution = title_resolution(other_uuid, ConflictSide::Remote);
-    let mut attachments: HashMap<String, AttachmentChoice> = HashMap::new();
-    attachments.insert("doc2.txt".into(), AttachmentChoice::KeepRemote);
-    resolution
-        .entry_attachment_choices
-        .insert(EntryId(other_uuid), attachments);
+    // Resolve `other`'s title: the peer's bytes land, which needs the
+    // rebuilt "theirs" to still carry them after the re-ingest above.
     engine_a
-        .apply_conflict_resolution(payload.id, &resolution)
+        .apply_conflict_resolution(
+            payload.id,
+            &title_resolution(other_uuid, ConflictSide::Remote),
+        )
         .expect("apply other");
     assert_eq!(
         engine_a
             .attachment_bytes(other_uuid, "doc2.txt")
-            .expect("divergent attachment adopted"),
+            .expect("the divergent peer attachment survives the re-ingest"),
         b"divergent-bytes",
     );
     assert!(

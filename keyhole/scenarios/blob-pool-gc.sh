@@ -11,7 +11,7 @@
 # referenced them while the bytes lingered forever.
 #
 # Reference roots the GC must honour: live entry_attachment links,
-# history-snapshot shas, and conflict_entry_attachment (a parked
+# history-snapshot shas, and conflict_entry_blob_ref (a parked
 # conflict's peer bytes exist ONLY in the pool — Finding #7).
 
 set -euo pipefail
