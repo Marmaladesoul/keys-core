@@ -84,6 +84,23 @@ jobs:
       - name: keyhole scenarios
         run: ./keyhole/scenarios/run-all.sh
 
+  ios:
+    name: iOS check
+    runs-on: macos-latest
+    # The build job compiles for the host only, so code that is cfg-gated per
+    # Apple platform (in this crate graph or a dependency's) can break the iOS
+    # staticlib while every other check stays green. Type-check the two crates
+    # the iOS app links, for the device target.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - name: cargo check (aarch64-apple-ios)
+        run: cargo check --target aarch64-apple-ios -p keys-ffi -p keys-iroh-sync
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
