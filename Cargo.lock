@@ -2611,7 +2611,7 @@ dependencies = [
 [[package]]
 name = "keepass-core"
 version = "0.0.0"
-source = "git+https://github.com/Marmaladesoul/keepass-core#5b0bdd19b974b27b0a5e1d412e59437af458333c"
+source = "git+https://github.com/Marmaladesoul/keepass-core#87dcff898af878f99f419a2024b72bb02bfa3f2a"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm 0.11.0",
@@ -2637,7 +2637,7 @@ dependencies = [
 [[package]]
 name = "keepass-merge"
 version = "0.0.0"
-source = "git+https://github.com/Marmaladesoul/keepass-core#5b0bdd19b974b27b0a5e1d412e59437af458333c"
+source = "git+https://github.com/Marmaladesoul/keepass-core#87dcff898af878f99f419a2024b72bb02bfa3f2a"
 dependencies = [
  "chrono",
  "keepass-core",
@@ -2754,9 +2754,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "libm"
