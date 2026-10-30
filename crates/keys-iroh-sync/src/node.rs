@@ -30,7 +30,7 @@ use iroh_blobs::{
     store::fs::FsStore,
 };
 use iroh_docs::{
-    ALPN as DOCS_ALPN, DocTicket, NamespaceId,
+    ALPN as DOCS_ALPN, DocTicket, NamespaceId, PeerIdBytes,
     api::Doc,
     engine::{LiveEvent, Origin},
     protocol::Docs,
@@ -333,6 +333,17 @@ async fn watch_redial(doc: Doc, mut events: impl Stream<Item = anyhow::Result<Li
             next_redial = None;
         }
     }
+}
+
+/// Short display forms of a doc's persisted peer ids, for logging.
+fn short_peer_ids(peers: &[PeerIdBytes]) -> Vec<String> {
+    peers
+        .iter()
+        .map(|bytes| match PublicKey::from_bytes(bytes) {
+            Ok(key) => key.fmt_short().to_string(),
+            Err(e) => format!("undecodable peer id ({e})"),
+        })
+        .collect()
 }
 
 /// One entry in a joined doc — key, content hash, content size. Cheap:
@@ -864,6 +875,24 @@ impl IrohNode {
             return Ok(false);
         };
         let joined = JoinedDoc::watch(doc.clone()).await?;
+        // Which peers the resume will dial — the first thing to know when
+        // a resumed doc never reaches its peer. Diagnostic only, so a
+        // failed lookup doesn't fail the resume, and the lookup is skipped
+        // unless something will record it.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            match doc.get_sync_peers().await {
+                Ok(peers) => tracing::debug!(
+                    doc = %namespace.fmt_short(),
+                    peers = ?short_peer_ids(&peers.unwrap_or_default()),
+                    "resuming doc with persisted sync peers"
+                ),
+                Err(e) => tracing::debug!(
+                    doc = %namespace.fmt_short(),
+                    error = ?e,
+                    "persisted sync peers unavailable"
+                ),
+            }
+        }
         // Enable live sync. Empty peer list — iroh-docs supplies the
         // persisted per-doc peers from its own store and handles
         // address rediscovery.

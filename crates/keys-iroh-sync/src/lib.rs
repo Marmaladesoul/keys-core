@@ -36,12 +36,16 @@
 
 uniffi::setup_scaffolding!();
 
+mod diagnostics;
 mod error;
 mod events;
 mod identity;
 mod node;
 mod policy;
 
+pub use diagnostics::{
+    DIAGNOSTIC_LOG_FILTER, DIAGNOSTIC_LOG_ROTATE_BYTES, ROTATED_LOG_SUFFIX, enable_diagnostic_log,
+};
 pub use error::{Result, SyncError};
 pub use events::{DocEvent, DocEventListener};
 pub use identity::{Identity, identity_generate};
