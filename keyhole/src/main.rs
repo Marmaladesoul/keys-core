@@ -1435,11 +1435,11 @@ impl Session {
             .engine
             .recycle_bin_enabled()
             .map_err(|e| anyhow::anyhow!("recycle_bin_enabled: {e:?}"))?;
-        let bin_present = self
+        let bin_uuid = self
             .engine
             .recycle_bin_uuid()
-            .map_err(|e| anyhow::anyhow!("recycle_bin_uuid: {e:?}"))?
-            .is_some();
+            .map_err(|e| anyhow::anyhow!("recycle_bin_uuid: {e:?}"))?;
+        let bin_present = bin_uuid.is_some();
         let recycled = self.recycled_count()?;
         let pool = self
             .engine
@@ -1455,6 +1455,7 @@ impl Session {
             "bin group:    {}",
             if bin_present { "present" } else { "absent" }
         );
+        println!("bin uuid:     {}", bin_uuid.as_deref().unwrap_or("none"));
         println!("recycled:     {recycled}");
         println!(
             "blob pool:    {} blob(s), {} byte(s)",

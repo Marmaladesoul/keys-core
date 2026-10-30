@@ -28,13 +28,17 @@ B="$TMP/device-b.kdbx"
 bin_state() { "$KEYHOLE" inspect "$1" | awk -F: '/recycle bin:/ {gsub(/ /,"",$2); print $2}'; }
 digest()    { "$KEYHOLE" digest "$1"; }
 
+# Pinned instants, all after the vault's creation: `create` stamps the new
+# vault's `recycle_bin_changed` on the real clock, so a toggle pinned before
+# that would rightly lose to it.
+T0=$(( ($(date +%s) + 3600) * 1000 ))
 "$KEYHOLE" create "$A" >/dev/null
-"$KEYHOLE" --at 1000000 create-entry "$A" "E" --username u >/dev/null
+"$KEYHOLE" --at "$(( T0 + 1000 ))" create-entry "$A" "E" --username u >/dev/null
 cp "$A" "$B"
 [ "$(bin_state "$A")" = "enabled" ] || { echo "FAIL(setup): A's bin not enabled by default"; exit 1; }
 
 # --- 1. one-sided disable: A turns the bin off; B must adopt it -----------
-"$KEYHOLE" --at 2000000 set-bin "$A" off >/dev/null
+"$KEYHOLE" --at "$(( T0 + 2000 ))" set-bin "$A" off >/dev/null
 [ "$(bin_state "$A")" = "disabled" ] || { echo "FAIL(setup): A did not disable its bin"; exit 1; }
 
 "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
@@ -46,9 +50,9 @@ rm -rf "$B.mirror"   # honest disk read
     || { echo "FAIL: digests diverge after a one-sided bin toggle (A=$(digest "$A") B=$(digest "$B"))"; exit 1; }
 
 # --- 2. LWW: both toggle, the strictly-newer write wins on both sides ------
-# A re-enables at t=4s; B disables at t=3s (older). A's enable must win on both.
-"$KEYHOLE" --at 4000000 set-bin "$A" on  >/dev/null
-"$KEYHOLE" --at 3000000 set-bin "$B" off >/dev/null
+# A re-enables at T0+4s; B disables at T0+3s (older). A's enable must win on both.
+"$KEYHOLE" --at "$(( T0 + 4000 ))" set-bin "$A" on  >/dev/null
+"$KEYHOLE" --at "$(( T0 + 3000 ))" set-bin "$B" off >/dev/null
 "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
 "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
 rm -rf "$A.mirror" "$B.mirror"
