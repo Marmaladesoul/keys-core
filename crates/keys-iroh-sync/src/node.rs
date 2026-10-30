@@ -112,6 +112,14 @@ const FETCH_BLOB_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 /// a missed completion's worst-case latency well inside human patience.
 const FETCH_BLOB_STATUS_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long [`IrohNode::fetch_blob_with_deadline`] leaves a still-incomplete
+/// blob to the doc engine's own download before requesting it from the
+/// doc's peers itself, and the spacing between such requests. Long enough
+/// for a just-synced entry's queued download to land first, so the two
+/// rarely overlap; short against the 60 s fetch deadline, so a download the
+/// engine lost is recovered well inside it.
+const MISSING_BLOB_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long a joined doc waits, after a failed round with a peer it owes
 /// a sync round, before each re-dial in turn; once these are spent it
 /// waits [`REDIAL_STEADY_INTERVAL`]. See [`watch_redial`].
@@ -614,11 +622,12 @@ impl IrohNode {
     /// the fetch is rejected as soon as the store has validated a size
     /// over the cap, and again on completion, so a publisher that
     /// announces a tiny blob and ships a huge one cannot OOM the
-    /// receiver. It does **not** bound what reaches **disk** — this call
-    /// neither starts nor cancels the transfer (see below), so an
-    /// over-cap blob still lands and is merely refused here. Only
-    /// [`DownloadPolicy`] governs what is pulled down in the first
-    /// place. Pass `0` for "no cap" only when the caller has already
+    /// receiver. It does **not** bound what reaches **disk**: the doc
+    /// engine's transfer runs on regardless, so an over-cap blob still
+    /// lands and is merely refused here. Only [`DownloadPolicy`] governs
+    /// what is pulled down in the first place — including the transfer
+    /// this call may request itself (see below), which is aborted when the
+    /// call returns. Pass `0` for "no cap" only when the caller has already
     /// inspected the `EntryInfo.size_bytes` from `list_entries` and made
     /// a policy decision.
     ///
@@ -627,10 +636,16 @@ impl IrohNode {
     /// property so an embedder can widen it for a large attachment on a
     /// slow link, or narrow it to fail fast, without a node-global
     /// setting; [`Self::fetch_blob`] is the 60s-default convenience form.
-    /// This node never initiates the download itself — the joined doc's
-    /// live engine queues it under the doc's [`DownloadPolicy`], and this
-    /// call just waits for the result. Content the policy excludes will
-    /// therefore never arrive, and the wait will time out.
+    /// The joined doc's live engine normally queues the download under the
+    /// doc's [`DownloadPolicy`], and this call waits for the result. A
+    /// download the engine lost — one that failed, or content its author
+    /// didn't yet have when the entry synced — is never retried by it, so
+    /// once the blob is still incomplete after
+    /// `MISSING_BLOB_REQUEST_INTERVAL`, this call requests it from the
+    /// doc's peers itself, again at that interval while it stays
+    /// incomplete. Only content the policy admits is requested (see
+    /// `request_missing_blob`); excluded content never arrives, and its
+    /// wait times out.
     ///
     /// `FETCH_BLOB_STATUS_BACKSTOP` bounds the wait between status
     /// re-reads independently of `deadline`: the blob store, not the doc
@@ -675,6 +690,11 @@ impl IrohNode {
             .map_err(SyncError::from)?;
 
         let deadline_at = tokio::time::Instant::now() + deadline;
+        // A transfer this call requested itself; dropping it (whichever way
+        // the call returns) aborts it. The first request waits an interval,
+        // so a download the engine has only just queued isn't duplicated.
+        let mut requested: Option<AbortOnDropHandle<()>> = None;
+        let mut next_request_at = tokio::time::Instant::now() + MISSING_BLOB_REQUEST_INTERVAL;
         loop {
             let status = self
                 .blobs_store
@@ -682,6 +702,12 @@ impl IrohNode {
                 .await
                 .context("blob status")
                 .map_err(SyncError::from)?;
+            let incomplete = !matches!(status, BlobStatus::Complete { .. });
+            let request_live = requested.as_ref().is_some_and(|r| !r.is_finished());
+            if incomplete && !request_live && tokio::time::Instant::now() >= next_request_at {
+                next_request_at = tokio::time::Instant::now() + MISSING_BLOB_REQUEST_INTERVAL;
+                requested = self.request_missing_blob(&doc, hash).await;
+            }
             // Reject as soon as the true size is known, without reading
             // the blob into memory. A partial entry carries a size only
             // once its last chunk has landed and bao-tree has validated
@@ -773,6 +799,95 @@ impl IrohNode {
             .context("read complete blob")
             .map_err(SyncError::from)?;
         Ok(bytes.to_vec())
+    }
+
+    /// Request `hash` from `doc`'s peers: the recovery for a blob the doc
+    /// engine lost. iroh-docs queues a doc's content downloads itself, but
+    /// one that fails — or content its author didn't yet have when the
+    /// entry synced — only lands in the engine's in-memory "missing" set:
+    /// nothing retries it, and a restart forgets it.
+    ///
+    /// Only a hash named by an entry the doc's [`DownloadPolicy`] admits is
+    /// requested, i.e. content the engine would have pulled down itself, so
+    /// this adds no reach beyond the policy's.
+    ///
+    /// Best effort: returns the transfer (aborted when dropped), or `None`
+    /// when there is nothing to request or the lookup failed — the caller
+    /// keeps waiting either way, as it did before this recovery existed.
+    async fn request_missing_blob(
+        &self,
+        doc: &Doc,
+        hash: iroh_blobs::Hash,
+    ) -> Option<AbortOnDropHandle<()>> {
+        match self.admitted_providers(doc, hash).await {
+            Ok(providers) if !providers.is_empty() => {
+                tracing::debug!(
+                    doc = %doc.id().fmt_short(),
+                    %hash,
+                    peers = providers.len(),
+                    "requesting a missing blob from the doc's peers"
+                );
+                let downloader = self.blobs_store.downloader(&self.endpoint);
+                let transfer = downloader.download(hash, providers);
+                Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                    if let Err(e) = transfer.await {
+                        tracing::debug!(error = ?e, "requested blob download failed");
+                    }
+                    // The downloader's actor serves the transfer only while
+                    // a handle to it is alive.
+                    drop(downloader);
+                })))
+            }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(error = ?e, "could not look up peers for a missing blob");
+                None
+            }
+        }
+    }
+
+    /// The doc's sync peers to ask for `hash` — empty unless an entry in
+    /// the doc names `hash` and the doc's download policy admits it.
+    async fn admitted_providers(
+        &self,
+        doc: &Doc,
+        hash: iroh_blobs::Hash,
+    ) -> Result<Vec<PublicKey>> {
+        use iroh_docs::store::Query;
+
+        let policy = doc
+            .get_download_policy()
+            .await
+            .context("download policy")
+            .map_err(SyncError::from)?;
+        let entries = doc
+            .get_many(Query::all().build())
+            .await
+            .context("get_many")
+            .map_err(SyncError::from)?;
+        tokio::pin!(entries);
+        let mut admitted = false;
+        while let Some(entry) = entries.next().await {
+            let entry = entry
+                .context("entry stream item")
+                .map_err(SyncError::from)?;
+            if entry.content_hash() == hash && policy.matches(&entry) {
+                admitted = true;
+                break;
+            }
+        }
+        if !admitted {
+            return Ok(Vec::new());
+        }
+        Ok(doc
+            .get_sync_peers()
+            .await
+            .context("sync peers")
+            .map_err(SyncError::from)?
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|bytes| PublicKey::from_bytes(bytes).ok())
+            .collect())
     }
 }
 
@@ -1112,5 +1227,145 @@ mod tests {
             .expect("bind");
         assert_eq!(endpoint.address_lookup().expect("open").len(), 3);
         endpoint.close().await;
+    }
+
+    async fn bind_test_node() -> (Arc<IrohNode>, tempfile::TempDir, tempfile::TempDir) {
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        let doc_dir = tempfile::tempdir().expect("doc tempdir");
+        let node = IrohNode::bind(NodeConfig {
+            identity: Identity::generate(),
+            blob_dir: blob_dir.path().to_string_lossy().into_owned(),
+            doc_dir: doc_dir.path().to_string_lossy().into_owned(),
+            relay_urls: vec![],
+        })
+        .await
+        .expect("bind");
+        (node, blob_dir, doc_dir)
+    }
+
+    /// Join `subscriber` to a doc of `publisher`'s that holds one entry
+    /// under `key` naming `payload`'s hash, and wait until the entry has
+    /// synced. `with_content` decides whether the publisher holds the
+    /// content at sync time.
+    async fn share_one_entry(
+        publisher: &IrohNode,
+        subscriber: &IrohNode,
+        key: &[u8],
+        payload: &[u8],
+        with_content: bool,
+        policy: DownloadPolicy,
+    ) -> String {
+        let hash = iroh_blobs::Hash::new(payload);
+        let doc_id = publisher.create_doc().await.expect("create_doc");
+        if with_content {
+            publisher
+                .set_entry(doc_id.clone(), key.to_vec(), payload.to_vec())
+                .await
+                .expect("set_entry");
+        } else {
+            let author = publisher.docs.api().author_default().await.expect("author");
+            publisher
+                .get_doc(&doc_id)
+                .await
+                .expect("doc")
+                .set_hash(author, key.to_vec(), hash, payload.len() as u64)
+                .await
+                .expect("set_hash");
+        }
+        let ticket = publisher
+            .share_doc(doc_id.clone(), true)
+            .await
+            .expect("share");
+        subscriber.join_doc(ticket, policy).await.expect("join");
+        loop {
+            let entries = subscriber.list_entries(doc_id.clone()).await.expect("list");
+            if entries.iter().any(|e| e.hash_hex == hash.to_string()) {
+                return doc_id;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// A blob the doc engine recorded as missing — here because its author
+    /// didn't have the content when the entry synced — is never fetched by
+    /// the engine afterwards. `fetch_blob` must request it from the doc's
+    /// peers itself rather than wait out its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_requests_a_blob_the_doc_engine_recorded_as_missing() {
+        let (publisher, _pb, _pd) = bind_test_node().await;
+        let (subscriber, _sb, _sd) = bind_test_node().await;
+        let payload = b"content that arrives after its entry".to_vec();
+        let hash = iroh_blobs::Hash::new(&payload);
+
+        let body = async {
+            let doc_id = share_one_entry(
+                &publisher,
+                &subscriber,
+                b"head",
+                &payload,
+                false,
+                DownloadPolicy::Everything,
+            )
+            .await;
+            // Only now does the publisher hold the content.
+            publisher
+                .blobs_store
+                .add_bytes(payload.clone())
+                .await
+                .expect("add");
+            subscriber
+                .fetch_blob_with_deadline(doc_id, hash.to_string(), 0, Duration::from_secs(20))
+                .await
+        };
+        let fetched = tokio::time::timeout(Duration::from_secs(60), body)
+            .await
+            .expect("test finished in time")
+            .expect("fetch requests the blob from the doc's peers");
+        assert_eq!(fetched, payload);
+        publisher.shutdown().await.expect("shutdown");
+        subscriber.shutdown().await.expect("shutdown");
+    }
+
+    /// The recovery request honours the doc's download policy: content the
+    /// policy excludes is never pulled, even though a peer holds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_never_requests_content_the_policy_excludes() {
+        let (publisher, _pb, _pd) = bind_test_node().await;
+        let (subscriber, _sb, _sd) = bind_test_node().await;
+        let payload = b"content outside the subscriber's policy".to_vec();
+        let hash = iroh_blobs::Hash::new(&payload);
+
+        let body = async {
+            let doc_id = share_one_entry(
+                &publisher,
+                &subscriber,
+                b"excluded",
+                &payload,
+                true,
+                DownloadPolicy::NothingExcept {
+                    key_prefixes: vec![b"admitted".to_vec()],
+                },
+            )
+            .await;
+            subscriber
+                .fetch_blob_with_deadline(
+                    doc_id,
+                    hash.to_string(),
+                    0,
+                    MISSING_BLOB_REQUEST_INTERVAL * 3,
+                )
+                .await
+        };
+        let fetched = tokio::time::timeout(Duration::from_secs(60), body)
+            .await
+            .expect("test finished in time");
+        assert!(fetched.is_err(), "excluded content must not be fetched");
+        let status = subscriber.blobs_store.status(hash).await.expect("status");
+        assert!(
+            matches!(status, iroh_blobs::api::blobs::BlobStatus::NotFound),
+            "excluded content must not reach disk, got {status:?}"
+        );
+        publisher.shutdown().await.expect("shutdown");
+        subscriber.shutdown().await.expect("shutdown");
     }
 }
