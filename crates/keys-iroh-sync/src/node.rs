@@ -19,8 +19,8 @@ use std::time::Duration;
 use anyhow::Context;
 use futures_util::{FutureExt, StreamExt};
 use iroh::{
-    Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, Watcher, endpoint::presets,
-    protocol::Router,
+    Endpoint, EndpointAddr, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher,
+    address_lookup::PkarrResolver, endpoint::presets, protocol::Router,
 };
 use iroh_blobs::{
     ALPN as BLOBS_ALPN, BlobsProtocol,
@@ -335,6 +335,25 @@ async fn watch_redial(doc: Doc, mut events: impl Stream<Item = anyhow::Result<Li
     }
 }
 
+/// The builder every node's endpoint starts from: N0's relays, publishing
+/// and DNS lookup, plus a pkarr lookup over HTTPS.
+///
+/// N0 resolves a peer's addressing (its home relay) only by plain
+/// DNS outside browsers, through the system resolver. A resolver that
+/// caches a negative answer for a peer's record — some home routers
+/// keep NXDOMAIN for up to an hour, ignoring the zone's zero negative
+/// TTL — leaves every NodeId-only dial to that peer failing with no
+/// addressing information, while the peer that's still up has nothing
+/// owed and never dials back. Also asking n0's pkarr relay over HTTPS
+/// (the same server our record is published to) reaches the current
+/// record without any intermediate cache. iroh runs both lookups and
+/// merges what they find.
+fn endpoint_builder(secret: SecretKey) -> iroh::endpoint::Builder {
+    Endpoint::builder(presets::N0)
+        .address_lookup(PkarrResolver::n0_dns())
+        .secret_key(secret)
+}
+
 /// Short display forms of a doc's persisted peer ids, for logging.
 fn short_peer_ids(peers: &[PeerIdBytes]) -> Vec<String> {
     peers
@@ -382,7 +401,7 @@ impl IrohNode {
             .with_context(|| format!("create doc_dir {}", doc_dir.display()))
             .map_err(SyncError::from)?;
 
-        let mut builder = Endpoint::builder(presets::N0).secret_key(secret);
+        let mut builder = endpoint_builder(secret);
         if !config.relay_urls.is_empty() {
             let urls = config
                 .relay_urls
@@ -1075,4 +1094,23 @@ impl DocSubscription {
 #[allow(clippy::needless_pass_by_value)]
 pub fn node_id(node: Arc<IrohNode>) -> String {
     node.node_id()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// N0 brings a pkarr publisher and a DNS lookup; the HTTPS pkarr
+    /// lookup must be there too, so a resolver caching a stale negative
+    /// answer can't leave a peer unaddressable.
+    #[tokio::test]
+    async fn endpoint_resolves_peers_over_https_as_well_as_dns() {
+        let endpoint = endpoint_builder(SecretKey::generate())
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .expect("bind");
+        assert_eq!(endpoint.address_lookup().expect("open").len(), 3);
+        endpoint.close().await;
+    }
 }
