@@ -1333,7 +1333,8 @@ pub(crate) fn recycle_entry(
 }
 
 /// Create the canonical "Recycle Bin" group at the vault root, flag it as
-/// the bin, and record it in meta (enabled + designation). Returns the new
+/// the bin, and record it in meta (enabled + designation + the
+/// `recycle_bin_changed` stamp). Returns the new
 /// group UUID. Mirrors keepass-core's `find_or_create_recycle_bin` — same
 /// name and icon (43) — so a bin created here is indistinguishable from one
 /// the model layer would mint, and projects/syncs identically.
@@ -1364,6 +1365,10 @@ fn create_recycle_bin_group(
     )?;
     crate::meta::write_recycle_bin_group(tx, &new_uuid)?;
     crate::meta::write_recycle_bin_enabled(tx, true)?;
+    // Repointing the bin is a bin-config change: stamp its LWW arbiter, or
+    // two replicas that each mint a bin keep the timestamp the vault arrived
+    // with, tie in the meta merge, and each keep their own bin.
+    crate::meta::write_recycle_bin_changed(tx, now)?;
     Ok(new_uuid)
 }
 
