@@ -670,9 +670,10 @@ impl Engine {
     /// `kdbx` is only an envelope (its contents are replaced wholesale), so
     /// this method can't tell which vault `path` holds. A caller that opened
     /// the file at `path` as the template — i.e. is about to overwrite it —
-    /// must first gate on [`Self::ensure_same_vault`] with that file's
-    /// [`crate::identity::file_identity`], or it may overwrite a different
-    /// vault (keys-ffi's save and re-key do).
+    /// must first gate on [`Self::ensure_same_replica`] with that file's
+    /// [`crate::identity::file_identity`] and Meta custom data, or it may
+    /// overwrite a different vault, or the other kind of vault (keys-ffi's
+    /// save and re-key do).
     ///
     /// # Errors
     ///
@@ -732,7 +733,7 @@ impl Engine {
     /// save; emits [`ChangeEvent::SaveCompleted`].
     ///
     /// As for [`Self::save_to_kdbx`], a caller re-keying the file at `path`
-    /// in place gates on [`Self::ensure_same_vault`] first.
+    /// in place gates on [`Self::ensure_same_replica`] first.
     ///
     /// # Errors
     ///

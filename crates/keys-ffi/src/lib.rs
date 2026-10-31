@@ -19,6 +19,7 @@ mod identity;
 mod keyfile;
 mod merge;
 mod protector;
+mod test_vault;
 mod totp;
 mod vault_create;
 
@@ -54,6 +55,7 @@ pub use merge::{
     IconDeltaFfi, ResolutionFfi,
 };
 pub use protector::{VaultFieldProtector, VaultProtectorError};
+pub use test_vault::mark_test_vault_file;
 pub use totp::{
     TotpAlgorithm, TotpParams, totp_base32_decode, totp_generate_code, totp_parse_uri,
     totp_progress, totp_seconds_remaining,

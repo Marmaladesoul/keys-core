@@ -15,7 +15,6 @@
 // `spawn_blocking` without re-cloning.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -159,7 +158,7 @@ pub async fn create_vault_deterministic(
 /// Map the mint core's [`VaultError`] onto the Engine generation's
 /// [`EngineError`]: the fail-closed key-material class keeps its
 /// actionable variant; everything else (I/O, serialise) is internal.
-fn vault_err_to_engine_err(e: VaultError) -> EngineError {
+pub(crate) fn vault_err_to_engine_err(e: VaultError) -> EngineError {
     match e {
         VaultError::WrongKey => EngineError::WrongKey,
         other => EngineError::Internal(other.to_string()),
@@ -249,22 +248,24 @@ pub(crate) fn mint_kdbx_file(
         .map_err(crate::error::model_err_to_vault_err)?;
     kdbx.set_recycle_bin(true, Some(bin));
 
-    // Initial save via the same atomic-write pattern as `Vault::save`.
     let bytes = kdbx.save_to_bytes()?;
-    let parent = path_buf
-        .parent()
-        .ok_or_else(|| VaultError::Io("create path has no parent directory".to_owned()))?;
-    let tmp_in = temp_dir.as_deref().map_or(parent, std::path::Path::new);
-    let mut tmp =
-        tempfile::NamedTempFile::new_in(tmp_in).map_err(|e| VaultError::Io(e.to_string()))?;
-    tmp.write_all(&bytes)
-        .map_err(|e| VaultError::Io(e.to_string()))?;
-    tmp.flush().map_err(|e| VaultError::Io(e.to_string()))?;
-    tmp.as_file_mut()
-        .sync_all()
-        .map_err(|e| VaultError::Io(e.to_string()))?;
-    tmp.persist(&path_buf)
-        .map_err(|e| VaultError::Io(e.error.to_string()))?;
+    write_atomically(
+        &path_buf,
+        &bytes,
+        temp_dir.as_deref().map(std::path::Path::new),
+    )?;
 
     Ok((kdbx, path_buf))
+}
+
+/// Write `bytes` to `path` with keys-engine's durable atomic write (fsynced
+/// tempfile in `temp_dir`, else beside `path`, renamed over it, parent
+/// directory fsynced).
+pub(crate) fn write_atomically(
+    path: &std::path::Path,
+    bytes: &[u8],
+    temp_dir: Option<&std::path::Path>,
+) -> Result<(), VaultError> {
+    keys_engine::save::write_atomically(path, bytes, temp_dir)
+        .map_err(|e| VaultError::Io(e.to_string()))
 }

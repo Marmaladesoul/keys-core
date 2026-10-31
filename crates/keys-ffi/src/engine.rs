@@ -430,6 +430,14 @@ impl Engine {
         self.with_engine(|e| Ok(e.database_metadata()?.into()))
     }
 
+    /// See [`keys_engine::Engine::is_test_vault`]. Clients that must only
+    /// ever open throwaway fixtures gate on this after the unlock. A mirror's
+    /// kind is fixed: mark a vault's *file* with
+    /// [`crate::mark_test_vault_file`], then re-add it.
+    pub fn is_test_vault(&self) -> Result<bool, EngineError> {
+        self.with_engine(|e| Ok(e.is_test_vault()?))
+    }
+
     /// See [`keys_engine::Engine::history_max_size`].
     pub fn history_max_size(&self) -> Result<i64, EngineError> {
         self.with_engine(|e| Ok(e.history_max_size()?))
@@ -1055,7 +1063,10 @@ impl Engine {
     /// stamped when nil: [`keys_engine::identity::file_identity`] — differs
     /// from the mirror's), the save is refused with
     /// [`EngineError::VaultIdentityMismatch`] before anything is written, so
-    /// it can never overwrite another vault's file. Covers every save that
+    /// it can never overwrite another vault's file. Likewise, if that file is
+    /// the other kind (a test vault vs an ordinary one, see
+    /// [`keys_engine::test_vault`]), it is refused with
+    /// [`EngineError::TestVaultMarkerMismatch`]. Covers every save that
     /// routes through here — including `sync_with_disk`'s write-back.
     pub async fn save_to_kdbx_with_keyfile(
         &self,
@@ -1075,11 +1086,15 @@ impl Engine {
         .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
         self.with_engine_mut(|e| {
             // The template IS the file at `path` (as read above): refuse to
-            // overwrite it if it is a different vault. Checked under the same
+            // overwrite it if it is a different vault or the other kind of
+            // vault (test vault vs ordinary). Checked under the same
             // engine lock as the save, so no other engine op interleaves; a
             // swap of the file itself between the read above and the rename
             // is a residual window this gate does not close.
-            e.ensure_same_vault(keys_engine::identity::file_identity(&kdbx))?;
+            e.ensure_same_replica(
+                keys_engine::identity::file_identity(&kdbx),
+                &kdbx.vault().meta.custom_data,
+            )?;
             Ok(e.save_to_kdbx(&path, &mut kdbx, temp_dir.as_deref())?)
         })
     }
@@ -1142,8 +1157,9 @@ impl Engine {
     /// (you must present the current keyfile to drop it).
     ///
     /// Refused with [`EngineError::VaultIdentityMismatch`], before anything is
-    /// written, if the file at `kdbx_path` is a different vault — exactly as
-    /// [`Self::save_to_kdbx_with_keyfile`].
+    /// written, if the file at `kdbx_path` is a different vault, and with
+    /// [`EngineError::TestVaultMarkerMismatch`] if it is the other kind —
+    /// exactly as [`Self::save_to_kdbx_with_keyfile`].
     pub async fn rekey_to_kdbx_with_keyfile(
         &self,
         kdbx_path: String,
@@ -1177,7 +1193,10 @@ impl Engine {
         self.with_engine_mut(|e| {
             // As for `save_to_kdbx_with_keyfile`: never re-key a different
             // vault's file with this mirror's contents.
-            e.ensure_same_vault(keys_engine::identity::file_identity(&kdbx))?;
+            e.ensure_same_replica(
+                keys_engine::identity::file_identity(&kdbx),
+                &kdbx.vault().meta.custom_data,
+            )?;
             Ok(e.rekey_to_kdbx(&path, &mut kdbx, &new_key, temp_dir.as_deref())?)
         })
     }
@@ -1189,6 +1208,12 @@ impl Engine {
     /// per-bucket stats AND a parked-conflicts summary the frontend
     /// reads to drive UX (e.g. "we parked 3 conflicts — review when
     /// ready"). No `Conflict` variant: this method never blocks.
+    ///
+    /// A file that is a different vault is refused with
+    /// [`EngineError::VaultIdentityMismatch`], and one of the other kind (a
+    /// test vault vs an ordinary one) with
+    /// [`EngineError::TestVaultMarkerMismatch`] — both before anything merges,
+    /// and neither worth retrying: the file at the path is not this mirror's.
     pub async fn reconcile_with_disk_park_conflicts(
         &self,
         kdbx_path: String,
@@ -1252,6 +1277,11 @@ impl Engine {
     /// [`Self::persistence_state`] for the caller's save orchestrator to
     /// flush, on every arm. `temp_dir` is threaded to the atomic-write
     /// tempfile exactly as in [`Self::save_to_kdbx`].
+    ///
+    /// The reconcile and the write-back refuse a file that is a different
+    /// vault ([`EngineError::VaultIdentityMismatch`]) or the other kind of
+    /// vault ([`EngineError::TestVaultMarkerMismatch`]); don't retry either —
+    /// re-point the vault, or re-add it so its mirror is rebuilt.
     pub async fn sync_with_disk(
         &self,
         kdbx_path: String,
@@ -1354,6 +1384,11 @@ impl Engine {
     /// A keyfile-keyed replica is unreadable without its keyfile: an absent or
     /// wrong `keyfile` fails closed at the unlock step, before any merge —
     /// there is no password-only fallback.
+    ///
+    /// A replica of a different vault is refused with
+    /// [`EngineError::VaultIdentityMismatch`], and one whose test-vault
+    /// marker differs from this vault's with
+    /// [`EngineError::TestVaultMarkerMismatch`] — both before anything merges.
     pub async fn ingest_peer_kdbx(
         &self,
         owner_id: String,
