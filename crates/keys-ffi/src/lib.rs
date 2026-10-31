@@ -168,12 +168,24 @@ pub fn url_credential_domain(service_identifier: &str) -> Option<String> {
     keys_engine::url_matcher::credential_domain(service_identifier)
 }
 
+/// The origin (`scheme://host[:port]`) of the page a service identifier
+/// names — the URL a credential saved from that page records. Keeps the
+/// page's scheme and port (a bare host reads as `https://`), drops path,
+/// query and user-info, and keys on the same host as the identifier, so
+/// [`url_domain_candidates`] and [`url_credential_domain`] agree for
+/// both. `None` when there is no web host to take an origin from.
+#[uniffi::export]
+#[must_use]
+pub fn url_origin(service_identifier: &str) -> Option<String> {
+    keys_engine::url_matcher::origin(service_identifier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         StrengthBucket, SyllableOptions, eff_random_word, eff_word_at, eff_word_count,
         password_strength, ping, syllable_estimate_entropy, syllable_generate,
-        url_credential_domain, url_domain_candidates,
+        url_credential_domain, url_domain_candidates, url_origin,
     };
 
     #[test]
@@ -262,5 +274,14 @@ mod tests {
             Some("cloudflare.com")
         );
         assert_eq!(url_credential_domain("github.io"), None);
+    }
+
+    #[test]
+    fn url_origin_smoke() {
+        assert_eq!(
+            url_origin("http://localhost:8765/login.html").as_deref(),
+            Some("http://localhost:8765")
+        );
+        assert_eq!(url_origin(""), None);
     }
 }

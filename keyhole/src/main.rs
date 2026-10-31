@@ -270,6 +270,16 @@ enum Command {
         /// Service identifier — bare host (`example.com`) or full URL.
         identifier: String,
     },
+    /// Print the origin a credential saved from a service identifier's
+    /// page records as its URL (`url_origin` on the seam): the page's
+    /// scheme, host and port, or `(none)` when there is no web host. The
+    /// save-side companion to `service` — feed the output to
+    /// `update-entry --url` to save an entry the way a client's
+    /// `AutoFill` "add new" does. Pure; opens no vault.
+    Origin {
+        /// Service identifier — bare host (`example.com`) or full URL.
+        identifier: String,
+    },
     /// Recycle (soft-delete) an entry, then persist to the KDBX.
     ///
     /// The save is the whole point: a recycle that isn't written back
@@ -874,6 +884,12 @@ async fn main() -> Result<()> {
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.service(&identifier)?;
             session.finish().await?;
+        }
+        Command::Origin { identifier } => {
+            println!(
+                "{}",
+                keys_ffi::url_origin(&identifier).unwrap_or_else(|| "(none)".to_owned())
+            );
         }
         Command::Recycle {
             vault,

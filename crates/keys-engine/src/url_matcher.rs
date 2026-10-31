@@ -41,7 +41,9 @@
 //! [`credential_domain`] is the registration-side twin of
 //! [`domain_candidates`]: the one domain a credential for the identifier
 //! should be filed under, so that a store keyed on it and a lookup that
-//! walks the candidates agree by construction.
+//! walks the candidates agree by construction. [`origin`] is the
+//! save-side companion: the URL a credential saved from the identifier's
+//! page records, which keys on the same host.
 
 use psl::Psl;
 use url::Url;
@@ -112,6 +114,31 @@ pub fn credential_domain(service_identifier: &str) -> Option<String> {
     }
 }
 
+/// The origin (`scheme://host[:port]`) of the page `service_identifier`
+/// names: the URL a credential saved from that page should record.
+///
+/// Scheme and port are the page's own, so an `http://` intranet page or
+/// a dev server on `:8765` saves as exactly that rather than as
+/// `https://` on the default port; a bare host (no scheme) reads as
+/// `https://`. The path, query, fragment and any user-info are dropped:
+/// a login page's path is incidental, a query can carry session tokens,
+/// and every lookup keys on the host alone. Serialisation is the WHATWG
+/// origin's: lower-cased host, default port omitted, IDN hosts in
+/// punycode, IPv6 bracketed.
+///
+/// `None` when [`domain_candidates`] would find no host (blank,
+/// unparseable, or an empty label such as a trailing dot), or when the
+/// scheme has no tuple origin (`file:`, custom schemes). By
+/// construction the origin keys on the same host as the identifier, so
+/// [`domain_candidates`] and [`credential_domain`] give the same answer
+/// for both.
+#[must_use]
+pub fn origin(service_identifier: &str) -> Option<String> {
+    normalise_host(service_identifier)?;
+    let origin = parse_with_default_scheme(service_identifier)?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
 /// A normalised service-identifier host. IP literals are kept apart
 /// because label-walking and public-suffix lookups are meaningless on
 /// them (and actively wrong under the PSL's wildcard rule).
@@ -121,16 +148,7 @@ enum Host {
 }
 
 fn normalise_host(s: &str) -> Option<Host> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let with_scheme = if trimmed.contains("://") {
-        trimmed.to_owned()
-    } else {
-        format!("https://{trimmed}")
-    };
-    let parsed = Url::parse(&with_scheme).ok()?;
+    let parsed = parse_with_default_scheme(s)?;
     let host = match parsed.host()? {
         url::Host::Ipv4(ip) => return Some(Host::Ip(ip.to_string())),
         url::Host::Ipv6(ip) => return Some(Host::Ip(ip.to_string())),
@@ -143,6 +161,20 @@ fn normalise_host(s: &str) -> Option<Host> {
         return None;
     }
     Some(Host::Domain(host.to_owned()))
+}
+
+/// Parse a service identifier as a URL, reading a bare host
+/// (`example.com`) as `https://example.com`.
+fn parse_with_default_scheme(s: &str) -> Option<Url> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains("://") {
+        Url::parse(trimmed).ok()
+    } else {
+        Url::parse(&format!("https://{trimmed}")).ok()
+    }
 }
 
 /// The registrable domain (eTLD+1) for `host`, per the Mozilla PSL.
@@ -381,5 +413,89 @@ mod tests {
         assert_eq!(credential_domain("not a url"), None);
         assert_eq!(credential_domain("https://example..com"), None);
         assert_eq!(credential_domain("www."), None);
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // origin — the URL a credential saved from the page records.
+    // ────────────────────────────────────────────────────────────
+
+    /// The page's scheme and port survive; path, query and fragment go.
+    #[test]
+    fn origin_keeps_scheme_and_port() {
+        assert_eq!(
+            origin("http://localhost:8765/login.html").as_deref(),
+            Some("http://localhost:8765")
+        );
+        assert_eq!(
+            origin("https://dash.cloudflare.com/login?next=/home#x").as_deref(),
+            Some("https://dash.cloudflare.com")
+        );
+    }
+
+    /// A bare host has no scheme to keep and reads as https.
+    #[test]
+    fn origin_of_bare_host_is_https() {
+        assert_eq!(
+            origin("example.com").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            origin("localhost:8080").as_deref(),
+            Some("https://localhost:8080")
+        );
+    }
+
+    #[test]
+    fn origin_of_ip_literals() {
+        assert_eq!(
+            origin("http://192.168.1.1:8080/admin").as_deref(),
+            Some("http://192.168.1.1:8080")
+        );
+        assert_eq!(
+            origin("http://[::1]:8080/").as_deref(),
+            Some("http://[::1]:8080")
+        );
+    }
+
+    /// WHATWG serialisation: host lower-cased, the scheme's default port
+    /// dropped, user-info never carried over, `www.` kept (it is the
+    /// page's real host).
+    #[test]
+    fn origin_is_canonical() {
+        assert_eq!(
+            origin("HTTPS://user:secret@WWW.Example.COM:443/").as_deref(),
+            Some("https://www.example.com")
+        );
+        assert_eq!(
+            origin("http://example.com:80/").as_deref(),
+            Some("http://example.com")
+        );
+    }
+
+    #[test]
+    fn origin_is_none_without_a_web_host() {
+        assert_eq!(origin(""), None);
+        assert_eq!(origin("not a url"), None);
+        assert_eq!(origin("https://example.com./"), None);
+        assert_eq!(origin("https://example..com"), None);
+        assert_eq!(origin("file:///etc/passwd"), None);
+    }
+
+    /// Saving the origin must not change which domain the store and the
+    /// lookup walk key on.
+    #[test]
+    fn origin_keys_on_the_same_domains_as_the_page() {
+        for page in [
+            "http://localhost:8765/login.html",
+            "https://www.login.example.com/path?q=1",
+            "https://shop.example.com.au/cart",
+            "http://192.168.1.1:8080/admin",
+            "http://[::1]:8080/",
+            "example.com",
+        ] {
+            let saved = origin(page).unwrap_or_else(|| panic!("no origin for {page}"));
+            assert_eq!(domain_candidates(&saved), domain_candidates(page), "{page}");
+            assert_eq!(credential_domain(&saved), credential_domain(page), "{page}");
+        }
     }
 }
