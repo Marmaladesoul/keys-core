@@ -240,6 +240,36 @@ fn search_by_service_ranks_tiers_in_order() {
     assert_eq!(rows[2].title, "substr");
 }
 
+/// A stored `www.` host is the page's own site whichever way the
+/// identifier spells it: exact tier, ahead of a sibling subdomain. The
+/// sibling is newer and sorts first by uuid, so it would win any tie.
+#[test]
+fn search_by_service_stored_www_host_is_an_exact_match() {
+    let (engine, _dir) = engine_with(|kdbx| {
+        let root = kdbx.vault().root.id;
+        kdbx.add_entry(
+            root,
+            NewEntry::new("www")
+                .url("https://www.example.com")
+                .with_uuid(Uuid::from_u128(u128::MAX)),
+        )
+        .expect("add");
+        kdbx.add_entry(
+            root,
+            NewEntry::new("sibling")
+                .url("https://mail.example.com")
+                .with_uuid(Uuid::from_u128(1)),
+        )
+        .expect("add");
+    });
+
+    for identifier in ["https://www.example.com/login", "example.com"] {
+        let rows = engine.search_by_service(identifier, 10).expect("search");
+        assert_eq!(rows.len(), 2, "{identifier}");
+        assert_eq!(rows[0].title, "www", "{identifier}");
+    }
+}
+
 #[test]
 fn search_by_service_excludes_recycled_entries() {
     let (mut engine, _dir) = engine_with(|kdbx| {

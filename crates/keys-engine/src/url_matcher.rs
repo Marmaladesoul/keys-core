@@ -134,8 +134,9 @@ pub fn credential_domain(service_identifier: &str) -> Option<String> {
 /// for both.
 #[must_use]
 pub fn origin(service_identifier: &str) -> Option<String> {
-    normalise_host(service_identifier)?;
-    let origin = parse_with_default_scheme(service_identifier)?.origin();
+    let parsed = parse_with_default_scheme(service_identifier)?;
+    site_host(&parsed)?;
+    let origin = parsed.origin();
     origin.is_tuple().then(|| origin.ascii_serialization())
 }
 
@@ -148,7 +149,12 @@ enum Host {
 }
 
 fn normalise_host(s: &str) -> Option<Host> {
-    let parsed = parse_with_default_scheme(s)?;
+    site_host(&parse_with_default_scheme(s)?)
+}
+
+/// The site host of a parsed identifier: lower-cased, `www.` stripped,
+/// IP literals kept whole; `None` when it names no site.
+fn site_host(parsed: &Url) -> Option<Host> {
     let host = match parsed.host()? {
         url::Host::Ipv4(ip) => return Some(Host::Ip(ip.to_string())),
         url::Host::Ipv6(ip) => return Some(Host::Ip(ip.to_string())),
