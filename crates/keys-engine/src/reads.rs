@@ -648,6 +648,11 @@ pub(crate) fn search_by_service(
         .unwrap_or_else(|| trimmed.to_ascii_lowercase());
 
     let exact_host = strip_www(&raw_host).to_owned();
+    // The identifier's `www.` is stripped above, but a stored URL keeps
+    // its own: an entry saved as `https://www.example.com` is the same
+    // site as the page, so it ranks as an exact match, not alongside
+    // every other subdomain in the eTLD+1 tier.
+    let www_host = format!("www.{exact_host}");
     let etld1 = registrable_domain(&exact_host);
 
     // The substring tier matches against the raw `url` column, which
@@ -679,14 +684,14 @@ pub(crate) fn search_by_service(
     // SQL strategy: pull every candidate row, tag it with the best
     // tier it satisfies, dedupe by uuid taking MIN(tier), then sort
     // by tier + recency. The CASE expression encodes tier priority
-    // (1 = exact host, 2 = eTLD+1, 3 = substring). The candidate set
+    // (1 = exact host, `www.` or not, 2 = eTLD+1, 3 = substring). The candidate set
     // is bounded by the WHERE clause: any row that matches at least
     // one tier.
     let sql = format!(
         "{with_clause} ranked AS ( \
              SELECT entry.uuid AS uuid, \
                     CASE \
-                        WHEN entry.url_host = ?1 THEN 1 \
+                        WHEN entry.url_host = ?1 OR entry.url_host = ?5 THEN 1 \
                         WHEN entry.url_host = ?2 OR entry.url_host LIKE ?3 ESCAPE '\\' \
                             THEN 2 \
                         WHEN entry.url LIKE ?4 ESCAPE '\\' COLLATE NOCASE THEN 3 \
@@ -695,6 +700,7 @@ pub(crate) fn search_by_service(
              FROM entry \
              WHERE ( \
                    entry.url_host = ?1 \
+                   OR entry.url_host = ?5 \
                    OR entry.url_host = ?2 \
                    OR entry.url_host LIKE ?3 ESCAPE '\\' \
                    OR entry.url LIKE ?4 ESCAPE '\\' COLLATE NOCASE \
@@ -712,7 +718,7 @@ pub(crate) fn search_by_service(
                   entry.last_used_at DESC, \
                   entry.modified_at DESC, \
                   entry.uuid ASC \
-         LIMIT ?5"
+         LIMIT ?6"
     );
 
     // Cap limit at i64::MAX (well above any realistic AutoFill limit).
@@ -721,7 +727,14 @@ pub(crate) fn search_by_service(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(
-            params![exact_host, etld1, etld_suffix_like, url_like, limit_i64],
+            params![
+                exact_host,
+                etld1,
+                etld_suffix_like,
+                url_like,
+                www_host,
+                limit_i64
+            ],
             row_to_summary,
         )?
         .collect::<Result<Vec<_>, _>>()?;
