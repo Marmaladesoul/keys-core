@@ -183,6 +183,16 @@ impl Engine {
         crate::meta::read_database_metadata(&self.conn)
     }
 
+    /// Is this vault a test vault — does its Meta `CustomData` carry the
+    /// test-vault marker? See [`crate::test_vault`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Sqlite`] on query failure.
+    pub fn is_test_vault(&self) -> Result<bool, EngineError> {
+        crate::meta::read_is_test_vault(&self.conn)
+    }
+
     /// Per-entry history retention count cap.
     ///
     /// Sourced from `setting` row `meta.history_max_items`. Returns the

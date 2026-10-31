@@ -280,6 +280,20 @@ fn save_inner(
     Ok(())
 }
 
+/// Write `bytes` to `path` atomically, then stat it for the self-write
+/// signature: [`write_atomically`] plus the stat a save records.
+fn atomic_write(
+    path: &Path,
+    bytes: &[u8],
+    temp_dir: Option<&Path>,
+) -> Result<SelfWriteSignature, EngineError> {
+    write_atomically(path, bytes, temp_dir)?;
+    let meta = std::fs::metadata(path)?;
+    let mtime = meta.modified()?;
+    let size = meta.len();
+    Ok(SelfWriteSignature { mtime, size })
+}
+
 /// Write `bytes` to `path` atomically.
 ///
 /// 1. Create a `NamedTempFile` in `temp_dir` (when supplied) or the
@@ -289,19 +303,23 @@ fn save_inner(
 ///    atomicity for same-volume renames.
 /// 4. Open the parent directory and `sync_all` so the directory entry
 ///    survives a power loss.
-/// 5. Stat the destination for the self-write signature.
 ///
 /// `temp_dir`, when supplied, must live on the same filesystem volume
 /// as `path` — `rename(2)` is not cross-volume atomic and will fail
 /// with `EXDEV`. The override exists so sandboxed callers whose
 /// security-scoped bookmark covers only the kdbx file (not its parent
 /// directory) can route the tempfile through a known-writable
-/// sandbox-friendly location.
-fn atomic_write(
+/// sandbox-friendly location. Public so every writer of a vault file
+/// (keys-ffi's create and mark-as-test-vault) shares one durable write.
+///
+/// # Errors
+///
+/// [`EngineError::Io`] if any step up to the rename fails.
+pub fn write_atomically(
     path: &Path,
     bytes: &[u8],
     temp_dir: Option<&Path>,
-) -> Result<SelfWriteSignature, EngineError> {
+) -> Result<(), EngineError> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -334,10 +352,5 @@ fn atomic_write(
         let _ = dir.sync_all();
     }
 
-    // Stat for the signature.
-    let meta = std::fs::metadata(path)?;
-    let mtime = meta.modified()?;
-    let size = meta.len();
-
-    Ok(SelfWriteSignature { mtime, size })
+    Ok(())
 }

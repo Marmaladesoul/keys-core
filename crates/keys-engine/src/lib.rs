@@ -26,6 +26,7 @@ pub mod save;
 pub mod smart_folder;
 pub mod strength;
 pub mod syllable_generator;
+pub mod test_vault;
 pub mod totp;
 pub mod url_matcher;
 mod util;

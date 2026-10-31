@@ -129,6 +129,27 @@ pub enum EngineError {
         found: String,
     },
 
+    /// A replica on the other side of the mirror↔file boundary — a peer
+    /// blob, the file on disk at reconcile, or the file a save / re-key would
+    /// overwrite — is the same vault but a different **kind**: exactly one of
+    /// it and this vault carries the test-vault marker (Meta `CustomData`
+    /// `KeysTestVault` = `1`, see [`keys_engine::test_vault`]). A test vault
+    /// and an ordinary vault never merge, and neither is written over the
+    /// other; the step merged nothing and wrote no file.
+    ///
+    /// Contract: returned only AFTER the replica has decrypted and passed
+    /// the identity check. The actionable reading is "these two are not
+    /// meant to sync": don't retry. Stop syncing the pair; or, when the file
+    /// on disk changed kind, re-add the vault so its mirror is rebuilt from
+    /// the file (a mirror's kind never changes in place).
+    #[error("{}", keys_engine::test_vault::mismatch_message(*local_is_test, *replica_is_test))]
+    TestVaultMarkerMismatch {
+        /// Whether this vault is a test vault.
+        local_is_test: bool,
+        /// Whether the replica offered is a test vault.
+        replica_is_test: bool,
+    },
+
     /// Catch-all for internal engine errors that aren't user-actionable.
     /// SQLite errors, migration runner failures, RNG failures, IO,
     /// projection, serialise, reveal-decode, file-watcher-init —
@@ -161,6 +182,13 @@ impl From<keys_engine::EngineError> for EngineError {
             E::VaultIdentityMismatch { expected, found } => Self::VaultIdentityMismatch {
                 expected: expected.to_string(),
                 found: found.to_string(),
+            },
+            E::TestVaultMarkerMismatch {
+                local_is_test,
+                replica_is_test,
+            } => Self::TestVaultMarkerMismatch {
+                local_is_test,
+                replica_is_test,
             },
             // Everything else — Sqlite, Io, Random, Ingest, Projection,
             // Reveal, Serialise, Wrap, SessionKey, FileWatcher —

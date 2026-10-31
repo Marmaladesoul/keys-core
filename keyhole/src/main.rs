@@ -480,6 +480,24 @@ enum Command {
         /// (`<HistoryMaxItems>`); negative = unlimited.
         items: i32,
     },
+    /// Mark the vault FILE as a test vault (Meta `CustomData` `KeysTestVault`
+    /// = `1`), or with `--unmark` remove the marker — rewriting the file the
+    /// way an external client would, with no mirror involved. A test vault
+    /// and an ordinary vault never merge, even replicas of one vault, and a
+    /// mirror's kind never changes in place: a warm mirror refuses the
+    /// changed file until it is rebuilt (`rm -rf <vault>.mirror`).
+    MarkTestVault {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// Remove the marker instead of setting it.
+        #[arg(long)]
+        unmark: bool,
+    },
+    /// Print `true` if the vault carries the test-vault marker, else `false`.
+    IsTestVault {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+    },
     /// Print the hex SHA-256 digest of the vault's user-visible
     /// content (fields, locations, icons, group tree, recycle-bin
     /// state). Equal digests ⇔ converged replicas — the convergence
@@ -1008,6 +1026,28 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.set_history_max(items)?;
+            session.finish().await?;
+        }
+        Command::MarkTestVault { vault, unmark } => {
+            keys_ffi::mark_test_vault_file(
+                vault.to_string_lossy().into_owned(),
+                password.clone(),
+                keyfile.clone(),
+                !unmark,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("mark_test_vault_file: {e:?}"))?;
+            println!(
+                "test-vault marker {} in {}",
+                if unmark { "absent" } else { "present" },
+                vault.display()
+            );
+        }
+        Command::IsTestVault { vault } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            println!("{}", session.is_test_vault()?);
             session.finish().await?;
         }
         Command::Digest { vault } => {
@@ -1950,6 +1990,12 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("set_history_max_items: {e:?}"))?;
         println!("set history_max_items = {items} and saved to disk");
         Ok(())
+    }
+
+    fn is_test_vault(&self) -> Result<bool> {
+        self.engine
+            .is_test_vault()
+            .map_err(|e| anyhow::anyhow!("is_test_vault: {e:?}"))
     }
 
     /// Add `data`'s bytes as a custom icon, link it to `entry`, persist, and

@@ -84,10 +84,21 @@ struct Fixture {
 /// UNSAVED local edit — so the refusal must also leave a dirty watermark
 /// exactly as it found it.
 fn fixture() -> Fixture {
+    fixture_of_kind(false)
+}
+
+/// [`fixture`], with the vault a test vault (`marked`) from the start — a
+/// mirror's kind is fixed, so it is set on the vault before the ingest.
+fn fixture_of_kind(marked: bool) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("keys.db");
     let kdbx_path = dir.path().join("vault.kdbx");
     let mut kdbx = vault_with_entry("alpha");
+    if marked {
+        let mut vault = kdbx.vault().clone();
+        keys_engine::test_vault::set_marked(&mut vault, true);
+        kdbx.replace_vault(vault);
+    }
     let root = kdbx.vault().root.id.0;
     let mut engine =
         Engine::open(&db_path, &FixedKey(DB_KEY_BYTES), protector(), None).expect("open engine");
@@ -331,4 +342,80 @@ fn ensure_same_vault_accepts_own_root_and_names_a_stranger() {
         other => panic!("expected VaultIdentityMismatch, got {other:?}"),
     }
     assert_eq!(mirror_state(&f.engine), before);
+}
+
+/// A replica of THIS vault as the transport would decode it, marked as a
+/// test vault or not. Same root, so the identity gate passes it.
+fn replica_of_kind(f: &Fixture, marked: bool) -> keepass_core::model::Vault {
+    let mut replica = reopen_kdbx(&f.kdbx_path).vault().clone();
+    keys_engine::test_vault::set_marked(&mut replica, marked);
+    replica
+}
+
+fn assert_marker_mismatch(
+    result: Result<keys_engine::ingest::IngestPeerOutcome, EngineError>,
+    local: bool,
+    replica: bool,
+) {
+    match result {
+        Err(EngineError::TestVaultMarkerMismatch {
+            local_is_test,
+            replica_is_test,
+        }) => assert_eq!((local_is_test, replica_is_test), (local, replica)),
+        other => panic!("expected TestVaultMarkerMismatch, got {other:?}"),
+    }
+}
+
+/// A marked copy of a vault is the same vault (the identity gate passes it)
+/// but a different kind: an ordinary mirror refuses it, and a test-vault
+/// mirror refuses an unmarked copy, touching nothing either way.
+#[test]
+fn peer_ingest_refuses_a_test_marker_mismatch_both_ways() {
+    let mut f = fixture();
+    assert!(!f.engine.is_test_vault().expect("read marker"));
+    let marked = replica_of_kind(&f, true);
+    let before = mirror_state(&f.engine);
+    assert_marker_mismatch(f.engine.ingest_peer("peer-device", &marked), false, true);
+    assert_eq!(mirror_state(&f.engine), before);
+
+    let mut f = fixture_of_kind(true);
+    assert!(f.engine.is_test_vault().expect("read marker"));
+    let unmarked = replica_of_kind(&f, false);
+    let before = mirror_state(&f.engine);
+    assert_marker_mismatch(f.engine.ingest_peer("peer-device", &unmarked), true, false);
+    assert_eq!(mirror_state(&f.engine), before);
+}
+
+/// Control: two test-vault replicas of one vault merge normally — the
+/// replica's new entry lands — and the marker survives a save + fresh read.
+#[test]
+fn two_test_vault_replicas_still_merge() {
+    let mut f = fixture_of_kind(true);
+    let mut replica_file = reopen_kdbx(&f.kdbx_path);
+    let root = replica_file.vault().root.id;
+    replica_file
+        .add_entry(root, NewEntry::new("beta"))
+        .expect("replica add");
+    let replica = replica_file.vault().clone();
+    assert!(keys_engine::test_vault::is_marked(
+        &replica.meta.custom_data
+    ));
+
+    f.engine
+        .ingest_peer("peer-device", &replica)
+        .expect("same-kind replicas must merge");
+    assert_eq!(
+        titles(&f.engine),
+        vec!["alpha".to_owned(), "beta".to_owned()]
+    );
+
+    let mut template = reopen_kdbx(&f.kdbx_path);
+    f.engine
+        .save_to_kdbx(&f.kdbx_path, &mut template, None)
+        .expect("save");
+    let fresh = reopen_kdbx(&f.kdbx_path);
+    assert!(keys_engine::test_vault::is_marked(
+        &fresh.vault().meta.custom_data
+    ));
+    assert!(f.engine.is_test_vault().expect("read marker"));
 }

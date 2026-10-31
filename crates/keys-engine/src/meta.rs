@@ -809,6 +809,21 @@ fn read_custom_data(conn: &Connection) -> Result<Vec<CustomDataItem>, EngineErro
     Ok(rows)
 }
 
+// ─────────────────────── test-vault marker ───────────────────────
+
+/// Does the mirror's Meta custom data carry the test-vault marker? Judged by
+/// [`crate::test_vault::is_marked`], the same rule a replica is judged by.
+/// Only the marker-keyed row is read.
+pub(crate) fn read_is_test_vault(conn: &Connection) -> Result<bool, EngineError> {
+    let mut stmt = conn.prepare("SELECT key, value FROM meta_custom_data WHERE key = ?1")?;
+    let items = stmt
+        .query_map(params![crate::test_vault::MARKER_KEY], |row| {
+            Ok(CustomDataItem::new(row.get(0)?, row.get(1)?, None))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(crate::test_vault::is_marked(&items))
+}
+
 // ─────────────────────── helpers ───────────────────────
 
 fn set_text(conn: &Connection, key: &str, value: &str) -> Result<(), rusqlite::Error> {

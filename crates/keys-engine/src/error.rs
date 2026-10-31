@@ -200,6 +200,25 @@ pub enum EngineError {
         /// The root-group UUID of the file (or peer vault) offered.
         found: uuid::Uuid,
     },
+
+    /// A replica on the other side of the mirror↔file boundary is the same
+    /// vault but a different **kind**: one side carries the test-vault
+    /// marker ([`crate::test_vault`]) and the other doesn't. Raised by
+    /// [`crate::Engine::ensure_same_replica`]: on every peer ingest and
+    /// every reconcile against the file on disk (merging would mix the two
+    /// kinds), and by writers about to overwrite a file (saving would put
+    /// one kind's contents over the other's). Refused before anything is
+    /// written: the mirror and the file are untouched.
+    ///
+    /// Raised only after the replica has decrypted under the supplied key
+    /// factors and passed the identity gate.
+    #[error("{}", crate::test_vault::mismatch_message(*local_is_test, *replica_is_test))]
+    TestVaultMarkerMismatch {
+        /// Whether this mirror is a test vault.
+        local_is_test: bool,
+        /// Whether the replica offered is a test vault.
+        replica_is_test: bool,
+    },
 }
 
 impl EngineError {

@@ -392,12 +392,16 @@ impl Engine {
     ///
     /// The peer must be a replica of **this** vault: its root-group UUID (the
     /// vault's identity — see [`crate::identity`]) must equal the mirror's.
-    /// A different vault is refused before anything is written.
+    /// A different vault is refused before anything is written. So is a
+    /// replica of a different kind — test vault vs ordinary vault, see
+    /// [`crate::test_vault`].
     ///
     /// # Errors
     ///
     /// Returns [`EngineError::VaultIdentityMismatch`] if `peer` is a different
-    /// vault (the mirror is untouched). Returns [`EngineError`] if projecting
+    /// vault, or [`EngineError::TestVaultMarkerMismatch`] if exactly one of
+    /// `peer` and the mirror is a test vault (either way the mirror is
+    /// untouched). Returns [`EngineError`] if projecting
     /// the local vault fails, or if any `SQLite` write / field-seal during the
     /// per-entry classification fails (the whole pass runs in one
     /// transaction, so a failure rolls back).
@@ -413,7 +417,7 @@ impl Engine {
         // verdict is definite even when projecting would fail (e.g. an
         // unwrap under a rotated session key) and a refusal costs no
         // whole-vault projection.
-        self.ensure_same_vault(peer.root.id.0)?;
+        self.ensure_same_replica(peer.root.id.0, &peer.meta.custom_data)?;
         let local = self.project_to_vault()?;
         let now = self.now();
         let mut outcome = crate::ingest::ingest_peer(
@@ -443,15 +447,12 @@ impl Engine {
 
     /// The vault-identity gate: refuse unless `found` — the root-group UUID
     /// of a vault on the other side of the mirror↔file boundary — is this
-    /// mirror's identity (see [`crate::identity`]).
-    ///
-    /// [`Self::ingest_peer`] runs it on every peer it is handed. A writer
-    /// that is about to overwrite the file at a path runs it on that file's
-    /// [`crate::identity::file_identity`] first: [`Self::save_to_kdbx`] /
-    /// [`Self::rekey_to_kdbx`] accept any envelope template (its contents are
-    /// replaced wholesale), so they can't know which file the bytes land on —
-    /// the caller that opened the file at the path as its template can, and
-    /// gates on it (keys-ffi's save and re-key do).
+    /// mirror's identity (see [`crate::identity`]). Half of
+    /// [`Self::ensure_same_replica`], which every replica and writer gates
+    /// on: [`Self::save_to_kdbx`] / [`Self::rekey_to_kdbx`] accept any
+    /// envelope template (its contents are replaced wholesale), so they can't
+    /// know which file the bytes land on — the caller that opened the file at
+    /// the path as its template can, and gates on it.
     ///
     /// Reads the mirror's root straight from `SQLite` — no projection — so
     /// the verdict is definite even when projecting would fail (e.g. an
@@ -468,6 +469,42 @@ impl Engine {
             Ok(())
         } else {
             Err(EngineError::VaultIdentityMismatch { expected, found })
+        }
+    }
+
+    /// The replica gate: refuse a replica — a peer vault, or the file a
+    /// writer is about to overwrite — unless it is this mirror's vault
+    /// ([`Self::ensure_same_vault`], on its root-group UUID `root`) **and**
+    /// the same kind (test vault or not, read from its Meta `custom_data`;
+    /// see [`crate::test_vault`]). The identity verdict comes first.
+    ///
+    /// [`Self::ingest_peer`] runs it on every peer it is handed. A writer
+    /// that is about to overwrite the file at a path runs it on that file
+    /// first ([`crate::identity::file_identity`] and the file's Meta custom
+    /// data): [`Self::save_to_kdbx`] / [`Self::rekey_to_kdbx`] can't know
+    /// which file their envelope lands on (keys-ffi's save and re-key gate).
+    /// Reads the mirror straight from `SQLite`, writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::VaultIdentityMismatch`] on a different vault;
+    /// [`EngineError::TestVaultMarkerMismatch`] on a kind mismatch;
+    /// [`EngineError::Sqlite`] if the mirror can't be read.
+    pub fn ensure_same_replica(
+        &self,
+        root: Uuid,
+        custom_data: &[keepass_core::model::CustomDataItem],
+    ) -> Result<(), EngineError> {
+        self.ensure_same_vault(root)?;
+        let local_is_test = self.is_test_vault()?;
+        let replica_is_test = crate::test_vault::is_marked(custom_data);
+        if local_is_test == replica_is_test {
+            Ok(())
+        } else {
+            Err(EngineError::TestVaultMarkerMismatch {
+                local_is_test,
+                replica_is_test,
+            })
         }
     }
 
