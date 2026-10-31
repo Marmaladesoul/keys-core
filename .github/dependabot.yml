@@ -42,12 +42,14 @@ updates:
       # (`simd-unsafe`); adopt it deliberately, with the feature decision
       # made explicitly, rather than as a weekly auto-bump.
       - dependency-name: "base64"
-      # libc 0.2.191 gates `in6_ifreq` to macOS, but netdev 0.43 (via iroh's
-      # netwatch) uses it on every Apple target, so the iOS staticlib stops
-      # compiling. CI doesn't build iOS, so a weekly bump would land green.
-      # Release the hold once iroh moves to a netdev that builds against it.
+      # Newer libc gates `in6_ifreq` to macOS (0.2.190 already does), but
+      # netdev 0.43 (via iroh's netwatch) uses it on every Apple target, so
+      # the iOS staticlib stops compiling. The iOS check catches it, so this
+      # hold only stops a red bump re-opening every week. Hold everything
+      # past the pinned 0.2.186; release it once iroh moves to a netdev that
+      # builds against the gate.
       - dependency-name: "libc"
-        versions: [">= 0.2.191"]
+        versions: ["> 0.2.186"]
 
   - package-ecosystem: github-actions
     directory: "/"
