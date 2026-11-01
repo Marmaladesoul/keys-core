@@ -579,7 +579,7 @@ async fn a_write_runs_a_sync_round_with_known_peers() {
             while let Some(event) = events.next().await {
                 if matches!(
                     event.expect("event"),
-                    DocEvent::SyncFinished { success: true }
+                    DocEvent::SyncFinished { error: None, .. }
                 ) {
                     return;
                 }
@@ -651,24 +651,33 @@ const ABSENT_PEER_FAILURE_WAIT: Duration = Duration::from_secs(90);
 /// schedule, not the steady state.
 const REDIAL_DELIVERY_WAIT: Duration = Duration::from_secs(120);
 
-/// A write made while its peer is unreachable reaches the peer once it is
-/// back, with no further write and no restart on the writer: the writer
-/// keeps re-dialling a peer it owes a sync round on a backoff schedule.
+/// A writer whose write failed to reach its reader, which has since gone
+/// away: the reader created the doc, the writer joined it, then the reader
+/// shut down and the writer wrote.
 ///
-/// The returning peer must not heal the gap itself, or this would pass on
-/// the peer's own resume dial. So it comes back holding the doc but with
-/// no record of the writer: its doc store is a copy taken before it ever
-/// synced with the writer, which leaves it no known peers to dial. Only a
-/// dial from the writer can deliver the entry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_write_made_while_the_peer_is_away_reaches_it_once_back() {
-    if is_network_test_skipped() {
-        eprintln!("skipping: KEYS_IROH_SYNC_SKIP_NETWORK_TESTS set");
-        return;
-    }
-    init_tracing();
+/// [`Self::bring_back`] returns the reader holding the doc but with no
+/// record of the writer: its doc store is a copy taken before it ever
+/// synced with the writer, which leaves it no known peers to dial. So the
+/// returning reader cannot heal the gap itself — only a dial from the
+/// writer can deliver the write.
+struct AbsentReader {
+    writer: std::sync::Arc<IrohNode>,
+    doc_id: String,
+    reader_identity: Identity,
+    reader_node_id: String,
+    /// The reader's doc store from before it synced with the writer.
+    pristine_docs: TempDir,
+    /// The failed round's peer and reason.
+    failed_round: (String, String),
+    /// Store directories that must outlive the nodes using them.
+    stores: Vec<TempDir>,
+}
 
-    let body = async {
+/// The key of the write made while the reader is away.
+const WHILE_AWAY: &[u8] = b"while-away";
+
+impl AbsentReader {
+    async fn new() -> Self {
         // The reader creates the doc, then stops. Its store at this point
         // holds the doc and no peers; each later reader starts from a copy.
         let reader_identity = Identity::generate();
@@ -680,13 +689,14 @@ async fn a_write_made_while_the_peer_is_away_reaches_it_once_back() {
             first_docs.path(),
         )
         .await;
+        let reader_node_id = reader.node_id();
         let doc_id = reader.create_doc().await.expect("create_doc");
         reader.shutdown().await.expect("reader shutdown");
         drop(reader);
         let before_writer = tempfile::tempdir().expect("snapshot tempdir");
-        let before_writer_again = tempfile::tempdir().expect("snapshot tempdir");
+        let pristine_docs = tempfile::tempdir().expect("snapshot tempdir");
         copy_dir(first_docs.path(), before_writer.path());
-        copy_dir(first_docs.path(), before_writer_again.path());
+        copy_dir(first_docs.path(), pristine_docs.path());
 
         // The writer joins while the reader is up, so the reader becomes
         // one of the writer's known peers for the doc.
@@ -705,7 +715,7 @@ async fn a_write_made_while_the_peer_is_away_reaches_it_once_back() {
             "the reader's store holds the doc"
         );
         let ticket = reader.share_doc(doc_id.clone(), true).await.expect("share");
-        let (writer, _wb, _wd) = spin_up_node().await;
+        let (writer, writer_blobs, writer_docs) = spin_up_node().await;
         writer
             .join_doc(ticket, DownloadPolicy::Everything)
             .await
@@ -717,56 +727,183 @@ async fn a_write_made_while_the_peer_is_away_reaches_it_once_back() {
         reader.shutdown().await.expect("reader shutdown");
         drop(reader);
         writer
-            .set_entry(doc_id.clone(), b"while-away".to_vec(), b"1".to_vec())
+            .set_entry(doc_id.clone(), WHILE_AWAY.to_vec(), b"1".to_vec())
             .await
             .expect("write while the reader is away");
-        tokio::time::timeout(ABSENT_PEER_FAILURE_WAIT, async {
+        let failed_round = tokio::time::timeout(ABSENT_PEER_FAILURE_WAIT, async {
             while let Some(event) = events.next().await {
-                if matches!(
-                    event.expect("event"),
-                    DocEvent::SyncFinished { success: false }
-                ) {
-                    return;
+                if let DocEvent::SyncFinished {
+                    peer_node_id,
+                    error: Some(reason),
+                } = event.expect("event")
+                {
+                    return (peer_node_id, reason);
                 }
             }
+            panic!("the writer's event stream ended");
         })
         .await
         .expect("the writer's round with the absent reader never failed");
 
-        // The reader comes back knowing no peers, and doesn't write.
-        let returned_blobs = tempfile::tempdir().expect("blob tempdir");
-        let reader = bind_node_at(
+        Self {
+            writer,
+            doc_id,
             reader_identity,
-            returned_blobs.path(),
-            before_writer_again.path(),
+            reader_node_id,
+            pristine_docs,
+            failed_round,
+            stores: vec![
+                first_blobs,
+                first_docs,
+                before_writer,
+                reader_blobs,
+                writer_blobs,
+                writer_docs,
+            ],
+        }
+    }
+
+    /// Bring the reader back, holding the doc but knowing no peers, and
+    /// with nothing to write. Callable once.
+    async fn bring_back(&mut self) -> std::sync::Arc<IrohNode> {
+        let blobs = tempfile::tempdir().expect("blob tempdir");
+        let reader = bind_node_at(
+            self.reader_identity.clone(),
+            blobs.path(),
+            self.pristine_docs.path(),
         )
         .await;
+        self.stores.push(blobs);
         assert!(
             reader
-                .open_existing_doc(doc_id.clone())
+                .open_existing_doc(self.doc_id.clone())
                 .await
                 .expect("open"),
             "the returning reader's store holds the doc"
         );
-        tokio::time::timeout(REDIAL_DELIVERY_WAIT, async {
-            while !reader
-                .list_entries(doc_id.clone())
-                .await
-                .expect("list")
-                .iter()
-                .any(|e| e.key == b"while-away")
-            {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        })
-        .await
-        .expect("the write never reached the returning reader");
+        reader
+    }
+}
 
-        writer.shutdown().await.expect("writer shutdown");
+/// Whether `node` holds an entry under `key` in `doc_id`.
+async fn holds_entry(node: &IrohNode, doc_id: &str, key: &[u8]) -> bool {
+    node.list_entries(doc_id.to_owned())
+        .await
+        .expect("list")
+        .iter()
+        .any(|e| e.key == key)
+}
+
+/// Wait up to `wait` for `node` to hold every key in `keys` in `doc_id`.
+async fn wait_for_entries(node: &IrohNode, doc_id: &str, keys: &[&[u8]], wait: Duration) -> bool {
+    tokio::time::timeout(wait, async {
+        loop {
+            let entries = node.list_entries(doc_id.to_owned()).await.expect("list");
+            if keys.iter().all(|key| entries.iter().any(|e| e.key == *key)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// A write made while its peer is unreachable reaches the peer once it is
+/// back, with no further write and no restart on the writer: the writer
+/// keeps re-dialling a peer it owes a sync round on a backoff schedule.
+/// The failed round names the peer and says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_made_while_the_peer_is_away_reaches_it_once_back() {
+    if is_network_test_skipped() {
+        eprintln!("skipping: KEYS_IROH_SYNC_SKIP_NETWORK_TESTS set");
+        return;
+    }
+    init_tracing();
+
+    let body = async {
+        let mut away = AbsentReader::new().await;
+        let (peer, reason) = &away.failed_round;
+        assert_eq!(
+            peer, &away.reader_node_id,
+            "the round failed with the reader"
+        );
+        assert!(!reason.is_empty(), "a failed round says why");
+        assert!(
+            !reason.contains(&away.reader_node_id) && !reason.contains(&away.doc_id),
+            "the reason carries no full ids: {reason}"
+        );
+
+        let reader = away.bring_back().await;
+        assert!(
+            wait_for_entries(&reader, &away.doc_id, &[WHILE_AWAY], REDIAL_DELIVERY_WAIT).await,
+            "the write never reached the returning reader"
+        );
+
+        away.writer.shutdown().await.expect("writer shutdown");
         reader.shutdown().await.expect("reader shutdown");
     };
 
     tokio::time::timeout(Duration::from_secs(300), body)
         .await
         .expect("test exceeded 300s — likely a hang, not a slow DERP");
+}
+
+/// How long a forgotten peer is left waiting for a write it missed. Spans
+/// the node's first two re-dial delays (`REDIAL_BACKOFF` in `src/node.rs`:
+/// 5 s, then 15 s) with headroom, so a re-dial would have reached the peer
+/// well inside it. Retune this with that schedule.
+const FORGOTTEN_PEER_WAIT: Duration = Duration::from_secs(45);
+
+/// A peer the writer has forgotten is not re-dialled after a failed round,
+/// so a write made while it was away stays undelivered until another
+/// write dials it. The closing write proves the reader was reachable all
+/// along, so the wait wasn't vacuous: a write still dials the doc's known
+/// peers, forgotten or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forgotten_peer_is_not_redialled() {
+    if is_network_test_skipped() {
+        eprintln!("skipping: KEYS_IROH_SYNC_SKIP_NETWORK_TESTS set");
+        return;
+    }
+    init_tracing();
+
+    let body = async {
+        let mut away = AbsentReader::new().await;
+        away.writer
+            .forget_peer(away.doc_id.clone(), away.reader_node_id.clone())
+            .await
+            .expect("forget the reader");
+
+        let reader = away.bring_back().await;
+        tokio::time::sleep(FORGOTTEN_PEER_WAIT).await;
+        assert!(
+            !holds_entry(&reader, &away.doc_id, WHILE_AWAY).await,
+            "the writer re-dialled the peer it forgot"
+        );
+
+        let once_back: &[u8] = b"once-back";
+        away.writer
+            .set_entry(away.doc_id.clone(), once_back.to_vec(), b"2".to_vec())
+            .await
+            .expect("write once the reader is back");
+        assert!(
+            wait_for_entries(
+                &reader,
+                &away.doc_id,
+                &[WHILE_AWAY, once_back],
+                REDIAL_DELIVERY_WAIT
+            )
+            .await,
+            "a write never reached the forgotten but reachable reader"
+        );
+
+        away.writer.shutdown().await.expect("writer shutdown");
+        reader.shutdown().await.expect("reader shutdown");
+    };
+
+    // Its waits alone can reach 255 s (failure, forgotten wait, delivery).
+    tokio::time::timeout(Duration::from_secs(360), body)
+        .await
+        .expect("test exceeded 360s — likely a hang, not a slow DERP");
 }
