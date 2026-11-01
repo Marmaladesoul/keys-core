@@ -37,7 +37,7 @@ use iroh_docs::{
 };
 use iroh_gossip::{ALPN as GOSSIP_ALPN, net::Gossip};
 use n0_future::{Stream, task::AbortOnDropHandle};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::error::{Result, SyncError};
 use crate::events::DocEvent;
@@ -223,6 +223,9 @@ pub struct IrohNode {
 struct JoinedDoc {
     doc: Doc,
     redial: AbortOnDropHandle<()>,
+    /// Peers to stop re-dialling, handed to the re-dial task (see
+    /// [`IrohNode::forget_peer`]).
+    forget: mpsc::UnboundedSender<PublicKey>,
 }
 
 impl JoinedDoc {
@@ -235,8 +238,14 @@ impl JoinedDoc {
             .await
             .context("subscribe for re-dial watch")
             .map_err(SyncError::from)?;
-        let redial = AbortOnDropHandle::new(tokio::spawn(watch_redial(doc.clone(), events)));
-        Ok(Self { doc, redial })
+        let (forget, forgotten) = mpsc::unbounded_channel();
+        let redial =
+            AbortOnDropHandle::new(tokio::spawn(watch_redial(doc.clone(), events, forgotten)));
+        Ok(Self {
+            doc,
+            redial,
+            forget,
+        })
     }
 }
 
@@ -265,7 +274,9 @@ impl JoinedDoc {
 /// also re-joins the doc's persisted peers and runs a direct round with
 /// each — cheap for a peer with nothing new, and the only dial iroh-docs
 /// offers. A peer that never comes back (a retired device) costs one dial
-/// every [`REDIAL_STEADY_INTERVAL`] while the node runs.
+/// every [`REDIAL_STEADY_INTERVAL`] while the node runs, until the caller
+/// forgets it ([`IrohNode::forget_peer`]): a forgotten peer is never owed
+/// a round, until a round with it succeeds. See [`RedialSet`].
 ///
 /// Each delay runs from the latest failed round, not from the previous
 /// re-dial: a dial to an absent peer can take tens of seconds to fail,
@@ -282,8 +293,12 @@ impl JoinedDoc {
 ///
 /// Ends when the doc's event stream does (the node shut down), or when
 /// aborted; the in-flight re-dial is aborted with it.
-async fn watch_redial(doc: Doc, mut events: impl Stream<Item = anyhow::Result<LiveEvent>> + Unpin) {
-    let mut owed: HashSet<PublicKey> = HashSet::new();
+async fn watch_redial(
+    doc: Doc,
+    mut events: impl Stream<Item = anyhow::Result<LiveEvent>> + Unpin,
+    mut forgotten: mpsc::UnboundedReceiver<PublicKey>,
+) {
+    let mut peers = RedialSet::default();
     let mut attempt = 0;
     let mut next_redial: Option<tokio::time::Instant> = None;
     // Held only for its drop: aborting this task aborts the re-dial too.
@@ -299,26 +314,22 @@ async fn watch_redial(doc: Doc, mut events: impl Stream<Item = anyhow::Result<Li
         };
         tokio::select! {
             event = events.next() => match event {
-                Some(Ok(LiveEvent::SyncFinished(sync))) => match (&sync.result, &sync.origin) {
-                    (Ok(_), _) => {
-                        owed.remove(&sync.peer);
-                    }
-                    (Err(_), Origin::Connect(_)) => {
-                        owed.insert(sync.peer);
+                Some(Ok(LiveEvent::SyncFinished(sync))) => {
+                    if peers.record_round(sync.peer, &sync.origin, sync.result.is_ok()) {
                         next_redial = Some(tokio::time::Instant::now() + redial_delay(attempt));
                     }
-                    (Err(_), Origin::Accept) => {}
-                },
+                }
                 // Other events say nothing about whether a round got
                 // through; a decode failure is one lost event on a stream
                 // that carries on.
                 Some(Ok(_) | Err(_)) => {}
                 None => return,
             },
+            Some(peer) = forgotten.recv() => peers.forget(peer),
             () = redial_due => {
                 tracing::info!(
                     doc = %doc.id(),
-                    owed = owed.len(),
+                    owed = peers.owed.len(),
                     attempt,
                     "re-dialling peers owed a sync round"
                 );
@@ -326,9 +337,9 @@ async fn watch_redial(doc: Doc, mut events: impl Stream<Item = anyhow::Result<Li
                 // task's event queue, so waiting on its reply while not
                 // draining that queue could deadlock both.
                 let doc = doc.clone();
-                let peers = owed.iter().copied().map(EndpointAddr::new).collect();
+                let owed = peers.owed.iter().copied().map(EndpointAddr::new).collect();
                 _in_flight = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                    if let Err(e) = doc.start_sync(peers).await {
+                    if let Err(e) = doc.start_sync(owed).await {
                         tracing::warn!(error = ?e, "re-dial of peers owed a round failed to start");
                     }
                 })));
@@ -336,10 +347,52 @@ async fn watch_redial(doc: Doc, mut events: impl Stream<Item = anyhow::Result<Li
                 next_redial = Some(tokio::time::Instant::now() + redial_delay(attempt));
             },
         }
-        if owed.is_empty() {
+        if peers.owed.is_empty() {
             attempt = 0;
             next_redial = None;
         }
+    }
+}
+
+/// Which of a doc's peers [`watch_redial`] owes a sync round, and which
+/// the caller has told it to stop re-dialling.
+#[derive(Debug, Default)]
+struct RedialSet {
+    /// Peers a round we dialled failed to reach, since the latest round
+    /// with each that succeeded.
+    owed: HashSet<PublicKey>,
+    /// Peers the caller has forgotten ([`IrohNode::forget_peer`]) and no
+    /// round has reached since.
+    forgotten: HashSet<PublicKey>,
+}
+
+impl RedialSet {
+    /// Account for one finished round with `peer`. Returns whether it left
+    /// the peer owed, i.e. whether a re-dial should be scheduled.
+    ///
+    /// A round that succeeds in either direction settles the peer's debt
+    /// and also un-forgets it: a peer that syncs again is live and in the
+    /// doc, so a later failure with it is worth re-dialling.
+    fn record_round(&mut self, peer: PublicKey, origin: &Origin, succeeded: bool) -> bool {
+        if succeeded {
+            self.owed.remove(&peer);
+            self.forgotten.remove(&peer);
+            return false;
+        }
+        match origin {
+            Origin::Connect(_) if !self.forgotten.contains(&peer) => {
+                self.owed.insert(peer);
+                true
+            }
+            Origin::Connect(_) | Origin::Accept => false,
+        }
+    }
+
+    /// Stop owing `peer` a round, and leave it un-owed by later failed
+    /// rounds until one with it succeeds.
+    fn forget(&mut self, peer: PublicKey) {
+        self.owed.remove(&peer);
+        self.forgotten.insert(peer);
     }
 }
 
@@ -1038,6 +1091,32 @@ impl IrohNode {
         Ok(true)
     }
 
+    /// Stop re-dialling `node_id` for `doc_id` after rounds with it fail —
+    /// for a peer the caller knows is gone for good, such as a retired
+    /// device. Without this, a peer a round we dialled failed to reach is
+    /// re-dialled every few minutes for as long as the node runs.
+    ///
+    /// Only the re-dial stops. iroh-docs still runs a round with every
+    /// peer in the doc's persisted peer list when a write (or a re-dial
+    /// owed to another peer) starts one; such a round with a forgotten
+    /// peer fails as before but leaves nothing owed. A round with the
+    /// peer that succeeds, in either direction, un-forgets it.
+    ///
+    /// Holds for this run of the node only: a caller that wants a peer to
+    /// stay forgotten repeats the call after each `open_existing_doc` of
+    /// the doc. Idempotent. Errors if the doc isn't joined or `node_id`
+    /// isn't a node id.
+    pub async fn forget_peer(&self, doc_id: String, node_id: String) -> Result<()> {
+        let peer: PublicKey = node_id
+            .parse()
+            .context("parse node id")
+            .map_err(SyncError::from)?;
+        self.with_joined(&doc_id, |joined| joined.forget.send(peer))
+            .await?
+            .context("re-dial watch for the doc has ended")
+            .map_err(SyncError::from)
+    }
+
     /// Mint a ticket for a doc this node holds. `writable` selects
     /// `ShareMode::Write` vs `ShareMode::Read`. The ticket embeds the
     /// node's relay-and-direct address so a fresh peer can dial back
@@ -1168,16 +1247,19 @@ impl IrohNode {
     }
 
     async fn get_doc(&self, doc_id: &str) -> Result<Doc> {
+        self.with_joined(doc_id, |joined| joined.doc.clone()).await
+    }
+
+    /// Run `f` on the joined doc `doc_id` names, under the map's lock.
+    async fn with_joined<T>(&self, doc_id: &str, f: impl FnOnce(&JoinedDoc) -> T) -> Result<T> {
         let namespace: NamespaceId = doc_id
             .parse()
             .context("parse doc id (NamespaceId)")
             .map_err(SyncError::from)?;
         let map = self.joined.lock().await;
-        map.get(&namespace)
-            .map(|joined| joined.doc.clone())
-            .ok_or_else(|| {
-                SyncError::Generic(format!("doc {doc_id} not joined — call join_doc first"))
-            })
+        map.get(&namespace).map(f).ok_or_else(|| {
+            SyncError::Generic(format!("doc {doc_id} not joined — call join_doc first"))
+        })
     }
 }
 
@@ -1227,6 +1309,53 @@ mod tests {
             .expect("bind");
         assert_eq!(endpoint.address_lookup().expect("open").len(), 3);
         endpoint.close().await;
+    }
+
+    const DIALLED: Origin = Origin::Connect(iroh_docs::engine::SyncReason::DirectJoin);
+
+    fn peer() -> PublicKey {
+        SecretKey::generate().public()
+    }
+
+    #[test]
+    fn a_failed_round_we_dialled_owes_the_peer_and_a_success_settles_it() {
+        let mut peers = RedialSet::default();
+        let p = peer();
+        assert!(peers.record_round(p, &DIALLED, false));
+        assert!(peers.owed.contains(&p));
+        assert!(!peers.record_round(p, &Origin::Accept, true));
+        assert!(peers.owed.is_empty());
+    }
+
+    #[test]
+    fn a_failed_round_the_peer_dialled_owes_nothing() {
+        let mut peers = RedialSet::default();
+        assert!(!peers.record_round(peer(), &Origin::Accept, false));
+        assert!(peers.owed.is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_peer_settles_its_debt_and_later_failures_owe_nothing() {
+        let mut peers = RedialSet::default();
+        let gone = peer();
+        let other = peer();
+        peers.record_round(gone, &DIALLED, false);
+        peers.record_round(other, &DIALLED, false);
+
+        peers.forget(gone);
+        assert_eq!(peers.owed, HashSet::from([other]));
+        assert!(!peers.record_round(gone, &DIALLED, false));
+        assert_eq!(peers.owed, HashSet::from([other]));
+    }
+
+    #[test]
+    fn a_forgotten_peer_that_syncs_again_is_owed_after_its_next_failure() {
+        let mut peers = RedialSet::default();
+        let p = peer();
+        peers.forget(p);
+        peers.record_round(p, &Origin::Accept, true);
+        assert!(peers.record_round(p, &DIALLED, false));
+        assert!(peers.owed.contains(&p));
     }
 
     async fn bind_test_node() -> (Arc<IrohNode>, tempfile::TempDir, tempfile::TempDir) {

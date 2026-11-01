@@ -47,10 +47,58 @@ pub enum DocEvent {
     NeighborUp { node_id: String },
     /// A swarm neighbour went away.
     NeighborDown { node_id: String },
-    /// A set-reconciliation sync round finished. The library exposes
-    /// only the boolean outcome — the granular per-peer detail is
-    /// iroh-internal and not worth threading through FFI.
-    SyncFinished { success: bool },
+    /// A set-reconciliation sync round with one peer finished.
+    /// `error` is `None` when the round succeeded; when it failed it
+    /// carries iroh's one-line reason with every identifier, key or
+    /// ticket in it removed, capped at a few lines of log. The entry
+    /// counts and timings stay iroh-internal.
+    SyncFinished {
+        peer_node_id: String,
+        error: Option<String>,
+    },
+}
+
+/// The longest reason a failed [`DocEvent::SyncFinished`] carries, in
+/// characters. iroh's reasons are one-line summaries; the cap keeps an
+/// unexpectedly verbose one from flooding a caller's log.
+const SYNC_ERROR_MAX_CHARS: usize = 160;
+
+/// The shortest run of ASCII letters and digits [`redact_sync_error`]
+/// treats as an identifier. Node ids, namespace ids, hashes and tickets
+/// are all far longer; ordinary words in iroh's reasons are far shorter.
+const REDACTED_TOKEN_MIN_CHARS: usize = 16;
+
+/// What replaces each identifier [`redact_sync_error`] removes.
+const REDACTED_TOKEN: &str = "…";
+
+/// A failed round's reason, made safe for a caller's log: every run of
+/// [`REDACTED_TOKEN_MIN_CHARS`] or more ASCII letters and digits — a
+/// node id, namespace id, hash, key or ticket — is replaced by
+/// [`REDACTED_TOKEN`], and the result is cut to
+/// [`SYNC_ERROR_MAX_CHARS`]. The failing peer travels in its own field,
+/// so nothing a caller needs is lost.
+fn redact_sync_error(reason: &str) -> String {
+    fn push_token(token: &mut String, out: &mut String) {
+        if token.len() >= REDACTED_TOKEN_MIN_CHARS {
+            out.push_str(REDACTED_TOKEN);
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    }
+
+    let mut redacted = String::with_capacity(reason.len());
+    let mut token = String::new();
+    for c in reason.chars() {
+        if c.is_ascii_alphanumeric() {
+            token.push(c);
+        } else {
+            push_token(&mut token, &mut redacted);
+            redacted.push(c);
+        }
+    }
+    push_token(&mut token, &mut redacted);
+    redacted.chars().take(SYNC_ERROR_MAX_CHARS).collect()
 }
 
 impl DocEvent {
@@ -85,7 +133,8 @@ impl DocEvent {
                 node_id: node.to_string(),
             },
             LiveEvent::SyncFinished(sync) => Self::SyncFinished {
-                success: sync.result.is_ok(),
+                peer_node_id: sync.peer.to_string(),
+                error: sync.result.err().as_deref().map(redact_sync_error),
             },
         }
     }
@@ -101,4 +150,37 @@ impl DocEvent {
 pub trait DocEventListener: Send + Sync {
     fn on_event(&self, event: DocEvent);
     fn on_closed(&self, reason: Option<String>);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redaction_keeps_the_reason_and_drops_identifiers() {
+        let reason = "Aborted sync of Some(5a8c0d6e1f2b3a4c5d6e7f8091a2b3c4) with \
+                      PublicKey(e13aab63f00dbeefcafe0123456789ab): NotFound";
+        assert_eq!(
+            redact_sync_error(reason),
+            "Aborted sync of Some(…) with PublicKey(…): NotFound"
+        );
+    }
+
+    #[test]
+    fn redaction_leaves_a_plain_reason_alone() {
+        assert_eq!(
+            redact_sync_error("Failed to establish connection"),
+            "Failed to establish connection"
+        );
+    }
+
+    #[test]
+    fn redaction_removes_a_ticket_and_caps_the_length() {
+        let ticket = "docaaacb".repeat(40);
+        let reason = format!("bad ticket {ticket} {}", "word ".repeat(100));
+        let redacted = redact_sync_error(&reason);
+        assert!(!redacted.contains("docaaacb"));
+        assert!(redacted.starts_with("bad ticket … word"));
+        assert_eq!(redacted.chars().count(), SYNC_ERROR_MAX_CHARS);
+    }
 }
