@@ -49,8 +49,9 @@ pub enum DocEvent {
     NeighborDown { node_id: String },
     /// A set-reconciliation sync round with one peer finished.
     /// `error` is `None` when the round succeeded; when it failed it
-    /// carries iroh's one-line reason with every identifier, key or
-    /// ticket in it removed, capped at a few lines of log. The entry
+    /// carries iroh's one-line reason with every full-length id, hash,
+    /// key or ticket in it removed (short id prefixes may remain), capped
+    /// at a few lines of log. The entry
     /// counts and timings stay iroh-internal.
     SyncFinished {
         peer_node_id: String,

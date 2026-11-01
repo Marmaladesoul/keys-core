@@ -1257,8 +1257,13 @@ impl IrohNode {
             .context("parse doc id (NamespaceId)")
             .map_err(SyncError::from)?;
         let map = self.joined.lock().await;
+        // The short form: callers log this, and a full namespace id is
+        // enough to ask a peer for the doc.
         map.get(&namespace).map(f).ok_or_else(|| {
-            SyncError::Generic(format!("doc {doc_id} not joined — call join_doc first"))
+            SyncError::Generic(format!(
+                "doc {} not joined — call join_doc first",
+                namespace.fmt_short()
+            ))
         })
     }
 }

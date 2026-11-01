@@ -798,11 +798,8 @@ async fn holds_entry(node: &IrohNode, doc_id: &str, key: &[u8]) -> bool {
 async fn wait_for_entries(node: &IrohNode, doc_id: &str, keys: &[&[u8]], wait: Duration) -> bool {
     tokio::time::timeout(wait, async {
         loop {
-            let mut all = true;
-            for key in keys {
-                all &= holds_entry(node, doc_id, key).await;
-            }
-            if all {
+            let entries = node.list_entries(doc_id.to_owned()).await.expect("list");
+            if keys.iter().all(|key| entries.iter().any(|e| e.key == *key)) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -853,8 +850,9 @@ async fn a_write_made_while_the_peer_is_away_reaches_it_once_back() {
 }
 
 /// How long a forgotten peer is left waiting for a write it missed. Spans
-/// the node's first two re-dial delays (5 s, then 15 s) with headroom, so
-/// a re-dial would have reached the peer well inside it.
+/// the node's first two re-dial delays (`REDIAL_BACKOFF` in `src/node.rs`:
+/// 5 s, then 15 s) with headroom, so a re-dial would have reached the peer
+/// well inside it. Retune this with that schedule.
 const FORGOTTEN_PEER_WAIT: Duration = Duration::from_secs(45);
 
 /// A peer the writer has forgotten is not re-dialled after a failed round,
@@ -904,7 +902,8 @@ async fn a_forgotten_peer_is_not_redialled() {
         reader.shutdown().await.expect("reader shutdown");
     };
 
-    tokio::time::timeout(Duration::from_secs(300), body)
+    // Its waits alone can reach 255 s (failure, forgotten wait, delivery).
+    tokio::time::timeout(Duration::from_secs(360), body)
         .await
-        .expect("test exceeded 300s — likely a hang, not a slow DERP");
+        .expect("test exceeded 360s — likely a hang, not a slow DERP");
 }
