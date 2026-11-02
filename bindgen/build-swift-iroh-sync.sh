@@ -18,6 +18,11 @@
 # (arm64), and iOS simulator universal (arm64 + x86_64) — so both
 # Keys-Mac and the future Keys-iOS target link the same artifact.
 #
+# KEYS_SWIFT_SLICES=macos builds only the macOS slice and skips the three
+# iOS cross-compiles, for Mac-only consumers that don't want to pay for
+# them. Unset (or `all`) builds all three slices. A macOS-only xcframework
+# can't link an iOS app, so never publish one.
+#
 # Pre-reqs:
 #   - rust toolchain with the Apple targets:
 #       aarch64-apple-darwin x86_64-apple-darwin
@@ -60,6 +65,12 @@ MACOS_TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
 IOS_SIM_TARGETS=(aarch64-apple-ios-sim x86_64-apple-ios)
 IOS_DEVICE_TARGET=aarch64-apple-ios
 
+SLICES="${KEYS_SWIFT_SLICES:-all}"
+case "$SLICES" in
+    all|macos) ;;
+    *) echo "build-swift-iroh-sync: KEYS_SWIFT_SLICES must be 'all' or 'macos' (got '$SLICES')" >&2; exit 2 ;;
+esac
+
 # 1. Per-target rust builds for the FFI staticlib.
 #
 # macOS builds every crate-type (unchanged). iOS builds *only* the
@@ -72,22 +83,27 @@ for target in "${MACOS_TARGETS[@]}"; do
     # shellcheck disable=SC2086
     cargo build $CARGO_PROFILE_FLAG --target "$target" -p "$CRATE"
 done
-for target in "$IOS_DEVICE_TARGET" "${IOS_SIM_TARGETS[@]}"; do
-    echo "==> cargo rustc $CARGO_PROFILE_FLAG --target $target -p $CRATE --crate-type staticlib"
-    # shellcheck disable=SC2086
-    cargo rustc $CARGO_PROFILE_FLAG --target "$target" -p "$CRATE" --crate-type staticlib
-done
+if [[ "$SLICES" == all ]]; then
+    for target in "$IOS_DEVICE_TARGET" "${IOS_SIM_TARGETS[@]}"; do
+        echo "==> cargo rustc $CARGO_PROFILE_FLAG --target $target -p $CRATE --crate-type staticlib"
+        # shellcheck disable=SC2086
+        cargo rustc $CARGO_PROFILE_FLAG --target "$target" -p "$CRATE" --crate-type staticlib
+    done
+fi
 
 # 2. lipo each multi-arch group to a universal staticlib.
-mkdir -p "$MACOS_UNIVERSAL_DIR" "$IOS_SIM_UNIVERSAL_DIR"
+mkdir -p "$MACOS_UNIVERSAL_DIR"
 lipo -create \
     "target/aarch64-apple-darwin/$PROFILE_DIR/$LIB_NAME" \
     "target/x86_64-apple-darwin/$PROFILE_DIR/$LIB_NAME" \
     -output "$MACOS_UNIVERSAL_DIR/$LIB_NAME"
-lipo -create \
-    "target/aarch64-apple-ios-sim/$PROFILE_DIR/$LIB_NAME" \
-    "target/x86_64-apple-ios/$PROFILE_DIR/$LIB_NAME" \
-    -output "$IOS_SIM_UNIVERSAL_DIR/$LIB_NAME"
+if [[ "$SLICES" == all ]]; then
+    mkdir -p "$IOS_SIM_UNIVERSAL_DIR"
+    lipo -create \
+        "target/aarch64-apple-ios-sim/$PROFILE_DIR/$LIB_NAME" \
+        "target/x86_64-apple-ios/$PROFILE_DIR/$LIB_NAME" \
+        -output "$IOS_SIM_UNIVERSAL_DIR/$LIB_NAME"
+fi
 
 # 3. Generate Swift bindings using the 0.29-pinned bindgen sibling.
 rm -rf "$HEADERS_STAGING" "$SWIFT_OUT"
@@ -127,17 +143,16 @@ rm -rf "$HARNESS_SOURCES"
 mkdir -p "$HARNESS_SOURCES"
 cp "$SWIFT_OUT"/*.swift "$HARNESS_SOURCES/"
 
-# 5. Assemble the xcframework with all three slices. The nested headers are
-#    architecture-independent, so every slice reuses the same staging dir.
+# 5. Assemble the xcframework with the slices built above. The nested
+#    headers are architecture-independent, so every slice reuses the same
+#    staging dir.
+XCF_SLICES=(-library "$MACOS_UNIVERSAL_DIR/$LIB_NAME" -headers "$HEADERS_STAGING/nested")
+if [[ "$SLICES" == all ]]; then
+    XCF_SLICES+=(-library "$IOS_DEVICE_LIB" -headers "$HEADERS_STAGING/nested")
+    XCF_SLICES+=(-library "$IOS_SIM_UNIVERSAL_DIR/$LIB_NAME" -headers "$HEADERS_STAGING/nested")
+fi
 rm -rf "$XCF_OUT"
-xcodebuild -create-xcframework \
-    -library "$MACOS_UNIVERSAL_DIR/$LIB_NAME" \
-    -headers "$HEADERS_STAGING/nested" \
-    -library "$IOS_DEVICE_LIB" \
-    -headers "$HEADERS_STAGING/nested" \
-    -library "$IOS_SIM_UNIVERSAL_DIR/$LIB_NAME" \
-    -headers "$HEADERS_STAGING/nested" \
-    -output "$XCF_OUT"
+xcodebuild -create-xcframework "${XCF_SLICES[@]}" -output "$XCF_OUT"
 
 # 6. Canonicalise the Info.plist so the multi-slice AvailableLibraries
 #    ordering is deterministic (see build-swift.sh for the rationale).
