@@ -9,6 +9,7 @@ pub mod fingerprint;
 mod history_snapshot;
 pub mod identity;
 pub mod ingest;
+pub mod kdf_cost;
 pub mod key_provider;
 pub mod meta;
 pub mod migrations;
@@ -42,6 +43,7 @@ pub use file_watcher::{
     FileWatcher, FileWatcherError, FileWatcherEvent, FileWatcherObserver, NotifyFileWatcher,
 };
 pub use fingerprint::fingerprint;
+pub use kdf_cost::KdfCost;
 pub use key_provider::{DbKey, KeyProvider, KeyProviderError};
 pub use meta::DatabaseMetadata;
 pub use migrations::MigrationError;

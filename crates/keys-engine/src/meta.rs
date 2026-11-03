@@ -28,6 +28,7 @@
 
 use base64::Engine as _;
 use chrono::{DateTime, TimeZone, Utc};
+use keepass_core::format::{OuterHeader, VersionFields};
 use keepass_core::model::{
     CustomDataItem, CustomIcon, DeletedObject, MemoryProtection, Meta, UnknownElement,
 };
@@ -36,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{EngineError, ProjectionError};
+use crate::kdf_cost::KdfCost;
 
 // ─────────────────────── setting keys ───────────────────────
 
@@ -207,16 +209,27 @@ pub(crate) fn write_deleted_objects(
 
 /// Delete every Meta-owned row so re-ingest produces a clean slate.
 /// Mirrors `clear_vault_tables` in `ingest.rs`.
+///
+/// The KDBX outer-header fact rows are kept: they describe the envelope,
+/// not the `Meta` payload, and an in-memory re-ingest (which has no
+/// envelope) must leave them as the originating file ingest wrote them —
+/// the peer-ingest KDF-cost gate reads them. A file ingest overwrites them
+/// whole via [`write_kdbx_outer_header_facts`].
 pub(crate) fn clear_meta_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute("DELETE FROM meta_custom_icon", [])?;
     conn.execute("DELETE FROM meta_custom_data", [])?;
     conn.execute("DELETE FROM meta_deleted_object", [])?;
     // Setting rows: only delete meta.* keys, not fingerprint_key /
     // meta.recycle_bin_enabled (the latter is re-written by ingest,
-    // but using a wildcard keeps cleanup honest).
+    // but using a wildcard keeps cleanup honest) / the envelope facts.
     conn.execute(
-        "DELETE FROM setting WHERE key LIKE 'meta.%' AND key != 'meta.recycle_bin_enabled'",
-        [],
+        "DELETE FROM setting WHERE key LIKE 'meta.%' AND key NOT IN (?1, ?2, ?3, ?4)",
+        params![
+            KEY_RECYCLE_BIN_ENABLED,
+            KEY_KDBX_CIPHER_OID,
+            KEY_KDBX_KDF_PARAMETERS,
+            KEY_KDBX_TRANSFORM_ROUNDS,
+        ],
     )?;
     Ok(())
 }
@@ -386,47 +399,68 @@ pub struct DatabaseMetadata {
     pub attachment_total_bytes: u64,
 }
 
-/// The KDF facts an outer header carries, mirroring
-/// [`keepass_core::format::VersionFields`]: KDBX3 states its AES-KDF
-/// round count directly in the outer header, KDBX4 carries an encoded
-/// KDF-parameter `VarDictionary` instead. Never both — modelling it as
-/// an enum keeps the illegal mix unrepresentable on this side of the
-/// seam too, and makes "write one row, clear the other" structural.
-pub(crate) enum KdfFacts {
-    /// KDBX3: AES-KDF round count.
-    TransformRounds(u64),
-    /// KDBX4: raw KDF-parameter `VarDictionary` bytes.
-    Parameters(Vec<u8>),
-}
-
-/// Persist the outer-header facts needed for cipher / KDF display.
-/// Caller is responsible for clearing stale rows first
-/// (`clear_meta_tables` does this via the `meta.%` wildcard).
+/// Persist the outer-header facts: the cipher / KDF display, and the KDF
+/// cost the peer-ingest gate compares against. Overwrites them whole —
+/// the cipher row, and whichever KDF row this header shape carries, with
+/// the other shape's row deleted.
 pub(crate) fn write_kdbx_outer_header_facts(
     conn: &Connection,
-    cipher_id_bytes: [u8; 16],
-    kdf: &KdfFacts,
+    header: &OuterHeader,
 ) -> Result<(), rusqlite::Error> {
-    set_blob(conn, KEY_KDBX_CIPHER_OID, &cipher_id_bytes)?;
+    set_blob(conn, KEY_KDBX_CIPHER_OID, header.cipher_id.0.as_bytes())?;
     // Whichever row this header shape doesn't populate is cleared, so a
     // re-ingest of a converted vault can't leave the other version's
-    // stale row behind for `read_kdf_display` to prefer.
-    let stale_key = match kdf {
-        KdfFacts::Parameters(blob) => {
-            set_blob(conn, KEY_KDBX_KDF_PARAMETERS, blob)?;
+    // stale row behind for `read_kdf_cost` to prefer.
+    let stale_key = match &header.version_fields {
+        VersionFields::V4 { kdf_parameters, .. } => {
+            set_blob(conn, KEY_KDBX_KDF_PARAMETERS, kdf_parameters)?;
             KEY_KDBX_TRANSFORM_ROUNDS
         }
-        KdfFacts::TransformRounds(rounds) => {
+        VersionFields::V3 {
+            transform_rounds, ..
+        } => {
             // Store as i64. `transform_rounds` is u64 in keepass-core;
             // reinterpret bits — round counts that actually fit a u64
             // but not an i64 are far beyond anything practical and
             // would just round-trip the bit pattern unchanged.
             #[allow(clippy::cast_possible_wrap)]
-            set_i64(conn, KEY_KDBX_TRANSFORM_ROUNDS, *rounds as i64)?;
+            set_i64(conn, KEY_KDBX_TRANSFORM_ROUNDS, *transform_rounds as i64)?;
             KEY_KDBX_KDF_PARAMETERS
         }
     };
     conn.execute("DELETE FROM setting WHERE key = ?1", params![stale_key])?;
+    Ok(())
+}
+
+/// Bring the outer-header fact rows in line with `header` — the vault's
+/// own file, just decrypted by a reconcile — when its cipher or KDF cost
+/// differs from what they record, or they record none. A salt rotation
+/// alone writes nothing: the rows are `meta.*`, so every write advances
+/// the persistence watermark, and a reconcile that changed nothing must
+/// leave the mirror owing nothing.
+///
+/// # Errors
+///
+/// [`EngineError::Serialise`] if `header`'s KDF parameters don't decode;
+/// [`EngineError::Sqlite`] / [`EngineError::Projection`] on a row read or
+/// write failure.
+pub(crate) fn refresh_kdbx_outer_header_facts(
+    conn: &Connection,
+    header: &OuterHeader,
+) -> Result<(), EngineError> {
+    let params = header
+        .decode_kdf_params()
+        .map_err(|e| EngineError::Serialise(format!("read kdf parameters: {e}")))?;
+    let same_cost = match read_kdf_cost(conn) {
+        Ok(recorded) => recorded == KdfCost::of(&params),
+        Err(EngineError::MirrorKdfUnknown) => false,
+        Err(e) => return Err(e),
+    };
+    let same_cipher =
+        get_blob(conn, KEY_KDBX_CIPHER_OID)?.as_deref() == Some(header.cipher_id.0.as_bytes());
+    if !(same_cost && same_cipher) {
+        write_kdbx_outer_header_facts(conn, header)?;
+    }
     Ok(())
 }
 
@@ -471,26 +505,40 @@ fn read_cipher_display(conn: &Connection) -> Result<String, EngineError> {
 }
 
 fn read_kdf_display(conn: &Connection) -> Result<String, EngineError> {
+    match read_kdf_cost(conn) {
+        Ok(cost) => Ok(cost.to_string()),
+        Err(EngineError::MirrorKdfUnknown) => Ok("Unknown KDF".to_owned()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The KDF cost of the vault file this mirror was last ingested from, as
+/// the outer-header facts recorded it (see [`write_kdbx_outer_header_facts`]).
+///
+/// # Errors
+///
+/// [`EngineError::MirrorKdfUnknown`] when no fact row is present (a mirror
+/// written before they were recorded, or by an in-memory ingest only) or
+/// the recorded KDBX4 parameters don't decode; [`EngineError::Sqlite`] /
+/// [`EngineError::Projection`] if the rows can't be read.
+pub(crate) fn read_kdf_cost(conn: &Connection) -> Result<KdfCost, EngineError> {
     use keepass_core::format::KdfParams;
     use keepass_core::format::var_dictionary::VarDictionary;
 
     // KDBX4: VarDictionary in `meta.kdbx_kdf_parameters`.
     if let Some(blob) = get_blob(conn, KEY_KDBX_KDF_PARAMETERS)? {
-        if let Ok(dict) = VarDictionary::parse(&blob)
-            && let Ok(params) = KdfParams::from_var_dictionary(&dict)
-        {
-            return Ok(format_kdf_params(&params));
-        }
+        let dict = VarDictionary::parse(&blob).map_err(|_| EngineError::MirrorKdfUnknown)?;
+        let params =
+            KdfParams::from_var_dictionary(&dict).map_err(|_| EngineError::MirrorKdfUnknown)?;
+        return Ok(KdfCost::of(&params));
     }
-    // KDBX3: rounds + seed in their own outer-header fields.
+    // KDBX3: the AES-KDF round count, in its own outer-header field.
     if let Some(rounds_i64) = get_i64(conn, KEY_KDBX_TRANSFORM_ROUNDS)? {
         // We stored u64 as i64 bits; reinterpret the same way.
         #[allow(clippy::cast_sign_loss)]
-        let rounds = rounds_i64 as u64;
-        let formatted = format_with_thousands(rounds);
-        return Ok(format!("AES-KDF ({formatted} rounds)"));
+        return Ok(KdfCost::aes_kdf(rounds_i64 as u64));
     }
-    Ok("Unknown KDF".to_owned())
+    Err(EngineError::MirrorKdfUnknown)
 }
 
 fn read_attachment_pool_stats(conn: &Connection) -> Result<(u32, u64), EngineError> {
@@ -511,53 +559,6 @@ fn read_attachment_pool_stats(conn: &Connection) -> Result<(u32, u64), EngineErr
         },
     )
     .map_err(EngineError::Sqlite)
-}
-
-/// Format a parsed [`keepass_core::format::KdfParams`] as a single-line
-/// display string. Argon2 variants render as
-/// `"<name> (<mib> MB · <iter> iter · <threads> threads)"`; AES-KDF as
-/// `"AES-KDF (<rounds> rounds)"` with thousands separators. Mirrors the
-/// legacy `Vault::kdf_display` formatter so the Info-tab string is
-/// byte-identical to what the in-memory shim produced.
-fn format_kdf_params(params: &keepass_core::format::KdfParams) -> String {
-    use keepass_core::format::{Argon2Variant, KdfParams};
-    match params {
-        KdfParams::AesKdf { rounds, .. } => {
-            let formatted = format_with_thousands(*rounds);
-            format!("AES-KDF ({formatted} rounds)")
-        }
-        KdfParams::Argon2 {
-            variant,
-            memory_bytes,
-            iterations,
-            parallelism,
-            ..
-        } => {
-            let name = match variant {
-                Argon2Variant::Argon2d => "Argon2d",
-                Argon2Variant::Argon2id => "Argon2id",
-                _ => "Argon2",
-            };
-            let mib = memory_bytes / (1024 * 1024);
-            format!("{name} ({mib} MB \u{00B7} {iterations} iter \u{00B7} {parallelism} threads)")
-        }
-        _ => "Unknown KDF".to_owned(),
-    }
-}
-
-/// Format an integer with comma thousands separators (e.g. 6000000 →
-/// "6,000,000"). Used by the AES-KDF branch.
-fn format_with_thousands(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(*ch as char);
-    }
-    out
 }
 
 // ─────────────────────── custom-icon accessors ───────────────────────
@@ -1048,6 +1049,99 @@ mod tests {
         let b = pack_memory_protection(mp);
         let back = unpack_memory_protection(b);
         assert_eq!(mp, back);
+    }
+
+    fn migrated_conn() -> Connection {
+        let mut c = Connection::open_in_memory().expect("open in-memory db");
+        crate::migrations::apply_pending(&mut c).expect("apply migrations");
+        c
+    }
+
+    /// The outer header of a fresh KDBX4 vault (Argon2).
+    fn fresh_header() -> OuterHeader {
+        let composite = keepass_core::CompositeKey::from_password(b"pw");
+        keepass_core::kdbx::Kdbx::create_empty_v4(&composite, "t")
+            .expect("create")
+            .outer_header()
+            .clone()
+    }
+
+    /// `header` with its KDF parameters edited by `edit`.
+    fn with_kdf(
+        header: &OuterHeader,
+        edit: impl FnOnce(&mut keepass_core::format::KdfParams),
+    ) -> OuterHeader {
+        let mut params = header.decode_kdf_params().expect("decode");
+        edit(&mut params);
+        let mut out = header.clone();
+        let VersionFields::V4 { kdf_parameters, .. } = &mut out.version_fields else {
+            panic!("fresh vaults are KDBX4");
+        };
+        *kdf_parameters = params.to_var_dictionary_blob().expect("encode");
+        out
+    }
+
+    fn mutation_seq(conn: &Connection) -> i64 {
+        crate::PersistenceState::read(conn)
+            .expect("watermark")
+            .mutation_seq
+    }
+
+    #[test]
+    fn refresh_records_a_cost_change_but_not_a_salt_rotation() {
+        use keepass_core::format::KdfParams;
+        let conn = migrated_conn();
+        let header = fresh_header();
+        assert!(matches!(
+            read_kdf_cost(&conn),
+            Err(EngineError::MirrorKdfUnknown)
+        ));
+
+        refresh_kdbx_outer_header_facts(&conn, &header).expect("refresh");
+        let cost = KdfCost::of(&header.decode_kdf_params().expect("decode"));
+        assert_eq!(read_kdf_cost(&conn).expect("recorded"), cost);
+
+        let seq = mutation_seq(&conn);
+        let resalted = with_kdf(&header, |p| {
+            if let KdfParams::Argon2 { salt, .. } = p {
+                for b in salt.iter_mut() {
+                    *b ^= 0xff;
+                }
+            }
+        });
+        refresh_kdbx_outer_header_facts(&conn, &resalted).expect("refresh");
+        assert_eq!(
+            mutation_seq(&conn),
+            seq,
+            "a salt rotation must not write (it would dirty the mirror)"
+        );
+
+        let costlier = with_kdf(&header, |p| {
+            if let KdfParams::Argon2 { iterations, .. } = p {
+                *iterations += 1;
+            }
+        });
+        refresh_kdbx_outer_header_facts(&conn, &costlier).expect("refresh");
+        let new_cost = KdfCost::of(&costlier.decode_kdf_params().expect("decode"));
+        assert_ne!(new_cost, cost);
+        assert_eq!(read_kdf_cost(&conn).expect("recorded"), new_cost);
+    }
+
+    #[test]
+    fn clearing_meta_keeps_the_envelope_facts() {
+        let conn = migrated_conn();
+        let header = fresh_header();
+        write_kdbx_outer_header_facts(&conn, &header).expect("write facts");
+        clear_meta_tables(&conn).expect("clear");
+        assert_eq!(
+            read_kdf_cost(&conn).expect("still recorded"),
+            KdfCost::of(&header.decode_kdf_params().expect("decode"))
+        );
+        assert!(
+            get_blob(&conn, KEY_KDBX_CIPHER_OID)
+                .expect("read")
+                .is_some()
+        );
     }
 
     #[test]

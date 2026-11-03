@@ -31,12 +31,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use keepass_core::CompositeKey;
-use keepass_core::kdbx::Kdbx;
+use keepass_core::kdbx::{HeaderRead, Kdbx, Unlocked};
 
 use crate::conflict_rows;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::events::{ChangeEvent, ConflictPayload};
+use crate::kdf_cost::KdfCost;
 use crate::util::tree::{contains_entry, find_entry};
 
 /// Owner sentinel for the disk/iroh sync peer.
@@ -583,45 +584,87 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     _now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ParkConflictsResult, EngineError> {
     // The disk file is one peer under the FILE_OWNER sentinel — the
-    // file-watcher / Syncthing / external-client path.
-    ingest_kdbx_as_owner(engine, kdbx_path, composite_key, FILE_OWNER)
+    // file-watcher / Syncthing / external-client path. No KDF-cost gate
+    // here: this is the vault's own file, whose KDF settings its user may
+    // legitimately change in any client.
+    let disk = unlock_kdbx(engine, read_kdbx_header(kdbx_path)?, composite_key)?;
+    let result = ingest_kdbx_as_owner(engine, &disk, FILE_OWNER)?;
+    // This mirror now saves under this file's envelope, so its recorded
+    // cipher / KDF cost follow the file — recorded only once the file has
+    // decrypted and passed the replica gate inside the ingest.
+    crate::meta::refresh_kdbx_outer_header_facts(engine.conn(), disk.outer_header())?;
+    Ok(result)
 }
 
 /// Per-device-key sync transport: ingest a fetched peer KDBX blob under the
 /// peer's own device-id `owner`, so 3+ peers' divergences land in distinct
 /// owner rows (vs the single `FILE_OWNER` used for the disk-watcher path). Same
-/// owner-rows engine; the owner string is the only difference.
+/// owner-rows engine; the owner string is the only difference — plus the
+/// KDF-cost gate, which runs on the blob's unauthenticated outer header before
+/// any key derivation ([`ensure_same_kdf_cost`]).
 pub(crate) fn ingest_peer_from_kdbx(
     engine: &mut Engine,
     kdbx_path: &Path,
     composite_key: &CompositeKey,
     owner: &str,
 ) -> Result<ParkConflictsResult, EngineError> {
-    ingest_kdbx_as_owner(engine, kdbx_path, composite_key, owner)
+    let peer = read_kdbx_header(kdbx_path)?;
+    ensure_same_kdf_cost(engine, &peer)?;
+    let peer = unlock_kdbx(engine, peer, composite_key)?;
+    ingest_kdbx_as_owner(engine, &peer, owner)
+}
+
+/// The KDF-cost gate: refuse a peer replica whose outer header demands a
+/// different KDF cost ([`crate::kdf_cost`]) from this mirror's vault file.
+/// The header is unauthenticated until the KDF has run, so this is checked
+/// from the header alone — no derivation, nothing written.
+fn ensure_same_kdf_cost(engine: &Engine, peer: &Kdbx<HeaderRead>) -> Result<(), EngineError> {
+    let local = crate::meta::read_kdf_cost(engine.conn())?;
+    let peer_params = peer
+        .header()
+        .decode_kdf_params()
+        .map_err(|e| EngineError::Serialise(format!("read peer kdf parameters: {e}")))?;
+    let peer = KdfCost::of(&peer_params);
+    if peer == local {
+        Ok(())
+    } else {
+        Err(EngineError::KdfParametersMismatch { local, peer })
+    }
+}
+
+/// Read and parse a KDBX file up to its outer header — everything that
+/// can be known about it before a key derivation.
+fn read_kdbx_header(kdbx_path: &Path) -> Result<Kdbx<HeaderRead>, EngineError> {
+    let bytes = std::fs::read(kdbx_path)?;
+    Kdbx::open_from_bytes(bytes)
+        .map_err(|e| EngineError::Serialise(format!("open disk kdbx: {e}")))?
+        .read_header()
+        .map_err(|e| EngineError::Serialise(format!("read disk header: {e}")))
+}
+
+/// Unlock a read KDBX under `composite_key` — the key derivation.
+fn unlock_kdbx(
+    engine: &Engine,
+    header_read: Kdbx<HeaderRead>,
+    composite_key: &CompositeKey,
+) -> Result<Kdbx<Unlocked>, EngineError> {
+    header_read
+        .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
+        .map_err(|e| EngineError::Serialise(format!("unlock disk kdbx: {e}")))
 }
 
 fn ingest_kdbx_as_owner(
     engine: &mut Engine,
-    kdbx_path: &Path,
-    composite_key: &CompositeKey,
+    disk_kdbx: &Kdbx<Unlocked>,
     owner: &str,
 ) -> Result<ParkConflictsResult, EngineError> {
-    // Read / parse / unlock the disk kdbx and project the remote vault — the
-    // same prefix the eager-merge path used.
-    let disk_bytes = std::fs::read(kdbx_path)?;
-    let disk_kdbx = Kdbx::open_from_bytes(disk_bytes.clone())
-        .map_err(|e| EngineError::Serialise(format!("open disk kdbx: {e}")))?
-        .read_header()
-        .map_err(|e| EngineError::Serialise(format!("read disk header: {e}")))?
-        .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
-        .map_err(|e| EngineError::Serialise(format!("unlock disk kdbx: {e}")))?;
-
+    // Project the remote vault — the same prefix the eager-merge path used.
     let mut remote_vault = disk_kdbx
         .vault_with_unwrapped_protected()
         .map_err(|e| EngineError::Serialise(format!("unwrap disk protected: {e}")))?;
     // The file's identity, stamped if its root has none — the identity the
     // ingest gave the mirror from the same file.
-    crate::identity::assign_file_identity(&mut remote_vault, &disk_kdbx);
+    crate::identity::assign_file_identity(&mut remote_vault, disk_kdbx);
 
     // Owner-rows ingest under `owner` (FILE_OWNER for the disk path, the peer's
     // device id for the per-device-key transport). `ingest_peer` advances local

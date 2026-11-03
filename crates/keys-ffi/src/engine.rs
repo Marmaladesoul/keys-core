@@ -1385,10 +1385,15 @@ impl Engine {
     /// wrong `keyfile` fails closed at the unlock step, before any merge —
     /// there is no password-only fallback.
     ///
-    /// A replica of a different vault is refused with
+    /// A blob whose outer header demands a different KDF cost from this
+    /// vault's file (its KDF parameters, salt aside, differ) is refused with
+    /// [`EngineError::KdfParametersMismatch`] from the header alone, before
+    /// any key derivation — so a blob can't make this call allocate or spin
+    /// beyond what opening this vault already costs. A replica of a
+    /// different vault is refused with
     /// [`EngineError::VaultIdentityMismatch`], and one whose test-vault
     /// marker differs from this vault's with
-    /// [`EngineError::TestVaultMarkerMismatch`] — both before anything merges.
+    /// [`EngineError::TestVaultMarkerMismatch`] — all before anything merges.
     pub async fn ingest_peer_kdbx(
         &self,
         owner_id: String,

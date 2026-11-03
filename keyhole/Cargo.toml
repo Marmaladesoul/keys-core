@@ -22,6 +22,11 @@ path = "src/main.rs"
 # alongside its staticlib/cdylib, so it links as a normal Rust dep.
 keys-ffi = { path = "../crates/keys-ffi" }
 
+# Only for the adversarial `forge-kdf` verb, which edits a KDBX header's
+# bytes directly — a hostile file, not a client capability, so it can't go
+# through the seam. Same git source as keys-engine's, so it resolves to the
+# same locked revision.
+keepass-core = { git = "https://github.com/Marmaladesoul/keepass-core" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # keys-ffi's slow ops (ingest_from_kdbx / save_to_kdbx) are async and

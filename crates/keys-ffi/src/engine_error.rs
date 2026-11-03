@@ -150,6 +150,28 @@ pub enum EngineError {
         replica_is_test: bool,
     },
 
+    /// A peer blob offered to `ingest_peer_kdbx` demands a different **KDF
+    /// cost** from this vault's file: its KDF parameters, salt aside, differ
+    /// (`local` and `peer` are display forms, e.g.
+    /// `"Argon2id (64 MB · 2 iter · 4 threads)"`). Replicas of one vault
+    /// share their KDF parameters, so this is either a re-key that changed
+    /// them or a blob crafted to make its reader allocate or spin without
+    /// bound. Refused from the blob's header alone, before any key
+    /// derivation; nothing merged, nothing written.
+    ///
+    /// Contract: raised ahead of the password, identity and kind checks,
+    /// which need the decrypted blob. The actionable reading is "this
+    /// peer's copy is keyed differently": don't retry the same blob, and
+    /// don't treat it as a wrong password. Adopting a peer's changed KDF
+    /// parameters is a re-key, which needs its own deliberate path.
+    #[error("the peer replica's KDF ({peer}) differs from this vault's ({local}); refusing it")]
+    KdfParametersMismatch {
+        /// This vault's KDF cost (display form).
+        local: String,
+        /// The KDF cost the peer blob's header demands (display form).
+        peer: String,
+    },
+
     /// Catch-all for internal engine errors that aren't user-actionable.
     /// SQLite errors, migration runner failures, RNG failures, IO,
     /// projection, serialise, reveal-decode, file-watcher-init —
@@ -189,6 +211,10 @@ impl From<keys_engine::EngineError> for EngineError {
             } => Self::TestVaultMarkerMismatch {
                 local_is_test,
                 replica_is_test,
+            },
+            E::KdfParametersMismatch { local, peer } => Self::KdfParametersMismatch {
+                local: local.to_string(),
+                peer: peer.to_string(),
             },
             // Everything else — Sqlite, Io, Random, Ingest, Projection,
             // Reveal, Serialise, Wrap, SessionKey, FileWatcher —

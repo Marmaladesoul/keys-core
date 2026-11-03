@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use keepass_core::format::VersionFields;
+use keepass_core::format::OuterHeader;
 use keepass_core::kdbx::{Kdbx, Unlocked, compute_history_drop_count};
 use keepass_core::model::{Binary, CustomIcon, Entry, Group, GroupId, Meta, Vault};
 use keepass_core::protector::{FieldProtector, SessionKey, seal_with_key};
@@ -30,7 +30,6 @@ use crate::error::{EngineError, IngestError};
 use crate::fingerprint;
 use crate::history_snapshot::HistorySnapshotIo;
 use crate::meta;
-use crate::meta::KdfFacts;
 use crate::strength;
 use crate::totp;
 use crate::util::PASSWORD_FIELD;
@@ -65,32 +64,16 @@ pub(crate) fn ingest(
     // until the mirror is next written back — so this ingest leaves the
     // mirror owing that write.
     let stamped = crate::identity::assign_file_identity(&mut vault, kdbx);
-    let header = kdbx.outer_header();
-    let cipher_id = *header.cipher_id.0.as_bytes();
-    let kdf = match &header.version_fields {
-        VersionFields::V3 {
-            transform_rounds, ..
-        } => KdfFacts::TransformRounds(*transform_rounds),
-        VersionFields::V4 { kdf_parameters, .. } => KdfFacts::Parameters(kdf_parameters.clone()),
-    };
     ingest_vault_with_header(
         conn,
         fingerprint_key,
         protector,
         &vault,
         Source::VaultFile {
-            facts: &HeaderFacts { cipher_id, kdf },
+            header: kdbx.outer_header(),
             settles: !stamped,
         },
     )
-}
-
-/// Outer-header facts the engine persists into `meta.*` setting rows
-/// so it doesn't have to hold a live [`Kdbx`] handle to surface them
-/// via [`crate::Engine::database_metadata`].
-struct HeaderFacts {
-    cipher_id: [u8; 16],
-    kdf: KdfFacts,
 }
 
 /// Re-ingest a pre-unwrapped [`Vault`] without going through a
@@ -123,7 +106,7 @@ enum Source<'a> {
     /// ingest stamped an identity the file lacks. Check, replace and
     /// settle share the ingest's own transaction.
     VaultFile {
-        facts: &'a HeaderFacts,
+        header: &'a OuterHeader,
         settles: bool,
     },
     /// The vault was rebuilt in memory from the mirror's own, possibly
@@ -183,8 +166,8 @@ fn ingest_vault_with_header(
     // that path mutates the in-memory vault without re-wrapping the
     // envelope, so the existing rows (written by the originating
     // ingest call) remain accurate.
-    if let Source::VaultFile { facts, .. } = source {
-        meta::write_kdbx_outer_header_facts(&tx, facts.cipher_id, &facts.kdf)?;
+    if let Source::VaultFile { header, .. } = source {
+        meta::write_kdbx_outer_header_facts(&tx, header)?;
     }
 
     // Persist `Meta::recycle_bin_enabled` explicitly. The `is_recycle_bin`
