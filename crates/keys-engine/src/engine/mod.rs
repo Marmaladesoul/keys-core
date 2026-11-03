@@ -1093,10 +1093,15 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Same shape as [`Self::reconcile_with_disk_park_conflicts`]: a
-    /// different vault's blob is refused with
-    /// [`EngineError::VaultIdentityMismatch`] (mirror untouched); IO, KDBX
-    /// open/parse/unlock, and ingest errors.
+    /// [`EngineError::KdfParametersMismatch`] if the blob's outer header
+    /// demands a different KDF cost from this mirror's vault file, checked
+    /// before any key derivation (see [`crate::kdf_cost`]), and
+    /// [`EngineError::MirrorKdfUnknown`] if the mirror has no recorded cost
+    /// to check it against — either way nothing is derived or written.
+    /// Otherwise the same shape as
+    /// [`Self::reconcile_with_disk_park_conflicts`]: a different vault's blob
+    /// is refused with [`EngineError::VaultIdentityMismatch`] (mirror
+    /// untouched); IO, KDBX open/parse/unlock, and ingest errors.
     pub fn ingest_peer_from_kdbx(
         &mut self,
         kdbx_path: &Path,

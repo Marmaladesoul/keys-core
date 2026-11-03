@@ -219,6 +219,41 @@ pub enum EngineError {
         /// Whether the replica offered is a test vault.
         replica_is_test: bool,
     },
+
+    /// A peer replica's KDBX envelope demands a different **KDF cost** from
+    /// the vault file this mirror was ingested from: its KDF parameters,
+    /// salt aside, differ (see [`crate::kdf_cost`]). Replicas of one vault
+    /// share their KDF parameters, so a differing cost is either a re-key
+    /// that changed them — which needs its own deliberate path — or a file
+    /// crafted to make its reader allocate or spin without bound. Raised by
+    /// [`crate::Engine::ingest_peer_from_kdbx`] from the peer's outer header
+    /// alone, **before** any key derivation: the refusal costs no KDF work
+    /// and writes nothing.
+    ///
+    /// Raised ahead of the identity and kind gates, which need the
+    /// decrypted replica.
+    #[error(
+        "the peer replica's KDF ({peer}) differs from this vault's ({local}); \
+         refusing it before deriving"
+    )]
+    KdfParametersMismatch {
+        /// The KDF cost of this mirror's vault file.
+        local: crate::kdf_cost::KdfCost,
+        /// The KDF cost the peer replica's header demands.
+        peer: crate::kdf_cost::KdfCost,
+    },
+
+    /// The mirror holds no readable record of its vault file's KDF
+    /// parameters — no outer-header fact row (a mirror never ingested from
+    /// its file since they were first recorded), or one that no longer
+    /// decodes — so a peer replica's KDF cost has nothing to be checked
+    /// against and the peer ingest is refused. Any ingest or reconcile of the
+    /// vault's file records them.
+    #[error(
+        "this vault's mirror records no KDF parameters to check a peer replica \
+         against; re-ingest or reconcile it from the vault file"
+    )]
+    MirrorKdfUnknown,
 }
 
 impl EngineError {

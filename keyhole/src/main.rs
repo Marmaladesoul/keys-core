@@ -498,6 +498,30 @@ enum Command {
         /// Path to the .kdbx vault.
         vault: PathBuf,
     },
+    /// ADVERSARIAL: write a copy of the vault to `out` whose outer header
+    /// demands different KDF work — the hostile peer blob anyone holding a
+    /// doc's write capability could plant. Only the header's KDF parameters
+    /// change (the salt is kept); the payload is copied verbatim, so the
+    /// copy's header HMAC no longer verifies and no key opens it. What it
+    /// probes is what a reader does BEFORE that check: the KDF must run
+    /// first, at whatever cost the header names. Needs no password (the
+    /// outer header is plaintext). Not a client capability, so it bypasses
+    /// the seam and edits the bytes with keepass-core directly.
+    ForgeKdf {
+        /// Path to the .kdbx vault to copy.
+        vault: PathBuf,
+        /// Where to write the forged copy.
+        out: PathBuf,
+        /// Argon2 memory cost, in MiB (Argon2 vaults only).
+        #[arg(long)]
+        argon2_memory_mib: Option<u64>,
+        /// Argon2 passes (Argon2 vaults only).
+        #[arg(long)]
+        argon2_iterations: Option<u64>,
+        /// AES-KDF rounds (AES-KDF vaults only).
+        #[arg(long)]
+        aes_rounds: Option<u64>,
+    },
     /// Print the hex SHA-256 digest of the vault's user-visible
     /// content (fields, locations, icons, group tree, recycle-bin
     /// state). Equal digests ⇔ converged replicas — the convergence
@@ -1049,6 +1073,21 @@ async fn main() -> Result<()> {
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             println!("{}", session.is_test_vault()?);
             session.finish().await?;
+        }
+        Command::ForgeKdf {
+            vault,
+            out,
+            argon2_memory_mib,
+            argon2_iterations,
+            aes_rounds,
+        } => {
+            forge_kdf(
+                &vault,
+                &out,
+                argon2_memory_mib,
+                argon2_iterations,
+                aes_rounds,
+            )?;
         }
         Command::Digest { vault } => {
             let session =
@@ -2587,6 +2626,79 @@ fn purge_vault(vault: &Path) -> Result<()> {
     println!("db-key-deleted: {key_deleted}");
     println!("sidecars-removed: {sidecars_removed}");
     println!("purged local data for {}", vault.display());
+    Ok(())
+}
+
+/// The `forge-kdf` verb: copy `vault` to `out` with the outer header's KDF
+/// work parameters replaced, everything else — salt, payload, header HMAC —
+/// byte-for-byte. Refuses an override for the other KDF family, so a typo
+/// can't produce a copy that differs in nothing.
+fn forge_kdf(
+    vault: &Path,
+    out: &Path,
+    argon2_memory_mib: Option<u64>,
+    argon2_iterations: Option<u64>,
+    aes_rounds: Option<u64>,
+) -> Result<()> {
+    use keepass_core::format::{FileSignature, KdfParams, VersionFields};
+    use keepass_core::kdbx::Kdbx;
+
+    let read = Kdbx::open(vault)
+        .with_context(|| format!("open {}", vault.display()))?
+        .read_header()
+        .context("read outer header")?;
+    let mut header = read.header().clone();
+    let mut params = header
+        .decode_kdf_params()
+        .context("decode KDF parameters")?;
+    match &mut params {
+        KdfParams::Argon2 {
+            memory_bytes,
+            iterations,
+            ..
+        } => {
+            anyhow::ensure!(aes_rounds.is_none(), "--aes-rounds on an Argon2 vault");
+            if let Some(mib) = argon2_memory_mib {
+                *memory_bytes = mib
+                    .checked_mul(1024 * 1024)
+                    .context("--argon2-memory-mib overflows a byte count")?;
+            }
+            if let Some(passes) = argon2_iterations {
+                *iterations = passes;
+            }
+        }
+        KdfParams::AesKdf { rounds, .. } => {
+            anyhow::ensure!(
+                argon2_memory_mib.is_none() && argon2_iterations.is_none(),
+                "--argon2-* on an AES-KDF vault"
+            );
+            if let Some(r) = aes_rounds {
+                *rounds = r;
+            }
+        }
+        other => anyhow::bail!("unsupported KDF family: {other:?}"),
+    }
+    match &mut header.version_fields {
+        VersionFields::V4 { kdf_parameters, .. } => {
+            *kdf_parameters = params
+                .to_var_dictionary_blob()
+                .context("encode KDF parameters")?;
+        }
+        VersionFields::V3 {
+            transform_rounds, ..
+        } => {
+            let KdfParams::AesKdf { rounds, .. } = params else {
+                anyhow::bail!("KDBX3 header with non-AES KDF parameters");
+            };
+            *transform_rounds = rounds;
+        }
+    }
+
+    let mut bytes = read.header_bytes()[..FileSignature::LEN].to_vec();
+    bytes.extend(header.write().context("write outer header")?);
+    bytes.extend_from_slice(read.payload_bytes());
+    std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
+    println!("forged {} (KDF: {params:?})", out.display());
     Ok(())
 }
 
