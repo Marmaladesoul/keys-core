@@ -24,18 +24,24 @@ use crate::vault_create::vault_err_to_engine_err;
 /// changed file ([`EngineError::TestVaultMarkerMismatch`]) until it is
 /// rebuilt from the file.
 ///
+/// The file is derived only within this process's ceiling or at exactly
+/// `approved_kdf` (see [`crate::KdfSettings`]).
+///
 /// # Errors
 ///
 /// The vault errors `create_vault` reports — a wrong password or malformed
-/// keyfile, IO, format — mapped onto [`EngineError`].
-#[uniffi::export(async_runtime = "tokio")]
+/// keyfile, IO, format — mapped onto [`EngineError`], and
+/// [`EngineError::KdfApprovalRequired`] from the header, before deriving.
+#[uniffi::export(async_runtime = "tokio", default(approved_kdf = None))]
 pub async fn mark_test_vault_file(
     kdbx_path: String,
     password: String,
     keyfile: Option<Vec<u8>>,
     marked: bool,
     temp_dir: Option<String>,
+    approved_kdf: Option<crate::KdfSettings>,
 ) -> Result<(), EngineError> {
+    let approved = crate::kdf::approved_cost(approved_kdf)?;
     tokio::task::spawn_blocking(move || {
         rewrite_marker(
             &kdbx_path,
@@ -43,6 +49,7 @@ pub async fn mark_test_vault_file(
             keyfile.as_deref(),
             marked,
             temp_dir.as_deref(),
+            approved.as_ref(),
         )
         .map_err(vault_err_to_engine_err)
     })
@@ -56,6 +63,7 @@ fn rewrite_marker(
     keyfile: Option<&[u8]>,
     marked: bool,
     temp_dir: Option<&str>,
+    approved: Option<&keys_engine::KdfCost>,
 ) -> Result<(), VaultError> {
     let secret = SecretString::from(password);
     let composite = composite_from_factors(secret.expose_secret().as_bytes(), keyfile)
@@ -63,9 +71,9 @@ fn rewrite_marker(
     let path = std::path::Path::new(kdbx_path);
     // No field protector: the vault is decoded only to be re-encoded, and is
     // dropped before we return.
-    let mut kdbx = keepass_core::kdbx::Kdbx::open(path)?
-        .read_header()?
-        .unlock(&composite)?;
+    let read = keepass_core::kdbx::Kdbx::open(path)?.read_header()?;
+    crate::kdf::check_unrecorded_file(&read, approved)?;
+    let mut kdbx = read.unlock(&composite)?;
     let mut vault = kdbx.vault().clone();
     keys_engine::test_vault::set_marked(&mut vault, marked);
     kdbx.replace_vault(vault);

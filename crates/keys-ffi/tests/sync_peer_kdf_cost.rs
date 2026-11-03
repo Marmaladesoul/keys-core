@@ -113,6 +113,7 @@ async fn bound_engine(dir: &std::path::Path) -> (Arc<Engine>, std::path::PathBuf
             KDBX_PASSWORD.to_owned(),
             None,
             None,
+            None,
         )
         .await
         .expect("first sync");

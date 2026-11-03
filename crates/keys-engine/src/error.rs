@@ -254,6 +254,40 @@ pub enum EngineError {
          against; re-ingest or reconcile it from the vault file"
     )]
     MirrorKdfUnknown,
+
+    /// The vault's own file demands a KDF cost this process won't derive
+    /// without the user's say-so (see [`crate::kdf_cost::check_vault_file`]):
+    /// its cost differs from the one `recorded` for it (its KDF settings
+    /// were changed, perhaps in another client), or nothing is recorded and
+    /// it goes past the [`crate::kdf_cost::KdfCeiling`]. Raised from the
+    /// file's outer header alone, before any key derivation; nothing is
+    /// derived or written. Show the user `file`, and on their yes pass it
+    /// back as [`crate::kdf_cost::KdfPolicy::approved`].
+    #[error(
+        "the vault file's KDF ({file}) needs approval before deriving{}",
+        recorded_kdf_suffix(.recorded.as_ref())
+    )]
+    KdfApprovalRequired {
+        /// The cost the mirror recorded for the vault's file, if any.
+        recorded: Option<crate::kdf_cost::KdfCost>,
+        /// The cost the file's header demands.
+        file: crate::kdf_cost::KdfCost,
+    },
+
+    /// The vault file a write was about to replace is no longer the one
+    /// this mirror last corresponded with: it changed after the mirror was
+    /// brought current with it, so writing over it could discard that
+    /// change — or another vault moved into its place. Checked from the
+    /// file's stat signature; nothing written. Bring the mirror current
+    /// with the file and retry.
+    #[error("the vault file changed since this mirror was brought current with it")]
+    VaultFileChanged,
+}
+
+/// The " (this vault's is …)" tail of a `KdfApprovalRequired` message,
+/// when a cost is recorded — shared with the FFI's display-string variant.
+pub fn recorded_kdf_suffix<T: std::fmt::Display + ?Sized>(recorded: Option<&T>) -> String {
+    recorded.map_or_else(String::new, |r| format!(" (this vault's is {r})"))
 }
 
 impl EngineError {

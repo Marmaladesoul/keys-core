@@ -163,7 +163,8 @@ pub enum EngineError {
     /// which need the decrypted blob. The actionable reading is "this
     /// peer's copy is keyed differently": don't retry the same blob, and
     /// don't treat it as a wrong password. Adopting a peer's changed KDF
-    /// parameters is a re-key, which needs its own deliberate path.
+    /// parameters is the deliberate path `Engine::adopt_peer_kdbx`, once the
+    /// user has approved them.
     #[error("the peer replica's KDF ({peer}) differs from this vault's ({local}); refusing it")]
     KdfParametersMismatch {
         /// This vault's KDF cost (display form).
@@ -171,6 +172,38 @@ pub enum EngineError {
         /// The KDF cost the peer blob's header demands (display form).
         peer: String,
     },
+
+    /// The vault's own file demands KDF settings this process won't derive
+    /// without the user's approval: they differ from the settings this vault
+    /// recorded for it (changed in another client, or by a peer this vault
+    /// hasn't adopted), or — with none recorded, as on a first open — they go
+    /// past this process's ceiling (`set_kdf_ceiling`). `recorded` and `file`
+    /// are display forms. Refused from the file's header alone, before any
+    /// key derivation; nothing derived, nothing written.
+    ///
+    /// Contract: not a wrong password, and not worth retrying unchanged.
+    /// Show the user what the file demands (`read_kdbx_kdf`) and what the
+    /// vault had (`Engine::recorded_kdf`); on their yes, repeat the call
+    /// with those exact settings as `approved_kdf`.
+    #[error(
+        "the vault file's KDF ({file}) needs approval before deriving{}",
+        keys_engine::error::recorded_kdf_suffix(.recorded.as_deref())
+    )]
+    KdfApprovalRequired {
+        /// This vault's recorded KDF settings, if any (display form).
+        recorded: Option<String>,
+        /// The KDF settings the file's header demands (display form).
+        file: String,
+    },
+
+    /// The vault file a write was about to replace changed after the mirror
+    /// was brought current with it (checked from its stat signature), so it
+    /// wasn't written over: nothing written.
+    ///
+    /// Contract: bring the vault current with its file (`sync_with_disk`)
+    /// and retry; not a wrong password.
+    #[error("the vault file changed since this vault was brought current with it")]
+    VaultFileChanged,
 
     /// Catch-all for internal engine errors that aren't user-actionable.
     /// SQLite errors, migration runner failures, RNG failures, IO,
@@ -212,10 +245,15 @@ impl From<keys_engine::EngineError> for EngineError {
                 local_is_test,
                 replica_is_test,
             },
+            E::KdfApprovalRequired { recorded, file } => Self::KdfApprovalRequired {
+                recorded: recorded.as_ref().map(ToString::to_string),
+                file: file.to_string(),
+            },
             E::KdfParametersMismatch { local, peer } => Self::KdfParametersMismatch {
                 local: local.to_string(),
                 peer: peer.to_string(),
             },
+            E::VaultFileChanged => Self::VaultFileChanged,
             // Everything else — Sqlite, Io, Random, Ingest, Projection,
             // Reveal, Serialise, Wrap, SessionKey, FileWatcher —
             // collapses to Internal. Sealed by `#[non_exhaustive]` on

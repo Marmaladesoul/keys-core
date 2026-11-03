@@ -52,6 +52,7 @@ async fn mark(path: &std::path::Path, marked: bool) {
         None,
         marked,
         None,
+        None,
     )
     .await
     .expect("mark file");
@@ -104,6 +105,7 @@ async fn bound_engine(
         .sync_with_disk(
             path_string(&kdbx_path),
             KDBX_PASSWORD.to_owned(),
+            None,
             None,
             None,
         )
@@ -161,6 +163,7 @@ async fn sync_with_disk_refuses_the_file_changing_kind() {
         .sync_with_disk(
             path_string(&kdbx_path),
             KDBX_PASSWORD.to_owned(),
+            None,
             None,
             None,
         )
@@ -230,6 +233,7 @@ async fn two_test_vault_replicas_still_merge() {
         .sync_with_disk(
             path_string(&kdbx_path),
             KDBX_PASSWORD.to_owned(),
+            None,
             None,
             None,
         )

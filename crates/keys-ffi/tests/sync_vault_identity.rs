@@ -119,6 +119,7 @@ async fn bound_engine(dir: &std::path::Path) -> (Arc<Engine>, std::path::PathBuf
             KDBX_PASSWORD.to_owned(),
             None,
             None,
+            None,
         )
         .await
         .expect("first sync");
@@ -142,6 +143,7 @@ async fn sync_with_disk_refuses_a_swapped_in_vault() {
         .sync_with_disk(
             kdbx_path.to_string_lossy().into_owned(),
             KDBX_PASSWORD.to_owned(),
+            None,
             None,
             None,
         )
@@ -280,6 +282,7 @@ async fn sync_with_disk_still_adopts_an_external_edit_of_the_same_vault() {
         .sync_with_disk(
             kdbx_path.to_string_lossy().into_owned(),
             KDBX_PASSWORD.to_owned(),
+            None,
             None,
             None,
         )

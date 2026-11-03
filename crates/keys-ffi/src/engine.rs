@@ -52,8 +52,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use keepass_core::CompositeKey;
-use keepass_core::kdbx::Kdbx;
 use keys_engine as eng;
+use keys_engine::KdfCost;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::db_key_provider::{BridgeDbKeyProvider, VaultDbKeyProvider};
@@ -68,6 +68,7 @@ use crate::engine_types::{
     RecycleBinFilter, SearchScope, SmartFolder, SyncWithDiskFfi, TagUsageCount, VaultState,
     parse_uuid,
 };
+use crate::kdf::{KdfSettings, KdfSummary};
 use crate::merge::{
     AttachmentDeltaFfi, AttachmentDeltaKindFfi, DeleteEditConflictFfi, EntryConflictFfi,
     FieldDeltaFfi, FieldDeltaKindFfi, IconDeltaFfi, ResolutionFfi, resolution_ffi_to_km,
@@ -1006,7 +1007,7 @@ impl Engine {
         kdbx_path: String,
         password: String,
     ) -> Result<(), EngineError> {
-        self.ingest_from_kdbx_with_keyfile(kdbx_path, password, None)
+        self.ingest_from_kdbx_with_keyfile(kdbx_path, password, None, None)
             .await
     }
 
@@ -1015,16 +1016,24 @@ impl Engine {
     /// hex, or an XML `.keyx`) when present, else password-only. A vault keyed
     /// with a keyfile is unreadable without it, so an absent or wrong keyfile
     /// fails closed at the unlock step.
+    ///
+    /// The file is derived only if its KDF settings pass the gate (see
+    /// [`KdfSettings`]): equal to those this mirror recorded for it, or — none
+    /// recorded — within this process's ceiling, or exactly `approved_kdf`.
+    /// Otherwise [`EngineError::KdfApprovalRequired`], before deriving.
+    #[uniffi::method(default(approved_kdf = None))]
     pub async fn ingest_from_kdbx_with_keyfile(
         &self,
         kdbx_path: String,
         password: String,
         keyfile: Option<Vec<u8>>,
+        approved_kdf: Option<KdfSettings>,
     ) -> Result<(), EngineError> {
         self.ingest_secret(
             PathBuf::from(kdbx_path),
             SecretString::from(password),
             keyfile,
+            crate::kdf::approved_cost(approved_kdf)?,
         )
         .await
     }
@@ -1079,8 +1088,18 @@ impl Engine {
         let pw = SecretString::from(password);
         let temp_dir = temp_dir.map(PathBuf::from);
         let path_for_open = path.clone();
+        // The template is derived at the cost recorded for it: a file whose
+        // KDF settings changed under the mirror needs approval through the
+        // reconcile, not a silent derive here.
+        let recorded = self.with_engine(|e| Ok(e.recorded_kdf_cost()?))?;
         let mut kdbx = tokio::task::spawn_blocking(move || {
-            open_unlocked_kf(&path_for_open, &pw, keyfile.as_deref())
+            crate::kdf::open_vault_file(
+                &path_for_open,
+                &pw,
+                keyfile.as_deref(),
+                recorded.as_ref(),
+                None,
+            )
         })
         .await
         .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
@@ -1178,8 +1197,15 @@ impl Engine {
         // slow Argon2 unlock), exactly as `save_to_kdbx` does. This doubles
         // as the fail-closed guard: a wrong current password OR keyfile can't
         // open the envelope, so it never reaches the rotation.
+        let recorded = self.with_engine(|e| Ok(e.recorded_kdf_cost()?))?;
         let mut kdbx = tokio::task::spawn_blocking(move || {
-            open_unlocked_kf(&path_for_open, &current_pw, current_keyfile.as_deref())
+            crate::kdf::open_vault_file(
+                &path_for_open,
+                &current_pw,
+                current_keyfile.as_deref(),
+                recorded.as_ref(),
+                None,
+            )
         })
         .await
         .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
@@ -1219,7 +1245,7 @@ impl Engine {
         kdbx_path: String,
         password: String,
     ) -> Result<ParkConflictsResultFfi, EngineError> {
-        self.reconcile_with_disk_park_conflicts_with_keyfile(kdbx_path, password, None)
+        self.reconcile_with_disk_park_conflicts_with_keyfile(kdbx_path, password, None, None)
             .await
     }
 
@@ -1227,24 +1253,36 @@ impl Engine {
     /// disk-watcher reconcile path for a vault keyed with a keyfile. Opens the
     /// changed-on-disk KDBX under the password plus `keyfile`; an absent or
     /// wrong keyfile fails closed before any merge is applied.
+    ///
+    /// The file is derived only if its KDF settings pass the gate (see
+    /// [`KdfSettings`]); a file whose settings changed since this mirror
+    /// recorded them is [`EngineError::KdfApprovalRequired`] until the call
+    /// is repeated with exactly those settings as `approved_kdf`, and the
+    /// reconcile then records them as this vault's.
+    #[uniffi::method(default(approved_kdf = None))]
     pub async fn reconcile_with_disk_park_conflicts_with_keyfile(
         &self,
         kdbx_path: String,
         password: String,
         keyfile: Option<Vec<u8>>,
+        approved_kdf: Option<KdfSettings>,
     ) -> Result<ParkConflictsResultFfi, EngineError> {
         let path = PathBuf::from(kdbx_path);
         let pw = SecretString::from(password);
+        let approved = crate::kdf::approved_cost(approved_kdf)?;
         let composite = tokio::task::spawn_blocking(move || {
             crate::keyfile::composite_for_engine(pw.expose_secret().as_bytes(), keyfile.as_deref())
         })
         .await
         .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
         self.with_engine_mut(|e| {
-            Ok(
-                e.reconcile_with_disk_park_conflicts(&path, &composite, chrono::Utc::now())?
-                    .into(),
-            )
+            Ok(e.reconcile_with_disk_kdf_policy(
+                &path,
+                &composite,
+                chrono::Utc::now(),
+                crate::kdf::policy(approved.as_ref()),
+            )?
+            .into())
         })
     }
 
@@ -1282,15 +1320,23 @@ impl Engine {
     /// vault ([`EngineError::VaultIdentityMismatch`]) or the other kind of
     /// vault ([`EngineError::TestVaultMarkerMismatch`]); don't retry either —
     /// re-point the vault, or re-add it so its mirror is rebuilt.
+    ///
+    /// Both the fresh ingest and the reconcile derive the file only if its
+    /// KDF settings pass the gate (see [`KdfSettings`]):
+    /// [`EngineError::KdfApprovalRequired`] otherwise, until the call is
+    /// repeated with exactly the file's settings as `approved_kdf`.
+    #[uniffi::method(default(approved_kdf = None))]
     pub async fn sync_with_disk(
         &self,
         kdbx_path: String,
         password: String,
         keyfile: Option<Vec<u8>>,
         temp_dir: Option<String>,
+        approved_kdf: Option<KdfSettings>,
     ) -> Result<SyncWithDiskFfi, EngineError> {
         let path = PathBuf::from(kdbx_path);
         let pw = SecretString::from(password);
+        let approved = crate::kdf::approved_cost(approved_kdf)?;
 
         // Read as one pair under one lock: a mutation landing between two
         // separate reads would skew the fresh-mirror decision.
@@ -1303,7 +1349,7 @@ impl Engine {
             // it falls through to the reconcile below instead.
             None if !owes_write => {
                 match self
-                    .ingest_secret(path.clone(), pw.clone(), keyfile.clone())
+                    .ingest_secret(path.clone(), pw.clone(), keyfile.clone(), approved.clone())
                     .await
                 {
                     Ok(()) => return Ok(SyncWithDiskFfi::FreshIngest),
@@ -1336,7 +1382,12 @@ impl Engine {
         .await
         .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
         let outcome = self.with_engine_mut(|e| {
-            Ok(e.reconcile_with_disk_park_conflicts(&path, &composite, chrono::Utc::now())?)
+            Ok(e.reconcile_with_disk_kdf_policy(
+                &path,
+                &composite,
+                chrono::Utc::now(),
+                crate::kdf::policy(approved.as_ref()),
+            )?)
         })?;
 
         match outcome {
@@ -1411,6 +1462,85 @@ impl Engine {
         self.with_engine_mut(|e| {
             Ok(e.ingest_peer_from_kdbx(&path, &composite, &owner_id)?
                 .into())
+        })
+    }
+
+    /// Adopt a peer's changed KDF settings: the deliberate path past
+    /// [`Self::ingest_peer_kdbx`]'s [`EngineError::KdfParametersMismatch`],
+    /// once the user has seen the peer blob's settings ([`read_kdbx_kdf`] on
+    /// `peer_kdbx_path`) and approved them.
+    ///
+    /// First brings the mirror current with this vault's own file at
+    /// `vault_kdbx_path` ([`Self::sync_with_disk`], gated as ever on the
+    /// file's recorded KDF settings), since the adoption ends by saving over
+    /// that file. Then the peer blob is derived only if its header demands
+    /// exactly `approved_kdf` — an approval covers the settings the user saw
+    /// and nothing else, so a peer that changed them again since is refused
+    /// with [`EngineError::KdfParametersMismatch`] before deriving. It merges
+    /// under `owner_id` like any peer replica (identity and kind gates
+    /// included), and the merged mirror is saved to `vault_kdbx_path` inside
+    /// the peer's envelope — its cipher and KDF settings, with fresh seeds —
+    /// so this vault's file, and every replica it publishes, carries the
+    /// adopted settings, and they become the ones this vault records.
+    ///
+    /// `password` / `keyfile` are the vault's key factors (shared by both
+    /// files); `temp_dir` is as for [`Self::save_to_kdbx`].
+    ///
+    /// [`read_kdbx_kdf`]: crate::read_kdbx_kdf
+    #[allow(clippy::too_many_arguments)]
+    pub async fn adopt_peer_kdbx(
+        &self,
+        owner_id: String,
+        peer_kdbx_path: String,
+        vault_kdbx_path: String,
+        password: String,
+        keyfile: Option<Vec<u8>>,
+        approved_kdf: KdfSettings,
+        temp_dir: Option<String>,
+    ) -> Result<ParkConflictsResultFfi, EngineError> {
+        let approved = crate::kdf::cost_of_settings(&approved_kdf)?;
+        // The approval covers the vault's own file too, should it already
+        // carry the same settings (re-keyed by the same change).
+        self.sync_with_disk(
+            vault_kdbx_path.clone(),
+            password.clone(),
+            keyfile.clone(),
+            temp_dir.clone(),
+            Some(approved_kdf),
+        )
+        .await?;
+        let pw = SecretString::from(password);
+        let composite = tokio::task::spawn_blocking(move || {
+            crate::keyfile::composite_for_engine(pw.expose_secret().as_bytes(), keyfile.as_deref())
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
+        let peer = PathBuf::from(peer_kdbx_path);
+        let vault = PathBuf::from(vault_kdbx_path);
+        let temp_dir = temp_dir.map(PathBuf::from);
+        self.with_engine_mut(|e| {
+            Ok(e.adopt_peer_kdf(
+                &peer,
+                &composite,
+                &owner_id,
+                &approved,
+                &vault,
+                temp_dir.as_deref(),
+            )?
+            .into())
+        })
+    }
+
+    /// The KDF settings this vault recorded for its file — the settings a
+    /// derive of the file is held to (see [`KdfSettings`]) — or `None` when
+    /// none are recorded yet (a mirror not yet ingested from its file). The
+    /// "before" side of an approval prompt for a changed file.
+    pub fn recorded_kdf(&self) -> Result<Option<KdfSummary>, EngineError> {
+        self.with_engine(|e| {
+            e.recorded_kdf_cost()?
+                .as_ref()
+                .map(crate::kdf::summary)
+                .transpose()
         })
     }
 
@@ -1584,10 +1714,18 @@ impl Engine {
         path: PathBuf,
         pw: SecretString,
         keyfile: Option<Vec<u8>>,
+        approved: Option<KdfCost>,
     ) -> Result<(), EngineError> {
         let path_for_open = path.clone();
+        let recorded = self.with_engine(|e| Ok(e.recorded_kdf_cost()?))?;
         let result = tokio::task::spawn_blocking(move || {
-            open_unlocked_kf(&path_for_open, &pw, keyfile.as_deref())
+            crate::kdf::open_vault_file(
+                &path_for_open,
+                &pw,
+                keyfile.as_deref(),
+                recorded.as_ref(),
+                approved.as_ref(),
+            )
         })
         .await
         .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
@@ -1766,26 +1904,6 @@ fn hex_encode(bytes: [u8; 32]) -> String {
     s
 }
 
-/// Open the KDBX file at `path`, unlocking under `password`. Pulled out
-/// so the three async-slow-op methods can `spawn_blocking` it without
-/// repeating the open dance.
-/// Unlock the on-disk KDBX under the password plus an optional keyfile (raw
-/// keyfile file content). A vault keyed with a keyfile cannot be unlocked
-/// without it, so an absent / wrong keyfile fails closed here at the unlock
-/// step. Pulled out so the slow-op methods can `spawn_blocking` it.
-fn open_unlocked_kf(
-    path: &std::path::Path,
-    password: &SecretString,
-    keyfile: Option<&[u8]>,
-) -> Result<Kdbx<keepass_core::kdbx::Unlocked>, EngineError> {
-    let composite =
-        crate::keyfile::composite_for_engine(password.expose_secret().as_bytes(), keyfile)?;
-    Kdbx::open(path)
-        .and_then(keepass_core::kdbx::Kdbx::<keepass_core::kdbx::Sealed>::read_header)
-        .and_then(|k| k.unlock(&composite))
-        .map_err(|e| EngineError::Internal(format!("open kdbx: {e}")))
-}
-
 /// Destroy a vault's local-device data: remove the database key from the
 /// platform keystore via `key_provider` **and** delete the `SQLCipher`
 /// `SQLite` mirror sidecar files at `db_path`.
@@ -1919,7 +2037,14 @@ pub struct SelfHealingOpen {
 /// path). A nil-root file's rebuild instead leaves the mirror owing its
 /// stamped identity, so that next open reconciles with the file — whose
 /// identity it already carries — and the owed write lands as usual.
-#[uniffi::export(async_runtime = "tokio")]
+///
+/// A rebuild holds the KDBX to the KDF settings the discarded mirror
+/// recorded, when it could still read them (a rotated session key); with
+/// none readable (a stale database key) only to this process's ceiling. At
+/// exactly `approved_kdf` (see [`KdfSettings`]) it derives either way;
+/// otherwise [`EngineError::KdfApprovalRequired`], before deriving.
+#[uniffi::export(async_runtime = "tokio", default(approved_kdf = None))]
+#[allow(clippy::too_many_arguments)]
 pub async fn open_vault_self_healing(
     db_path: String,
     kdbx_path: String,
@@ -1928,8 +2053,10 @@ pub async fn open_vault_self_healing(
     key_provider: Arc<dyn VaultDbKeyProvider>,
     field_protector: Arc<dyn VaultFieldProtector>,
     file_watcher: Option<Arc<dyn VaultFileWatcher>>,
+    approved_kdf: Option<KdfSettings>,
 ) -> Result<SelfHealingOpen, EngineError> {
     let pw = SecretString::from(password);
+    let approved = crate::kdf::approved_cost(approved_kdf)?;
     tokio::task::spawn_blocking(move || {
         let db = PathBuf::from(&db_path);
         let kdbx = PathBuf::from(&kdbx_path);
@@ -1942,8 +2069,19 @@ pub async fn open_vault_self_healing(
         // password by unlocking the KDBX first, so a wrong password /
         // corrupt KDBX fails closed HERE and is surfaced as the genuine
         // error, never masked as a heal.
-        let heal = |reason: SidecarRebuildReason| -> Result<SelfHealingOpen, EngineError> {
-            let unlocked = open_unlocked_kf(&kdbx, &pw, keyfile.as_deref())?;
+        // `recorded` is the KDF cost the discarded mirror recorded, when it
+        // could still be read: the rebuild holds the file to it, as any open
+        // would.
+        let heal = |reason: SidecarRebuildReason,
+                    recorded: Option<eng::KdfCost>|
+         -> Result<SelfHealingOpen, EngineError> {
+            let unlocked = crate::kdf::open_vault_file(
+                &kdbx,
+                &pw,
+                keyfile.as_deref(),
+                recorded.as_ref(),
+                approved.as_ref(),
+            )?;
             let (mut inner, _discarded) = eng::Engine::rebuild_local_data(
                 &db,
                 &kp,
@@ -1983,8 +2121,9 @@ pub async fn open_vault_self_healing(
                 // answered by discarding the sidecar.
                 match inner.session_key_status()? {
                     eng::SessionKeyStatus::Rotated => {
+                        let recorded = inner.recorded_kdf_cost()?;
                         drop(inner);
-                        heal(SidecarRebuildReason::RotatedSessionKey)
+                        heal(SidecarRebuildReason::RotatedSessionKey, recorded)
                     }
                     eng::SessionKeyStatus::Matches | eng::SessionKeyStatus::NoProtectedData => {
                         Ok(SelfHealingOpen {
@@ -1994,7 +2133,10 @@ pub async fn open_vault_self_healing(
                     }
                 }
             }
-            Err(e) if e.is_recoverable_sidecar_failure() => heal(SidecarRebuildReason::StaleDbKey),
+            // The mirror can't be read, nor its recorded cost.
+            Err(e) if e.is_recoverable_sidecar_failure() => {
+                heal(SidecarRebuildReason::StaleDbKey, None)
+            }
             Err(e) => Err(e.into()),
         }
     })
@@ -2020,7 +2162,13 @@ pub async fn open_vault_self_healing(
 /// saved back to the KDBX is dropped. That is intrinsic to "re-ingest from
 /// the source of truth" and is acceptable for the mid-session SE-failure
 /// case (the session was already unusable for protected fields).
-#[uniffi::export(async_runtime = "tokio")]
+///
+/// The rebuild starts from no recorded KDF settings, so it derives the KDBX
+/// only within this process's ceiling or at exactly `approved_kdf`. A client
+/// holding the vault open can pass its `Engine::recorded_kdf` settings, so
+/// the rebuild keeps to them.
+#[uniffi::export(async_runtime = "tokio", default(approved_kdf = None))]
+#[allow(clippy::too_many_arguments)]
 pub async fn rebuild_vault_local_data(
     db_path: String,
     kdbx_path: String,
@@ -2029,15 +2177,18 @@ pub async fn rebuild_vault_local_data(
     key_provider: Arc<dyn VaultDbKeyProvider>,
     field_protector: Arc<dyn VaultFieldProtector>,
     file_watcher: Option<Arc<dyn VaultFileWatcher>>,
+    approved_kdf: Option<KdfSettings>,
 ) -> Result<u32, EngineError> {
     let pw = SecretString::from(password);
+    let approved = crate::kdf::approved_cost(approved_kdf)?;
     tokio::task::spawn_blocking(move || {
         let db = PathBuf::from(&db_path);
         let kdbx = PathBuf::from(&kdbx_path);
         let kp = BridgeDbKeyProvider::new(key_provider);
         let fp: Arc<dyn keepass_core::protector::FieldProtector> =
             Arc::new(BridgeProtector::new(field_protector));
-        let unlocked = open_unlocked_kf(&kdbx, &pw, keyfile.as_deref())?;
+        let unlocked =
+            crate::kdf::open_vault_file(&kdbx, &pw, keyfile.as_deref(), None, approved.as_ref())?;
         let (mut inner, discarded) = eng::Engine::rebuild_local_data(
             &db,
             &kp,

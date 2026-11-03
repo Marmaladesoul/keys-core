@@ -429,6 +429,7 @@ async fn sync_with_disk_reconciles_an_unsigned_mirror_that_owes_a_write() {
             KDBX_PASSWORD.to_owned(),
             None,
             None,
+            None,
         )
         .await
         .expect("sync_with_disk must bring the mirror current, not refuse");
@@ -1293,6 +1294,7 @@ async fn open_vault_self_healing_rebuilds_a_stale_keyed_sidecar() {
         Arc::new(WrongDbKey),
         Arc::new(FixedProtector),
         None,
+        None,
     )
     .await
     .expect("self-healing open must succeed under a stale key");
@@ -1326,6 +1328,7 @@ async fn open_vault_self_healing_rebuilds_a_stale_keyed_sidecar() {
         None,
         Arc::new(WrongDbKey),
         Arc::new(FixedProtector),
+        None,
         None,
     )
     .await
@@ -1371,6 +1374,7 @@ async fn open_vault_self_healing_rebuilds_a_rotated_session_key_sidecar() {
         Arc::new(FixedDbKey),
         Arc::new(RotatedProtector),
         None,
+        None,
     )
     .await
     .expect("self-healing open must succeed under a rotated session key");
@@ -1410,6 +1414,7 @@ async fn open_vault_self_healing_rebuilds_a_rotated_session_key_sidecar() {
         None,
         Arc::new(FixedDbKey),
         Arc::new(RotatedProtector),
+        None,
         None,
     )
     .await
@@ -1458,6 +1463,7 @@ async fn open_vault_self_healing_preserves_the_sidecar_when_the_protector_is_una
         Arc::new(FixedDbKey),
         Arc::new(FailingProtector),
         None,
+        None,
     )
     .await
     .expect_err("an unavailable protector must fail the open, not heal it");
@@ -1483,6 +1489,7 @@ async fn open_vault_self_healing_preserves_the_sidecar_when_the_protector_is_una
         None,
         Arc::new(FixedDbKey),
         Arc::new(FixedProtector),
+        None,
         None,
     )
     .await
@@ -1537,6 +1544,7 @@ async fn open_vault_self_healing_wrong_password_fails_closed() {
         Arc::new(WrongDbKey),
         Arc::new(FixedProtector),
         None,
+        None,
     )
     .await
     .expect_err("stale key + wrong password must fail closed, not open");
@@ -1575,6 +1583,7 @@ async fn rebuild_vault_local_data_rebuilds_without_deleting_the_key() {
             deleted: deleted.clone(),
         }),
         Arc::new(FixedProtector),
+        None,
         None,
     )
     .await

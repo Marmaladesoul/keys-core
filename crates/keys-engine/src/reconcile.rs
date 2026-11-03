@@ -37,7 +37,7 @@ use crate::conflict_rows;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::events::{ChangeEvent, ConflictPayload};
-use crate::kdf_cost::KdfCost;
+use crate::kdf_cost::{self, KdfCost, KdfPolicy};
 use crate::util::tree::{contains_entry, find_entry};
 
 /// Owner sentinel for the disk/iroh sync peer.
@@ -582,12 +582,16 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     kdbx_path: &Path,
     composite_key: &CompositeKey,
     _now: chrono::DateTime<chrono::Utc>,
+    kdf: KdfPolicy<'_>,
 ) -> Result<ParkConflictsResult, EngineError> {
     // The disk file is one peer under the FILE_OWNER sentinel — the
-    // file-watcher / Syncthing / external-client path. No KDF-cost gate
-    // here: this is the vault's own file, whose KDF settings its user may
-    // legitimately change in any client.
-    let disk = unlock_kdbx(engine, read_kdbx_header(kdbx_path)?, composite_key)?;
+    // file-watcher / Syncthing / external-client path. It is the vault's own
+    // file, whose KDF settings its user may legitimately change in any
+    // client — so a changed cost isn't refused outright like a peer's, but
+    // it isn't derived until the user approves it either.
+    let disk = read_kdbx_header(kdbx_path)?;
+    kdf_cost::check_vault_header(&disk, recorded_kdf_cost(engine)?.as_ref(), kdf)?;
+    let disk = unlock_kdbx(engine, disk, composite_key)?;
     let result = ingest_kdbx_as_owner(engine, &disk, FILE_OWNER)?;
     // This mirror now saves under this file's envelope, so its recorded
     // cipher / KDF cost follow the file — recorded only once the file has
@@ -620,15 +624,89 @@ pub(crate) fn ingest_peer_from_kdbx(
 /// from the header alone — no derivation, nothing written.
 fn ensure_same_kdf_cost(engine: &Engine, peer: &Kdbx<HeaderRead>) -> Result<(), EngineError> {
     let local = crate::meta::read_kdf_cost(engine.conn())?;
-    let peer_params = peer
-        .header()
-        .decode_kdf_params()
-        .map_err(|e| EngineError::Serialise(format!("read peer kdf parameters: {e}")))?;
-    let peer = KdfCost::of(&peer_params);
+    let peer = KdfCost::of_header(peer)?;
     if peer == local {
         Ok(())
     } else {
         Err(EngineError::KdfParametersMismatch { local, peer })
+    }
+}
+
+/// The KDF cost the mirror recorded for its vault file, `None` when it
+/// recorded none (a fresh or pre-fact-row mirror).
+pub(crate) fn recorded_kdf_cost(engine: &Engine) -> Result<Option<KdfCost>, EngineError> {
+    match crate::meta::read_kdf_cost(engine.conn()) {
+        Ok(cost) => Ok(Some(cost)),
+        Err(EngineError::MirrorKdfUnknown) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Adopt a peer replica whose KDF settings changed — the approved
+/// counterpart of [`ingest_peer_from_kdbx`]. The peer blob is derived only
+/// if its header demands exactly the `approved` cost; it then merges under
+/// `owner` like any peer replica, and the merged mirror is saved to the
+/// vault file at `vault_path` **inside the peer's envelope** (its cipher
+/// and KDF parameters, with fresh seeds), so this vault's file — and every
+/// replica it publishes — carries the adopted settings, and the mirror
+/// records them as its own.
+///
+/// The facts are recorded only after the save lands: a failed save leaves
+/// the mirror merged but keyed as before, so the next peer round asks
+/// again rather than refusing this vault's own file.
+pub(crate) fn adopt_peer_kdf(
+    engine: &mut Engine,
+    peer_path: &Path,
+    composite_key: &CompositeKey,
+    owner: &str,
+    approved: &KdfCost,
+    vault_path: &Path,
+    temp_dir: Option<&Path>,
+) -> Result<ParkConflictsResult, EngineError> {
+    let peer = read_kdbx_header(peer_path)?;
+    let peer_cost = KdfCost::of_header(&peer)?;
+    if peer_cost != *approved {
+        // The approval was for other settings — the peer has moved on since
+        // the user saw it. Refused as any unapproved peer cost is.
+        return Err(EngineError::KdfParametersMismatch {
+            local: crate::meta::read_kdf_cost(engine.conn())?,
+            peer: peer_cost,
+        });
+    }
+    // The save replaces the vault's file, so it must still be the file the
+    // mirror is current with — what sits at the path otherwise has been
+    // neither merged nor identity-checked. Checked before the derive, and
+    // again after it, since the derive can take a while.
+    ensure_vault_file_current(engine, vault_path)?;
+    // Unlocked with no field protector, like any save template: a
+    // protector's side table would hold the peer's protected values, and
+    // the save would write those over the merged mirror's. The ingest reads
+    // the same plaintext either way.
+    let mut peer = peer
+        .unlock(composite_key)
+        .map_err(|e| EngineError::Serialise(format!("unlock peer kdbx: {e}")))?;
+    ensure_vault_file_current(engine, vault_path)?;
+    let result = ingest_kdbx_as_owner(engine, &peer, owner)?;
+    crate::save::save(engine, vault_path, &mut peer, temp_dir)?;
+    // The adopted settings become the recorded ones. The fact rows are
+    // mirror state, so the file just written still corresponds: settle the
+    // watermark past them, or the mirror would owe the file a rewrite.
+    crate::meta::refresh_kdbx_outer_header_facts(engine.conn(), peer.outer_header())?;
+    let settled = engine.persistence_state()?.mutation_seq;
+    engine.record_kdbx_correspondence(vault_path, settled)?;
+    engine.emit(ChangeEvent::SaveCompleted);
+    Ok(result)
+}
+
+/// Refuse with [`EngineError::VaultFileChanged`] unless the file at
+/// `vault_path` is the one the mirror last corresponded with (its stat
+/// signature) — the precondition for writing over it.
+fn ensure_vault_file_current(engine: &Engine, vault_path: &Path) -> Result<(), EngineError> {
+    let recorded = engine.kdbx_state_signature()?;
+    if recorded.is_some() && recorded == Some(crate::KdbxStateSignature::from_path(vault_path)?) {
+        Ok(())
+    } else {
+        Err(EngineError::VaultFileChanged)
     }
 }
 
