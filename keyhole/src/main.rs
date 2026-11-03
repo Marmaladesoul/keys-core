@@ -21,6 +21,7 @@
 //! scenario scripts can parse them.
 
 mod adapters;
+mod kdf;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,11 +33,11 @@ use keys_ffi::{
     AttachmentChoiceFfi, AttachmentChoiceKindFfi, ConflictPayloadFfi, ConflictSideFfi,
     DeleteEditChoiceEntryFfi, DeleteEditChoiceFfi, Engine, EngineEntryUpdate,
     EntryAttachmentChoiceFfi, EntryFieldChoiceFfi, EntryIconChoiceFfi, EntrySave, FieldChoiceFfi,
-    IconRef, NewCustomField, NewEntryFields, Page, ParkConflictsResultFfi, RecycleBinFilter,
-    ResolutionFfi, SearchScope, SidecarRebuildReason, SyncWithDiskFfi, VaultIdentityVerdict,
-    create_vault as ffi_create_vault, create_vault_deterministic as ffi_create_vault_deterministic,
-    open_vault_self_healing, purge_vault_local_data, rebuild_vault_local_data,
-    verify_vault_identity,
+    IconRef, KdfCeilingProfile, KdfSettings, NewCustomField, NewEntryFields, Page,
+    ParkConflictsResultFfi, RecycleBinFilter, ResolutionFfi, SearchScope, SidecarRebuildReason,
+    SyncWithDiskFfi, VaultIdentityVerdict, create_vault as ffi_create_vault,
+    create_vault_deterministic as ffi_create_vault_deterministic, open_vault_self_healing,
+    purge_vault_local_data, rebuild_vault_local_data, verify_vault_identity,
 };
 
 use adapters::{FixedDbKey, FixedProtector, RecordingDbKey};
@@ -96,6 +97,29 @@ struct Cli {
     /// is replayable.
     #[arg(long = "uuid-seed", global = true)]
     uuid_seed: Option<u64>,
+
+    /// Approve exactly these KDF settings for this command's derive of a
+    /// vault file whose settings need approval (changed since the mirror
+    /// recorded them, or past the ceiling on a first open), and for
+    /// `adopt-peer-kdf`. A spec as `keyhole kdf` prints it, e.g.
+    /// `argon2id:memory=67108864:iterations=2:parallelism=2:version=19`.
+    #[arg(long = "approve-kdf", global = true)]
+    approve_kdf: Option<String>,
+
+    /// The KDF ceiling this process derives within without approval when
+    /// nothing is recorded to compare with — `memory-constrained` stands in
+    /// for a credential provider extension.
+    #[arg(long = "kdf-ceiling", global = true, value_enum, default_value_t = CeilingArg::Standard)]
+    kdf_ceiling: CeilingArg,
+}
+
+/// `--kdf-ceiling` values.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum CeilingArg {
+    /// An ordinary app process.
+    Standard,
+    /// A process with a hard memory budget.
+    MemoryConstrained,
 }
 
 #[derive(Subcommand)]
@@ -336,6 +360,49 @@ enum Command {
         /// Owner id the peer's rows land under (its device id in real sync).
         #[arg(long, default_value = "keyhole-peer")]
         owner: String,
+    },
+    /// Adopt a peer replica whose KDF settings changed — the deliberate
+    /// path past `ingest-peer`'s KDF refusal. Requires `--approve-kdf` with
+    /// the peer's exact settings (`keyhole kdf <peer>`): the peer is derived
+    /// only if it still demands exactly those, then merged, and the vault
+    /// is saved inside the peer's envelope so it carries the adopted
+    /// settings from then on.
+    AdoptPeerKdf {
+        /// Path to the .kdbx vault receiving the merge.
+        vault: PathBuf,
+        /// Path to the peer's .kdbx with the changed KDF settings.
+        peer_kdbx: PathBuf,
+        /// Owner id the peer's rows land under (its device id in real sync).
+        #[arg(long, default_value = "keyhole-peer")]
+        owner: String,
+    },
+    /// Print the KDF settings a vault file demands, read from its header
+    /// alone (no password, no derive): one tab-separated line led by the
+    /// `--approve-kdf` spec. `--recorded` prints what the vault's mirror
+    /// recorded for its file instead (`none` if nothing), without syncing.
+    Kdf {
+        /// Path to the .kdbx vault (or peer copy).
+        vault: PathBuf,
+        /// Print the mirror's recorded settings rather than the file's.
+        #[arg(long)]
+        recorded: bool,
+    },
+    /// Change a vault file's KDF settings in place, as another client
+    /// would: re-key it under the same password with the overridden
+    /// parameters. Not a client capability of Keys, so it bypasses the seam
+    /// (password-only vaults).
+    SetKdf {
+        /// Path to the .kdbx vault to change.
+        vault: PathBuf,
+        /// Argon2 memory cost, in MiB (Argon2 vaults only).
+        #[arg(long)]
+        argon2_memory_mib: Option<u64>,
+        /// Argon2 passes (Argon2 vaults only).
+        #[arg(long)]
+        argon2_iterations: Option<u64>,
+        /// AES-KDF rounds (AES-KDF vaults only).
+        #[arg(long)]
+        aes_rounds: Option<u64>,
     },
     /// List UUIDs of entries currently held in an unresolved sync
     /// conflict — the headless twin of the GUI's conflict badge. Read
@@ -772,6 +839,11 @@ async fn main() -> Result<()> {
     restore_default_sigpipe();
 
     let cli = Cli::parse();
+    kdf::set_approved(cli.approve_kdf.as_deref())?;
+    keys_ffi::set_kdf_ceiling(match cli.kdf_ceiling {
+        CeilingArg::Standard => KdfCeilingProfile::Standard,
+        CeilingArg::MemoryConstrained => KdfCeilingProfile::MemoryConstrained,
+    });
     let password = read_password(&cli.password_env)?;
     let clock_ms = cli.clock_ms;
     let uuid_seed = cli.uuid_seed;
@@ -971,6 +1043,30 @@ async fn main() -> Result<()> {
             session.ingest_peer(owner, &peer_kdbx).await?;
             session.finish().await?;
         }
+        Command::AdoptPeerKdf {
+            vault,
+            peer_kdbx,
+            owner,
+        } => {
+            let approved = kdf::approved().context("adopt-peer-kdf needs --approve-kdf")?;
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.adopt_peer_kdf(owner, &peer_kdbx, approved).await?;
+            session.finish().await?;
+        }
+        Command::Kdf { vault, recorded } => kdf::print(&vault, recorded)?,
+        Command::SetKdf {
+            vault,
+            argon2_memory_mib,
+            argon2_iterations,
+            aes_rounds,
+        } => kdf::set_kdf(
+            &vault,
+            &password,
+            argon2_memory_mib,
+            argon2_iterations,
+            aes_rounds,
+        )?,
         Command::ListConflicts { vault } => {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
@@ -1059,6 +1155,7 @@ async fn main() -> Result<()> {
                 keyfile.clone(),
                 !unmark,
                 None,
+                kdf::approved(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("mark_test_vault_file: {e:?}"))?;
@@ -1323,6 +1420,7 @@ impl Session {
                     Arc::new(FixedDbKey),
                     Arc::new(FixedProtector),
                     None, // no file watcher — keyhole drives state explicitly
+                    kdf::approved(),
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("engine open: {e:?}"))?;
@@ -1376,6 +1474,7 @@ impl Session {
                 password.to_owned(),
                 session.keyfile.clone(),
                 None,
+                kdf::approved(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("sync_with_disk: {e:?}"))?;
@@ -1432,6 +1531,7 @@ impl Session {
                 self.vault_path.to_string_lossy().into_owned(),
                 self.password.clone(),
                 self.keyfile.clone(),
+                kdf::approved(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("reingest: {e}"))?;
@@ -1893,6 +1993,33 @@ impl Session {
         Ok(())
     }
 
+    /// Adopt the peer replica at `peer`, whose KDF settings differ from
+    /// this vault's, under the `approved` settings (see `adopt-peer-kdf`).
+    async fn adopt_peer_kdf(
+        &self,
+        owner: String,
+        peer: &Path,
+        approved: KdfSettings,
+    ) -> Result<()> {
+        anyhow::ensure!(peer.exists(), "peer vault not found: {}", peer.display());
+        let result = self
+            .engine
+            .adopt_peer_kdbx(
+                owner.clone(),
+                peer.to_string_lossy().into_owned(),
+                self.vault_path.to_string_lossy().into_owned(),
+                self.password.clone(),
+                self.keyfile.clone(),
+                approved,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("adopt_peer_kdbx: {e:?}"))?;
+        print_park_result(&format!("adopted peer '{owner}'"), &result);
+        println!("vault saved under the peer's KDF settings");
+        Ok(())
+    }
+
     /// Print the UUIDs of entries held in unresolved conflicts — one
     /// per line, machine-greppable.
     fn list_conflicts(&self) -> Result<()> {
@@ -2320,7 +2447,7 @@ fn mirror_dir_for(vault: &Path) -> PathBuf {
 /// The vault's persistent mirror DB file: `<vault>.mirror/mirror.sqlite`.
 /// The one place the mirror filename is spelled, shared by `Session::open`
 /// (which opens it) and `purge_vault` (which destroys it).
-fn mirror_db_for(vault: &Path) -> PathBuf {
+pub(crate) fn mirror_db_for(vault: &Path) -> PathBuf {
     mirror_dir_for(vault).join("mirror.sqlite")
 }
 
@@ -2726,6 +2853,7 @@ async fn rebuild_vault(vault: &Path, password: &str, keyfile: Option<Vec<u8>>) -
         Arc::new(FixedDbKey),
         Arc::new(FixedProtector),
         None,
+        kdf::approved(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("rebuild: {e:?}"))?;
@@ -2783,6 +2911,7 @@ fn verify_identity(
         password.to_owned(),
         keyfile,
         expected.to_owned(),
+        kdf::approved(),
     )
     .map_err(|e| anyhow::anyhow!("verify: {e}"))?;
     match verdict {

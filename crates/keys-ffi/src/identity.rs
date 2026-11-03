@@ -99,19 +99,27 @@ pub enum VaultIdentityVerdict {
 ///
 /// - [`VaultError::Io`] if `path` cannot be read (missing, permission).
 /// - [`VaultError::Format`] if the file is not a KDBX file at all (bad magic).
+/// - [`VaultError::KdfApprovalRequired`] if the file's KDF settings go past
+///   this process's ceiling and aren't `approved_kdf` (see
+///   [`crate::KdfSettings`]) — refused from the header, before deriving. A
+///   caller re-linking a vault it knows can pass that vault's recorded
+///   settings (`Engine::recorded_kdf`) as the approval.
 ///
 /// A wrong password / malformed keyfile / corruption past the magic does NOT
 /// error: it is reported as [`VaultIdentityVerdict::Undecryptable`], because
 /// "won't open under this credential" is a verdict the caller acts on (re-
 /// derive), not an exceptional failure.
-#[uniffi::export]
+#[uniffi::export(default(approved_kdf = None))]
 pub fn verify_vault_identity(
     path: String,
     password: String,
     keyfile: Option<Vec<u8>>,
     expected_root_uuid: String,
+    approved_kdf: Option<crate::KdfSettings>,
 ) -> Result<VaultIdentityVerdict, VaultError> {
-    match read_file_identity(&path, &password, keyfile.as_deref()) {
+    let approved = crate::kdf::approved_cost(approved_kdf)
+        .map_err(|e| VaultError::Unexpected(e.to_string()))?;
+    match read_file_identity(&path, &password, keyfile.as_deref(), approved.as_ref()) {
         Ok(picked) => Ok(classify(picked, &expected_root_uuid)),
         // "Won't open under this credential" is a verdict, not an error — it
         // covers a genuine re-keyed vault as well as a wrong/corrupt file.
@@ -149,6 +157,7 @@ fn read_file_identity(
     path: &str,
     password: &str,
     keyfile: Option<&[u8]>,
+    approved: Option<&keys_engine::KdfCost>,
 ) -> Result<Uuid, VaultError> {
     let secret = SecretString::from(password.to_owned());
     // Same composite construction as create / open / re-key, so a
@@ -160,9 +169,11 @@ fn read_file_identity(
 
     // No field protector: we read only the group tree's root id, never a
     // protected field, and the unlocked vault is dropped before we return.
-    let kdbx = Kdbx::open(std::path::Path::new(path))?
-        .read_header()?
-        .unlock_with_protector(&composite, crate::protector::bridge(None))?;
+    // No mirror to hold the file's KDF settings to: the ceiling, or the
+    // caller's approval.
+    let read = Kdbx::open(std::path::Path::new(path))?.read_header()?;
+    crate::kdf::check_unrecorded_file(&read, approved)?;
+    let kdbx = read.unlock_with_protector(&composite, crate::protector::bridge(None))?;
 
     Ok(keys_engine::identity::file_identity(&kdbx))
 }

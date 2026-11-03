@@ -100,7 +100,13 @@ async fn bound_to_nil_root(
     std::fs::write(&kdbx_path, bytes).expect("write vault");
     let engine = open_fresh_engine(&dir.join("keys.db"));
     let first = engine
-        .sync_with_disk(path_str(&kdbx_path), KDBX_PASSWORD.to_owned(), None, None)
+        .sync_with_disk(
+            path_str(&kdbx_path),
+            KDBX_PASSWORD.to_owned(),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("first sync");
     assert!(
@@ -140,7 +146,13 @@ async fn first_save_writes_the_stamped_identity_into_a_nil_root_file() {
         .await
         .expect("a later save");
     let again = engine
-        .sync_with_disk(path_str(&kdbx_path), KDBX_PASSWORD.to_owned(), None, None)
+        .sync_with_disk(
+            path_str(&kdbx_path),
+            KDBX_PASSWORD.to_owned(),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("sync after stamping");
     assert!(matches!(again, SyncWithDiskFfi::UpToDate), "got {again:?}");
@@ -221,7 +233,13 @@ async fn a_touch_only_change_before_the_flush_reconciles_as_the_same_vault() {
         .expect("bump mtime");
 
     engine
-        .sync_with_disk(path_str(&kdbx_path), KDBX_PASSWORD.to_owned(), None, None)
+        .sync_with_disk(
+            path_str(&kdbx_path),
+            KDBX_PASSWORD.to_owned(),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("the stamped-from file reconciles as the same vault");
     engine
@@ -248,6 +266,7 @@ fn relink_verify_reads_a_nil_root_files_stamped_identity() {
             KDBX_PASSWORD.to_owned(),
             None,
             stamp_of(&bytes).to_string(),
+            None,
         )
         .expect("verify")
     };

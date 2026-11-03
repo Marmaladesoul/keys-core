@@ -161,6 +161,11 @@ pub async fn create_vault_deterministic(
 pub(crate) fn vault_err_to_engine_err(e: VaultError) -> EngineError {
     match e {
         VaultError::WrongKey => EngineError::WrongKey,
+        // A file with no mirror behind it: nothing recorded to report.
+        VaultError::KdfApprovalRequired(file) => EngineError::KdfApprovalRequired {
+            recorded: None,
+            file,
+        },
         other => EngineError::Internal(other.to_string()),
     }
 }

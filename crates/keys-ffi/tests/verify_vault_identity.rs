@@ -67,7 +67,8 @@ async fn same_vault_matches() {
     create(&path, "Vault").await;
     let expected = root_uuid(&path, "pw");
 
-    let verdict = verify_vault_identity(path, "pw".to_owned(), None, expected).expect("verify");
+    let verdict =
+        verify_vault_identity(path, "pw".to_owned(), None, expected, None).expect("verify");
     assert_eq!(verdict, VaultIdentityVerdict::Match);
 }
 
@@ -82,7 +83,7 @@ async fn different_vault_mismatches() {
 
     // B decrypts under the same password but is a different vault — the
     // dangerous case the guard exists for. Definitive Mismatch.
-    let verdict = verify_vault_identity(b, "pw".to_owned(), None, a_root).expect("verify");
+    let verdict = verify_vault_identity(b, "pw".to_owned(), None, a_root, None).expect("verify");
     assert_eq!(verdict, VaultIdentityVerdict::Mismatch);
 }
 
@@ -97,7 +98,8 @@ async fn identity_is_path_agnostic() {
     std::fs::copy(&original, &moved).expect("copy to new path");
     let expected = root_uuid(&original, "pw");
 
-    let verdict = verify_vault_identity(moved, "pw".to_owned(), None, expected).expect("verify");
+    let verdict =
+        verify_vault_identity(moved, "pw".to_owned(), None, expected, None).expect("verify");
     assert_eq!(verdict, VaultIdentityVerdict::Match);
 }
 
@@ -121,7 +123,8 @@ async fn wrong_password_is_undecryptable_not_mismatch() {
     .expect("create");
     let expected = root_uuid(&path, "correct");
 
-    let verdict = verify_vault_identity(path, "wrong".to_owned(), None, expected).expect("verify");
+    let verdict =
+        verify_vault_identity(path, "wrong".to_owned(), None, expected, None).expect("verify");
     assert_eq!(verdict, VaultIdentityVerdict::Undecryptable);
 }
 
@@ -134,6 +137,7 @@ fn missing_file_errors_io() {
         "pw".to_owned(),
         None,
         "11111111-1111-1111-1111-111111111111".to_owned(),
+        None,
     );
     assert!(matches!(result, Err(VaultError::Io(_))), "{result:?}");
 }
@@ -148,6 +152,7 @@ fn non_kdbx_file_errors_format() {
         "pw".to_owned(),
         None,
         "11111111-1111-1111-1111-111111111111".to_owned(),
+        None,
     );
     assert!(matches!(result, Err(VaultError::Format)), "{result:?}");
 }
@@ -176,13 +181,13 @@ async fn keyfile_vault_without_its_keyfile_is_undecryptable() {
     let any = "11111111-1111-1111-1111-111111111111".to_owned();
 
     // Right password, NO keyfile → Undecryptable.
-    let without =
-        verify_vault_identity(path.clone(), "pw".to_owned(), None, any.clone()).expect("verify");
+    let without = verify_vault_identity(path.clone(), "pw".to_owned(), None, any.clone(), None)
+        .expect("verify");
     assert_eq!(without, VaultIdentityVerdict::Undecryptable);
 
     // Right password, WRONG keyfile → Undecryptable.
     let wrong_keyfile = generate_keyfile().expect("mint second keyfile");
-    let wrong =
-        verify_vault_identity(path, "pw".to_owned(), Some(wrong_keyfile), any).expect("verify");
+    let wrong = verify_vault_identity(path, "pw".to_owned(), Some(wrong_keyfile), any, None)
+        .expect("verify");
     assert_eq!(wrong, VaultIdentityVerdict::Undecryptable);
 }

@@ -94,6 +94,14 @@ pub enum VaultError {
     #[error("field protector failed: {0}")]
     Protector(String),
 
+    /// The KDBX file demands KDF settings past this process's ceiling
+    /// (`set_kdf_ceiling`) that the caller didn't approve, so it wasn't
+    /// derived. Refused from the file's outer header alone. The string
+    /// carries the settings (display form); approve them as for
+    /// `EngineError::KdfApprovalRequired`.
+    #[error("the vault file's KDF ({0}) needs approval before deriving")]
+    KdfApprovalRequired(String),
+
     /// A new variant of an upstream `#[non_exhaustive]` error enum
     /// (`keepass_core::model::ModelError`, `keepass_merge::MergeError`)
     /// reached the FFI facade without an explicit mapping in this

@@ -58,7 +58,7 @@ async fn engine_over(
         None,
     )?;
     engine
-        .ingest_from_kdbx_with_keyfile(kdbx_path.to_owned(), PASSWORD.to_owned(), keyfile)
+        .ingest_from_kdbx_with_keyfile(kdbx_path.to_owned(), PASSWORD.to_owned(), keyfile, None)
         .await?;
     Ok(engine)
 }

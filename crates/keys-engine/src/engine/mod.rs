@@ -23,6 +23,7 @@ use crate::events::{ChangeEvent, ConflictPayload, DataChangeObserver};
 use crate::file_watcher::{FileWatcher, FileWatcherEvent, FileWatcherObserver};
 use crate::fingerprint;
 use crate::ingest;
+use crate::kdf_cost::{KdfCost, KdfPolicy};
 use crate::key_provider::{DbKey, KeyProvider};
 use crate::migrations;
 use crate::projection;
@@ -1046,9 +1047,35 @@ impl Engine {
         composite_key: &CompositeKey,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<ParkConflictsResult, EngineError> {
+        self.reconcile_with_disk_kdf_policy(kdbx_path, composite_key, now, KdfPolicy::STANDARD)
+    }
+
+    /// [`Self::reconcile_with_disk_park_conflicts`] under an explicit KDF
+    /// policy: the file is derived only if [`crate::kdf_cost::check_vault_file`]
+    /// passes it — its KDF cost equals the one this mirror recorded, or is
+    /// `kdf.approved`, or (nothing recorded) is within `kdf.ceiling`. The
+    /// reconcile then records the file's cost as this vault's.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::KdfApprovalRequired`] when the gate refuses, from the
+    /// file's outer header alone — nothing derived or written. Otherwise as
+    /// [`Self::reconcile_with_disk_park_conflicts`].
+    pub fn reconcile_with_disk_kdf_policy(
+        &mut self,
+        kdbx_path: &Path,
+        composite_key: &CompositeKey,
+        now: chrono::DateTime<chrono::Utc>,
+        kdf: KdfPolicy<'_>,
+    ) -> Result<ParkConflictsResult, EngineError> {
         let was_dirty = self.persistence_state()?.is_dirty();
-        let result =
-            reconcile::reconcile_with_disk_park_conflicts(self, kdbx_path, composite_key, now)?;
+        let result = reconcile::reconcile_with_disk_park_conflicts(
+            self,
+            kdbx_path,
+            composite_key,
+            now,
+            kdf,
+        )?;
 
         // Digest-proven convergence is a mirror↔disk correspondence
         // point — but only when the mirror was CLEAN going in. Then
@@ -1109,6 +1136,66 @@ impl Engine {
         owner: &str,
     ) -> Result<ParkConflictsResult, EngineError> {
         reconcile::ingest_peer_from_kdbx(self, kdbx_path, composite_key, owner)
+    }
+
+    /// Adopt a peer replica whose KDF settings differ from this vault's,
+    /// after the user approved exactly them: the deliberate path past the
+    /// [`EngineError::KdfParametersMismatch`] refusal of
+    /// [`Self::ingest_peer_from_kdbx`].
+    ///
+    /// The blob at `kdbx_path` is derived only if its outer header demands
+    /// exactly the `approved` cost, so an approval covers the settings the
+    /// user saw and nothing else — a peer that has moved on since is refused
+    /// like any unapproved one. It then merges under `owner` as a peer
+    /// replica does (the identity and kind gates included), and the merged
+    /// mirror is saved to the vault file at `vault_path` inside the peer's
+    /// envelope: its cipher and KDF parameters, with fresh seeds. This
+    /// vault's file and the replicas it publishes then carry the adopted
+    /// settings, and the mirror records them as its own.
+    ///
+    /// Bring the mirror current with `vault_path` first — the save writes
+    /// the mirror over the file, as [`Self::save_to_kdbx`] does, and only
+    /// while the file is still the one the mirror corresponds with.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::KdfParametersMismatch`] when the blob's cost isn't the
+    /// approved one (checked before deriving; nothing written);
+    /// [`EngineError::MirrorKdfUnknown`] if, in that case, the mirror records
+    /// no cost to report; [`EngineError::VaultFileChanged`] if the file at
+    /// `vault_path` isn't the one the mirror last corresponded with, before
+    /// or after the derive (nothing merged or written). Otherwise as
+    /// [`Self::ingest_peer_from_kdbx`], plus the save's IO errors.
+    pub fn adopt_peer_kdf(
+        &mut self,
+        kdbx_path: &Path,
+        composite_key: &CompositeKey,
+        owner: &str,
+        approved: &KdfCost,
+        vault_path: &Path,
+        temp_dir: Option<&Path>,
+    ) -> Result<ParkConflictsResult, EngineError> {
+        reconcile::adopt_peer_kdf(
+            self,
+            kdbx_path,
+            composite_key,
+            owner,
+            approved,
+            vault_path,
+            temp_dir,
+        )
+    }
+
+    /// The KDF cost this mirror recorded for its vault file — the cost
+    /// [`crate::kdf_cost::check_vault_file`] holds the file to — or `None`
+    /// when it recorded none (a mirror not yet ingested from its file).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Sqlite`] / [`EngineError::Projection`] if the rows
+    /// can't be read.
+    pub fn recorded_kdf_cost(&self) -> Result<Option<KdfCost>, EngineError> {
+        reconcile::recorded_kdf_cost(self)
     }
 
     /// Build the rich conflict payload for the currently **held** (parked)
