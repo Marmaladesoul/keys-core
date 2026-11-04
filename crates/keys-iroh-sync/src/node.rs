@@ -1460,6 +1460,92 @@ mod tests {
         subscriber.shutdown().await.expect("shutdown");
     }
 
+    /// How long a peer gets to pick up a lost blob after a round with a holder
+    /// succeeds. Far longer than the transfer takes between local nodes.
+    const LOST_BLOB_RECOVERY_WAIT: Duration = Duration::from_secs(30);
+    /// How long a round between local nodes may take.
+    const LOCAL_ROUND_WAIT: Duration = Duration::from_secs(30);
+    /// How long the doc's event stream must stay silent before the rounds of
+    /// the subscriber's join count as finished.
+    const JOIN_ROUNDS_QUIET: Duration = Duration::from_secs(2);
+
+    /// KNOWN GAP, red today. A successful round with a peer holding a blob the
+    /// doc engine lost doesn't recover it: only a caller's `fetch_blob` does,
+    /// or a neighbour announcing that it just finished downloading that blob.
+    /// So a peer that only fetches and never reads keeps an entry without its
+    /// content when the blob's holder comes back already holding it, and can't
+    /// pass that content on. A transfer interrupted because its source went
+    /// offline ends up here too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "known gap: a successful round doesn't recover a blob the doc engine lost"]
+    async fn a_lost_blob_is_fetched_once_a_round_with_its_holder_succeeds() {
+        let (publisher, _pb, _pd) = bind_test_node().await;
+        let (subscriber, _sb, _sd) = bind_test_node().await;
+        let payload = b"content that arrives after its entry".to_vec();
+        let hash = iroh_blobs::Hash::new(&payload);
+
+        let doc_id = share_one_entry(
+            &publisher,
+            &subscriber,
+            b"head",
+            &payload,
+            false,
+            DownloadPolicy::Everything,
+        )
+        .await;
+        let mut events = subscriber
+            .subscribe_doc_events(&doc_id)
+            .await
+            .expect("events");
+        while tokio::time::timeout(JOIN_ROUNDS_QUIET, events.next())
+            .await
+            .is_ok()
+        {}
+        publisher
+            .blobs_store
+            .add_bytes(payload.clone())
+            .await
+            .expect("add");
+
+        // A fresh round between them, as when the holder comes back.
+        let subscriber_id: PublicKey = subscriber.node_id().parse().expect("node id");
+        publisher
+            .get_doc(&doc_id)
+            .await
+            .expect("doc")
+            .start_sync(vec![EndpointAddr::new(subscriber_id)])
+            .await
+            .expect("start_sync");
+        tokio::time::timeout(LOCAL_ROUND_WAIT, async {
+            while let Some(event) = events.next().await {
+                if matches!(
+                    event.expect("event"),
+                    DocEvent::SyncFinished { error: None, .. }
+                ) {
+                    return;
+                }
+            }
+            panic!("the event stream ended");
+        })
+        .await
+        .expect("a round with the holder succeeds");
+        drop(events);
+
+        let recovered = tokio::time::timeout(LOST_BLOB_RECOVERY_WAIT, async {
+            while !matches!(
+                subscriber.blobs_store.status(hash).await.expect("status"),
+                iroh_blobs::api::blobs::BlobStatus::Complete { .. }
+            ) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .is_ok();
+        publisher.shutdown().await.expect("shutdown");
+        subscriber.shutdown().await.expect("shutdown");
+        assert!(recovered, "the lost blob was never fetched");
+    }
+
     /// The recovery request honours the doc's download policy: content the
     /// policy excludes is never pulled, even though a peer holds it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

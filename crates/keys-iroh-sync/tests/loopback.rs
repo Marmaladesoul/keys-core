@@ -34,7 +34,13 @@ use iroh_blobs::{
     store::mem::MemStore,
 };
 use iroh_docs::DocTicket;
+use keys_ffi::{
+    Engine, IconRef, NewEntryFields, Page, ParkConflictsResultFfi, VaultDbKeyProvider,
+    VaultDbKeyProviderError, VaultFieldProtector, VaultProtectorError, create_vault,
+};
 use keys_iroh_sync::{DocEvent, DownloadPolicy, Identity, IrohNode, NodeConfig};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -906,4 +912,526 @@ async fn a_forgotten_peer_is_not_redialled() {
     tokio::time::timeout(Duration::from_secs(360), body)
         .await
         .expect("test exceeded 360s — likely a hang, not a slow DERP");
+}
+
+// Store-and-forward: a peer that fetches what a doc names but never merges
+// or publishes (a client whose vault is locked behaves this way) still
+// carries heads between peers that are never online together.
+
+/// The key each device publishes its whole-vault blob under.
+fn vault_key(device: &str) -> Vec<u8> {
+    format!("v1/vault/{device}").into_bytes()
+}
+
+/// How long a peer may take to deliver a head. Spans a first dial through a
+/// relay and the blob transfer behind it.
+const HEAD_DELIVERY_WAIT: Duration = Duration::from_secs(60);
+/// How long two peers sharing a doc may take to meet over its gossip mesh.
+const MESH_MEETING_WAIT: Duration = Duration::from_secs(60);
+const HEAD_POLL: Duration = Duration::from_millis(250);
+/// Larger than any vault these tests write.
+const MAX_HEAD_BYTES: u64 = 16 * 1024 * 1024;
+/// Caps a whole store-and-forward test. Its waits alone can reach 360 s,
+/// though a healthy run takes far less.
+const STORE_AND_FORWARD_TEST_CAP: Duration = Duration::from_secs(600);
+/// More entries than any vault these tests write.
+const ENTRY_PAGE_LIMIT: u64 = 100;
+
+/// A device's on-disk transport state, which outlives any one run of its node.
+struct Device {
+    identity: Identity,
+    blobs: TempDir,
+    docs: TempDir,
+}
+
+impl Device {
+    fn new() -> Self {
+        Self {
+            identity: Identity::generate(),
+            blobs: tempfile::tempdir().expect("blob tempdir"),
+            docs: tempfile::tempdir().expect("doc tempdir"),
+        }
+    }
+
+    async fn start(&self) -> Arc<IrohNode> {
+        bind_node_at(self.identity.clone(), self.blobs.path(), self.docs.path()).await
+    }
+
+    /// Run the node again after a shutdown and resume `doc_id`. It dials
+    /// only the peers the doc store remembers.
+    async fn resume(&self, doc_id: &str) -> Arc<IrohNode> {
+        let node = self.start().await;
+        assert!(
+            node.open_existing_doc(doc_id.to_owned())
+                .await
+                .expect("open"),
+            "the device's store holds the doc"
+        );
+        node
+    }
+}
+
+/// Whether `node`'s store already holds `hash` in full. Looks only at the
+/// local store and requests nothing, so it can't help the content along.
+async fn holds_blob(node: &IrohNode, doc_id: &str, hash: &str) -> bool {
+    match node
+        .fetch_blob_with_deadline(doc_id.to_owned(), hash.to_owned(), 0, Duration::ZERO)
+        .await
+    {
+        Ok(_) => true,
+        Err(e) if e.to_string().contains("did not complete within") => false,
+        Err(e) => panic!("reading the local store failed: {e}"),
+    }
+}
+
+/// Wait for `node` to hold `key` at `hash` with its content, left entirely to
+/// the transport: nothing here asks for the blob.
+async fn wait_for_head(node: &IrohNode, doc_id: &str, key: &[u8], hash: &str) -> bool {
+    tokio::time::timeout(HEAD_DELIVERY_WAIT, async {
+        loop {
+            let entries = node.list_entries(doc_id.to_owned()).await.expect("list");
+            if entries.iter().any(|e| e.key == key && e.hash_hex == hash)
+                && holds_blob(node, doc_id, hash).await
+            {
+                return;
+            }
+            tokio::time::sleep(HEAD_POLL).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Assert the transport alone delivers `head` to `node` under `key`, byte for
+/// byte, by way of `route`.
+async fn assert_head_arrives(
+    node: &IrohNode,
+    doc_id: &str,
+    key: &[u8],
+    (hash, head): (&str, &[u8]),
+    route: &str,
+) {
+    assert!(
+        wait_for_head(node, doc_id, key, hash).await,
+        "the head never arrived through {route}"
+    );
+    let delivered = node
+        .fetch_blob(doc_id.to_owned(), hash.to_owned(), MAX_HEAD_BYTES)
+        .await
+        .expect("read head");
+    assert_eq!(delivered, head, "a different head arrived through {route}");
+}
+
+const VAULT_PASSWORD: &str = "test-password";
+const DB_KEY: [u8; 32] = [0x42; 32];
+const SESSION_KEY: [u8; 32] = [0x9c; 32];
+
+struct FixedDbKey;
+impl VaultDbKeyProvider for FixedDbKey {
+    fn acquire_db_key(&self) -> Result<Vec<u8>, VaultDbKeyProviderError> {
+        Ok(DB_KEY.to_vec())
+    }
+    fn delete_db_key(&self) -> Result<(), VaultDbKeyProviderError> {
+        Ok(())
+    }
+}
+
+struct FixedProtector;
+impl VaultFieldProtector for FixedProtector {
+    fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
+        Ok(SESSION_KEY.to_vec())
+    }
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Write a new, empty vault to `path`.
+async fn new_vault_file(path: &Path) {
+    create_vault(
+        path_string(path),
+        VAULT_PASSWORD.to_owned(),
+        None,
+        "store and forward".to_owned(),
+        Some(Arc::new(FixedProtector)),
+        None,
+    )
+    .await
+    .expect("create_vault");
+}
+
+/// A device's replica of the vault: its file, and an engine bound to it.
+struct Replica {
+    dir: TempDir,
+    kdbx: PathBuf,
+    engine: Arc<Engine>,
+}
+
+impl Replica {
+    /// A replica starting from a copy of the vault file at `vault`.
+    async fn of(vault: &Path) -> Self {
+        let dir = tempfile::tempdir().expect("replica tempdir");
+        let kdbx = dir.path().join("vault.kdbx");
+        std::fs::copy(vault, &kdbx).expect("copy vault");
+        let engine = engine_over_file(&kdbx, &dir.path().join("mirror.db")).await;
+        Self { dir, kdbx, engine }
+    }
+
+    /// Add an entry and save it to the file, returning the file's new bytes:
+    /// what the device publishes as its head.
+    async fn add_entry(&self, title: &str) -> Vec<u8> {
+        let root = self
+            .engine
+            .group_tree()
+            .expect("group_tree")
+            .into_iter()
+            .find(|g| g.parent_uuid.is_none())
+            .expect("root group");
+        self.engine
+            .create_entry(
+                root.uuid,
+                NewEntryFields {
+                    title: title.to_owned(),
+                    username: String::new(),
+                    url: String::new(),
+                    notes: String::new(),
+                    password: String::new(),
+                    icon: IconRef::Builtin { index: 0 },
+                    custom_fields: vec![],
+                    tags: vec![],
+                },
+            )
+            .expect("create_entry");
+        self.save().await;
+        std::fs::read(&self.kdbx).expect("read vault")
+    }
+
+    async fn save(&self) {
+        self.engine
+            .save_to_kdbx(
+                path_string(&self.kdbx),
+                VAULT_PASSWORD.to_owned(),
+                Some(path_string(self.dir.path())),
+            )
+            .await
+            .expect("save_to_kdbx");
+    }
+
+    /// Merge every other device's head in `doc_id` into this replica, under
+    /// that device's owner id, and save. Asserts nothing was parked.
+    async fn merge_heads(&self, node: &IrohNode, doc_id: &str) {
+        let own_key = vault_key(&node.node_id());
+        let prefix = vault_key("");
+        let entries = node.list_entries(doc_id.to_owned()).await.expect("list");
+        for head in entries
+            .iter()
+            .filter(|e| e.key.starts_with(&prefix) && e.key != own_key)
+        {
+            let bytes = node
+                .fetch_blob(doc_id.to_owned(), head.hash_hex.clone(), MAX_HEAD_BYTES)
+                .await
+                .expect("fetch head");
+            let blob = self.dir.path().join("peer-head.kdbx");
+            std::fs::write(&blob, bytes).expect("write peer head");
+            let owner = String::from_utf8(head.key[prefix.len()..].to_vec()).expect("owner id");
+            let merged = self
+                .engine
+                .ingest_peer_kdbx(owner, path_string(&blob), VAULT_PASSWORD.to_owned(), None)
+                .await
+                .expect("ingest head");
+            if let ParkConflictsResultFfi::Applied { parked, .. } = merged {
+                assert!(
+                    parked.entries_with_parked_conflict.is_empty(),
+                    "disjoint edits must merge clean"
+                );
+                self.save().await;
+            }
+        }
+    }
+
+    /// The entry titles in the vault file itself, read through a fresh mirror
+    /// so nothing this replica's engine remembers can answer for the file.
+    async fn titles_on_disk(&self) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("reread tempdir");
+        let engine = engine_over_file(&self.kdbx, &dir.path().join("reread.db")).await;
+        let page = Page {
+            offset: 0,
+            limit: ENTRY_PAGE_LIMIT,
+        };
+        let mut titles: Vec<String> = engine
+            .list_entries(None, page)
+            .expect("list")
+            .into_iter()
+            .map(|e| e.title)
+            .collect();
+        titles.sort();
+        titles
+    }
+}
+
+async fn engine_over_file(kdbx: &Path, db: &Path) -> Arc<Engine> {
+    let engine = Engine::open(
+        path_string(db),
+        Arc::new(FixedDbKey),
+        Arc::new(FixedProtector),
+        None,
+    )
+    .expect("open engine");
+    engine
+        .ingest_from_kdbx(path_string(kdbx), VAULT_PASSWORD.to_owned())
+        .await
+        .expect("ingest vault");
+    engine
+}
+
+/// Wait until `events`' node has finished a successful round with `peer`,
+/// which is what makes it remember `peer` as a peer of the doc.
+async fn wait_for_round_with(
+    events: &mut (impl futures_util::Stream<Item = keys_iroh_sync::Result<DocEvent>> + Unpin),
+    peer: &str,
+) {
+    tokio::time::timeout(MESH_MEETING_WAIT, async {
+        while let Some(event) = events.next().await {
+            if matches!(
+                event.expect("event"),
+                DocEvent::SyncFinished { peer_node_id, error: None } if peer_node_id == peer
+            ) {
+                return;
+            }
+        }
+        panic!("the event stream ended");
+    })
+    .await
+    .expect("no round succeeded with the peer");
+}
+
+/// A peer holding a head it fetched but never merged serves that head to
+/// another peer once its writer is offline, and heads travel the other way
+/// too, so two writers that are never online together stay in step through
+/// it. Each head arrives byte-exact and merges into a real vault file.
+///
+/// The fetch-only peer publishes one head while it can, then nothing: after
+/// that it only runs its node, and no call on it can fetch anything (see
+/// [`holds_blob`]). Each writer shuts down before the other returns, so the
+/// fetch-only peer is the only peer either can reach.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_only_fetches_carries_heads_between_writers_never_online_together() {
+    if is_network_test_skipped() {
+        eprintln!("skipping: KEYS_IROH_SYNC_SKIP_NETWORK_TESTS set");
+        return;
+    }
+    init_tracing();
+
+    let body = async {
+        let vault_dir = tempfile::tempdir().expect("vault tempdir");
+        let vault = vault_dir.path().join("vault.kdbx");
+        new_vault_file(&vault).await;
+        let seed = std::fs::read(&vault).expect("read vault");
+        let a_replica = Replica::of(&vault).await;
+        let c_replica = Replica::of(&vault).await;
+
+        let (a_device, b_device, c_device) = (Device::new(), Device::new(), Device::new());
+        let a = a_device.start().await;
+        let b = b_device.start().await;
+        let c = c_device.start().await;
+        let (a_id, b_id, c_id) = (a.node_id(), b.node_id(), c.node_id());
+
+        // All three share the doc. The third peer joins through the writer's
+        // ticket, so it can only learn of the fetch-only peer over the doc's
+        // mesh.
+        let doc_id = a.create_doc().await.expect("create_doc");
+        let first_hash = a
+            .set_entry(doc_id.clone(), vault_key(&a_id), seed.clone())
+            .await
+            .expect("first head");
+        let ticket = a.share_doc(doc_id.clone(), true).await.expect("share");
+        b.join_doc(ticket.clone(), DownloadPolicy::Everything)
+            .await
+            .expect("fetch-only peer joins");
+        let mut b_events = b.subscribe_doc_events(&doc_id).await.expect("events");
+        c.join_doc(ticket, DownloadPolicy::Everything)
+            .await
+            .expect("third peer joins");
+        wait_for_round_with(&mut b_events, &c_id).await;
+        drop(b_events);
+
+        // The fetch-only peer publishes its one head. Its write dials the
+        // third peer, so the third peer's own record of the round is seen
+        // too: it is the one that must remember the fetch-only peer.
+        let mut c_events = c.subscribe_doc_events(&doc_id).await.expect("events");
+        b.set_entry(doc_id.clone(), vault_key(&b_id), seed.clone())
+            .await
+            .expect("fetch-only peer's one head");
+        wait_for_round_with(&mut c_events, &b_id).await;
+        drop(c_events);
+        assert!(
+            wait_for_head(&c, &doc_id, &vault_key(&a_id), &first_hash).await,
+            "the third peer never fetched the writer's first head"
+        );
+
+        // The third peer goes away, the writer edits, and the fetch-only
+        // peer fetches; then the writer goes away too.
+        c.shutdown().await.expect("third peer shutdown");
+        drop(c);
+        let a_head = a_replica.add_entry("from-a").await;
+        let a_hash = a
+            .set_entry(doc_id.clone(), vault_key(&a_id), a_head.clone())
+            .await
+            .expect("writer's edit");
+        assert!(
+            wait_for_head(&b, &doc_id, &vault_key(&a_id), &a_hash).await,
+            "the fetch-only peer never fetched the writer's head"
+        );
+        a.shutdown().await.expect("writer shutdown");
+        drop(a);
+
+        // The third peer returns with only the fetch-only peer to reach.
+        let c = c_device.resume(&doc_id).await;
+        assert_head_arrives(
+            &c,
+            &doc_id,
+            &vault_key(&a_id),
+            (&a_hash, &a_head),
+            "the fetch-only peer, to the third peer",
+        )
+        .await;
+        c_replica.merge_heads(&c, &doc_id).await;
+        assert_eq!(c_replica.titles_on_disk().await, vec!["from-a"]);
+
+        // The reverse: the third peer edits, the fetch-only peer fetches, the
+        // third peer goes away and the first writer returns.
+        let c_head = c_replica.add_entry("from-c").await;
+        let c_hash = c
+            .set_entry(doc_id.clone(), vault_key(&c_id), c_head.clone())
+            .await
+            .expect("third peer's edit");
+        assert!(
+            wait_for_head(&b, &doc_id, &vault_key(&c_id), &c_hash).await,
+            "the fetch-only peer never fetched the third peer's head"
+        );
+        c.shutdown().await.expect("third peer shutdown");
+        drop(c);
+
+        let a = a_device.resume(&doc_id).await;
+        assert_head_arrives(
+            &a,
+            &doc_id,
+            &vault_key(&c_id),
+            (&c_hash, &c_head),
+            "the fetch-only peer, to the returning writer",
+        )
+        .await;
+        a_replica.merge_heads(&a, &doc_id).await;
+        assert_eq!(a_replica.titles_on_disk().await, vec!["from-a", "from-c"]);
+
+        a.shutdown().await.expect("writer shutdown");
+        b.shutdown().await.expect("fetch-only peer shutdown");
+    };
+
+    tokio::time::timeout(STORE_AND_FORWARD_TEST_CAP, body)
+        .await
+        .expect("test exceeded its cap — likely a hang, not a slow DERP");
+}
+
+/// A peer that has never synced can join through a fetch-only peer while the
+/// doc's writer is offline, as long as its ticket names that peer: the
+/// fetch-only peer's own ticket does, and so does the writer's capability
+/// with its address list swapped. It is the address that counts, not who
+/// minted the capability. A ticket naming only the offline writer reaches
+/// nobody, since a ticket lists only the node that minted it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_peer_joins_through_a_fetch_only_peer_while_the_writer_is_offline() {
+    if is_network_test_skipped() {
+        eprintln!("skipping: KEYS_IROH_SYNC_SKIP_NETWORK_TESTS set");
+        return;
+    }
+    init_tracing();
+
+    let body = async {
+        let (a, _ab, _ad) = spin_up_node().await;
+        let (b, _bb, _bd) = spin_up_node().await;
+        let doc_id = a.create_doc().await.expect("create_doc");
+        let head = b"the writer's head".to_vec();
+        let key = vault_key(&a.node_id());
+        let hash = a
+            .set_entry(doc_id.clone(), key.clone(), head.clone())
+            .await
+            .expect("writer's head");
+        let writer_ticket = a.share_doc(doc_id.clone(), true).await.expect("share");
+        b.join_doc(writer_ticket.clone(), DownloadPolicy::Everything)
+            .await
+            .expect("fetch-only peer joins");
+        assert!(
+            wait_for_head(&b, &doc_id, &key, &hash).await,
+            "the fetch-only peer never fetched the writer's head"
+        );
+        a.shutdown().await.expect("writer shutdown");
+        drop(a);
+
+        let b_ticket = b.share_doc(doc_id.clone(), true).await.expect("share");
+        let b_id: iroh::PublicKey = b.node_id().parse().expect("node id");
+        let readdressed = |nodes: Vec<iroh::EndpointAddr>| {
+            let mut ticket: DocTicket = writer_ticket.parse().expect("parse ticket");
+            ticket.nodes = nodes;
+            ticket.to_string()
+        };
+        let b_addr = b_ticket.parse::<DocTicket>().expect("parse ticket").nodes;
+        assert_eq!(b_addr.len(), 1, "a ticket lists only its minter");
+        assert_eq!(b_addr[0].id, b_id);
+
+        for (route, ticket) in [
+            ("the fetch-only peer's ticket", b_ticket),
+            (
+                "the writer's capability, addressed to it",
+                readdressed(b_addr),
+            ),
+            (
+                "the writer's capability, naming only its id",
+                readdressed(vec![iroh::EndpointAddr::new(b_id)]),
+            ),
+        ] {
+            let (newcomer, _nb, _nd) = spin_up_node().await;
+            newcomer
+                .join_doc(ticket, DownloadPolicy::Everything)
+                .await
+                .unwrap_or_else(|e| panic!("join through {route} failed: {e}"));
+            assert_head_arrives(&newcomer, &doc_id, &key, (&hash, &head), route).await;
+
+            // The capability is writable, so the newcomer is a full peer.
+            let own_key = vault_key(&newcomer.node_id());
+            let own_hash = newcomer
+                .set_entry(doc_id.clone(), own_key.clone(), b"newcomer's head".to_vec())
+                .await
+                .expect("newcomer writes");
+            assert!(
+                wait_for_head(&b, &doc_id, &own_key, &own_hash).await,
+                "the fetch-only peer never fetched the newcomer's head from {route}"
+            );
+            newcomer.shutdown().await.expect("newcomer shutdown");
+        }
+
+        let (stranded, _sb, _sd) = spin_up_node().await;
+        let joined = stranded
+            .join_doc(writer_ticket, DownloadPolicy::Everything)
+            .await;
+        // Reaching nobody, the join times out, or ends on a failed round
+        // with nothing to come.
+        match joined {
+            Err(e) => assert!(
+                e.to_string().contains("initial sync timed out"),
+                "expected the join to time out, got: {e}"
+            ),
+            Ok(id) => assert!(
+                !wait_for_head(&stranded, &id, &key, &hash).await,
+                "a ticket naming only the offline writer delivered a head"
+            ),
+        }
+        stranded.shutdown().await.expect("shutdown");
+        b.shutdown().await.expect("fetch-only peer shutdown");
+    };
+
+    tokio::time::timeout(STORE_AND_FORWARD_TEST_CAP, body)
+        .await
+        .expect("test exceeded its cap — likely a hang, not a slow DERP");
 }

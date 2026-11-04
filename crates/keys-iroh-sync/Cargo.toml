@@ -45,6 +45,8 @@ uniffi = { version = "0.29", features = ["tokio"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+# Store-and-forward tests merge what the transport delivered into a real vault.
+keys-ffi = { path = "../keys-ffi" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "test-util"] }
