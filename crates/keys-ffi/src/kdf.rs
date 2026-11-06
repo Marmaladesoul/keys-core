@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use keepass_core::format::{Argon2Variant, Argon2Version, KdfParams};
 use keepass_core::kdbx::{Kdbx, Unlocked};
+use keys_engine::KdbxStateSignature;
 use keys_engine::kdf_cost::{self, KdfCeiling, KdfCost, KdfPolicy};
 use secrecy::{ExposeSecret, SecretString};
 
@@ -177,6 +178,10 @@ pub(crate) fn summary(cost: &KdfCost) -> Result<KdfSummary, EngineError> {
 /// deriving only if its KDF cost passes the gate against `recorded` (the
 /// cost the mirror recorded for it, if any) and `approved`.
 ///
+/// Also returns the signature of the file as it was read, which is what a
+/// caller ingesting it must record: the derive can take seconds, and a stat
+/// afterwards would describe any change that landed meanwhile.
+///
 /// # Errors
 ///
 /// [`EngineError::KdfApprovalRequired`] from the header alone when the gate
@@ -188,15 +193,19 @@ pub(crate) fn open_vault_file(
     keyfile: Option<&[u8]>,
     recorded: Option<&KdfCost>,
     approved: Option<&KdfCost>,
-) -> Result<Kdbx<Unlocked>, EngineError> {
+) -> Result<(Kdbx<Unlocked>, KdbxStateSignature), EngineError> {
     let composite =
         crate::keyfile::composite_for_engine(password.expose_secret().as_bytes(), keyfile)?;
-    let read = Kdbx::open(path)
+    let (bytes, signature) = KdbxStateSignature::read_file(path)
+        .map_err(|e| EngineError::Internal(format!("open kdbx: {e}")))?;
+    let read = Kdbx::open_from_bytes(bytes)
         .and_then(Kdbx::read_header)
         .map_err(|e| EngineError::Internal(format!("open kdbx: {e}")))?;
     kdf_cost::check_vault_header(&read, recorded, policy(approved))?;
-    read.unlock(&composite)
-        .map_err(|e| EngineError::Internal(format!("open kdbx: {e}")))
+    let unlocked = read
+        .unlock(&composite)
+        .map_err(|e| EngineError::Internal(format!("open kdbx: {e}")))?;
+    Ok((unlocked, signature))
 }
 
 /// Gate a file read with no mirror to hold it to: it may be derived within

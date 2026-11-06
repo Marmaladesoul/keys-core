@@ -738,6 +738,16 @@ enum Command {
         /// KDBX field names shown by `show-conflict`.
         #[arg(long = "field", value_name = "KEY=SIDE")]
         field: Vec<String>,
+        /// Create an entry with this title while the resolver is open:
+        /// after the conflict is stashed, before the choice is applied.
+        /// Models anything else landing in the mirror meanwhile, such as
+        /// a write on another connection or an external edit being merged.
+        #[arg(long, value_name = "TITLE")]
+        while_open_create: Option<String>,
+        /// Set the held entry's notes while the resolver is open, so the
+        /// conflict being decided changes underneath the choice.
+        #[arg(long, value_name = "NOTES")]
+        while_open_notes: Option<String>,
     },
     /// Re-key the vault: rotate its master key material and re-encrypt
     /// the KDBX so the OLD password no longer opens it and the NEW one
@@ -1284,6 +1294,8 @@ async fn main() -> Result<()> {
             entry,
             choose,
             field,
+            while_open_create,
+            while_open_notes,
         } => {
             let side = parse_side(&choose)?;
             let overrides = field
@@ -1297,8 +1309,16 @@ async fn main() -> Result<()> {
                 .collect::<Result<Vec<(String, ConflictSideFfi)>>>()?;
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.resolve(entry, side, &overrides).await?;
-            session.finish().await?;
+            let while_open = WhileResolverOpen {
+                create: while_open_create,
+                notes: while_open_notes,
+            };
+            let resolved = session.resolve(entry, side, &overrides, while_open).await;
+            // Saved even when the resolution is refused, as a client's flush
+            // would: anything else that landed meanwhile is still owed.
+            let finished = session.finish().await;
+            resolved?;
+            finished?;
         }
         Command::Rekey {
             vault,
@@ -1462,6 +1482,8 @@ impl Session {
             eprintln!("note: open-time sync skipped ({SKIP_OPEN_SYNC_ENV})");
             return Ok(session);
         }
+
+        adapters::arm_file_landing(vault);
 
         // The whole "bring the mirror current" gate — fresh-ingest /
         // signature-skip / reconcile / write-back — lives below the
@@ -2394,6 +2416,7 @@ impl Session {
         entry: String,
         side: ConflictSideFfi,
         overrides: &[(String, ConflictSideFfi)],
+        while_open: WhileResolverOpen,
     ) -> Result<()> {
         let payload = self
             .engine
@@ -2420,6 +2443,23 @@ impl Session {
         }
 
         let resolution = resolution_choosing(&payload, side, overrides);
+
+        if let Some(title) = while_open.create {
+            self.create_entry(title, String::new(), String::new(), None)?;
+        }
+        if let Some(notes) = while_open.notes {
+            let update = EngineEntryUpdate {
+                title: None,
+                username: None,
+                url: None,
+                notes: Some(notes),
+                password: None,
+                icon: None,
+                expires_at: None,
+            };
+            self.update_entry(&entry, update)?;
+        }
+
         self.engine
             .apply_conflict_resolution(payload.id, resolution)
             .await
@@ -2433,6 +2473,15 @@ impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.engine.close();
     }
+}
+
+/// What `resolve` does to the mirror between opening the resolver and
+/// applying the choice.
+struct WhileResolverOpen {
+    /// Title of an entry to create.
+    create: Option<String>,
+    /// Notes to set on the held entry.
+    notes: Option<String>,
 }
 
 /// The vault's persistent mirror directory: `<vault-path>.mirror`.

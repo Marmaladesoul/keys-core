@@ -89,7 +89,9 @@ fn record_after_ingest_matches_file_stat() {
 
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     engine
-        .record_kdbx_state_signature(&kdbx_path)
+        .record_kdbx_state_signature(
+            keys_engine::KdbxStateSignature::from_path(&kdbx_path).expect("stat"),
+        )
         .expect("record");
 
     let (mtime_ms, byte_count) = stat_as_signature(&kdbx_path);
@@ -137,7 +139,9 @@ fn signature_survives_engine_reopen() {
         let mut engine = open_engine(&db_path);
         engine.ingest_from_kdbx(&kdbx).expect("ingest");
         engine
-            .record_kdbx_state_signature(&kdbx_path)
+            .record_kdbx_state_signature(
+                keys_engine::KdbxStateSignature::from_path(&kdbx_path).expect("stat"),
+            )
             .expect("record");
     }
 
@@ -188,5 +192,30 @@ fn signature_updates_on_re_save() {
     assert!(
         sig2.mtime_ms >= sig1.mtime_ms,
         "second save's mtime is not earlier than the first's"
+    );
+}
+
+/// A signature from `read_file` describes the bytes it returned, however the
+/// path has moved on since: that is what stops an unread change being marked
+/// as seen when the file is replaced during the derive.
+#[test]
+fn read_file_signature_describes_the_bytes_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("vault.kdbx");
+    std::fs::write(&path, b"version a").expect("write a");
+    let at_read = keys_engine::KdbxStateSignature::from_path(&path).expect("stat a");
+
+    let (bytes, signature) = keys_engine::KdbxStateSignature::read_file(&path).expect("read");
+
+    let newer = dir.path().join("newer.kdbx");
+    std::fs::write(&newer, b"a longer version b").expect("write b");
+    std::fs::rename(&newer, &path).expect("replace");
+
+    assert_eq!(bytes, b"version a");
+    assert_eq!(signature, at_read);
+    assert_ne!(
+        signature,
+        keys_engine::KdbxStateSignature::from_path(&path).expect("stat b"),
+        "the file at the path has moved on",
     );
 }

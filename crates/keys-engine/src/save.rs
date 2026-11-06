@@ -35,8 +35,8 @@
 //! `stat` the destination to capture mtime + size for the self-write
 //! signature.
 
-use std::fs::File;
-use std::io::Write;
+use std::fs::{File, Metadata};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -151,7 +151,33 @@ impl KdbxStateSignature {
     ///
     /// [`EngineError::Io`] if `path` can't be stat'd or its mtime read.
     pub fn from_path(path: &Path) -> Result<Self, EngineError> {
-        let meta = std::fs::metadata(path)?;
+        Self::from_metadata(&std::fs::metadata(path)?)
+    }
+
+    /// Read the file at `path`, returning its bytes and the signature of
+    /// that same file.
+    ///
+    /// This is the only signature a read may record, because a stat taken
+    /// later describes whatever is at the path by then. The stat is of the
+    /// open handle, so a writer renaming a new file over `path` can't come
+    /// between the two, and it precedes the read, so one writing in place
+    /// leaves a signature older than the bytes. A stale signature only costs
+    /// a redundant merge next time; a too-new one would mark unread content
+    /// as seen.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Io`] if the file can't be opened, stat'd or read.
+    pub fn read_file(path: &Path) -> Result<(Vec<u8>, Self), EngineError> {
+        let mut file = File::open(path)?;
+        let signature = Self::from_metadata(&file.metadata()?)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok((bytes, signature))
+    }
+
+    /// The signature of a file described by `meta`.
+    fn from_metadata(meta: &Metadata) -> Result<Self, EngineError> {
         let mtime = meta.modified()?;
         let mtime_ms = match mtime.duration_since(SystemTime::UNIX_EPOCH) {
             Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
@@ -262,7 +288,7 @@ fn save_inner(
     //    watermark to the sequence snapshotted at step 0 — the file
     //    just written corresponds to the mirror as of save start, not
     //    as of now.
-    engine.record_kdbx_correspondence(path, seq_at_start)?;
+    engine.record_kdbx_correspondence(KdbxStateSignature::from_path(path)?, seq_at_start)?;
 
     // 7. Sweep the mirror's attachment blob pool — the mirror-side twin
     //    of keepass-core's save-time `gc_binaries_pool` for the file

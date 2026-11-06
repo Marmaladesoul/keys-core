@@ -370,6 +370,24 @@ impl Engine {
         Ok(())
     }
 
+    /// Crate-internal: [`Self::ingest_vault`] of a vault projected from this
+    /// mirror when its `mutation_seq` was `projected_at_seq`, refused if the
+    /// mirror has moved since. See [`crate::ingest::ingest_projected_vault`].
+    pub(crate) fn ingest_projected_vault(
+        &mut self,
+        vault: &keepass_core::model::Vault,
+        projected_at_seq: i64,
+    ) -> Result<(), EngineError> {
+        let _outcome = crate::ingest::ingest_projected_vault(
+            &mut self.conn,
+            &self.fingerprint_key,
+            &*self.field_protector,
+            vault,
+            projected_at_seq,
+        )?;
+        Ok(())
+    }
+
     /// Ingest one peer's vault as owner-tagged conflict rows — the
     /// multi-peer owner-rows store.
     ///

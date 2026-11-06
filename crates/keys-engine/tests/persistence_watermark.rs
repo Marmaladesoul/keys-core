@@ -97,7 +97,9 @@ fn settled_engine() -> (Engine, uuid::Uuid, Kdbx<Unlocked>, tempfile::TempDir) {
     let mut engine = open_engine(&db_path);
     engine.ingest_from_kdbx(&kdbx).expect("ingest");
     engine
-        .record_kdbx_state_signature(&kdbx_path)
+        .record_kdbx_state_signature(
+            keys_engine::KdbxStateSignature::from_path(&kdbx_path).expect("stat"),
+        )
         .expect("record signature");
     (engine, root, kdbx, dir)
 }
@@ -176,7 +178,9 @@ fn unsaved_mutation_reads_back_dirty_after_reopen() {
         let mut engine = open_engine(&db_path);
         engine.ingest_from_kdbx(&kdbx).expect("ingest");
         engine
-            .record_kdbx_state_signature(&kdbx_path)
+            .record_kdbx_state_signature(
+                keys_engine::KdbxStateSignature::from_path(&kdbx_path).expect("stat"),
+            )
             .expect("record signature");
         engine
             .create_entry(root, new_entry_fields("crash-me"))

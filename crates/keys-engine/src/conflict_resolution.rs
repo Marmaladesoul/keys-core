@@ -25,7 +25,9 @@
 //!    record carries no value and no side — secret-safe; the chosen value
 //!    rides as ordinary protected entry data that step 2 already set.
 //! 4. Reconcile timestamps and re-ingest the merged [`Vault`] into
-//!    `SQLite` via the single-transaction `Engine::ingest_vault` path.
+//!    `SQLite` in a single transaction, refused if the mirror's
+//!    `mutation_seq` has moved since the stash: the merged vault is a
+//!    whole-vault snapshot and would discard whatever moved it.
 //! 5. Drop the resolved entries' owner (`conflict_*`) rows so the badge
 //!    clears, and emit
 //!    [`crate::events::ChangeEvent::ExternalChangeMerged`] with empty
@@ -47,7 +49,10 @@
 //! first; any mismatch (entry not in conflict bucket, field key not
 //! in delta list, missing resolution for a `delete_edit` conflict,
 //! `KeepBoth` on a single-sided attachment) is collapsed to
-//! [`EngineError::ResolutionMismatch`] via the `MergeError` Display.
+//! [`EngineError::ResolutionMismatch`] via the `MergeError` Display. A
+//! moved mirror is refused with the same error: nothing has been applied,
+//! the conflict stays held, and the caller rebuilds the resolver from
+//! `held_conflict_payload`.
 
 use std::collections::HashSet;
 
@@ -74,7 +79,9 @@ use crate::util::tree::find_entry;
 /// - the full [`MergeOutcome`] (the public payload only carries the
 ///   conflict buckets);
 /// - both pre-merge vaults (so apply has both sides verbatim, and the
-///   per-side reveal path can read either).
+///   per-side reveal path can read either);
+/// - the `mutation_seq` as of `local_vault`'s projection, so apply can tell
+///   whether the mirror has moved on from that snapshot.
 ///
 /// The apply path re-ingests the merged [`Vault`] directly via
 /// `Engine::ingest_vault`, so the context no longer carries a disk Kdbx
@@ -84,6 +91,7 @@ use crate::util::tree::find_entry;
 pub(crate) struct PendingConflictContext {
     pub(crate) payload: ConflictPayload,
     pub(crate) outcome: MergeOutcome,
+    pub(crate) projected_at_seq: i64,
     pub(crate) local_vault: Vault,
     pub(crate) remote_vault: Vault,
 }
@@ -128,6 +136,7 @@ pub(crate) fn apply_conflict_resolution(
     let PendingConflictContext {
         payload: _,
         outcome,
+        projected_at_seq,
         local_vault,
         remote_vault,
     } = ctx;
@@ -165,8 +174,8 @@ pub(crate) fn apply_conflict_resolution(
     //    in-memory re-ingest, so `ingest_vault` reuses the existing rows.
     //    This also drops the baseline refresh the eager-merge path did — the
     //    owner-rows switch took `set_last_saved_kdbx_bytes` off this path
-    //    (Keys-Mac saves the resolved projection out of band).
-    engine.ingest_vault(&merged)?;
+    //    (the caller saves the resolved projection out of band).
+    engine.ingest_projected_vault(&merged, projected_at_seq)?;
 
     // Drop the resolved entries' owner rows so the badge clears: their
     // conflicts have converged locally to the chosen values, so there is no

@@ -173,9 +173,14 @@ pub enum EngineError {
     /// entry, an unknown field, a missing per-entry decision, or a
     /// `KeepBoth` on an attachment that isn't `BothDiffer`. The exact
     /// `keepass-merge` validation message is carried verbatim.
+    ///
+    /// Also raised when the mirror has changed since the resolver opened, as
+    /// applying would discard that change. Nothing was applied and the conflict
+    /// stays held: rebuild the resolver with
+    /// [`crate::Engine::held_conflict_payload`] and ask again.
     #[error("resolution does not match stashed conflict: {reason}")]
     ResolutionMismatch {
-        /// The validation diagnostic from `keepass-merge`.
+        /// What didn't match.
         reason: String,
     },
 
