@@ -174,6 +174,62 @@ fn title_resolution(seed_uuid: Uuid, side: ConflictSide) -> ConflictResolution {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
+/// The stash is a whole-vault snapshot, so applying over a mirror that moved
+/// after the resolver opened would discard the move. It's refused with nothing
+/// changed, and a fresh resolver applies with the move intact.
+#[test]
+fn apply_refuses_when_the_mirror_moved_after_the_resolver_opened() {
+    let mut f = fixture();
+    let stale_id = drive_title_conflict(&mut f, "local-title", "disk-title");
+    let saved_meanwhile = "saved meanwhile";
+    f.engine
+        .update_entry(
+            f.seed_uuid,
+            keys_engine::EntryUpdate {
+                notes: Some(saved_meanwhile.into()),
+                ..Default::default()
+            },
+        )
+        .expect("edit while the resolver is open");
+
+    let err = f
+        .engine
+        .apply_conflict_resolution(
+            stale_id,
+            &title_resolution(f.seed_uuid, ConflictSide::Remote),
+        )
+        .expect_err("the mirror moved");
+    assert!(
+        matches!(err, EngineError::ResolutionMismatch { .. }),
+        "{err:?}"
+    );
+    let refused = f
+        .engine
+        .entry(f.seed_uuid)
+        .expect("entry")
+        .expect("present");
+    assert_eq!(refused.title, "local-title", "nothing was applied");
+    assert_eq!(refused.notes, saved_meanwhile);
+
+    let fresh = f
+        .engine
+        .held_conflict_payload(&f.kdbx_path, &composite(), None)
+        .expect("held payload")
+        .expect("the conflict is still held");
+    f.engine
+        .apply_conflict_resolution(
+            fresh.id,
+            &title_resolution(f.seed_uuid, ConflictSide::Remote),
+        )
+        .expect("a fresh resolver applies");
+    let applied = f
+        .engine
+        .entry(f.seed_uuid)
+        .expect("entry")
+        .expect("present");
+    assert_eq!(applied.title, "disk-title", "the choice landed");
+    assert_eq!(applied.notes, saved_meanwhile, "the edit survived");
+}
 
 #[test]
 fn apply_resolution_with_take_remote_all_fields() {

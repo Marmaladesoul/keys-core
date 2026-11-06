@@ -92,7 +92,38 @@ pub(crate) fn ingest_vault(
     protector: &dyn FieldProtector,
     vault: &Vault,
 ) -> Result<IngestOutcome, EngineError> {
-    ingest_vault_with_header(conn, fingerprint_key, protector, vault, Source::InMemory)
+    ingest_vault_with_header(
+        conn,
+        fingerprint_key,
+        protector,
+        vault,
+        Source::InMemory {
+            projected_at_seq: None,
+        },
+    )
+}
+
+/// [`ingest_vault`] of a vault projected from this mirror when its
+/// `mutation_seq` was `projected_at_seq`: refused with
+/// [`EngineError::ResolutionMismatch`] if the mirror has changed since, because
+/// replacing it would discard that change. Other connections to the mirror can
+/// write at any time, so the check shares the ingest's transaction.
+pub(crate) fn ingest_projected_vault(
+    conn: &mut Connection,
+    fingerprint_key: &[u8; 32],
+    protector: &dyn FieldProtector,
+    vault: &Vault,
+    projected_at_seq: i64,
+) -> Result<IngestOutcome, EngineError> {
+    ingest_vault_with_header(
+        conn,
+        fingerprint_key,
+        protector,
+        vault,
+        Source::InMemory {
+            projected_at_seq: Some(projected_at_seq),
+        },
+    )
 }
 
 /// Where an ingested vault came from — which decides whether the ingest
@@ -113,8 +144,10 @@ enum Source<'a> {
     /// modified, content — it may hold changes no file has seen, so the
     /// watermark advances with the ingest's writes and stays owed. The
     /// envelope is unchanged, so the header-fact rows are left as the
-    /// originating ingest wrote them.
-    InMemory,
+    /// originating ingest wrote them. `projected_at_seq`, when set, is the
+    /// `mutation_seq` it was projected at, and the ingest is refused if the
+    /// mirror has moved on.
+    InMemory { projected_at_seq: Option<i64> },
 }
 
 fn ingest_vault_with_header(
@@ -137,14 +170,22 @@ fn ingest_vault_with_header(
     // the commit, so no other connection's mutation can land between
     // "the mirror owes nothing" and the wipe that relies on it.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if matches!(source, Source::VaultFile { .. }) {
-        let state = PersistenceState::read(&tx)?;
-        if state.is_dirty() {
+    let state = PersistenceState::read(&tx)?;
+    match source {
+        Source::VaultFile { .. } if state.is_dirty() => {
             return Err(EngineError::MirrorOwesWrite {
                 mutation_seq: state.mutation_seq,
                 persisted_seq: state.persisted_seq,
             });
         }
+        Source::InMemory {
+            projected_at_seq: Some(projected_at_seq),
+        } if state.mutation_seq != projected_at_seq => {
+            return Err(EngineError::ResolutionMismatch {
+                reason: "the vault changed after the resolver opened".to_owned(),
+            });
+        }
+        _ => {}
     }
     clear_vault_tables(&tx)?;
     meta::clear_meta_tables(&tx)?;
@@ -2617,6 +2658,48 @@ mod ingest_peer_tests {
             |r| r.get(0),
         )
         .expect("count tombstones")
+    }
+
+    /// A projection's ingest lands only if nothing else wrote since the
+    /// projection, however that write reached the mirror: another connection,
+    /// such as a credential provider's, can land one at any moment.
+    #[test]
+    fn ingest_projected_vault_refuses_a_mirror_that_moved() {
+        let id = Uuid::new_v4();
+        let vault = vault_of(vec![entry_at(id, "projected", 1)]);
+        let mut conn = seeded(&vault);
+        let at = super::PersistenceState::read(&conn)
+            .expect("state")
+            .mutation_seq;
+
+        conn.execute(
+            "UPDATE entry SET title = 'saved meanwhile' WHERE uuid = ?1",
+            params![id.to_string()],
+        )
+        .expect("another write");
+        let err = super::ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, &vault, at)
+            .expect_err("the mirror moved");
+        assert!(
+            matches!(err, crate::error::EngineError::ResolutionMismatch { .. }),
+            "{err:?}"
+        );
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM entry WHERE uuid = ?1",
+                params![id.to_string()],
+                |r| r.get(0),
+            )
+            .expect("read title");
+        assert_eq!(
+            title, "saved meanwhile",
+            "the refused ingest changed nothing"
+        );
+
+        let now = super::PersistenceState::read(&conn)
+            .expect("state")
+            .mutation_seq;
+        super::ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, &vault, now)
+            .expect("an unmoved mirror takes the ingest");
     }
 
     /// Seed the local mirror from `local`.

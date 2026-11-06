@@ -427,7 +427,9 @@ fn reconcile_round_trip_with_file_watcher() {
 fn digest_equal_adoption_settles_a_clean_mirror() {
     let mut f = fixture();
     f.engine
-        .record_kdbx_state_signature(&f.kdbx_path)
+        .record_kdbx_state_signature(
+            keys_engine::KdbxStateSignature::from_path(&f.kdbx_path).expect("stat"),
+        )
         .expect("settle");
     assert!(!f.engine.persistence_state().expect("state").is_dirty());
     let seed_uuid = f
@@ -478,7 +480,9 @@ fn digest_equal_adoption_settles_a_clean_mirror() {
 fn digest_equal_adoption_never_settles_over_pending_local_change() {
     let mut f = fixture();
     f.engine
-        .record_kdbx_state_signature(&f.kdbx_path)
+        .record_kdbx_state_signature(
+            keys_engine::KdbxStateSignature::from_path(&f.kdbx_path).expect("stat"),
+        )
         .expect("settle");
     let seed_uuid = f
         .engine

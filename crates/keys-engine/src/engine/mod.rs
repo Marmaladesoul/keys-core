@@ -870,12 +870,16 @@ impl Engine {
         }
     }
 
-    /// Record the `(mtime, size)` of the KDBX file at `path` as the
-    /// signature corresponding to the engine's current `SQLite` state,
-    /// and advance the persistence watermark
-    /// ([`Engine::persistence_state`]) to the current `mutation_seq` —
-    /// the two halves of one fact: "the mirror and this file now
-    /// correspond".
+    /// Record `signature` as that of the KDBX file corresponding to the
+    /// engine's current `SQLite` state, and advance the persistence
+    /// watermark ([`Engine::persistence_state`]) to the current
+    /// `mutation_seq` — the two halves of one fact: "the mirror and this
+    /// file now correspond".
+    ///
+    /// Takes the signature rather than a path, so that it comes from the read
+    /// that produced the content ([`crate::KdbxStateSignature::read_file`]).
+    /// A stat taken now would describe whatever is at the path now, marking
+    /// any change that landed since the read as seen.
     ///
     /// After an [`Engine::ingest_from_kdbx`] call
     /// [`Engine::record_ingested_kdbx_signature`] instead: the ingest
@@ -886,19 +890,17 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// - [`EngineError::Io`] if `path` can't be stat'd or its mtime
-    ///   can't be read.
-    /// - [`EngineError::Sqlite`] on persistence failure.
+    /// [`EngineError::Sqlite`] on persistence failure.
     pub fn record_kdbx_state_signature(
         &mut self,
-        path: &std::path::Path,
+        signature: crate::KdbxStateSignature,
     ) -> Result<(), EngineError> {
         let seq = self.persistence_state()?.mutation_seq;
-        self.record_kdbx_correspondence(path, seq)
+        self.record_kdbx_correspondence(signature, seq)
     }
 
     /// [`Engine::record_kdbx_state_signature`] with an explicit
-    /// watermark: persist the signature of `path` and set
+    /// watermark: persist `signature` and set
     /// `persisted_seq = persisted_seq_value` in one transaction.
     ///
     /// The save path passes the `mutation_seq` it snapshotted *before*
@@ -907,12 +909,11 @@ impl Engine {
     /// next round.
     pub(crate) fn record_kdbx_correspondence(
         &mut self,
-        path: &std::path::Path,
+        signature: crate::KdbxStateSignature,
         persisted_seq_value: i64,
     ) -> Result<(), EngineError> {
-        let sig = crate::KdbxStateSignature::from_path(path)?;
         let tx = self.conn.transaction()?;
-        write_kdbx_state_signature(&tx, &sig)?;
+        write_kdbx_state_signature(&tx, &signature)?;
         tx.execute(
             "UPDATE setting SET value = ?1 WHERE key = 'persistence.persisted_seq'",
             rusqlite::params![persisted_seq_value],
@@ -921,24 +922,24 @@ impl Engine {
         Ok(())
     }
 
-    /// Record the `(mtime, size)` of the KDBX file at `path`, just
-    /// ingested by [`Engine::ingest_from_kdbx`], as the signature that
-    /// arms the open-time fast path — leaving the persistence watermark
-    /// as the ingest left it. That is settled, except when the ingest
-    /// stamped an identity the file lacks and so still owes it a write.
+    /// Record `signature`, that of the KDBX file just ingested by
+    /// [`Engine::ingest_from_kdbx`], as the one that arms the open-time fast
+    /// path — leaving the persistence watermark as the ingest left it. That
+    /// is settled, except when the ingest stamped an identity the file lacks
+    /// and so still owes it a write.
+    ///
+    /// As with [`Engine::record_kdbx_state_signature`], it comes from the read
+    /// of the ingested bytes ([`crate::KdbxStateSignature::read_file`]).
     ///
     /// # Errors
     ///
-    /// - [`EngineError::Io`] if `path` can't be stat'd or its mtime
-    ///   can't be read.
-    /// - [`EngineError::Sqlite`] on persistence failure.
+    /// [`EngineError::Sqlite`] on persistence failure.
     pub fn record_ingested_kdbx_signature(
         &mut self,
-        path: &std::path::Path,
+        signature: crate::KdbxStateSignature,
     ) -> Result<(), EngineError> {
-        let sig = crate::KdbxStateSignature::from_path(path)?;
         let tx = self.conn.transaction()?;
-        write_kdbx_state_signature(&tx, &sig)?;
+        write_kdbx_state_signature(&tx, &signature)?;
         tx.commit()?;
         Ok(())
     }
@@ -1069,7 +1070,7 @@ impl Engine {
         kdf: KdfPolicy<'_>,
     ) -> Result<ParkConflictsResult, EngineError> {
         let was_dirty = self.persistence_state()?.is_dirty();
-        let result = reconcile::reconcile_with_disk_park_conflicts(
+        let (result, read_signature) = reconcile::reconcile_with_disk_park_conflicts(
             self,
             kdbx_path,
             composite_key,
@@ -1107,7 +1108,7 @@ impl Engine {
                 }
             )
         {
-            self.record_kdbx_state_signature(kdbx_path)?;
+            self.record_kdbx_state_signature(read_signature)?;
         }
         Ok(result)
     }

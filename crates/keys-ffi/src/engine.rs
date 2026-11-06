@@ -1092,7 +1092,7 @@ impl Engine {
         // KDF settings changed under the mirror needs approval through the
         // reconcile, not a silent derive here.
         let recorded = self.with_engine(|e| Ok(e.recorded_kdf_cost()?))?;
-        let mut kdbx = tokio::task::spawn_blocking(move || {
+        let (mut kdbx, _read_signature) = tokio::task::spawn_blocking(move || {
             crate::kdf::open_vault_file(
                 &path_for_open,
                 &pw,
@@ -1198,7 +1198,7 @@ impl Engine {
         // as the fail-closed guard: a wrong current password OR keyfile can't
         // open the envelope, so it never reaches the rotation.
         let recorded = self.with_engine(|e| Ok(e.recorded_kdf_cost()?))?;
-        let mut kdbx = tokio::task::spawn_blocking(move || {
+        let (mut kdbx, _read_signature) = tokio::task::spawn_blocking(move || {
             crate::kdf::open_vault_file(
                 &path_for_open,
                 &current_pw,
@@ -1644,6 +1644,11 @@ impl Engine {
 
     /// Apply a user-resolved conflict.
     ///
+    /// Refused with [`EngineError::ResolutionMismatch`] if anything has changed
+    /// the mirror since the resolver opened: nothing is applied and the
+    /// conflict stays held. Reopen the resolver with
+    /// [`Self::held_conflict_payload`] and ask again.
+    ///
     /// Marked `async` for symmetry with the other slow ops even though
     /// the body is currently sync — the validation pass + apply walk
     /// run in-thread. If a future refactor pushes the apply onto a
@@ -1718,7 +1723,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let path_for_open = path.clone();
         let recorded = self.with_engine(|e| Ok(e.recorded_kdf_cost()?))?;
-        let result = tokio::task::spawn_blocking(move || {
+        let (kdbx, read_signature) = tokio::task::spawn_blocking(move || {
             crate::kdf::open_vault_file(
                 &path_for_open,
                 &pw,
@@ -1730,15 +1735,13 @@ impl Engine {
         .await
         .map_err(|e| EngineError::Internal(format!("join: {e}")))??;
         self.with_engine_mut(|e| {
-            e.ingest_from_kdbx(&result)?;
-            // Record the post-ingest kdbx-state signature so the
+            e.ingest_from_kdbx(&kdbx)?;
+            // Record the signature of what was just ingested, so the
             // frontend can skip re-ingest on a later unlock when the
-            // on-disk KDBX hasn't changed. `save_to_kdbx` records the
-            // same signature internally; only `ingest_from_kdbx` needs
-            // the path threaded through here (the engine method
-            // doesn't take one — kept that way to avoid churning every
-            // existing call site).
-            e.record_ingested_kdbx_signature(&path)?;
+            // on-disk KDBX hasn't changed. `save_to_kdbx` records its own
+            // internally; `ingest_from_kdbx` doesn't see the file, so it's
+            // handed over from the read here.
+            e.record_ingested_kdbx_signature(read_signature)?;
             Ok(())
         })
     }
@@ -2075,7 +2078,7 @@ pub async fn open_vault_self_healing(
         let heal = |reason: SidecarRebuildReason,
                     recorded: Option<eng::KdfCost>|
          -> Result<SelfHealingOpen, EngineError> {
-            let unlocked = crate::kdf::open_vault_file(
+            let (unlocked, read_signature) = crate::kdf::open_vault_file(
                 &kdbx,
                 &pw,
                 keyfile.as_deref(),
@@ -2089,7 +2092,7 @@ pub async fn open_vault_self_healing(
                 engine_file_watcher::bridge(file_watcher.clone()),
                 &unlocked,
             )?;
-            inner.record_ingested_kdbx_signature(&kdbx)?;
+            inner.record_ingested_kdbx_signature(read_signature)?;
             Ok(SelfHealingOpen {
                 engine: wrap_engine(inner),
                 rebuilt: Some(reason),
@@ -2187,7 +2190,7 @@ pub async fn rebuild_vault_local_data(
         let kp = BridgeDbKeyProvider::new(key_provider);
         let fp: Arc<dyn keepass_core::protector::FieldProtector> =
             Arc::new(BridgeProtector::new(field_protector));
-        let unlocked =
+        let (unlocked, read_signature) =
             crate::kdf::open_vault_file(&kdbx, &pw, keyfile.as_deref(), None, approved.as_ref())?;
         let (mut inner, discarded) = eng::Engine::rebuild_local_data(
             &db,
@@ -2196,7 +2199,7 @@ pub async fn rebuild_vault_local_data(
             engine_file_watcher::bridge(file_watcher),
             &unlocked,
         )?;
-        inner.record_ingested_kdbx_signature(&kdbx)?;
+        inner.record_ingested_kdbx_signature(read_signature)?;
         drop(inner);
         Ok(discarded)
     })

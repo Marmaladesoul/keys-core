@@ -206,6 +206,10 @@ pub(crate) fn held_conflict_payload(
         parked.retain(|u| *u == filter);
     }
 
+    // Read before projecting, so a write landing in between reads as moved. If
+    // a settle below lands a merge this is behind too, and costs one more trip
+    // through the resolver.
+    let projected_at_seq = engine.persistence_state()?.mutation_seq;
     let mut local_vault = engine.project_to_vault()?;
     let session_key = engine
         .field_protector_arc()
@@ -250,6 +254,7 @@ pub(crate) fn held_conflict_payload(
         engine.stash_conflict_context(crate::conflict_resolution::PendingConflictContext {
             payload: payload.clone(),
             outcome,
+            projected_at_seq,
             local_vault,
             remote_vault: theirs_vault,
         });
@@ -577,19 +582,23 @@ fn swap_entry_in_tree(
 /// mtime for every other watcher, and between two rewrite-on-ingest
 /// clients (two clients sharing a vault over syncthing/rsync) would
 /// ping-pong forever.
+///
+/// Also returns the signature of the file as it was read, for the caller to
+/// record if the reconcile settled.
 pub(crate) fn reconcile_with_disk_park_conflicts(
     engine: &mut Engine,
     kdbx_path: &Path,
     composite_key: &CompositeKey,
     _now: chrono::DateTime<chrono::Utc>,
     kdf: KdfPolicy<'_>,
-) -> Result<ParkConflictsResult, EngineError> {
+) -> Result<(ParkConflictsResult, crate::KdbxStateSignature), EngineError> {
     // The disk file is one peer under the FILE_OWNER sentinel — the
     // file-watcher / Syncthing / external-client path. It is the vault's own
     // file, whose KDF settings its user may legitimately change in any
     // client — so a changed cost isn't refused outright like a peer's, but
     // it isn't derived until the user approves it either.
-    let disk = read_kdbx_header(kdbx_path)?;
+    let (bytes, read_signature) = crate::KdbxStateSignature::read_file(kdbx_path)?;
+    let disk = parse_kdbx_header(bytes)?;
     kdf_cost::check_vault_header(&disk, recorded_kdf_cost(engine)?.as_ref(), kdf)?;
     let disk = unlock_kdbx(engine, disk, composite_key)?;
     let result = ingest_kdbx_as_owner(engine, &disk, FILE_OWNER)?;
@@ -597,7 +606,7 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     // cipher / KDF cost follow the file — recorded only once the file has
     // decrypted and passed the replica gate inside the ingest.
     crate::meta::refresh_kdbx_outer_header_facts(engine.conn(), disk.outer_header())?;
-    Ok(result)
+    Ok((result, read_signature))
 }
 
 /// Per-device-key sync transport: ingest a fetched peer KDBX blob under the
@@ -693,7 +702,8 @@ pub(crate) fn adopt_peer_kdf(
     // watermark past them, or the mirror would owe the file a rewrite.
     crate::meta::refresh_kdbx_outer_header_facts(engine.conn(), peer.outer_header())?;
     let settled = engine.persistence_state()?.mutation_seq;
-    engine.record_kdbx_correspondence(vault_path, settled)?;
+    engine
+        .record_kdbx_correspondence(crate::KdbxStateSignature::from_path(vault_path)?, settled)?;
     engine.emit(ChangeEvent::SaveCompleted);
     Ok(result)
 }
@@ -713,7 +723,11 @@ fn ensure_vault_file_current(engine: &Engine, vault_path: &Path) -> Result<(), E
 /// Read and parse a KDBX file up to its outer header — everything that
 /// can be known about it before a key derivation.
 fn read_kdbx_header(kdbx_path: &Path) -> Result<Kdbx<HeaderRead>, EngineError> {
-    let bytes = std::fs::read(kdbx_path)?;
+    parse_kdbx_header(std::fs::read(kdbx_path)?)
+}
+
+/// Parse a KDBX file's bytes up to its outer header.
+fn parse_kdbx_header(bytes: Vec<u8>) -> Result<Kdbx<HeaderRead>, EngineError> {
     Kdbx::open_from_bytes(bytes)
         .map_err(|e| EngineError::Serialise(format!("open disk kdbx: {e}")))?
         .read_header()

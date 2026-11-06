@@ -32,8 +32,9 @@
 //! fall back to the default — a scenario that fat-fingers the key should
 //! see it, not a misleadingly-passing run.
 
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use keys_ffi::{
     VaultDbKeyProvider, VaultDbKeyProviderError, VaultFieldProtector, VaultProtectorError,
@@ -48,6 +49,36 @@ const MIRROR_SESSION_KEY: [u8; 32] = [0x9c; 32];
 const DB_KEY_ENV: &str = "KEYHOLE_DB_KEY";
 /// Env var overriding [`MIRROR_SESSION_KEY`] (32 bytes of hex). See module docs.
 const FIELD_KEY_ENV: &str = "KEYHOLE_FIELD_KEY";
+
+/// Env var naming a KDBX file to rename over the vault part-way through
+/// the open-time sync. See [`arm_file_landing`].
+const LAND_FILE_ENV: &str = "KEYHOLE_LAND_FILE_AFTER_READ";
+
+/// The pending `(replacement, vault)` rename [`arm_file_landing`] armed.
+static PENDING_LANDING: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
+
+/// Arm the [`LAND_FILE_ENV`] rename, if the env var is set: the next session
+/// key request moves that file over `vault`.
+///
+/// This models another writer replacing the vault file while the engine is
+/// deriving. The open-time sync asks for the session key only once it has
+/// read the file, so the timing is exact where a race against a slow KDF
+/// would not be, and the rename runs on a test double, so no production code
+/// carries a hook. Arm it just before the sync: the open itself may ask for
+/// the key too, before anything has been read.
+pub fn arm_file_landing(vault: &Path) {
+    if let Some(replacement) = std::env::var_os(LAND_FILE_ENV) {
+        *PENDING_LANDING.lock().unwrap() = Some((PathBuf::from(replacement), vault.to_owned()));
+    }
+}
+
+/// Perform the armed rename, once. A failed rename is a broken scenario, so
+/// it's fatal rather than a run that passes without testing anything.
+fn land_armed_file() {
+    if let Some((replacement, vault)) = PENDING_LANDING.lock().unwrap().take() {
+        std::fs::rename(&replacement, &vault).expect("rename the landing file over the vault");
+    }
+}
 
 /// Resolve an optional 32-byte key override from `env_var` (32 bytes of
 /// hex). The caller applies its own default when there is no override.
@@ -167,6 +198,7 @@ pub struct FixedProtector;
 
 impl VaultFieldProtector for FixedProtector {
     fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
+        land_armed_file();
         match key_override(FIELD_KEY_ENV) {
             Ok(Some(bytes)) => Ok(bytes.to_vec()),
             Ok(None) => Ok(MIRROR_SESSION_KEY.to_vec()),
