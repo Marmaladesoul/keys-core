@@ -30,6 +30,9 @@ const UPDATE_REQUESTS_BEFORE_LANDING: usize = 3;
 /// Session-key requests resolver-open makes before its settle lands: the
 /// projection's and its own. The landing's is the next one.
 const RESOLVER_OPEN_REQUESTS_BEFORE_LANDING: usize = 2;
+/// Session-key requests between an abandoned settle's landing and its
+/// retry's: the re-projection the abandoned settle takes.
+const REQUESTS_BEFORE_RETRY_LANDING: usize = 1;
 
 #[derive(Debug)]
 struct FixedKey;
@@ -65,9 +68,13 @@ impl std::fmt::Debug for HookedProtector {
 }
 
 impl HookedProtector {
-    /// Run `action` on the request after the next `skip` requests.
+    /// Run `action` on the request after the next `skip` requests. There is
+    /// one slot: arming over a pending action would drop it unrun, and the
+    /// test would pass without testing what it was for.
     fn arm(&self, skip: usize, action: impl FnOnce() + Send + 'static) {
-        *self.armed.lock().unwrap() = Some((skip, Box::new(action)));
+        let mut armed = self.armed.lock().unwrap();
+        assert!(armed.is_none(), "an action is already armed and hasn't run");
+        *armed = Some((skip, Box::new(action)));
     }
 
     fn fired(&self) -> bool {
@@ -185,7 +192,8 @@ fn sidecar(db_path: &std::path::Path) -> Engine {
 }
 
 /// An action editing `other`'s notes through a second engine on the mirror:
-/// a vault write, so it moves `mutation_seq`.
+/// a vault write, so it moves `mutation_seq` (if `notes` differ from what
+/// `other` already has: a no-op edit writes nothing).
 fn edit_other(db_path: std::path::PathBuf, other: Uuid, notes: &'static str) -> impl FnOnce() {
     move || {
         sidecar(&db_path)
@@ -198,6 +206,40 @@ fn edit_other(db_path: std::path::PathBuf, other: Uuid, notes: &'static str) -> 
             )
             .expect("write through the second engine");
     }
+}
+
+/// An action moving the mirror (see [`edit_other`]) at the landing it is
+/// armed for, and again at the landing of the settle's one retry.
+fn move_twice(f: &Fixture) -> impl FnOnce() + Send + 'static {
+    let (hook, db_path, other) = (f.hook.clone(), f.db_path.clone(), f.other);
+    move || {
+        edit_other(db_path.clone(), other, "moved at the landing")();
+        hook.arm(
+            REQUESTS_BEFORE_RETRY_LANDING,
+            edit_other(db_path, other, "moved at the retry's landing"),
+        );
+    }
+}
+
+/// A converged local with owner a's row dissolved but still parked: a's
+/// adoption of its title was abandoned because the mirror moved.
+fn dissolved_but_parked() -> Fixture {
+    let mut f = fixture();
+    set_username(&mut f, "u-local");
+    f.engine
+        .ingest_peer("a", &peer(&f, "seed-a", "u-a"))
+        .expect("ingest a");
+    f.hook.arm(
+        UPDATE_REQUESTS_BEFORE_LANDING,
+        edit_other(f.db_path.clone(), f.other, "meanwhile"),
+    );
+    set_username(&mut f, "u-a");
+    assert!(f.hook.fired(), "the second engine never wrote");
+    assert_eq!(
+        f.engine.conflict_owners(f.seed).unwrap(),
+        vec!["a".to_owned()]
+    );
+    f
 }
 
 fn set_username(f: &mut Fixture, username: &str) {
@@ -292,10 +334,8 @@ fn resolver_open_surfaces_a_live_owner_behind_a_dissolved_one() {
     set_username(&mut f, "u-a");
     assert!(f.hook.fired(), "the second engine never wrote");
 
-    f.hook.arm(
-        RESOLVER_OPEN_REQUESTS_BEFORE_LANDING,
-        edit_other(f.db_path.clone(), f.other, "meanwhile 2"),
-    );
+    f.hook
+        .arm(RESOLVER_OPEN_REQUESTS_BEFORE_LANDING, move_twice(&f));
     let payload = f
         .engine
         .held_conflict_payload(&f.kdbx_path, &composite(), Some(f.seed))
@@ -423,5 +463,100 @@ fn a_settle_drops_nothing_once_the_mirror_moves() {
         f.engine.conflict_owners(f.seed).expect("owners"),
         vec!["a".to_owned(), "b".to_owned()],
         "a row judged on a stale projection was dropped"
+    );
+}
+
+/// Resolver open retries a settle the mirror's moving abandoned, so `None`
+/// still means nothing is left: the dissolved row is settled, not left
+/// parked behind a resolver that has nothing to show.
+#[test]
+fn resolver_open_retries_a_settle_the_mirror_moved() {
+    let mut f = dissolved_but_parked();
+    f.hook.arm(
+        RESOLVER_OPEN_REQUESTS_BEFORE_LANDING,
+        edit_other(f.db_path.clone(), f.other, "meanwhile again"),
+    );
+    let payload = f
+        .engine
+        .held_conflict_payload(&f.kdbx_path, &composite(), Some(f.seed))
+        .expect("held payload");
+    assert!(f.hook.fired(), "the second engine never wrote");
+    assert!(payload.is_none(), "nothing clashes");
+    assert_eq!(seed_title(&f), "seed-a", "the retry didn't land a's change");
+    assert!(
+        f.engine.entries_with_parked_conflict().unwrap().is_empty(),
+        "resolver open reported nothing to resolve over a row still parked"
+    );
+}
+
+/// If the mirror moves again during the retry, resolver open fails, to be
+/// opened again, rather than report nothing to resolve over a parked row.
+#[test]
+fn resolver_open_fails_rather_than_report_nothing_over_a_parked_row() {
+    let mut f = dissolved_but_parked();
+    f.hook
+        .arm(RESOLVER_OPEN_REQUESTS_BEFORE_LANDING, move_twice(&f));
+    let opened = f
+        .engine
+        .held_conflict_payload(&f.kdbx_path, &composite(), Some(f.seed));
+    assert!(f.hook.fired(), "the second engine never wrote twice");
+    assert!(
+        matches!(opened, Err(crate::EngineError::ResolutionMismatch { .. })),
+        "{opened:?}"
+    );
+    assert_eq!(
+        f.engine.conflict_owners(f.seed).unwrap(),
+        vec!["a".to_owned()]
+    );
+
+    // Opened again with nothing writing meanwhile, it settles the row.
+    assert!(
+        f.engine
+            .held_conflict_payload(&f.kdbx_path, &composite(), Some(f.seed))
+            .expect("held payload")
+            .is_none()
+    );
+    assert_eq!(seed_title(&f), "seed-a");
+    assert!(f.engine.entries_with_parked_conflict().unwrap().is_empty());
+}
+
+/// Owners that park the same peer value (peers that synced each other)
+/// present one clash: a resolution answers it for all of them. An owner
+/// parking a different value has a clash of its own, which stays.
+#[test]
+fn a_resolution_answers_every_owner_parking_the_same_value() {
+    let mut f = fixture();
+    set_username(&mut f, "u-local");
+    let shared = peer(&f, "seed", "u-peer");
+    for owner in ["b", "c"] {
+        f.engine.ingest_peer(owner, &shared).expect("ingest");
+    }
+    f.engine
+        .ingest_peer("d", &peer(&f, "seed", "u-other"))
+        .expect("ingest d");
+
+    let payload = f
+        .engine
+        .held_conflict_payload(&f.kdbx_path, &composite(), Some(f.seed))
+        .expect("held payload")
+        .expect("a clash to resolve");
+    let mut resolution = ConflictResolution::default();
+    for conflict in &payload.entry_conflicts {
+        resolution.entry_field_choices.insert(
+            conflict.entry_id,
+            conflict
+                .field_deltas
+                .iter()
+                .map(|d| (d.key.clone(), ConflictSide::Local))
+                .collect(),
+        );
+    }
+    f.engine
+        .apply_conflict_resolution(payload.id, &resolution)
+        .expect("resolve");
+    assert_eq!(
+        f.engine.conflict_owners(f.seed).expect("owners"),
+        vec!["d".to_owned()],
+        "the choice answered b and c alike, and nothing else"
     );
 }

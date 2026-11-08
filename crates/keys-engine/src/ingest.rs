@@ -145,22 +145,38 @@ pub(crate) fn drop_projected_rows(
     projected_at_seq: i64,
     rows: &[conflict_rows::ParkedRow],
 ) -> Result<ProjectedIngest, EngineError> {
+    let source = Source::InMemory {
+        projected_at_seq,
+        consumed: rows,
+    };
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if PersistenceState::read(&tx)?.mutation_seq != projected_at_seq {
+    if source.refuses(&PersistenceState::read(&tx)?) {
         return Ok(ProjectedIngest::MirrorMoved);
     }
-    let at = AtProjection(&tx);
-    for row in rows {
-        conflict_rows::drop_peer_row_as_read(&at, row)?;
-    }
+    drop_rows_at_projection(&tx, rows)?;
     tx.commit()?;
     Ok(ProjectedIngest::Landed)
 }
 
+/// Drop `rows`, each only if it is still the row as read, in `tx`, which
+/// the caller has just found still at the `mutation_seq` of the projection
+/// the rows were decided on, before any write.
+fn drop_rows_at_projection(
+    tx: &rusqlite::Transaction<'_>,
+    rows: &[conflict_rows::ParkedRow],
+) -> Result<(), EngineError> {
+    let at = AtProjection(tx);
+    for row in rows {
+        conflict_rows::drop_peer_row_as_read(&at, row)?;
+    }
+    Ok(())
+}
+
 /// A transaction in which the mirror has been found, before any write, to
-/// be still at the `mutation_seq` a projection was taken at. Only this
-/// module makes one, right after that check, so a write decided on a
-/// projection (dropping a conflict row) can't commit without it.
+/// be still at the `mutation_seq` a projection was taken at. Only
+/// [`drop_rows_at_projection`] makes one, and its callers call it right
+/// after that check, so a write decided on a projection (dropping a
+/// conflict row) can't commit without it.
 pub(crate) struct AtProjection<'t, 'c>(&'t rusqlite::Transaction<'c>);
 
 impl AtProjection<'_, '_> {
@@ -311,10 +327,7 @@ fn replace_vault(
 
     if let Source::InMemory { consumed, .. } = source {
         // `source.refuses` passed above, before any write.
-        let at = AtProjection(&tx);
-        for row in consumed {
-            conflict_rows::drop_peer_row_as_read(&at, row)?;
-        }
+        drop_rows_at_projection(&tx, consumed)?;
     }
 
     if matches!(source, Source::VaultFile { settles: true, .. }) {

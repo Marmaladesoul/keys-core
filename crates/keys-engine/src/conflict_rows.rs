@@ -272,18 +272,19 @@ pub(crate) fn drop_peer_row_as_read(
 ) -> Result<bool, EngineError> {
     let conn = at.conn();
     let uuid_str = row.entry_uuid.to_string();
+    // Children first, parent last, as everywhere in this module; the
+    // children only while the parent is still the row as read.
+    conn.execute(
+        "DELETE FROM conflict_entry_blob_ref WHERE owner = ?1 AND entry_uuid = ?2 \
+         AND EXISTS (SELECT 1 FROM conflict_entry \
+                     WHERE owner = ?1 AND entry_uuid = ?2 AND entry_json = ?3)",
+        params![row.owner, uuid_str, row.entry_json],
+    )?;
     let removed = conn.execute(
         "DELETE FROM conflict_entry WHERE owner = ?1 AND entry_uuid = ?2 AND entry_json = ?3",
         params![row.owner, uuid_str, row.entry_json],
     )?;
-    if removed == 0 {
-        return Ok(false);
-    }
-    conn.execute(
-        "DELETE FROM conflict_entry_blob_ref WHERE owner = ?1 AND entry_uuid = ?2",
-        params![row.owner, uuid_str],
-    )?;
-    Ok(true)
+    Ok(removed == 1)
 }
 
 #[cfg(test)]

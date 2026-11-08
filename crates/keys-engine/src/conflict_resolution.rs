@@ -80,8 +80,9 @@ use crate::util::tree::find_entry;
 ///   per-side reveal path can read either);
 /// - the `mutation_seq` as of `local_vault`'s projection, so apply can tell
 ///   whether the mirror has moved on from that snapshot;
-/// - the conflict row `remote_vault` was rebuilt from, as read, which is
-///   the only row apply drops.
+/// - the conflict row `remote_vault` was rebuilt from, first, and every
+///   other owner's row parking the same peer value, as read: the rows the
+///   user's choice answers, and the only rows apply drops.
 ///
 /// The apply path re-ingests the merged [`Vault`] directly via
 /// `Engine::ingest_projected_vault`, so the context no longer carries a disk Kdbx
@@ -94,7 +95,7 @@ pub(crate) struct PendingConflictContext {
     pub(crate) projected_at_seq: i64,
     pub(crate) local_vault: Vault,
     pub(crate) remote_vault: Vault,
-    pub(crate) remote_row: conflict_rows::ParkedRow,
+    pub(crate) remote_rows: Vec<conflict_rows::ParkedRow>,
 }
 
 impl std::fmt::Debug for PendingConflictContext {
@@ -140,7 +141,7 @@ pub(crate) fn apply_conflict_resolution(
         projected_at_seq,
         local_vault,
         remote_vault,
-        remote_row,
+        remote_rows,
     } = ctx;
 
     // 2. Apply the merge against an owned copy of the local side.
@@ -178,14 +179,15 @@ pub(crate) fn apply_conflict_resolution(
     //    owner-rows switch took `set_last_saved_kdbx_bytes` off this path
     //    (the caller saves the resolved projection out of band).
     //
-    //    The conflict row the resolver showed is dropped with it, so the
-    //    badge clears, but only that row and only as read: the user chose
-    //    against that peer value, not against a newer one re-parked since,
-    //    nor against another owner's row, which may still carry changes
-    //    local lacks. Those stay parked for the next settle or resolver
-    //    open. (Cross-peer clearing rides the resolution records written in
-    //    step 3.)
-    match engine.ingest_projected_vault(&merged, projected_at_seq, &[remote_row])? {
+    //    The conflict rows the user's choice answers (the one the resolver
+    //    showed, and any other owner's parking the same value) are dropped
+    //    with it, so the badge clears, but only those and only as read: the
+    //    user chose against that peer value, not against a newer one
+    //    re-parked since, nor against another owner's different value,
+    //    which may still carry changes local lacks. Those stay parked for
+    //    the next settle or resolver open. (Cross-peer clearing rides the
+    //    resolution records written in step 3.)
+    match engine.ingest_projected_vault(&merged, projected_at_seq, &remote_rows)? {
         crate::ingest::ProjectedIngest::Landed => {}
         crate::ingest::ProjectedIngest::MirrorMoved => {
             return Err(EngineError::ResolutionMismatch {

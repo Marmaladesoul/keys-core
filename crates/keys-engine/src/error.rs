@@ -177,7 +177,9 @@ pub enum EngineError {
     /// Also raised when the mirror has changed since the resolver opened, as
     /// applying would discard that change. Nothing was applied and the conflict
     /// stays held: rebuild the resolver with
-    /// [`crate::Engine::held_conflict_payload`] and ask again.
+    /// [`crate::Engine::held_conflict_payload`] and ask again. And raised by
+    /// that call itself if the mirror kept changing while it settled the held
+    /// rows: open it again.
     #[error("resolution does not match stashed conflict: {reason}")]
     ResolutionMismatch {
         /// What didn't match.

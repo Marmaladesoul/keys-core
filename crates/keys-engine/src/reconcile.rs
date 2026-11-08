@@ -186,7 +186,14 @@ pub(crate) static NEXT_CONFLICT_ID: AtomicI64 = AtomicI64::new(1);
 /// the entry forever (found by keyhole's fuzz soak — DESIGN.md Finding #5).
 /// After clearing a dissolved candidate, the unfiltered path moves on to the
 /// next held entry, so `None` genuinely means "nothing left to resolve".
+/// That needs the settle to have run: one the mirror's moving abandons is
+/// retried once against the fresh projection, and if the mirror moves again
+/// the call fails with [`EngineError::ResolutionMismatch`] (open it again)
+/// rather than return `None` over rows the settle never got to drop.
 ///
+/// The stash carries the surfaced row and every other owner's row for the
+/// entry that parks the same peer value ([`same_parked_value`]): the
+/// user's choice answers each of them, so the apply drops them together.
 /// Multi-peer note: when an entry carries rows from several peers this picks
 /// the first owner that still clashes ([`conflict_rows::conflict_owners_for`]
 /// returns them sorted) — surfacing the full N-value picker is deferred.
@@ -215,6 +222,7 @@ pub(crate) fn held_conflict_payload(
         .acquire_session_key()
         .map_err(|e| EngineError::Serialise(format!("acquire session key: {e}")))?;
 
+    let mut unsettled = false;
     for uuid in parked {
         // First settle this entry's rows owner-by-owner: drop any whose
         // divergence has dissolved (or all, if the entry is gone), leaving
@@ -222,7 +230,12 @@ pub(crate) fn held_conflict_payload(
         // write-side reconcile keeps badge and resolver in agreement and
         // avoids the multi-owner over-clear an owner-agnostic drop here
         // would cause (drop owner B's dissolved row, NOT peer C's live one).
-        settle_entry_rows(engine, &mut local, &session_key, uuid)?;
+        // A settle the mirror's moving abandoned gets one more try, against
+        // the projection it refreshed.
+        let mut settled = settle_entry_rows(engine, &mut local, &session_key, uuid)?;
+        if settled.abandoned {
+            settled = settle_entry_rows(engine, &mut local, &session_key, uuid)?;
+        }
 
         // Build "theirs" from the first remaining owner that still clashes.
         // A remaining owner can merge clean: a settle abandoned because the
@@ -239,6 +252,7 @@ pub(crate) fn held_conflict_payload(
                 continue;
             }
 
+            let remote_rows = rows_answered_with(engine, &session_key, row)?;
             let id = NEXT_CONFLICT_ID.fetch_add(1, Ordering::Relaxed);
             let payload = ConflictPayload {
                 id,
@@ -252,12 +266,69 @@ pub(crate) fn held_conflict_payload(
                 projected_at_seq: local.at_seq,
                 local_vault: local.vault,
                 remote_vault: theirs_vault,
-                remote_row: row,
+                remote_rows,
             });
             return Ok(Some(payload));
         }
+        // Nothing to show for this entry. If its settle was abandoned twice,
+        // dissolved rows may still be parked, which the badge still lists.
+        unsettled |= settled.abandoned;
+    }
+    if unsettled {
+        return Err(EngineError::ResolutionMismatch {
+            reason: "the vault kept changing while the resolver opened".to_owned(),
+        });
     }
     Ok(None)
+}
+
+/// `surfaced`, first, with every other owner's row for its entry that parks
+/// the same peer value ([`same_parked_value`]).
+fn rows_answered_with(
+    engine: &Engine,
+    session_key: &keepass_core::protector::SessionKey,
+    surfaced: conflict_rows::ParkedRow,
+) -> Result<Vec<conflict_rows::ParkedRow>, EngineError> {
+    // One pool for every rebuild, so equal attachment bytes bind to equal
+    // refs and compare equal.
+    let mut pool = Vec::new();
+    let value =
+        conflict_rows::reconstruct_peer_entry(engine.conn(), &surfaced, session_key, &mut pool)?;
+    let uuid = surfaced.entry_uuid;
+    let owners = conflict_rows::conflict_owners_for(engine.conn(), uuid)?;
+    let mut rows = vec![surfaced];
+    for owner in owners {
+        if owner == rows[0].owner {
+            continue;
+        }
+        let Some(row) = conflict_rows::read_peer_row(engine.conn(), &owner, uuid)? else {
+            continue;
+        };
+        let other =
+            conflict_rows::reconstruct_peer_entry(engine.conn(), &row, session_key, &mut pool)?;
+        if same_parked_value(&other, &value) {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// Whether two owners' parked versions of an entry are the same peer value,
+/// so a choice made against one answers the other: equal in every field,
+/// attachment, icon, tag, `<CustomData>`, expiry and history version (the
+/// [`same_entry`] comparison), whenever each was last modified, accessed or
+/// used. Two peers that synced each other park the same value, and so do
+/// two that made the same edit to the same base. A row differing in
+/// anything else carries a change the choice never saw, and stays.
+fn same_parked_value(a: &keepass_core::model::Entry, b: &keepass_core::model::Entry) -> bool {
+    let unclocked = |e: &keepass_core::model::Entry| {
+        let mut e = e.clone();
+        e.times.last_modification_time = None;
+        e.times.last_access_time = None;
+        e.times.usage_count = 0;
+        e
+    };
+    same_entry(&unclocked(a), &unclocked(b))
 }
 
 /// The local vault as projected from the mirror, with the `mutation_seq` it
@@ -433,40 +504,60 @@ fn same_entry(a: &keepass_core::model::Entry, b: &keepass_core::model::Entry) ->
 /// `local`, since local changed, and re-check the remaining owners against
 /// it). Each pass drops at least one row or stops, so the loop is bounded
 /// by the owner count, plus one pass per row re-parked by another writer
-/// during the settle. Returns whether any merge was landed (local changed).
+/// during the settle.
 ///
 /// If the mirror moved after `local` was projected, the decision is applied
 /// not at all — no merge landed, no row dropped: the settle stops there,
 /// leaving the rows parked for the next settle (the next sweep, local edit
 /// of the entry or resolver open) rather than retrying against a mirror
-/// something else is writing. `local` is
-/// re-projected, so the caller's next entry is checked against the mirror
-/// as it now is.
+/// something else is writing. `local` is re-projected, so the caller's next
+/// entry is checked against the mirror as it now is.
 fn settle_entry_rows(
     engine: &mut Engine,
     local: &mut LocalProjection,
     session_key: &keepass_core::protector::SessionKey,
     uuid: uuid::Uuid,
-) -> Result<bool, EngineError> {
+) -> Result<Settled, EngineError> {
     let mut adopted = false;
     loop {
         let owners = conflict_rows::conflict_owners_for(engine.conn(), uuid)?;
         if owners.is_empty() {
-            return Ok(adopted);
+            return Ok(Settled {
+                adopted,
+                abandoned: false,
+            });
         }
         let decision = dissolve_decision(engine, &local.vault, session_key, uuid, &owners)?;
         match apply_dissolve(engine, uuid, decision, local.at_seq)? {
-            Dissolved::Unchanged => return Ok(adopted),
+            Dissolved::Unchanged => {
+                return Ok(Settled {
+                    adopted,
+                    abandoned: false,
+                });
+            }
             Dissolved::Adopted => {
                 adopted = true;
                 *local = LocalProjection::take(engine)?;
             }
             Dissolved::MirrorMoved => {
                 *local = LocalProjection::take(engine)?;
-                return Ok(adopted);
+                return Ok(Settled {
+                    adopted,
+                    abandoned: true,
+                });
             }
         }
     }
+}
+
+/// What [`settle_entry_rows`] did.
+struct Settled {
+    /// A merge landed: local changed.
+    adopted: bool,
+    /// The settle stopped because the mirror moved after the projection it
+    /// was deciding on, so rows it would have dropped or landed may still
+    /// be parked.
+    abandoned: bool,
 }
 
 /// Reconcile ONE entry's parked conflict rows against the current local
@@ -534,7 +625,7 @@ pub(crate) fn reconcile_all_conflict_rows(
         .map_err(|e| EngineError::Serialise(format!("acquire session key: {e}")))?;
     let mut adopted = Vec::new();
     for uuid in parked {
-        if settle_entry_rows(engine, &mut local, &session_key, uuid)? {
+        if settle_entry_rows(engine, &mut local, &session_key, uuid)?.adopted {
             adopted.push(uuid);
         }
     }
