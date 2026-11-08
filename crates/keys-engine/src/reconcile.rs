@@ -655,14 +655,23 @@ pub(crate) fn recorded_kdf_cost(engine: &Engine) -> Result<Option<KdfCost>, Engi
 /// counterpart of [`ingest_peer_from_kdbx`]. The peer blob is derived only
 /// if its header demands exactly the `approved` cost; it then merges under
 /// `owner` like any peer replica, and the merged mirror is saved to the
-/// vault file at `vault_path` **inside the peer's envelope** (its cipher
-/// and KDF parameters, with fresh seeds), so this vault's file — and every
-/// replica it publishes — carries the adopted settings, and the mirror
-/// records them as its own.
+/// vault file at `vault_path` in **that file's own envelope with only its
+/// KDF settings replaced** by the approved ones (fresh seeds), so this
+/// vault's file — and every replica it publishes — carries the adopted
+/// settings, and the mirror records them as its own.
 ///
-/// The facts are recorded only after the save lands: a failed save leaves
-/// the mirror merged but keyed as before, so the next peer round asks
-/// again rather than refusing this vault's own file.
+/// What an approval covers is the KDF settings the user was shown, and
+/// nothing else of the peer's envelope: the vault keeps its own KDBX
+/// version, outer cipher, compression and inner-stream cipher whatever the
+/// peer's are. A KDF the vault's format can't carry (Argon2 in a KDBX3
+/// file) is refused rather than taken as licence to change the format.
+///
+/// Every derive — the vault's file as the save template, its re-key to the
+/// approved settings, the peer — runs before anything merges, so a failure
+/// there leaves the mirror untouched. The facts are recorded only after the
+/// save lands: a failed save leaves the mirror merged but keyed as before,
+/// so the next peer round asks again rather than refusing this vault's own
+/// file.
 pub(crate) fn adopt_peer_kdf(
     engine: &mut Engine,
     peer_path: &Path,
@@ -682,30 +691,73 @@ pub(crate) fn adopt_peer_kdf(
             peer: peer_cost,
         });
     }
-    // The save replaces the vault's file, so it must still be the file the
-    // mirror is current with — what sits at the path otherwise has been
-    // neither merged nor identity-checked. Checked before the derive, and
-    // again after it, since the derive can take a while.
-    ensure_vault_file_current(engine, vault_path)?;
-    // Unlocked with no field protector, like any save template: a
-    // protector's side table would hold the peer's protected values, and
-    // the save would write those over the merged mirror's. The ingest reads
-    // the same plaintext either way.
-    let mut peer = peer
+    // The peer's parameters as its header states them: the approved cost
+    // plus a salt of the peer's length, which the re-key replaces.
+    let approved_params = peer
+        .header()
+        .decode_kdf_params()
+        .map_err(|e| EngineError::Serialise(format!("read peer kdf parameters: {e}")))?;
+    // The save template is the vault's own file, which the save replaces —
+    // so it must still be the file the mirror is current with: what sits at
+    // the path otherwise has been neither merged nor identity-checked.
+    // Checked here, and again after the derives, which can take a while.
+    let template = read_current_vault_file(engine, vault_path)?;
+    // Its own derive is gated like any open of it: the recorded settings, or
+    // the approved ones should it already carry them.
+    kdf_cost::check_vault_header(
+        &template,
+        recorded_kdf_cost(engine)?.as_ref(),
+        KdfPolicy {
+            approved: Some(approved),
+            ..KdfPolicy::STANDARD
+        },
+    )?;
+    // Unlocked with no field protector, like any save template: the save
+    // projects the mirror over its contents.
+    let mut template = template
         .unlock(composite_key)
-        .map_err(|e| EngineError::Serialise(format!("unlock peer kdbx: {e}")))?;
+        .map_err(|e| EngineError::Serialise(format!("unlock vault kdbx: {e}")))?;
+    engine.ensure_same_replica(
+        crate::identity::file_identity(&template),
+        &template.vault().meta.custom_data,
+    )?;
+    // Only the KDF changes; keepass-core refuses a KDF the template's format
+    // can't carry before deriving.
+    template
+        .rekey_with_kdf(composite_key, &approved_params)
+        .map_err(|e| {
+            EngineError::Serialise(format!(
+                "re-key the vault file to the approved KDF settings: {e}"
+            ))
+        })?;
+    let peer = unlock_kdbx(engine, peer, composite_key)?;
     ensure_vault_file_current(engine, vault_path)?;
     let result = ingest_kdbx_as_owner(engine, &peer, owner)?;
-    crate::save::save(engine, vault_path, &mut peer, temp_dir)?;
+    crate::save::save(engine, vault_path, &mut template, temp_dir)?;
     // The adopted settings become the recorded ones. The fact rows are
     // mirror state, so the file just written still corresponds: settle the
     // watermark past them, or the mirror would owe the file a rewrite.
-    crate::meta::refresh_kdbx_outer_header_facts(engine.conn(), peer.outer_header())?;
+    crate::meta::refresh_kdbx_outer_header_facts(engine.conn(), template.outer_header())?;
     let settled = engine.persistence_state()?.mutation_seq;
     engine
         .record_kdbx_correspondence(crate::KdbxStateSignature::from_path(vault_path)?, settled)?;
     engine.emit(ChangeEvent::SaveCompleted);
     Ok(result)
+}
+
+/// Read the vault's own file up to its outer header, refusing with
+/// [`EngineError::VaultFileChanged`] unless it is the file the mirror last
+/// corresponded with (by the signature of the bytes read).
+fn read_current_vault_file(
+    engine: &Engine,
+    vault_path: &Path,
+) -> Result<Kdbx<HeaderRead>, EngineError> {
+    let (bytes, signature) = crate::KdbxStateSignature::read_file(vault_path)?;
+    if engine.kdbx_state_signature()? == Some(signature) {
+        parse_kdbx_header(bytes)
+    } else {
+        Err(EngineError::VaultFileChanged)
+    }
 }
 
 /// Refuse with [`EngineError::VaultFileChanged`] unless the file at

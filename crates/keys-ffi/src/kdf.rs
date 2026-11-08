@@ -84,11 +84,78 @@ pub struct KdfSummary {
     /// Memory the derive allocates, in bytes.
     pub memory_bytes: u64,
     /// Estimated derive time in seconds on a recent Mac or phone; slower
-    /// devices take longer.
+    /// devices take longer. Not a measure of strength: two settings with the
+    /// same estimate can resist an attacker very differently, so judge a
+    /// change with [`kdf_weakenings`], not by comparing these.
     pub estimated_seconds: f64,
     /// Whether these settings go past this process's ceiling
     /// ([`set_kdf_ceiling`]) — a first open would need approval.
     pub exceeds_ceiling: bool,
+}
+
+/// One respect in which proposed KDF settings are weaker than the ones they
+/// would replace — see [`kdf_weakenings`].
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KdfWeakening {
+    /// Argon2 replaced by AES-KDF, which is not memory-hard: a GPU or ASIC
+    /// runs far more guesses per second against it than the time estimate
+    /// suggests.
+    LosesMemoryHardness,
+    /// Less Argon2 memory per guess.
+    LessMemory,
+    /// Less work within the same KDF family: fewer Argon2 memory-passes, or
+    /// fewer AES-KDF rounds.
+    LessWork,
+    /// Argon2id replaced by Argon2d, giving up Argon2id's resistance to
+    /// side-channel attacks.
+    LosesArgon2id,
+    /// Argon2 version 1.3 replaced by 1.0, which is easier to attack with
+    /// time-memory trade-offs.
+    OlderArgon2Version,
+    /// A change to or from a KDF this build doesn't model, which can't be
+    /// judged.
+    Unmodelled,
+}
+
+impl From<keys_engine::KdfWeakening> for KdfWeakening {
+    fn from(w: keys_engine::KdfWeakening) -> Self {
+        use keys_engine::KdfWeakening as E;
+        match w {
+            E::LosesMemoryHardness => Self::LosesMemoryHardness,
+            E::LessMemory => Self::LessMemory,
+            E::LessWork => Self::LessWork,
+            E::LosesArgon2id => Self::LosesArgon2id,
+            E::OlderArgon2Version => Self::OlderArgon2Version,
+            E::Unmodelled => Self::Unmodelled,
+        }
+    }
+}
+
+/// Every respect in which the `proposed` KDF settings are weaker than the
+/// `current` ones against someone guessing the password offline — empty
+/// when they are weaker in none. A client asking the user to approve a
+/// change ([`KdfSettings`]) shows these, rather than judging strength
+/// itself: two settings can take the same time to derive and resist an
+/// attacker very differently (Argon2 vs AES-KDF, less memory for more
+/// passes, Argon2id vs Argon2d, Argon2 1.3 vs 1.0), so comparing
+/// [`KdfSummary::estimated_seconds`] misses them. Moving from AES-KDF to
+/// Argon2 is never weaker.
+///
+/// # Errors
+///
+/// [`EngineError::Internal`] if either side names an Argon2 version other
+/// than `0x10` or `0x13`.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)] // uniffi exports take owned arguments
+pub fn kdf_weakenings(
+    current: KdfSettings,
+    proposed: KdfSettings,
+) -> Result<Vec<KdfWeakening>, EngineError> {
+    Ok(cost_of_settings(&proposed)?
+        .weakenings_from(&cost_of_settings(&current)?)
+        .into_iter()
+        .map(KdfWeakening::from)
+        .collect())
 }
 
 /// How much KDF cost this process derives without approval when there is no
@@ -326,6 +393,23 @@ mod tests {
             let cost = cost_of_settings(&settings).expect("cost");
             assert_eq!(settings_of_cost(&cost).expect("settings"), settings);
         }
+    }
+
+    #[test]
+    fn weakenings_cross_the_seam_from_the_engine() {
+        let argon2id = KdfSettings::Argon2 {
+            variant: Argon2Kind::Argon2id,
+            memory_bytes: 64 << 20,
+            iterations: 2,
+            parallelism: 4,
+            version: ARGON2_VERSION_13,
+        };
+        let aes = KdfSettings::AesKdf { rounds: 6_000_000 };
+        assert_eq!(
+            kdf_weakenings(argon2id.clone(), aes.clone()).expect("judge"),
+            [KdfWeakening::LosesMemoryHardness]
+        );
+        assert!(kdf_weakenings(aes, argon2id).expect("judge").is_empty());
     }
 
     #[test]

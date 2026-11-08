@@ -48,7 +48,8 @@ pub use engine_types::{
 pub use error::VaultError;
 pub use identity::{VaultIdentityVerdict, verify_vault_identity};
 pub use kdf::{
-    Argon2Kind, KdfCeilingProfile, KdfSettings, KdfSummary, read_kdbx_kdf, set_kdf_ceiling,
+    Argon2Kind, KdfCeilingProfile, KdfSettings, KdfSummary, KdfWeakening, kdf_weakenings,
+    read_kdbx_kdf, set_kdf_ceiling,
 };
 pub use keyfile::generate_keyfile;
 pub use merge::{

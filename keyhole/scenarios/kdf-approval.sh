@@ -42,14 +42,33 @@
 #      vault's file untouched.
 #   5. CONTROL → ordinary opens and peer merges at unchanged settings need no
 #      approval.
+#   6. WEAKER WHATEVER THE TIME → settings that derive in no less time than
+#      the vault's recorded Argon2id are still reported weaker (`kdf
+#      --against`, the judgement a client shows beside the prompt): AES-KDF
+#      (not memory-hard), less memory for more passes, Argon2d, Argon2 1.0.
+#      More memory is not.
+#   7. ONLY THE KDF IS ADOPTED → a peer copy in a KDBX3 envelope (rewrapped
+#      into the vendored fixture's) is adopted under its approved AES-KDF
+#      settings: the vault's file takes those settings but stays KDBX4 with
+#      its own cipher, and the merge survives a fresh re-ingest.
 #
 # Self-contained: keyhole's own create / create-entry / list / kdf / set-kdf
-# / forge-kdf / ingest-peer / adopt-peer-kdf verbs; throwaway vaults.
+# / forge-kdf / ingest-peer / adopt-peer-kdf / envelope / rewrap verbs, plus
+# the vendored KDBX3 fixture; throwaway vaults.
 
 set -uo pipefail
 
 KEYHOLE="$(cd "$(dirname "$0")/../.." && pwd)/target/debug/keyhole"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 export KEYHOLE_PASSWORD="keyhole-kdf-approval-pw"
+KDBX3_FIXTURE="$HERE/fixtures/kdbx3-minimal.kdbx"
+# The fixture's password — a public test credential, mirrored in
+# peer-kdf-cost-refused.sh.
+export KEYHOLE_TEMPLATE_PASSWORD='tëst pässwörd 🔑/\'
+# The reference-device rates `KdfCost::estimate` models, to pick settings
+# whose estimate is no lower than the vault's.
+ARGON2_BYTES_PER_SEC=$((400 * 1024 * 1024))
+AES_ROUNDS_PER_SEC=15000000
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -214,4 +233,64 @@ rm -rf "$CTRL.mirror"
     || fail "a default vault's first open needed approval, even memory-constrained"
 grep -q "Ctrl Peer" "$TMP/p5.out" || fail "the ordinary merge didn't persist"
 
-echo "PASS: a vault file is derived only at its recorded settings, within the ceiling on a first open, or at exactly the settings approved — first opens past the ceiling and on-disk changes wait for approval, an approved peer re-key merges and becomes the vault's settings, a peer that moved on or a hostile one is refused, and ordinary opens and merges are unaffected"
+# --- 6: WEAKER WHATEVER THE TIME ----------------------------------------
+WEAK="$TMP/weak.kdbx"
+"$KEYHOLE" create "$WEAK" >/dev/null || fail "create the vault for the weakening checks"
+"$KEYHOLE" create-entry "$WEAK" "Weak Login" --username weak >/dev/null || fail "seed it"
+mem=67108864; iters=2; lanes=8
+"$KEYHOLE" set-kdf "$WEAK" --kdf "argon2id:memory=$mem:iterations=$iters:parallelism=$lanes:version=19" \
+    >/dev/null || fail "move it to Argon2id"
+rm -rf "$WEAK.mirror"   # record the Argon2id settings on a first open
+"$KEYHOLE" list "$WEAK" >/dev/null || fail "open it at Argon2id"
+current_secs="$("$KEYHOLE" kdf --recorded "$WEAK" | tr '\t' '\n' | sed -n 's/^estimated_seconds=//p')"
+# AES-KDF rounds whose estimate is just past the vault's.
+aes_rounds=$((mem * iters * AES_ROUNDS_PER_SEC / ARGON2_BYTES_PER_SEC + 1))
+
+# $1 = spec, $2 = expected `weaker=` value.
+expect_weakening() {
+    local spec="$1" expected="$2" cand="$TMP/cand.kdbx"
+    cp "$WEAK" "$cand"
+    "$KEYHOLE" set-kdf "$cand" --kdf "$spec" >/dev/null || fail "set $spec"
+    local secs
+    secs="$("$KEYHOLE" kdf "$cand" | tr '\t' '\n' | sed -n 's/^estimated_seconds=//p')"
+    awk -v a="$secs" -v b="$current_secs" 'BEGIN { exit !(a >= b) }' \
+        || fail "$spec estimates ${secs}s, under the vault's ${current_secs}s — not the case under test"
+    local got
+    got="$("$KEYHOLE" kdf "$cand" --against "$WEAK")" || fail "judge $spec"
+    [ "$got" = "weaker=$expected" ] || fail "$spec: expected weaker=$expected, got $got"
+}
+expect_weakening "aes-kdf:rounds=$aes_rounds" loses-memory-hardness
+expect_weakening "argon2id:memory=$((mem / 8)):iterations=$((iters * 8)):parallelism=$lanes:version=19" less-memory
+expect_weakening "argon2d:memory=$mem:iterations=$iters:parallelism=$lanes:version=19" loses-argon2id
+expect_weakening "argon2id:memory=$mem:iterations=$iters:parallelism=$lanes:version=16" older-argon2-version
+expect_weakening "argon2id:memory=$((mem * 2)):iterations=$iters:parallelism=$lanes:version=19" none
+
+echo "note: a weaker KDF is reported weaker even when it derives no faster"
+
+# --- 7: ONLY THE KDF IS ADOPTED -----------------------------------------
+cp "$WEAK" "$TMP/weak-src.kdbx"
+"$KEYHOLE" create-entry "$TMP/weak-src.kdbx" "KDBX3 Peer" --username k3 >/dev/null \
+    || fail "edit the replica's source"
+K3PEER="$TMP/k3-peer.kdbx"
+"$KEYHOLE" rewrap "$TMP/weak-src.kdbx" "$KDBX3_FIXTURE" "$K3PEER" >/dev/null \
+    || fail "rewrap the replica in the KDBX3 envelope"
+"$KEYHOLE" envelope "$K3PEER" | grep -q "^kdbx=3" || fail "the replica isn't KDBX3"
+[ "$("$KEYHOLE" kdf "$K3PEER" --against "$WEAK")" = "weaker=loses-memory-hardness" ] \
+    || fail "the KDBX3 replica's AES-KDF isn't reported weaker"
+envelope_before="$("$KEYHOLE" envelope "$WEAK")"
+k3_spec="$(spec_of "$K3PEER")"
+expect_refused "$PEER_REFUSED" "$WEAK" "ingest of the KDBX3 replica" ingest-peer "$WEAK" "$K3PEER"
+"$KEYHOLE" adopt-peer-kdf "$WEAK" "$K3PEER" --approve-kdf "$k3_spec" >/dev/null 2>"$TMP/p7.err" \
+    || { cat "$TMP/p7.err"; fail "adopting the KDBX3 replica's KDF failed"; }
+[ "$(spec_of "$WEAK")" = "$k3_spec" ] || fail "the vault's file didn't take the approved KDF"
+[ "$(spec_of --recorded "$WEAK")" = "$k3_spec" ] || fail "the vault didn't record the approved KDF"
+[ "$("$KEYHOLE" envelope "$WEAK")" = "$envelope_before" ] \
+    || fail "the adoption changed the vault's envelope: $("$KEYHOLE" envelope "$WEAK"), was $envelope_before"
+rm -rf "$WEAK.mirror"
+"$KEYHOLE" list "$WEAK" >"$TMP/p7.out" || fail "fresh re-ingest after the KDBX3 adoption"
+grep -q "KDBX3 Peer" "$TMP/p7.out" || fail "the KDBX3 replica's entry didn't persist"
+grep -q "Weak Login" "$TMP/p7.out" || fail "the vault lost its own entry in the KDBX3 adoption"
+
+echo "note: an adoption takes the approved KDF settings and nothing else of the peer's envelope"
+
+echo "PASS: a vault file is derived only at its recorded settings, within the ceiling on a first open, or at exactly the settings approved — first opens past the ceiling and on-disk changes wait for approval, an approved peer re-key merges and becomes the vault's settings, a peer that moved on or a hostile one is refused, ordinary opens and merges are unaffected, a weaker KDF is reported weaker whatever its time estimate, and an adoption changes only the vault's KDF settings"

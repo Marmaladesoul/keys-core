@@ -1,6 +1,7 @@
 //! KDF settings on the command line: the `--approve-kdf` spec, the `kdf`
-//! report that prints one, and `set-kdf`, which changes a vault file's KDF
-//! settings the way another client would.
+//! report that prints one (or how a file's settings weaken a vault's
+//! recorded ones), `set-kdf`, which changes a vault file's KDF settings the
+//! way another client would, and the envelope tools `envelope` / `rewrap`.
 //!
 //! A spec names exact settings, salt aside:
 //! `argon2id:memory=67108864:iterations=2:parallelism=2:version=19`
@@ -12,7 +13,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
-use keys_ffi::{Argon2Kind, Engine, KdfSettings, KdfSummary, read_kdbx_kdf};
+use keys_ffi::{
+    Argon2Kind, Engine, KdfSettings, KdfSummary, KdfWeakening, kdf_weakenings, read_kdbx_kdf,
+};
 
 use crate::adapters::{FixedDbKey, FixedProtector};
 
@@ -36,32 +39,70 @@ pub fn approved() -> Option<KdfSettings> {
 /// Print what the vault file demands of its KDF — one line, the scenario
 /// contract: `<spec>\t<description>\tmemory_bytes=<n>\testimated_seconds=<s>\texceeds_ceiling=<bool>`.
 /// With `recorded`, print instead what the vault's mirror recorded for it
-/// (`none` when nothing is), read without syncing the mirror.
-pub fn print(vault: &Path, recorded: bool) -> Result<()> {
+/// (`none` when nothing is), read without syncing the mirror. With
+/// `against`, print instead how the file's settings would weaken those
+/// that vault's mirror recorded — `weaker=<comma-separated weakenings>`, or
+/// `weaker=none` — the judgement a client shows beside an approval prompt.
+pub fn print(vault: &Path, recorded: bool, against: Option<&Path>) -> Result<()> {
+    if let Some(against) = against {
+        let current = recorded_summary(against)?
+            .with_context(|| format!("no recorded KDF settings for {}", against.display()))?;
+        let weakenings = kdf_weakenings(current.settings, file_summary(vault)?.settings)
+            .map_err(|e| anyhow::anyhow!("kdf_weakenings: {e:?}"))?;
+        let rendered: Vec<&str> = weakenings.into_iter().map(weakening_name).collect();
+        println!(
+            "weaker={}",
+            if rendered.is_empty() {
+                "none".to_owned()
+            } else {
+                rendered.join(",")
+            }
+        );
+        return Ok(());
+    }
     let summary = if recorded {
-        let db = crate::mirror_db_for(vault);
-        anyhow::ensure!(db.exists(), "no mirror for {}", vault.display());
-        let engine = Engine::open(
-            db.to_string_lossy().into_owned(),
-            std::sync::Arc::new(FixedDbKey),
-            std::sync::Arc::new(FixedProtector),
-            None,
-        )
-        .map_err(|e| anyhow::anyhow!("engine open: {e:?}"))?;
-        engine
-            .recorded_kdf()
-            .map_err(|e| anyhow::anyhow!("recorded_kdf: {e:?}"))?
+        recorded_summary(vault)?
     } else {
-        Some(
-            read_kdbx_kdf(vault.to_string_lossy().into_owned())
-                .map_err(|e| anyhow::anyhow!("read_kdbx_kdf: {e:?}"))?,
-        )
+        Some(file_summary(vault)?)
     };
     match summary {
         Some(s) => println!("{}", render(&s)),
         None => println!("none"),
     }
     Ok(())
+}
+
+/// What the file at `vault` demands, from its header alone.
+fn file_summary(vault: &Path) -> Result<KdfSummary> {
+    read_kdbx_kdf(vault.to_string_lossy().into_owned())
+        .map_err(|e| anyhow::anyhow!("read_kdbx_kdf: {e:?}"))
+}
+
+/// What the vault's mirror recorded for its file, read without syncing.
+fn recorded_summary(vault: &Path) -> Result<Option<KdfSummary>> {
+    let db = crate::mirror_db_for(vault);
+    anyhow::ensure!(db.exists(), "no mirror for {}", vault.display());
+    let engine = Engine::open(
+        db.to_string_lossy().into_owned(),
+        std::sync::Arc::new(FixedDbKey),
+        std::sync::Arc::new(FixedProtector),
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("engine open: {e:?}"))?;
+    engine
+        .recorded_kdf()
+        .map_err(|e| anyhow::anyhow!("recorded_kdf: {e:?}"))
+}
+
+fn weakening_name(w: KdfWeakening) -> &'static str {
+    match w {
+        KdfWeakening::LosesMemoryHardness => "loses-memory-hardness",
+        KdfWeakening::LessMemory => "less-memory",
+        KdfWeakening::LessWork => "less-work",
+        KdfWeakening::LosesArgon2id => "loses-argon2id",
+        KdfWeakening::OlderArgon2Version => "older-argon2-version",
+        KdfWeakening::Unmodelled => "unmodelled",
+    }
 }
 
 fn render(s: &KdfSummary) -> String {
@@ -77,11 +118,13 @@ fn render(s: &KdfSummary) -> String {
 
 /// Change the KDF settings of the vault file at `vault` in place, as
 /// another client would: re-key it under the same password with the
-/// overridden parameters. Not a client capability of Keys, so it bypasses
-/// the seam and uses keepass-core directly.
+/// overridden parameters, or with exactly the settings `spec` names (which
+/// may switch family, variant or version). Not a client capability of
+/// Keys, so it bypasses the seam and uses keepass-core directly.
 pub fn set_kdf(
     vault: &Path,
     password: &str,
+    spec: Option<&str>,
     argon2_memory_mib: Option<u64>,
     argon2_iterations: Option<u64>,
     aes_rounds: Option<u64>,
@@ -101,6 +144,13 @@ pub fn set_kdf(
         .outer_header()
         .decode_kdf_params()
         .context("decode KDF parameters")?;
+    if let Some(spec) = spec {
+        anyhow::ensure!(
+            argon2_memory_mib.is_none() && argon2_iterations.is_none() && aes_rounds.is_none(),
+            "--kdf names the whole setting; don't combine it with --argon2-* / --aes-rounds"
+        );
+        params = params_of(&parse_spec(spec)?)?;
+    }
     match &mut params {
         KdfParams::Argon2 {
             memory_bytes,
@@ -133,6 +183,113 @@ pub fn set_kdf(
     let bytes = kdbx.save_to_bytes().context("save")?;
     std::fs::write(vault, bytes).with_context(|| format!("write {}", vault.display()))?;
     println!("set KDF of {}", vault.display());
+    Ok(())
+}
+
+/// The salt length `params_of` writes; the re-key replaces the bytes with
+/// fresh ones of this length. 32 is what KDBX writers emit.
+const SPEC_SALT_LEN: usize = 32;
+
+/// Argon2 1.0, as KDBX stores it.
+const ARGON2_VERSION_10: u32 = 0x10;
+/// Argon2 1.3, as KDBX stores it.
+const ARGON2_VERSION_13: u32 = 0x13;
+
+/// keepass-core parameters for exactly `settings`, with a placeholder salt.
+fn params_of(settings: &KdfSettings) -> Result<keepass_core::format::KdfParams> {
+    use keepass_core::format::{Argon2Variant, Argon2Version, KdfParams};
+    Ok(match *settings {
+        KdfSettings::AesKdf { rounds } => KdfParams::AesKdf {
+            seed: [0; SPEC_SALT_LEN],
+            rounds,
+        },
+        KdfSettings::Argon2 {
+            variant,
+            memory_bytes,
+            iterations,
+            parallelism,
+            version,
+        } => KdfParams::Argon2 {
+            variant: match variant {
+                Argon2Kind::Argon2d => Argon2Variant::Argon2d,
+                Argon2Kind::Argon2id => Argon2Variant::Argon2id,
+            },
+            salt: vec![0; SPEC_SALT_LEN],
+            iterations,
+            memory_bytes,
+            parallelism,
+            version: match version {
+                ARGON2_VERSION_10 => Argon2Version::V10,
+                ARGON2_VERSION_13 => Argon2Version::V13,
+                other => anyhow::bail!("Argon2 version {other} is not 16 (1.0) or 19 (1.3)"),
+            },
+        },
+    })
+}
+
+/// Print the parts of a file's envelope an approval of its KDF settings
+/// doesn't cover, from its header alone: `kdbx=<major>\tcipher=<uuid>`.
+pub fn envelope(vault: &Path) -> Result<()> {
+    use keepass_core::format::Version;
+    use keepass_core::kdbx::Kdbx;
+
+    let read = Kdbx::open(vault)
+        .with_context(|| format!("open {}", vault.display()))?
+        .read_header()
+        .context("read outer header")?;
+    let major = match read.version() {
+        Version::V3 => "3",
+        Version::V4 => "4",
+        other => anyhow::bail!("unmodelled KDBX version: {other:?}"),
+    };
+    println!(
+        "kdbx={major}\tcipher={}",
+        read.header().cipher_id.0.hyphenated()
+    );
+    Ok(())
+}
+
+/// Write the contents of the vault file at `vault` (opened under
+/// `password`) into the envelope of the file at `template` (opened under
+/// `template_password`) — its KDBX version, cipher and KDF — re-keyed to
+/// `password`, at `out`: the same vault as another client writing another
+/// format would save it. keepass-core authors KDBX4 only, so this is how a
+/// scenario gets a KDBX3 replica. Not a client capability of Keys, so it
+/// bypasses the seam.
+pub fn rewrap(
+    vault: &Path,
+    template: &Path,
+    out: &Path,
+    password: &str,
+    template_password: &str,
+) -> Result<()> {
+    use keepass_core::CompositeKey;
+    use keepass_core::kdbx::Kdbx;
+
+    let key = CompositeKey::from_password(password.as_bytes());
+    let contents = Kdbx::open(vault)
+        .with_context(|| format!("open {}", vault.display()))?
+        .read_header()
+        .context("read vault header")?
+        .unlock(&key)
+        .context("unlock vault")?;
+    let mut wrapped = Kdbx::open(template)
+        .with_context(|| format!("open {}", template.display()))?
+        .read_header()
+        .context("read template header")?
+        .unlock(&CompositeKey::from_password(template_password.as_bytes()))
+        .context("unlock template")?;
+    wrapped.replace_vault(contents.vault().clone());
+    wrapped
+        .rekey(&key)
+        .context("re-key to the vault's password")?;
+    let bytes = wrapped.save_to_bytes().context("save")?;
+    std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
+    println!(
+        "rewrapped {} in the envelope of {}",
+        vault.display(),
+        template.display()
+    );
     Ok(())
 }
 
