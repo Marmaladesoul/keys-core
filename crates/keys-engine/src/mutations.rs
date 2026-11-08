@@ -1539,8 +1539,9 @@ pub(crate) fn move_entry(
     }
     let from_group = Uuid::parse_str(&previous_group_str)
         .map_err(|e| EngineError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
-    // Any relocation records the source group (KDBX 4.1
-    // <PreviousParentGroup>), matching KeePassXC's behaviour on move.
+    // A relocation records the source group (KDBX 4.1
+    // <PreviousParentGroup>), matching KeePassXC's behaviour on move,
+    // except a bin → bin move (`keep_origin` below), which keeps it.
     // `is_recycled` follows the destination: a move into the Trash
     // subtree IS a recycle, a move out IS a restore — leaving the flag
     // stale would lie to every flag-scoped read until the next ingest

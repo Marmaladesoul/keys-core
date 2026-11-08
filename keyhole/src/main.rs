@@ -2368,6 +2368,9 @@ impl Session {
             .engine
             .group_tree()
             .map_err(|e| anyhow::anyhow!("group_tree: {e:?}"))?;
+        if !groups.iter().any(|g| g.uuid == parent_uuid) {
+            anyhow::bail!("child-groups: no group {parent_uuid}");
+        }
         for g in groups
             .iter()
             .filter(|g| g.parent_uuid.as_deref() == Some(parent_uuid.as_str()))
