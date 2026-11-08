@@ -356,13 +356,13 @@ impl Engine {
     /// from a projection of this mirror taken when its `mutation_seq` was
     /// `projected_at_seq`, without round-tripping through a fresh KDBX
     /// envelope — unless the mirror has moved since — and drop the
-    /// `consumed` conflict row with it, if it is still as read. See
+    /// `consumed` conflict rows with it, each if it is still as read. See
     /// [`crate::ingest::ingest_projected_vault`].
     pub(crate) fn ingest_projected_vault(
         &mut self,
         vault: &keepass_core::model::Vault,
         projected_at_seq: i64,
-        consumed: Option<&crate::conflict_rows::ParkedRow>,
+        consumed: &[crate::conflict_rows::ParkedRow],
     ) -> Result<crate::ingest::ProjectedIngest, EngineError> {
         crate::ingest::ingest_projected_vault(
             &mut self.conn,
@@ -372,6 +372,18 @@ impl Engine {
             projected_at_seq,
             consumed,
         )
+    }
+
+    /// Crate-internal: drop conflict `rows` decided on a projection of this
+    /// mirror taken when its `mutation_seq` was `projected_at_seq`, each if
+    /// it is still as read — unless the mirror has moved since. See
+    /// [`crate::ingest::drop_projected_rows`].
+    pub(crate) fn drop_projected_rows(
+        &mut self,
+        projected_at_seq: i64,
+        rows: &[crate::conflict_rows::ParkedRow],
+    ) -> Result<crate::ingest::ProjectedIngest, EngineError> {
+        crate::ingest::drop_projected_rows(&mut self.conn, projected_at_seq, rows)
     }
 
     /// Ingest one peer's vault as owner-tagged conflict rows — the

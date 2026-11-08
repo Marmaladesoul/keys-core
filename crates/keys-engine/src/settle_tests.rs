@@ -1,5 +1,5 @@
-//! A held conflict's settle while another engine writes the same mirror on
-//! its own connection.
+//! A held conflict's settle, and a resolution of it, while another engine
+//! writes the same mirror on its own connection.
 //!
 //! The settle projects the vault, decides from the owners' conflict rows,
 //! then lands an adopted merge. These tests put the other engine's write in
@@ -9,11 +9,13 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::{
+    ConflictResolution, ConflictSide, DbKey, Engine, EntryUpdate, KeyProvider, KeyProviderError,
+};
 use keepass_core::CompositeKey;
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::{EntryId, HistoryPolicy, NewEntry, Vault};
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
-use keys_engine::{DbKey, Engine, EntryUpdate, KeyProvider, KeyProviderError};
 use secrecy::SecretString;
 use uuid::Uuid;
 
@@ -182,6 +184,22 @@ fn sidecar(db_path: &std::path::Path) -> Engine {
     Engine::open(db_path, &FixedKey, plain(), None).expect("open a second engine")
 }
 
+/// An action editing `other`'s notes through a second engine on the mirror:
+/// a vault write, so it moves `mutation_seq`.
+fn edit_other(db_path: std::path::PathBuf, other: Uuid, notes: &'static str) -> impl FnOnce() {
+    move || {
+        sidecar(&db_path)
+            .update_entry(
+                other,
+                EntryUpdate {
+                    notes: Some(notes.into()),
+                    ..Default::default()
+                },
+            )
+            .expect("write through the second engine");
+    }
+}
+
 fn set_username(f: &mut Fixture, username: &str) {
     f.engine
         .update_entry(
@@ -267,19 +285,6 @@ fn resolver_open_surfaces_a_live_owner_behind_a_dissolved_one() {
 
     // Local converges on a's username, dissolving a's row; a write through
     // a second engine during each settle leaves it parked.
-    let edit_other = |db_path: std::path::PathBuf, other: Uuid, notes: &'static str| {
-        move || {
-            sidecar(&db_path)
-                .update_entry(
-                    other,
-                    EntryUpdate {
-                        notes: Some(notes.into()),
-                        ..Default::default()
-                    },
-                )
-                .expect("write through the second engine");
-        }
-    };
     f.hook.arm(
         UPDATE_REQUESTS_BEFORE_LANDING,
         edit_other(f.db_path.clone(), f.other, "meanwhile 1"),
@@ -301,8 +306,122 @@ fn resolver_open_surfaces_a_live_owner_behind_a_dissolved_one() {
         "seed",
         "a's adoption landed, so no dissolved row was left parked ahead of b"
     );
+    let payload = payload.expect("b still clashes with local, so the resolver shows it");
+
+    // Resolving b's clash consumes b's row only. a's row still carries a
+    // title local lacks, so dropping it with b's would lose that change.
+    let mut resolution = ConflictResolution::default();
+    for conflict in &payload.entry_conflicts {
+        resolution.entry_field_choices.insert(
+            conflict.entry_id,
+            conflict
+                .field_deltas
+                .iter()
+                .map(|d| (d.key.clone(), ConflictSide::Local))
+                .collect(),
+        );
+    }
+    f.engine
+        .apply_conflict_resolution(payload.id, &resolution)
+        .expect("resolve b");
+    assert_eq!(
+        f.engine.conflict_owners(f.seed).expect("owners"),
+        vec!["a".to_owned()],
+        "resolving b's clash dropped a's unmerged row"
+    );
+
+    // With nothing writing meanwhile, the next settle lands a's change.
     assert!(
-        payload.is_some(),
-        "b still clashes with local, so the resolver has something to show"
+        f.engine
+            .held_conflict_payload(&f.kdbx_path, &composite(), Some(f.seed))
+            .expect("held payload")
+            .is_none()
+    );
+    assert_eq!(seed_title(&f), "seed-a", "a's title was never adopted");
+    assert!(f.engine.conflict_owners(f.seed).expect("owners").is_empty());
+}
+
+/// A settle decides on one projection which rows to drop as dissolved and
+/// which to land. A peer's newer version of a row it judged dissolved,
+/// re-parked while it lands, was never judged: it must survive.
+#[test]
+fn a_settle_keeps_a_re_parked_row_it_judged_dissolved() {
+    let mut f = fixture();
+    set_username(&mut f, "u-local");
+    // Converging on "u-shared" dissolves both rows: a's carries nothing
+    // else, so it is dropped; b's carries a title, so it is landed.
+    f.engine
+        .ingest_peer("a", &peer(&f, "seed", "u-shared"))
+        .expect("ingest a");
+    f.engine
+        .ingest_peer("b", &peer(&f, "seed-b", "u-shared"))
+        .expect("ingest b");
+
+    // a's next version (a fresh clash) is parked through a second engine
+    // as the landing starts. Parked directly: a peer ingest there would
+    // also settle b itself, moving the mirror under this settle.
+    let newer = peer(&f, "seed", "u-a-2");
+    let (db_path, seed) = (f.db_path.clone(), f.seed);
+    f.hook.arm(UPDATE_REQUESTS_BEFORE_LANDING, move || {
+        let sidecar = sidecar(&db_path);
+        let entry = crate::util::tree::find_entry(&newer.root, EntryId(seed))
+            .expect("peer entry")
+            .clone();
+        crate::conflict_rows::drop_conflict_rows_for_owner(sidecar.conn(), "a", seed)
+            .expect("unpark a");
+        crate::conflict_rows::write_peer_entry(
+            sidecar.conn(),
+            "a",
+            &entry,
+            &SessionKey::from_bytes(SESSION_KEY_BYTES),
+            &[],
+        )
+        .expect("re-park a");
+    });
+    set_username(&mut f, "u-shared");
+    assert!(f.hook.fired(), "the second engine never wrote");
+
+    assert_eq!(
+        seed_title(&f),
+        "seed-b",
+        "b's change didn't land, so the drop as read went untested"
+    );
+    assert_eq!(
+        f.engine.conflict_owners(f.seed).expect("owners"),
+        vec!["a".to_owned()],
+        "a's newer row was dropped as the dissolved one it replaced"
+    );
+}
+
+/// A settle whose landing finds the mirror moved applies none of its
+/// decision: the rows it judged dissolved against the stale projection are
+/// not dropped either.
+#[test]
+fn a_settle_drops_nothing_once_the_mirror_moves() {
+    let mut f = fixture();
+    set_username(&mut f, "u-local");
+    f.engine
+        .ingest_peer("a", &peer(&f, "seed", "u-shared"))
+        .expect("ingest a");
+    f.engine
+        .ingest_peer("b", &peer(&f, "seed-b", "u-shared"))
+        .expect("ingest b");
+
+    f.hook.arm(
+        UPDATE_REQUESTS_BEFORE_LANDING,
+        edit_other(f.db_path.clone(), f.other, "meanwhile"),
+    );
+    set_username(&mut f, "u-shared");
+    assert!(f.hook.fired(), "the second engine never wrote");
+
+    assert_eq!(
+        seed_title(&f),
+        "seed",
+        "b's change landed over a moved mirror"
+    );
+    assert_eq!(
+        f.engine.conflict_owners(f.seed).expect("owners"),
+        vec!["a".to_owned(), "b".to_owned()],
+        "a row judged on a stale projection was dropped"
     );
 }

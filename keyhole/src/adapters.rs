@@ -73,9 +73,18 @@ static ARMED: Mutex<Option<ArmedAction>> = Mutex::new(None);
 /// seam gives it no other way into: the engine asks for the key at fixed
 /// points in each call, so the timing is exact where a race would not be,
 /// and the action runs on a test double, so no production code carries a
-/// hook. Re-arming replaces a pending action.
+/// hook.
+///
+/// There is one slot. Arming while an action is still pending would drop
+/// it, and the scenario would pass without testing what that action was
+/// for, so it's fatal instead.
 pub fn on_key_request(nth: NonZeroUsize, action: impl FnOnce() + Send + 'static) {
-    *ARMED.lock().unwrap() = Some(ArmedAction {
+    let mut armed = ARMED.lock().unwrap();
+    assert!(
+        armed.is_none(),
+        "on_key_request: an action is already armed and hasn't run"
+    );
+    *armed = Some(ArmedAction {
         remaining: nth,
         action: Box::new(action),
     });

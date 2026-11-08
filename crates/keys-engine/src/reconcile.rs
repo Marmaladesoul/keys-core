@@ -252,6 +252,7 @@ pub(crate) fn held_conflict_payload(
                 projected_at_seq: local.at_seq,
                 local_vault: local.vault,
                 remote_vault: theirs_vault,
+                remote_row: row,
             });
             return Ok(Some(payload));
         }
@@ -289,26 +290,26 @@ enum Dissolved {
     /// An adopted merge landed, and its row was dropped unless re-parked
     /// meanwhile: local changed.
     Adopted,
-    /// The adopted merge was not landed, because the mirror moved after the
-    /// projection it was built from: landing it would have discarded
-    /// whatever moved it. Its row stays parked for the next settle.
+    /// Nothing was landed or dropped, because the mirror moved after the
+    /// projection the decision was made on: landing a merge built from it
+    /// would have discarded whatever moved it, and its judgements of which
+    /// rows had dissolved may no longer hold. The rows stay parked for the
+    /// next settle.
     MirrorMoved,
 }
 
-/// Per-owner decision for one entry's parked conflict rows.
-enum DissolveDecision {
-    /// The entry is gone locally (deleted) — drop every owner's rows.
-    DropAll,
-    /// Drop `dropped` owners' rows (their divergence dissolved and local
-    /// already holds everything they carry); any owner not listed still
-    /// genuinely conflicts and stays parked. When `adopt` is set, that
-    /// row's divergence dissolved too but it still carries changes local
-    /// lacks: land `merged` (local with those changes merged in), dropping
-    /// the row with it.
-    Settle {
-        dropped: Vec<String>,
-        adopt: Option<(conflict_rows::ParkedRow, Box<keepass_core::model::Vault>)>,
-    },
+/// Per-owner decision for one entry's parked conflict rows, made against a
+/// projection of local: what to drop, and what, if anything, to land.
+struct DissolveDecision {
+    /// Rows to drop, as read: their divergence dissolved and local already
+    /// holds everything they carry, or the entry is gone locally (deleted)
+    /// and so is every row. An owner whose row isn't listed still
+    /// genuinely conflicts and stays parked.
+    drops: Vec<conflict_rows::ParkedRow>,
+    /// A row whose divergence dissolved too but which still carries changes
+    /// local lacks: land the vault (local with those changes merged in),
+    /// dropping the row with it.
+    adopt: Option<(conflict_rows::ParkedRow, Box<keepass_core::model::Vault>)>,
 }
 
 /// Read-only: decide which of `uuid`'s parked conflict rows have
@@ -336,16 +337,18 @@ fn dissolve_decision(
     owners: &[String],
 ) -> Result<DissolveDecision, EngineError> {
     let id = keepass_core::model::EntryId(uuid);
+    let mut drops = Vec::new();
     // Entry deleted locally → no live side to conflict against; the
     // rows are orphans (Finding #11). Drop them all.
     let Some(local_entry) = find_entry(&local_vault.root, id) else {
-        return Ok(DissolveDecision::DropAll);
+        for owner in owners {
+            drops.extend(conflict_rows::read_peer_row(engine.conn(), owner, uuid)?);
+        }
+        return Ok(DissolveDecision { drops, adopt: None });
     };
-    let mut dropped = Vec::new();
     for owner in owners {
-        // A row that is gone is itself stale → drop it.
+        // A row already gone needs no drop.
         let Some(row) = conflict_rows::read_peer_row(engine.conn(), owner, uuid)? else {
-            dropped.push(owner.clone());
             continue;
         };
         let theirs = theirs_vault(engine, local_vault, session_key, &row)?;
@@ -364,57 +367,50 @@ fn dissolve_decision(
         .map_err(|e| EngineError::Serialise(format!("apply_merge: {e}")))?;
         keepass_merge::reconcile_timestamps(&mut merged, &theirs);
         if find_entry(&merged.root, id).is_some_and(|m| same_entry(m, local_entry)) {
-            dropped.push(owner.clone());
+            drops.push(row);
         } else {
-            return Ok(DissolveDecision::Settle {
-                dropped,
+            return Ok(DissolveDecision {
+                drops,
                 adopt: Some((row, Box::new(merged))),
             });
         }
     }
-    Ok(DissolveDecision::Settle {
-        dropped,
-        adopt: None,
-    })
+    Ok(DissolveDecision { drops, adopt: None })
 }
 
 /// Apply a [`DissolveDecision`] made against a projection taken at
-/// `projected_at_seq`.
+/// `projected_at_seq`: all of it, in one transaction, or none of it if the
+/// mirror has moved since. Every drop is of a row as read, so a newer
+/// version re-parked meanwhile stays.
 fn apply_dissolve(
     engine: &mut Engine,
     uuid: uuid::Uuid,
     decision: DissolveDecision,
     projected_at_seq: i64,
 ) -> Result<Dissolved, EngineError> {
-    let (dropped, adopt) = match decision {
-        DissolveDecision::DropAll => {
-            let tx = engine.conn_mut().transaction()?;
-            conflict_rows::drop_conflict_rows(&tx, uuid)?;
-            tx.commit()?;
+    use crate::ingest::ProjectedIngest;
+    let DissolveDecision { mut drops, adopt } = decision;
+    let Some((row, merged)) = adopt else {
+        if drops.is_empty() {
             return Ok(Dissolved::Unchanged);
         }
-        DissolveDecision::Settle { dropped, adopt } => (dropped, adopt),
+        return Ok(
+            match engine.drop_projected_rows(projected_at_seq, &drops)? {
+                ProjectedIngest::Landed => Dissolved::Unchanged,
+                ProjectedIngest::MirrorMoved => Dissolved::MirrorMoved,
+            },
+        );
     };
-    if !dropped.is_empty() {
-        let tx = engine.conn_mut().transaction()?;
-        for owner in &dropped {
-            conflict_rows::drop_conflict_rows_for_owner(&tx, owner, uuid)?;
+    // Same landing as a resolution's apply: re-ingest the merged vault,
+    // dropping the row it settled with the rest.
+    drops.push(row);
+    match engine.ingest_projected_vault(&merged, projected_at_seq, &drops)? {
+        ProjectedIngest::Landed => {
+            engine.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
+            Ok(Dissolved::Adopted)
         }
-        tx.commit()?;
+        ProjectedIngest::MirrorMoved => Ok(Dissolved::MirrorMoved),
     }
-    let Some((row, merged)) = adopt else {
-        return Ok(Dissolved::Unchanged);
-    };
-    // Same landing as a resolution's apply: re-ingest the merged vault, unless
-    // the mirror moved since its projection. The row it settled is dropped
-    // in the same transaction, unless the peer's newer version has been
-    // re-parked over it since, which stays for the next pass to check.
-    match engine.ingest_projected_vault(&merged, projected_at_seq, Some(&row))? {
-        crate::ingest::ProjectedIngest::Landed => {}
-        crate::ingest::ProjectedIngest::MirrorMoved => return Ok(Dissolved::MirrorMoved),
-    }
-    engine.emit(ChangeEvent::EntriesUpdated(vec![uuid]));
-    Ok(Dissolved::Adopted)
 }
 
 /// Entry equality that ignores custom-field order, which carries no
@@ -439,10 +435,11 @@ fn same_entry(a: &keepass_core::model::Entry, b: &keepass_core::model::Entry) ->
 /// by the owner count, plus one pass per row re-parked by another writer
 /// during the settle. Returns whether any merge was landed (local changed).
 ///
-/// If the mirror moved after `local` was projected, an adopted merge isn't
-/// landed: the settle stops there, leaving that row parked for the next
-/// settle (the next sweep, local edit of the entry or resolver open) rather
-/// than retrying against a mirror something else is writing. `local` is
+/// If the mirror moved after `local` was projected, the decision is applied
+/// not at all — no merge landed, no row dropped: the settle stops there,
+/// leaving the rows parked for the next settle (the next sweep, local edit
+/// of the entry or resolver open) rather than retrying against a mirror
+/// something else is writing. `local` is
 /// re-projected, so the caller's next entry is checked against the mirror
 /// as it now is.
 fn settle_entry_rows(

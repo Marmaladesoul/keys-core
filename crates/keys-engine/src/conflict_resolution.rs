@@ -54,8 +54,6 @@
 //! the conflict stays held, and the caller rebuilds the resolver from
 //! `held_conflict_payload`.
 
-use std::collections::HashSet;
-
 use keepass_core::model::{EntryId, Vault};
 use keepass_merge::{ConflictKind, ConflictResolution, MergeOutcome, Resolution};
 use secrecy::SecretString;
@@ -81,7 +79,9 @@ use crate::util::tree::find_entry;
 /// - both pre-merge vaults (so apply has both sides verbatim, and the
 ///   per-side reveal path can read either);
 /// - the `mutation_seq` as of `local_vault`'s projection, so apply can tell
-///   whether the mirror has moved on from that snapshot.
+///   whether the mirror has moved on from that snapshot;
+/// - the conflict row `remote_vault` was rebuilt from, as read, which is
+///   the only row apply drops.
 ///
 /// The apply path re-ingests the merged [`Vault`] directly via
 /// `Engine::ingest_projected_vault`, so the context no longer carries a disk Kdbx
@@ -94,6 +94,7 @@ pub(crate) struct PendingConflictContext {
     pub(crate) projected_at_seq: i64,
     pub(crate) local_vault: Vault,
     pub(crate) remote_vault: Vault,
+    pub(crate) remote_row: conflict_rows::ParkedRow,
 }
 
 impl std::fmt::Debug for PendingConflictContext {
@@ -139,6 +140,7 @@ pub(crate) fn apply_conflict_resolution(
         projected_at_seq,
         local_vault,
         remote_vault,
+        remote_row,
     } = ctx;
 
     // 2. Apply the merge against an owned copy of the local side.
@@ -175,30 +177,21 @@ pub(crate) fn apply_conflict_resolution(
     //    This also drops the baseline refresh the eager-merge path did — the
     //    owner-rows switch took `set_last_saved_kdbx_bytes` off this path
     //    (the caller saves the resolved projection out of band).
-    match engine.ingest_projected_vault(&merged, projected_at_seq, None)? {
+    //
+    //    The conflict row the resolver showed is dropped with it, so the
+    //    badge clears, but only that row and only as read: the user chose
+    //    against that peer value, not against a newer one re-parked since,
+    //    nor against another owner's row, which may still carry changes
+    //    local lacks. Those stay parked for the next settle or resolver
+    //    open. (Cross-peer clearing rides the resolution records written in
+    //    step 3.)
+    match engine.ingest_projected_vault(&merged, projected_at_seq, &[remote_row])? {
         crate::ingest::ProjectedIngest::Landed => {}
         crate::ingest::ProjectedIngest::MirrorMoved => {
             return Err(EngineError::ResolutionMismatch {
                 reason: "the vault changed after the resolver opened".to_owned(),
             });
         }
-    }
-
-    // Drop the resolved entries' owner rows so the badge clears: their
-    // conflicts have converged locally to the chosen values, so there is no
-    // peer side left to hold. (Cross-peer clearing rides the resolution
-    // records written in step 3.) Keeps the badge consistent without waiting
-    // for the next reconcile.
-    let resolved_entries: HashSet<Uuid> = resolution
-        .entry_field_choices
-        .keys()
-        .chain(resolution.entry_attachment_choices.keys())
-        .chain(resolution.entry_icon_choices.keys())
-        .chain(resolution.delete_edit_choices.keys())
-        .map(|e| e.0)
-        .collect();
-    for entry_uuid in resolved_entries {
-        conflict_rows::drop_conflict_rows(engine.conn(), entry_uuid)?;
     }
 
     // 6. Emit the success event. Stats are best-effort — the resolved

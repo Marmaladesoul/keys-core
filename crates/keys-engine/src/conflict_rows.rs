@@ -260,12 +260,17 @@ pub(crate) fn drop_conflict_rows_for_owner(
 
 /// Drop `row` if it is still the stored row for its owner and entry,
 /// returning whether it was. A row re-parked since `row` was read (the
-/// peer's newer version) stays: whoever read `row` consumed only what it
+/// peer's newer version) stays: whoever read `row` decided only on what it
 /// held, and must not discard a value it never saw.
+///
+/// Whoever read `row` decided on a projection of the vault, so the drop
+/// takes the transaction that checked the mirror still holds that
+/// projection ([`crate::ingest::AtProjection`]).
 pub(crate) fn drop_peer_row_as_read(
-    conn: &Connection,
+    at: &crate::ingest::AtProjection<'_, '_>,
     row: &ParkedRow,
 ) -> Result<bool, EngineError> {
+    let conn = at.conn();
     let uuid_str = row.entry_uuid.to_string();
     let removed = conn.execute(
         "DELETE FROM conflict_entry WHERE owner = ?1 AND entry_uuid = ?2 AND entry_json = ?3",
@@ -559,27 +564,5 @@ mod tests {
                 .expect("read row")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn drop_as_read_keeps_a_row_re_parked_since() {
-        let conn = mem_conn();
-        let id = Uuid::new_v4();
-        park(&conn, "peerB", &simple(id, "older", "pw"), &[]);
-        let older = read_peer_row(&conn, "peerB", id).unwrap().unwrap();
-
-        // The peer's newer version is re-parked over the row read above.
-        drop_conflict_rows_for_owner(&conn, "peerB", id).unwrap();
-        park(&conn, "peerB", &simple(id, "newer", "pw"), &[]);
-        assert!(
-            !drop_peer_row_as_read(&conn, &older).expect("drop"),
-            "the row read is gone, so nothing is dropped"
-        );
-        let mut pool = Vec::new();
-        assert_eq!(rebuild(&conn, "peerB", id, &mut pool).title, "newer");
-
-        let newer = read_peer_row(&conn, "peerB", id).unwrap().unwrap();
-        assert!(drop_peer_row_as_read(&conn, &newer).expect("drop"));
-        assert_eq!(parked_conflict_uuids(&conn).unwrap(), Vec::<Uuid>::new());
     }
 }
