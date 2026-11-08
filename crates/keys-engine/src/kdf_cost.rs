@@ -603,6 +603,9 @@ mod tests {
         )
     }
 
+    /// What `weakenings_from` returns for a change that is weaker in no respect.
+    const NOT_WEAKER: [KdfWeakening; 0] = [];
+
     fn seconds(cost: &KdfCost) -> f64 {
         cost.estimate().expect("modelled").seconds
     }
@@ -702,14 +705,13 @@ mod tests {
             }),
             // Argon2d → Argon2id and 1.0 → 1.3 are upgrades.
         ] {
-            assert!(proposed.weakenings_from(&current).is_empty(), "{proposed}");
+            assert_eq!(proposed.weakenings_from(&current), NOT_WEAKER, "{proposed}");
         }
         let legacy = argon2_cost(Argon2Variant::Argon2d, 64 * MIB, 2, Argon2Version::V10);
-        assert!(current.weakenings_from(&legacy).is_empty());
-        assert!(
-            KdfCost::aes_kdf(6_000_001)
-                .weakenings_from(&KdfCost::aes_kdf(6_000_000))
-                .is_empty()
+        assert_eq!(current.weakenings_from(&legacy), NOT_WEAKER);
+        assert_eq!(
+            KdfCost::aes_kdf(6_000_001).weakenings_from(&KdfCost::aes_kdf(6_000_000)),
+            NOT_WEAKER
         );
     }
 
@@ -719,11 +721,10 @@ mod tests {
         let current = KdfCost::aes_kdf(60_000_000);
         let proposed = argon2id(64 * MIB, 2);
         assert!(seconds(&proposed) < seconds(&current));
-        assert!(proposed.weakenings_from(&current).is_empty());
-        assert!(
-            argon2id(MEMORY_HARD_FLOOR_BYTES, 1)
-                .weakenings_from(&current)
-                .is_empty()
+        assert_eq!(proposed.weakenings_from(&current), NOT_WEAKER);
+        assert_eq!(
+            argon2id(MEMORY_HARD_FLOOR_BYTES, 1).weakenings_from(&current),
+            NOT_WEAKER
         );
     }
 
@@ -736,7 +737,7 @@ mod tests {
         // Too little memory to count, but as slow as what it replaces.
         let slow = argon2id(MIB, 4_000);
         assert!(seconds(&slow) >= seconds(&current));
-        assert!(slow.weakenings_from(&current).is_empty());
+        assert_eq!(slow.weakenings_from(&current), NOT_WEAKER);
     }
 
     #[test]

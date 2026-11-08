@@ -409,7 +409,8 @@ mod tests {
             kdf_weakenings(argon2id.clone(), aes.clone()).expect("judge"),
             [KdfWeakening::LosesMemoryHardness]
         );
-        assert!(kdf_weakenings(aes, argon2id).expect("judge").is_empty());
+        let not_weaker: [KdfWeakening; 0] = [];
+        assert_eq!(kdf_weakenings(aes, argon2id).expect("judge"), not_weaker);
     }
 
     #[test]
