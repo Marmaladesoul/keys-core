@@ -355,12 +355,14 @@ impl Engine {
     /// Crate-internal: replace the mirror with `vault`, rebuilt in memory
     /// from a projection of this mirror taken when its `mutation_seq` was
     /// `projected_at_seq`, without round-tripping through a fresh KDBX
-    /// envelope — unless the mirror has moved since. See
+    /// envelope — unless the mirror has moved since — and drop the
+    /// `consumed` conflict row with it, if it is still as read. See
     /// [`crate::ingest::ingest_projected_vault`].
     pub(crate) fn ingest_projected_vault(
         &mut self,
         vault: &keepass_core::model::Vault,
         projected_at_seq: i64,
+        consumed: Option<&crate::conflict_rows::ParkedRow>,
     ) -> Result<crate::ingest::ProjectedIngest, EngineError> {
         crate::ingest::ingest_projected_vault(
             &mut self.conn,
@@ -368,6 +370,7 @@ impl Engine {
             &*self.field_protector,
             vault,
             projected_at_seq,
+            consumed,
         )
     }
 

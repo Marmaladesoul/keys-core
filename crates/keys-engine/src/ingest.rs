@@ -64,24 +64,22 @@ pub(crate) fn ingest(
     // until the mirror is next written back — so this ingest leaves the
     // mirror owing that write.
     let stamped = crate::identity::assign_file_identity(&mut vault, kdbx);
-    let (session_key, tx) = begin_replace(conn, protector)?;
-    let state = PersistenceState::read(&tx)?;
-    if state.is_dirty() {
-        return Err(EngineError::MirrorOwesWrite {
-            mutation_seq: state.mutation_seq,
-            persisted_seq: state.persisted_seq,
-        });
-    }
-    replace_vault(
-        tx,
+    match replace_vault(
+        conn,
         fingerprint_key,
-        &session_key,
+        protector,
         &vault,
         Source::VaultFile {
             header: kdbx.outer_header(),
             settles: !stamped,
         },
-    )
+    )? {
+        Replaced::Done(outcome) => Ok(outcome),
+        Replaced::Refused(state) => Err(EngineError::MirrorOwesWrite {
+            mutation_seq: state.mutation_seq,
+            persisted_seq: state.persisted_seq,
+        }),
+    }
 }
 
 /// Whether [`ingest_projected_vault`] replaced the mirror.
@@ -105,6 +103,12 @@ pub(crate) enum ProjectedIngest {
 /// a snapshot, so there is no unguarded form. Read `projected_at_seq` before
 /// projecting, so a write landing in between reads as moved.
 ///
+/// `consumed` is the conflict row, if any, that `vault` merged in. It is
+/// dropped in the replace's transaction, and only if it is still the row
+/// as read: `conflict_*` writes don't move `mutation_seq`, so the seq check
+/// can't see a newer version of the row re-parked meanwhile, which `vault`
+/// never saw and which therefore stays parked.
+///
 /// The outer-header facts (cipher / KDF / transform-rounds) carried
 /// in `meta.*` setting rows are left as the existing ingest wrote
 /// them; the database envelope hasn't changed, only its decoded
@@ -115,66 +119,94 @@ pub(crate) fn ingest_projected_vault(
     protector: &dyn FieldProtector,
     vault: &Vault,
     projected_at_seq: i64,
+    consumed: Option<&conflict_rows::ParkedRow>,
 ) -> Result<ProjectedIngest, EngineError> {
-    let (session_key, tx) = begin_replace(conn, protector)?;
-    if PersistenceState::read(&tx)?.mutation_seq != projected_at_seq {
-        return Ok(ProjectedIngest::MirrorMoved);
-    }
-    replace_vault(tx, fingerprint_key, &session_key, vault, Source::InMemory)?;
-    Ok(ProjectedIngest::Landed)
+    let source = Source::InMemory {
+        projected_at_seq,
+        consumed,
+    };
+    Ok(
+        match replace_vault(conn, fingerprint_key, protector, vault, source)? {
+            Replaced::Done(_) => ProjectedIngest::Landed,
+            Replaced::Refused(_) => ProjectedIngest::MirrorMoved,
+        },
+    )
 }
 
-/// Where an ingested vault came from — which decides whether the ingest
-/// is a persistence correspondence point.
+/// Where a replacing vault came from, which decides what the mirror must
+/// be for the replace to go ahead and whether the replace is a persistence
+/// correspondence point.
 #[derive(Clone, Copy)]
 enum Source<'a> {
     /// The vault was read from its file, whose outer-header facts it
     /// carries. Replacing the mirror with it is refused while the mirror
     /// owes a write. Once ingested the mirror owes that file nothing, so
     /// the watermark settles — unless `settles` is false because the
-    /// ingest stamped an identity the file lacks. Check, replace and
-    /// settle share the ingest's own transaction.
+    /// ingest stamped an identity the file lacks.
     VaultFile {
         header: &'a OuterHeader,
         settles: bool,
     },
-    /// The vault was rebuilt in memory from the mirror's own, possibly
-    /// modified, content — it may hold changes no file has seen, so the
-    /// watermark advances with the ingest's writes and stays owed. The
+    /// The vault was rebuilt in memory from a projection of the mirror
+    /// taken at `projected_at_seq`, possibly with `consumed`'s conflict row
+    /// merged in. Replacing the mirror with it is refused once the mirror
+    /// has moved past that seq. It may hold changes no file has seen, so
+    /// the watermark advances with the replace's writes and stays owed. The
     /// envelope is unchanged, so the header-fact rows are left as the
     /// originating ingest wrote them.
-    InMemory,
+    InMemory {
+        projected_at_seq: i64,
+        consumed: Option<&'a conflict_rows::ParkedRow>,
+    },
 }
 
-/// Open a replace's transaction, having fetched the session key it seals
-/// under: one fetch per ingest call, the same discipline as the
-/// keepass-core wrap pass.
+impl Source<'_> {
+    /// Whether the mirror, in `state`, must not be replaced from this
+    /// source.
+    fn refuses(&self, state: &PersistenceState) -> bool {
+        match self {
+            Source::VaultFile { .. } => state.is_dirty(),
+            Source::InMemory {
+                projected_at_seq, ..
+            } => state.mutation_seq != *projected_at_seq,
+        }
+    }
+}
+
+/// What [`replace_vault`] did.
+enum Replaced {
+    /// The mirror now holds the vault.
+    Done(IngestOutcome),
+    /// The source refused the mirror, in this state. Nothing was written.
+    Refused(PersistenceState),
+}
+
+/// Replace the mirror's vault content with `vault`, in one transaction
+/// that first checks the mirror is one `source` may replace (see
+/// [`Source::refuses`]). Every replace goes through here, so no caller can
+/// wipe the mirror unchecked.
 ///
-/// IMMEDIATE: the write lock is held from the caller's check of the
-/// persistence state through [`replace_vault`]'s commit, so no other
-/// connection's mutation can land between the check and the wipe that
-/// relies on it.
-fn begin_replace<'c>(
-    conn: &'c mut Connection,
+/// The session key is fetched first: one fetch per ingest call, the same
+/// discipline as the keepass-core wrap pass. The transaction is IMMEDIATE,
+/// so the write lock is held from the check through the commit, and no
+/// other connection's mutation can land between the check and the wipe
+/// that relies on it.
+fn replace_vault(
+    conn: &mut Connection,
+    fingerprint_key: &[u8; 32],
     protector: &dyn FieldProtector,
-) -> Result<(SessionKey, rusqlite::Transaction<'c>), EngineError> {
+    vault: &Vault,
+    source: Source<'_>,
+) -> Result<Replaced, EngineError> {
     let session_key = protector
         .acquire_session_key()
         .map_err(|e| EngineError::Ingest(IngestError::SessionKey(e.to_string())))?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    Ok((session_key, tx))
-}
+    let state = PersistenceState::read(&tx)?;
+    if source.refuses(&state) {
+        return Ok(Replaced::Refused(state));
+    }
 
-/// Wipe the mirror's vault content inside `tx`, opened by
-/// [`begin_replace`] and already checked by the caller, write `vault` in
-/// its place, and commit.
-fn replace_vault(
-    tx: rusqlite::Transaction<'_>,
-    fingerprint_key: &[u8; 32],
-    session_key: &SessionKey,
-    vault: &Vault,
-    source: Source<'_>,
-) -> Result<IngestOutcome, EngineError> {
     let recycle_bin_uuid = vault.meta.recycle_bin_uuid;
     let recycle_bin_enabled = vault.meta.recycle_bin_enabled;
 
@@ -235,10 +267,18 @@ fn replace_vault(
         recycle_bin_uuid,
         false,
         fingerprint_key,
-        session_key,
+        &session_key,
         &binaries,
         &mut outcome,
     )?;
+
+    if let Source::InMemory {
+        consumed: Some(row),
+        ..
+    } = source
+    {
+        conflict_rows::drop_peer_row_as_read(&tx, row)?;
+    }
 
     if matches!(source, Source::VaultFile { settles: true, .. }) {
         // After every row write above has advanced `mutation_seq`.
@@ -251,7 +291,7 @@ fn replace_vault(
     }
 
     tx.commit()?;
-    Ok(outcome)
+    Ok(Replaced::Done(outcome))
 }
 
 /// `DELETE FROM` every vault-content table. Schema and migration rows
@@ -2668,8 +2708,8 @@ mod ingest_peer_tests {
             params![id.to_string()],
         )
         .expect("another write");
-        let refused =
-            ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, &vault, at).expect("ingest");
+        let refused = ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, &vault, at, None)
+            .expect("ingest");
         assert!(
             matches!(refused, ProjectedIngest::MirrorMoved),
             "{refused:?}"
@@ -2689,7 +2729,7 @@ mod ingest_peer_tests {
         let now = super::PersistenceState::read(&conn)
             .expect("state")
             .mutation_seq;
-        let landed = ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, &vault, now)
+        let landed = ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, &vault, now, None)
             .expect("ingest");
         assert!(
             matches!(landed, ProjectedIngest::Landed),
@@ -2703,7 +2743,7 @@ mod ingest_peer_tests {
         let at = super::PersistenceState::read(&conn)
             .expect("state")
             .mutation_seq;
-        let seeded = ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, local, at)
+        let seeded = ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, local, at, None)
             .expect("seed local");
         assert!(matches!(seeded, ProjectedIngest::Landed), "{seeded:?}");
         conn
@@ -2770,15 +2810,16 @@ mod ingest_peer_tests {
     /// Rebuild `owner`'s parked entry for `uuid` through the one reader,
     /// protected values unsealed.
     fn peer_entry(conn: &Connection, owner: &str, uuid: Uuid) -> Entry {
+        let row = conflict_rows::read_peer_row(conn, owner, uuid)
+            .expect("read row")
+            .expect("peer row");
         conflict_rows::reconstruct_peer_entry(
             conn,
-            owner,
-            uuid,
+            &row,
             &SessionKey::from_bytes(SK),
             &mut Vec::new(),
         )
         .expect("reconstruct")
-        .expect("peer row")
     }
 
     #[test]

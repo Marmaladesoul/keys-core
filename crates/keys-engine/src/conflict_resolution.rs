@@ -175,7 +175,7 @@ pub(crate) fn apply_conflict_resolution(
     //    This also drops the baseline refresh the eager-merge path did — the
     //    owner-rows switch took `set_last_saved_kdbx_bytes` off this path
     //    (the caller saves the resolved projection out of band).
-    match engine.ingest_projected_vault(&merged, projected_at_seq)? {
+    match engine.ingest_projected_vault(&merged, projected_at_seq, None)? {
         crate::ingest::ProjectedIngest::Landed => {}
         crate::ingest::ProjectedIngest::MirrorMoved => {
             return Err(EngineError::ResolutionMismatch {

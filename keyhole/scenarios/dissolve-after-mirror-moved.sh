@@ -11,8 +11,10 @@
 #
 # keyhole's `update-entry --sidecar-create` opens a second engine on the same
 # mirror and creates an entry through it on a chosen session-key request of
-# the update. The third request is the settle's, made after its projection:
-# the update's own edit asks first, then the projection, then the settle.
+# the update. The update asks for the key four times: for its own edit, for
+# the settle's projection (`project_to_vault`), in the settle itself
+# (`reconcile_conflict_rows`), and to land the adopted merge. So the third
+# request falls after the projection and before the landing.
 #
 # Assertions:
 #   1. NOT LOST → the entry the second engine created survives in the file.
