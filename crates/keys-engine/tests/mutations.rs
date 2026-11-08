@@ -825,6 +825,48 @@ fn move_entry_changes_group_membership() {
     assert_eq!(entry.group_uuid, other);
 }
 
+/// Organising inside the bin: a move between two bin groups keeps the
+/// entry recycled AND keeps its recorded origin, so a later restore still
+/// returns it to the live folder it was recycled from (not the root).
+#[test]
+fn move_entry_within_bin_keeps_recycled_and_origin() {
+    let (mut engine, root, _dir) = engine_with_empty_vault();
+    let group = |engine: &mut Engine, parent: Uuid, name: &str| {
+        engine
+            .create_group(
+                parent,
+                NewGroupFields {
+                    name: name.into(),
+                    notes: String::new(),
+                    icon: IconRef::Builtin(0),
+                },
+            )
+            .expect("create_group")
+    };
+    let bin = group(&mut engine, root, "Recycle Bin");
+    engine.set_recycle_bin(true, Some(bin)).expect("set bin");
+    let nest = group(&mut engine, root, "Nest");
+    let sorted = group(&mut engine, bin, "Sorted");
+
+    let uuid = engine
+        .create_entry(nest, new_entry("x", "p"))
+        .expect("create");
+    engine.recycle_entry(uuid).expect("recycle");
+
+    engine.move_entry(uuid, sorted).expect("bin → bin move");
+    let moved = engine.entry(uuid).unwrap().unwrap();
+    assert_eq!(moved.group_uuid, sorted, "re-parented inside the bin");
+    assert!(moved.is_recycled, "still recycled after a bin → bin move");
+
+    engine.restore_entry(uuid).expect("restore");
+    let restored = engine.entry(uuid).unwrap().unwrap();
+    assert_eq!(
+        restored.group_uuid, nest,
+        "restore returns to the original folder, not the root"
+    );
+    assert!(!restored.is_recycled);
+}
+
 #[test]
 fn move_entry_unknown_group_returns_not_found() {
     let (mut engine, root, _dir) = engine_with_empty_vault();
