@@ -1484,10 +1484,18 @@ impl Engine {
     /// and nothing else, so a peer that changed them again since is refused
     /// with [`EngineError::KdfParametersMismatch`] before deriving. It merges
     /// under `owner_id` like any peer replica (identity and kind gates
-    /// included), and the merged mirror is saved to `vault_kdbx_path` inside
-    /// the peer's envelope — its cipher and KDF settings, with fresh seeds —
-    /// so this vault's file, and every replica it publishes, carries the
-    /// adopted settings, and they become the ones this vault records.
+    /// included), and the merged mirror is saved to `vault_kdbx_path` in that
+    /// file's own envelope with only its KDF settings replaced by the
+    /// approved ones (fresh seeds), so this vault's file, and every replica
+    /// it publishes, carries the adopted settings, and they become the ones
+    /// this vault records. The approval covers the KDF settings and nothing
+    /// else of the peer's envelope: the vault keeps its own KDBX version and
+    /// ciphers. Approved settings the vault's format can't carry (Argon2 in
+    /// a KDBX3 file) are refused with [`EngineError::Internal`] from the
+    /// headers, before any derive, nothing merged or written.
+    ///
+    /// Whether the approved settings are weaker than the vault's is for the
+    /// prompt to show beforehand ([`crate::kdf_weakenings`]).
     ///
     /// `password` / `keyfile` are the vault's key factors (shared by both
     /// files); `temp_dir` is as for [`Self::save_to_kdbx`].
@@ -1530,6 +1538,7 @@ impl Engine {
                 &composite,
                 &owner_id,
                 &approved,
+                crate::kdf::ceiling(),
                 &vault,
                 temp_dir.as_deref(),
             )?

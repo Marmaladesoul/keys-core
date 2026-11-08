@@ -365,8 +365,8 @@ enum Command {
     /// path past `ingest-peer`'s KDF refusal. Requires `--approve-kdf` with
     /// the peer's exact settings (`keyhole kdf <peer>`): the peer is derived
     /// only if it still demands exactly those, then merged, and the vault
-    /// is saved inside the peer's envelope so it carries the adopted
-    /// settings from then on.
+    /// is saved in its own envelope with only its KDF settings replaced, so
+    /// it carries the adopted settings from then on.
     AdoptPeerKdf {
         /// Path to the .kdbx vault receiving the merge.
         vault: PathBuf,
@@ -379,21 +379,31 @@ enum Command {
     /// Print the KDF settings a vault file demands, read from its header
     /// alone (no password, no derive): one tab-separated line led by the
     /// `--approve-kdf` spec. `--recorded` prints what the vault's mirror
-    /// recorded for its file instead (`none` if nothing), without syncing.
+    /// recorded for its file instead (`none` if nothing), without syncing;
+    /// `--against <vault>` prints how the file's settings would weaken that
+    /// vault's recorded ones.
     Kdf {
         /// Path to the .kdbx vault (or peer copy).
         vault: PathBuf,
         /// Print the mirror's recorded settings rather than the file's.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "against")]
         recorded: bool,
+        /// Print instead how the file's settings would weaken those the
+        /// mirror of this vault recorded: `weaker=<list>` or `weaker=none`.
+        #[arg(long)]
+        against: Option<PathBuf>,
     },
     /// Change a vault file's KDF settings in place, as another client
     /// would: re-key it under the same password with the overridden
-    /// parameters. Not a client capability of Keys, so it bypasses the seam
-    /// (password-only vaults).
+    /// parameters (or exactly `--kdf`'s). Not a client capability of Keys,
+    /// so it bypasses the seam (password-only vaults).
     SetKdf {
         /// Path to the .kdbx vault to change.
         vault: PathBuf,
+        /// Exactly these settings, as an `--approve-kdf` spec — may switch
+        /// family, variant or version. Excludes the other flags.
+        #[arg(long)]
+        kdf: Option<String>,
         /// Argon2 memory cost, in MiB (Argon2 vaults only).
         #[arg(long)]
         argon2_memory_mib: Option<u64>,
@@ -403,6 +413,29 @@ enum Command {
         /// AES-KDF rounds (AES-KDF vaults only).
         #[arg(long)]
         aes_rounds: Option<u64>,
+    },
+    /// Print the parts of a file's envelope that an approval of its KDF
+    /// settings doesn't cover, from its header alone (no password):
+    /// `kdbx=<major>\tcipher=<uuid>\tcompression=<none|gzip>`.
+    Envelope {
+        /// Path to the .kdbx file.
+        vault: PathBuf,
+    },
+    /// Write a vault file's contents into another file's envelope (its KDBX
+    /// version, cipher and KDF), re-keyed to the vault's password — the
+    /// same vault as a client writing another format would save it, e.g. a
+    /// KDBX3 replica from the vendored fixture. Not a client capability, so
+    /// it bypasses the seam (password-only vaults).
+    Rewrap {
+        /// Path to the .kdbx vault whose contents are written.
+        vault: PathBuf,
+        /// Path to the .kdbx file whose envelope they are written in.
+        template: PathBuf,
+        /// Where to write the result.
+        out: PathBuf,
+        /// Name of the environment variable holding the template's password.
+        #[arg(long, default_value = "KEYHOLE_TEMPLATE_PASSWORD")]
+        template_password_env: String,
     },
     /// List UUIDs of entries currently held in an unresolved sync
     /// conflict — the headless twin of the GUI's conflict badge. Read
@@ -1096,15 +1129,31 @@ async fn main() -> Result<()> {
             session.adopt_peer_kdf(owner, &peer_kdbx, approved).await?;
             session.finish().await?;
         }
-        Command::Kdf { vault, recorded } => kdf::print(&vault, recorded)?,
+        Command::Kdf {
+            vault,
+            recorded,
+            against,
+        } => kdf::print(&vault, recorded, against.as_deref())?,
+        Command::Envelope { vault } => kdf::envelope(&vault)?,
+        Command::Rewrap {
+            vault,
+            template,
+            out,
+            template_password_env,
+        } => {
+            let template_password = read_password(&template_password_env)?;
+            kdf::rewrap(&vault, &template, &out, &password, &template_password)?;
+        }
         Command::SetKdf {
             vault,
+            kdf,
             argon2_memory_mib,
             argon2_iterations,
             aes_rounds,
         } => kdf::set_kdf(
             &vault,
             &password,
+            kdf.as_deref(),
             argon2_memory_mib,
             argon2_iterations,
             aes_rounds,

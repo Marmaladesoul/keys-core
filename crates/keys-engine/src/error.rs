@@ -287,6 +287,17 @@ pub enum EngineError {
     /// with the file and retry.
     #[error("the vault file changed since this mirror was brought current with it")]
     VaultFileChanged,
+
+    /// Approved KDF settings the vault file's format can't carry — Argon2
+    /// for a KDBX3 file, whose outer header holds AES-KDF rounds only. An
+    /// approval covers the KDF settings, not a change of format, so the
+    /// adoption ([`crate::Engine::adopt_peer_kdf`]) is refused from the
+    /// headers alone, before any key derivation; nothing merged or written.
+    #[error("this vault's KDBX3 file can't carry the approved KDF ({kdf}); only AES-KDF")]
+    KdfUnsupportedByFormat {
+        /// The approved cost the file's format can't carry.
+        kdf: crate::kdf_cost::KdfCost,
+    },
 }
 
 /// The " (this vault's is …)" tail of a `KdfApprovalRequired` message,

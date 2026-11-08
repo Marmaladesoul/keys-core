@@ -43,7 +43,7 @@ pub use file_watcher::{
     FileWatcher, FileWatcherError, FileWatcherEvent, FileWatcherObserver, NotifyFileWatcher,
 };
 pub use fingerprint::fingerprint;
-pub use kdf_cost::{KdfCeiling, KdfCost, KdfEstimate, KdfPolicy};
+pub use kdf_cost::{KdfCeiling, KdfCost, KdfEstimate, KdfPolicy, KdfWeakening};
 pub use key_provider::{DbKey, KeyProvider, KeyProviderError};
 pub use meta::DatabaseMetadata;
 pub use migrations::MigrationError;
