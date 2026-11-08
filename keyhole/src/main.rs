@@ -638,6 +638,38 @@ enum Command {
         #[arg(long)]
         to: String,
     },
+    /// Reorder a group among its siblings (same parent), then persist.
+    /// `--position` is the group's 0-based index in the sibling list
+    /// *after* the move — the moved group is removed from its old slot
+    /// first, then inserted at `--position`; values past the end clamp
+    /// to last. See `child-groups` for the resulting order.
+    ReorderGroup {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the group to reorder (see `list-groups`).
+        uuid: String,
+        /// Final 0-based index among the group's siblings.
+        #[arg(long)]
+        position: u32,
+    },
+    /// Recycle a group (move it, with its subtree, into the recycle
+    /// bin), then persist.
+    RecycleGroup {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// UUID of the group to recycle (see `list-groups`).
+        uuid: String,
+    },
+    /// Print the direct child groups of a parent, in sibling order
+    /// (`sort_order`): UUID and name, one per line. The assertion
+    /// surface for group ordering.
+    ChildGroups {
+        /// Path to the .kdbx vault.
+        vault: PathBuf,
+        /// Parent group UUID. Defaults to the vault root.
+        #[arg(long)]
+        parent: Option<String>,
+    },
     /// List every group: UUID, name, and direct entry count, one per
     /// line (the group-side twin of `list`).
     ListGroups {
@@ -1228,6 +1260,28 @@ async fn main() -> Result<()> {
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
             session.delete_group(&uuid)?;
+            session.finish().await?;
+        }
+        Command::ReorderGroup {
+            vault,
+            uuid,
+            position,
+        } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.reorder_group(&uuid, position)?;
+            session.finish().await?;
+        }
+        Command::RecycleGroup { vault, uuid } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.recycle_group(&uuid)?;
+            session.finish().await?;
+        }
+        Command::ChildGroups { vault, parent } => {
+            let session =
+                Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            session.child_groups(parent)?;
             session.finish().await?;
         }
         Command::ListGroups { vault } => {
@@ -2280,6 +2334,46 @@ impl Session {
             .move_group(uuid.to_owned(), to.to_owned())
             .map_err(|e| anyhow::anyhow!("move_group: {e:?}"))?;
         println!("moved group {uuid} under {to} and saved to disk");
+        Ok(())
+    }
+
+    /// Reorder a group among its siblings to final index `position`,
+    /// then persist.
+    fn reorder_group(&self, uuid: &str, position: u32) -> Result<()> {
+        self.engine
+            .reorder_group(uuid.to_owned(), position)
+            .map_err(|e| anyhow::anyhow!("reorder_group: {e:?}"))?;
+        println!("reordered group {uuid} to position {position} and saved to disk");
+        Ok(())
+    }
+
+    /// Recycle a group (with its subtree) into the bin, then persist.
+    fn recycle_group(&self, uuid: &str) -> Result<()> {
+        self.engine
+            .recycle_group(uuid.to_owned())
+            .map_err(|e| anyhow::anyhow!("recycle_group: {e:?}"))?;
+        println!("recycled group {uuid} and saved to disk");
+        Ok(())
+    }
+
+    /// Print `parent`'s (root if `None`) direct child groups in sibling
+    /// order. `group_tree` is already ordered by `sort_order`, so a
+    /// parent filter preserves the order.
+    fn child_groups(&self, parent: Option<String>) -> Result<()> {
+        let parent_uuid = match parent {
+            Some(p) => p,
+            None => self.root_uuid()?,
+        };
+        let groups = self
+            .engine
+            .group_tree()
+            .map_err(|e| anyhow::anyhow!("group_tree: {e:?}"))?;
+        for g in groups
+            .iter()
+            .filter(|g| g.parent_uuid.as_deref() == Some(parent_uuid.as_str()))
+        {
+            println!("{}  {}", g.uuid, g.name);
+        }
         Ok(())
     }
 

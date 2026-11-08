@@ -984,6 +984,12 @@ impl Engine {
         self.with_engine_mut(|e| Ok(e.move_group(u, p)?))
     }
 
+    /// Reorder a group among its siblings (same parent). `new_position`
+    /// is the group's 0-based index in the sibling list *after* the move:
+    /// the group is removed from its old slot, then inserted at
+    /// `new_position` (values past the end clamp to last). With siblings
+    /// `[A B C D E]`, moving `B` to 3 gives `[A C D B E]`. A caller holding
+    /// a pre-removal insertion gap must subtract one for a downward move.
     pub fn reorder_group(&self, uuid: String, new_position: u32) -> Result<(), EngineError> {
         let u = parse_uuid(&uuid, "group")?;
         self.with_engine_mut(|e| Ok(e.reorder_group(u, new_position)?))

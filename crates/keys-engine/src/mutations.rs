@@ -1546,14 +1546,28 @@ pub(crate) fn move_entry(
     // stale would lie to every flag-scoped read until the next ingest
     // re-derived it from ancestry. (Adversarial-review catch.)
     let dest_in_bin = group_in_bin_subtree(&tx, &group_str)?;
+    // A move from one bin group to another (organising inside the Trash)
+    // keeps the recorded origin: overwriting it with a bin group would
+    // lose where the entry was recycled from, and `restore_entry` would
+    // fall back to the root — the same clobber `recycle_entry` guards
+    // against for a double-recycle.
+    let keep_origin = dest_in_bin && group_in_bin_subtree(&tx, &previous_group_str)?;
     // Stamp <LocationChanged> (5d sync LWW key) — a move is a location
     // event, distinct from a content edit. `modified_at` is also
     // bumped (pre-existing behaviour); the content hash is unchanged by
     // a pure move, so field merge is unaffected either way.
     tx.execute(
-        "UPDATE entry SET previous_parent_uuid = group_uuid, group_uuid = ?1, \
-         is_recycled = ?2, modified_at = ?3, location_changed_at = ?3 WHERE uuid = ?4",
-        params![group_str, i64::from(dest_in_bin), now, uuid_str],
+        "UPDATE entry SET \
+         previous_parent_uuid = CASE WHEN ?5 THEN previous_parent_uuid ELSE group_uuid END, \
+         group_uuid = ?1, is_recycled = ?2, modified_at = ?3, location_changed_at = ?3 \
+         WHERE uuid = ?4",
+        params![
+            group_str,
+            i64::from(dest_in_bin),
+            now,
+            uuid_str,
+            keep_origin
+        ],
     )?;
     tx.commit()?;
     Ok(MoveEntryOutcome {
