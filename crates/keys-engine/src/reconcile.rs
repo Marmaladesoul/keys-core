@@ -31,13 +31,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use keepass_core::CompositeKey;
+use keepass_core::format::{KdfParams, Version};
 use keepass_core::kdbx::{HeaderRead, Kdbx, Unlocked};
 
 use crate::conflict_rows;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::events::{ChangeEvent, ConflictPayload};
-use crate::kdf_cost::{self, KdfCost, KdfPolicy};
+use crate::kdf_cost::{self, KdfCeiling, KdfCost, KdfPolicy};
 use crate::util::tree::{contains_entry, find_entry};
 
 /// Owner sentinel for the disk/iroh sync peer.
@@ -664,20 +665,25 @@ pub(crate) fn recorded_kdf_cost(engine: &Engine) -> Result<Option<KdfCost>, Engi
 /// nothing else of the peer's envelope: the vault keeps its own KDBX
 /// version, outer cipher, compression and inner-stream cipher whatever the
 /// peer's are. A KDF the vault's format can't carry (Argon2 in a KDBX3
-/// file) is refused rather than taken as licence to change the format.
+/// file) is refused from the headers, before any derive, rather than taken
+/// as licence to change the format
+/// ([`EngineError::KdfUnsupportedByFormat`]).
 ///
-/// Every derive — the vault's file as the save template, its re-key to the
-/// approved settings, the peer — runs before anything merges, so a failure
-/// there leaves the mirror untouched. The facts are recorded only after the
+/// The vault's file is derived as the save template, gated on its recorded
+/// cost (or the approved one) under `ceiling`; then the peer; then the
+/// template's re-key to the approved settings. All run before anything
+/// merges, so a failure there leaves the mirror untouched. The facts are recorded only after the
 /// save lands: a failed save leaves the mirror merged but keyed as before,
 /// so the next peer round asks again rather than refusing this vault's own
 /// file.
+#[allow(clippy::too_many_arguments)] // the adoption's inputs are each distinct
 pub(crate) fn adopt_peer_kdf(
     engine: &mut Engine,
     peer_path: &Path,
     composite_key: &CompositeKey,
     owner: &str,
     approved: &KdfCost,
+    ceiling: KdfCeiling,
     vault_path: &Path,
     temp_dir: Option<&Path>,
 ) -> Result<ParkConflictsResult, EngineError> {
@@ -701,15 +707,24 @@ pub(crate) fn adopt_peer_kdf(
     // so it must still be the file the mirror is current with: what sits at
     // the path otherwise has been neither merged nor identity-checked.
     // Checked here, and again after the derives, which can take a while.
-    let template = read_current_vault_file(engine, vault_path)?;
+    let (bytes, signature) = crate::KdbxStateSignature::read_file(vault_path)?;
+    ensure_corresponds(engine, signature)?;
+    let template = parse_kdbx_header(bytes)?;
+    // A KDBX3 header carries AES-KDF rounds only; anything else would mean
+    // changing the vault's format, which the approval doesn't cover.
+    if template.version() == Version::V3 && !matches!(approved_params, KdfParams::AesKdf { .. }) {
+        return Err(EngineError::KdfUnsupportedByFormat {
+            kdf: approved.clone(),
+        });
+    }
     // Its own derive is gated like any open of it: the recorded settings, or
     // the approved ones should it already carry them.
     kdf_cost::check_vault_header(
         &template,
         recorded_kdf_cost(engine)?.as_ref(),
         KdfPolicy {
+            ceiling,
             approved: Some(approved),
-            ..KdfPolicy::STANDARD
         },
     )?;
     // Unlocked with no field protector, like any save template: the save
@@ -721,8 +736,8 @@ pub(crate) fn adopt_peer_kdf(
         crate::identity::file_identity(&template),
         &template.vault().meta.custom_data,
     )?;
-    // Only the KDF changes; keepass-core refuses a KDF the template's format
-    // can't carry before deriving.
+    // The peer must open before the vault pays for a re-key to its settings.
+    let peer = unlock_kdbx(engine, peer, composite_key)?;
     template
         .rekey_with_kdf(composite_key, &approved_params)
         .map_err(|e| {
@@ -730,7 +745,6 @@ pub(crate) fn adopt_peer_kdf(
                 "re-key the vault file to the approved KDF settings: {e}"
             ))
         })?;
-    let peer = unlock_kdbx(engine, peer, composite_key)?;
     ensure_vault_file_current(engine, vault_path)?;
     let result = ingest_kdbx_as_owner(engine, &peer, owner)?;
     crate::save::save(engine, vault_path, &mut template, temp_dir)?;
@@ -745,27 +759,20 @@ pub(crate) fn adopt_peer_kdf(
     Ok(result)
 }
 
-/// Read the vault's own file up to its outer header, refusing with
-/// [`EngineError::VaultFileChanged`] unless it is the file the mirror last
-/// corresponded with (by the signature of the bytes read).
-fn read_current_vault_file(
-    engine: &Engine,
-    vault_path: &Path,
-) -> Result<Kdbx<HeaderRead>, EngineError> {
-    let (bytes, signature) = crate::KdbxStateSignature::read_file(vault_path)?;
-    if engine.kdbx_state_signature()? == Some(signature) {
-        parse_kdbx_header(bytes)
-    } else {
-        Err(EngineError::VaultFileChanged)
-    }
-}
-
 /// Refuse with [`EngineError::VaultFileChanged`] unless the file at
 /// `vault_path` is the one the mirror last corresponded with (its stat
 /// signature) — the precondition for writing over it.
 fn ensure_vault_file_current(engine: &Engine, vault_path: &Path) -> Result<(), EngineError> {
-    let recorded = engine.kdbx_state_signature()?;
-    if recorded.is_some() && recorded == Some(crate::KdbxStateSignature::from_path(vault_path)?) {
+    ensure_corresponds(engine, crate::KdbxStateSignature::from_path(vault_path)?)
+}
+
+/// Refuse with [`EngineError::VaultFileChanged`] unless `signature` is the
+/// one the mirror last recorded for its vault file.
+fn ensure_corresponds(
+    engine: &Engine,
+    signature: crate::KdbxStateSignature,
+) -> Result<(), EngineError> {
+    if engine.kdbx_state_signature()? == Some(signature) {
         Ok(())
     } else {
         Err(EngineError::VaultFileChanged)

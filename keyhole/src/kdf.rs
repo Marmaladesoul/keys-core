@@ -228,9 +228,10 @@ fn params_of(settings: &KdfSettings) -> Result<keepass_core::format::KdfParams> 
 }
 
 /// Print the parts of a file's envelope an approval of its KDF settings
-/// doesn't cover, from its header alone: `kdbx=<major>\tcipher=<uuid>`.
+/// doesn't cover, from its header alone:
+/// `kdbx=<major>\tcipher=<uuid>\tcompression=<none|gzip>`.
 pub fn envelope(vault: &Path) -> Result<()> {
-    use keepass_core::format::Version;
+    use keepass_core::format::{CompressionFlags, Version};
     use keepass_core::kdbx::Kdbx;
 
     let read = Kdbx::open(vault)
@@ -242,8 +243,13 @@ pub fn envelope(vault: &Path) -> Result<()> {
         Version::V4 => "4",
         other => anyhow::bail!("unmodelled KDBX version: {other:?}"),
     };
+    let compression = match read.header().compression {
+        CompressionFlags::None => "none",
+        CompressionFlags::Gzip => "gzip",
+        other => anyhow::bail!("unmodelled compression: {other:?}"),
+    };
     println!(
-        "kdbx={major}\tcipher={}",
+        "kdbx={major}\tcipher={}\tcompression={compression}",
         read.header().cipher_id.0.hyphenated()
     );
     Ok(())

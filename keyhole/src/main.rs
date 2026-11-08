@@ -416,7 +416,7 @@ enum Command {
     },
     /// Print the parts of a file's envelope that an approval of its KDF
     /// settings doesn't cover, from its header alone (no password):
-    /// `kdbx=<major>\tcipher=<uuid>`.
+    /// `kdbx=<major>\tcipher=<uuid>\tcompression=<none|gzip>`.
     Envelope {
         /// Path to the .kdbx file.
         vault: PathBuf,

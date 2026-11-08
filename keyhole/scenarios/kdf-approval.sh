@@ -65,10 +65,12 @@ KDBX3_FIXTURE="$HERE/fixtures/kdbx3-minimal.kdbx"
 # The fixture's password — a public test credential, mirrored in
 # peer-kdf-cost-refused.sh.
 export KEYHOLE_TEMPLATE_PASSWORD='tëst pässwörd 🔑/\'
-# The reference-device rates `KdfCost::estimate` models, to pick settings
-# whose estimate is no lower than the vault's.
-ARGON2_BYTES_PER_SEC=$((400 * 1024 * 1024))
-AES_ROUNDS_PER_SEC=15000000
+# AES-KDF rounds of the probe whose estimate scales step 6's AES-KDF
+# setting to the vault's estimate (about a second's worth on the reference
+# device, so its two-decimal estimate is precise to 1%).
+AES_PROBE_ROUNDS=15000000
+# Headroom on that scaling, so rounding can't land the setting under.
+AES_PROBE_MARGIN=1.02
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -242,9 +244,16 @@ mem=67108864; iters=2; lanes=8
     >/dev/null || fail "move it to Argon2id"
 rm -rf "$WEAK.mirror"   # record the Argon2id settings on a first open
 "$KEYHOLE" list "$WEAK" >/dev/null || fail "open it at Argon2id"
-current_secs="$("$KEYHOLE" kdf --recorded "$WEAK" | tr '\t' '\n' | sed -n 's/^estimated_seconds=//p')"
-# AES-KDF rounds whose estimate is just past the vault's.
-aes_rounds=$((mem * iters * AES_ROUNDS_PER_SEC / ARGON2_BYTES_PER_SEC + 1))
+estimated_secs() { tr '\t' '\n' | sed -n 's/^estimated_seconds=//p'; }
+current_secs="$("$KEYHOLE" kdf --recorded "$WEAK" | estimated_secs)"
+# AES-KDF rounds whose estimate is just past the vault's, scaled from a
+# probe's estimate rather than a copy of the engine's reference rates.
+cp "$WEAK" "$TMP/probe.kdbx"
+"$KEYHOLE" set-kdf "$TMP/probe.kdbx" --kdf "aes-kdf:rounds=$AES_PROBE_ROUNDS" >/dev/null \
+    || fail "set the AES-KDF probe"
+probe_secs="$("$KEYHOLE" kdf "$TMP/probe.kdbx" | estimated_secs)"
+aes_rounds="$(awk -v r="$AES_PROBE_ROUNDS" -v p="$probe_secs" -v c="$current_secs" -v m="$AES_PROBE_MARGIN" \
+    'BEGIN { printf "%d", r * c / p * m + 1 }')"
 
 # $1 = spec, $2 = expected `weaker=` value.
 expect_weakening() {
@@ -252,7 +261,7 @@ expect_weakening() {
     cp "$WEAK" "$cand"
     "$KEYHOLE" set-kdf "$cand" --kdf "$spec" >/dev/null || fail "set $spec"
     local secs
-    secs="$("$KEYHOLE" kdf "$cand" | tr '\t' '\n' | sed -n 's/^estimated_seconds=//p')"
+    secs="$("$KEYHOLE" kdf "$cand" | estimated_secs)"
     awk -v a="$secs" -v b="$current_secs" 'BEGIN { exit !(a >= b) }' \
         || fail "$spec estimates ${secs}s, under the vault's ${current_secs}s — not the case under test"
     local got

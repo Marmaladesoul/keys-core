@@ -1157,7 +1157,8 @@ impl Engine {
     /// covers the KDF settings the user saw, so the vault keeps its own KDBX
     /// version, outer cipher, compression and inner-stream cipher. The
     /// vault's file is derived too, as the save template, before anything
-    /// merges.
+    /// merges — gated on its recorded cost (or the approved one) under
+    /// `ceiling`, the process's bound for a file with nothing recorded.
     ///
     /// Bring the mirror current with `vault_path` first — the save writes
     /// the mirror over the file, as [`Self::save_to_kdbx`] does, and only
@@ -1173,16 +1174,18 @@ impl Engine {
     /// or after the derive (nothing merged or written);
     /// [`EngineError::KdfApprovalRequired`] if the vault's own file no longer
     /// demands its recorded settings (or the approved ones);
-    /// [`EngineError::Serialise`] if the vault's file can't carry the
-    /// approved KDF (Argon2 in a KDBX3 file) — refused before the peer is
-    /// derived, nothing merged or written. Otherwise as
+    /// [`EngineError::KdfUnsupportedByFormat`] if the vault's file can't
+    /// carry the approved KDF (Argon2 in a KDBX3 file) — refused from the
+    /// headers, before any derive, nothing merged or written. Otherwise as
     /// [`Self::ingest_peer_from_kdbx`], plus the save's IO errors.
+    #[allow(clippy::too_many_arguments)] // the adoption's inputs are each distinct
     pub fn adopt_peer_kdf(
         &mut self,
         kdbx_path: &Path,
         composite_key: &CompositeKey,
         owner: &str,
         approved: &KdfCost,
+        ceiling: crate::kdf_cost::KdfCeiling,
         vault_path: &Path,
         temp_dir: Option<&Path>,
     ) -> Result<ParkConflictsResult, EngineError> {
@@ -1192,6 +1195,7 @@ impl Engine {
             composite_key,
             owner,
             approved,
+            ceiling,
             vault_path,
             temp_dir,
         )

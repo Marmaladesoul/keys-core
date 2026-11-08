@@ -13,7 +13,9 @@ use keepass_core::format::{KdfParams, Version};
 use keepass_core::kdbx::{Kdbx, Unlocked};
 use keepass_core::model::NewEntry;
 use keepass_core::protector::{FieldProtector, ProtectorError, SessionKey};
-use keys_engine::{DbKey, Engine, EngineError, KdfCost, KeyProvider, KeyProviderError, Pagination};
+use keys_engine::{
+    DbKey, Engine, EngineError, KdfCeiling, KdfCost, KeyProvider, KeyProviderError, Pagination,
+};
 
 // ── Fixtures (inlined per the `tests/` posture — see parked_conflicts.rs) ──
 
@@ -158,7 +160,15 @@ fn fixture() -> Fixture {
 fn an_adoption_leaves_the_mirror_owing_its_file_nothing() {
     let mut f = fixture();
     f.engine
-        .adopt_peer_kdf(&f.peer, &composite(), "peer", &f.approved, &f.vault, None)
+        .adopt_peer_kdf(
+            &f.peer,
+            &composite(),
+            "peer",
+            &f.approved,
+            KdfCeiling::STANDARD,
+            &f.vault,
+            None,
+        )
         .expect("adopt");
 
     assert_eq!(titles(&f.engine), ["alpha", "from-peer"]);
@@ -185,9 +195,15 @@ fn an_adoption_refuses_a_vault_file_that_changed_under_it() {
     let changed = other.save_to_bytes().expect("external bytes");
     std::fs::write(&f.vault, &changed).expect("external write");
 
-    let refused =
-        f.engine
-            .adopt_peer_kdf(&f.peer, &composite(), "peer", &f.approved, &f.vault, None);
+    let refused = f.engine.adopt_peer_kdf(
+        &f.peer,
+        &composite(),
+        "peer",
+        &f.approved,
+        KdfCeiling::STANDARD,
+        &f.vault,
+        None,
+    );
 
     assert!(
         matches!(refused, Err(EngineError::VaultFileChanged)),
@@ -221,7 +237,15 @@ fn an_adoption_changes_only_the_vault_files_kdf_settings() {
     assert_ne!(KdfCost::of_header(&before).expect("vault cost"), approved);
 
     f.engine
-        .adopt_peer_kdf(&f.peer, &composite(), "peer", &approved, &f.vault, None)
+        .adopt_peer_kdf(
+            &f.peer,
+            &composite(),
+            "peer",
+            &approved,
+            KdfCeiling::STANDARD,
+            &f.vault,
+            None,
+        )
         .expect("adopt");
 
     let after = header_of(&f.vault);
@@ -239,6 +263,11 @@ fn an_adoption_changes_only_the_vault_files_kdf_settings() {
         after.header().cipher_id,
         before.header().cipher_id,
         "the adoption changed the vault file's outer cipher"
+    );
+    assert_eq!(
+        after.header().compression,
+        before.header().compression,
+        "the adoption changed the vault file's compression"
     );
     assert_eq!(
         f.engine.recorded_kdf_cost().expect("recorded"),
@@ -292,10 +321,18 @@ fn an_adoption_refuses_a_kdf_the_vault_files_format_cannot_carry() {
     std::fs::write(&peer, v4_peer.save_to_bytes().expect("peer bytes")).expect("write peer");
     let approved = KdfCost::of_header(&header_of(&peer)).expect("peer cost");
 
-    let refused = engine.adopt_peer_kdf(&peer, &composite(), "peer", &approved, &vault, None);
+    let refused = engine.adopt_peer_kdf(
+        &peer,
+        &composite(),
+        "peer",
+        &approved,
+        KdfCeiling::STANDARD,
+        &vault,
+        None,
+    );
 
     assert!(
-        matches!(&refused, Err(EngineError::Serialise(m)) if m.contains("KDBX3")),
+        matches!(&refused, Err(EngineError::KdfUnsupportedByFormat { kdf }) if *kdf == approved),
         "{refused:?}"
     );
     assert_eq!(

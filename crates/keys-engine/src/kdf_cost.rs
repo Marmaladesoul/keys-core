@@ -69,6 +69,12 @@ const STANDARD_MAX_MEMORY_BYTES: u64 = GIB;
 /// default vault still opens there.
 const CONSTRAINED_MAX_MEMORY_BYTES: u64 = 64 * MIB;
 
+/// The least Argon2 memory credited with memory-hardness when judging a
+/// change away from AES-KDF ([`KdfCost::weakenings_from`]): OWASP's minimum
+/// Argon2id memory, 19 MiB. Below it, the change is judged on its time
+/// estimate, as a change within one family is on its work.
+const MEMORY_HARD_FLOOR_BYTES: u64 = 19 * MIB;
+
 /// The work a KDBX envelope's KDF demands: its [`KdfParams`] with the
 /// salt / transform seed cleared. Two envelopes with equal `KdfCost`
 /// take the same derivation work to open, whatever their salts.
@@ -187,7 +193,9 @@ impl KdfCost {
     /// differently. The order is family first (memory-hard Argon2 above
     /// AES-KDF), then within Argon2 memory, total work, variant and
     /// version, each judged on its own. Moving from AES-KDF to Argon2 is
-    /// never weaker, whatever the estimates: it gains memory-hardness. A
+    /// not weaker, whatever the estimates — it gains memory-hardness — so
+    /// long as the Argon2 memory is enough to count (19 MiB, OWASP's
+    /// minimum); below that it is judged on its time estimate. A
     /// KDF family this build doesn't model can't be judged, so a change to
     /// or from one is [`KdfWeakening::Unmodelled`].
     #[must_use]
@@ -245,7 +253,17 @@ impl KdfCost {
             (KdfParams::Argon2 { .. }, KdfParams::AesKdf { .. }) => {
                 weakenings.push(KdfWeakening::LosesMemoryHardness);
             }
-            (KdfParams::AesKdf { .. }, KdfParams::Argon2 { .. }) => {}
+            (KdfParams::AesKdf { .. }, KdfParams::Argon2 { memory_bytes, .. }) => {
+                // Gains memory-hardness — unless it hardly uses any memory,
+                // when it is only as good as the work it asks.
+                let quicker = self
+                    .estimate()
+                    .zip(current.estimate())
+                    .is_some_and(|(proposed, current)| proposed.seconds < current.seconds);
+                if *memory_bytes < MEMORY_HARD_FLOOR_BYTES && quicker {
+                    weakenings.push(KdfWeakening::LessWork);
+                }
+            }
             _ => weakenings.push(KdfWeakening::Unmodelled),
         }
         weakenings
@@ -696,12 +714,29 @@ mod tests {
     }
 
     #[test]
-    fn moving_from_aes_kdf_to_argon2_is_never_weaker() {
+    fn moving_from_aes_kdf_to_argon2_is_not_weaker() {
         // Quicker by the estimate, but memory-hard: an upgrade.
         let current = KdfCost::aes_kdf(60_000_000);
         let proposed = argon2id(64 * MIB, 2);
         assert!(seconds(&proposed) < seconds(&current));
         assert!(proposed.weakenings_from(&current).is_empty());
+        assert!(
+            argon2id(MEMORY_HARD_FLOOR_BYTES, 1)
+                .weakenings_from(&current)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn argon2_with_too_little_memory_to_count_is_judged_on_its_work() {
+        let current = KdfCost::aes_kdf(60_000_000);
+        // Next to no memory, and next to no time: no upgrade at all.
+        let token = argon2_cost(Argon2Variant::Argon2d, 8 * 1024, 1, Argon2Version::V13);
+        assert_eq!(token.weakenings_from(&current), [KdfWeakening::LessWork]);
+        // Too little memory to count, but as slow as what it replaces.
+        let slow = argon2id(MIB, 4_000);
+        assert!(seconds(&slow) >= seconds(&current));
+        assert!(slow.weakenings_from(&current).is_empty());
     }
 
     #[test]

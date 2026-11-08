@@ -1491,8 +1491,8 @@ impl Engine {
     /// this vault records. The approval covers the KDF settings and nothing
     /// else of the peer's envelope: the vault keeps its own KDBX version and
     /// ciphers. Approved settings the vault's format can't carry (Argon2 in
-    /// a KDBX3 file) are refused with [`EngineError::Internal`] before the
-    /// peer is derived, nothing merged or written.
+    /// a KDBX3 file) are refused with [`EngineError::Internal`] from the
+    /// headers, before any derive, nothing merged or written.
     ///
     /// Whether the approved settings are weaker than the vault's is for the
     /// prompt to show beforehand ([`crate::kdf_weakenings`]).
@@ -1538,6 +1538,7 @@ impl Engine {
                 &composite,
                 &owner_id,
                 &approved,
+                crate::kdf::ceiling(),
                 &vault,
                 temp_dir.as_deref(),
             )?
