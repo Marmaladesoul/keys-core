@@ -23,6 +23,7 @@
 mod adapters;
 mod kdf;
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -168,6 +169,18 @@ enum Command {
         url: Option<String>,
         #[arg(long)]
         notes: Option<String>,
+        /// Create an entry with this title through a second engine on the
+        /// same mirror, part-way through the update: on the
+        /// `--sidecar-at-key-request`-th session-key request the update
+        /// makes. Models another process's engine on the shared mirror,
+        /// such as a credential provider's, writing on its own connection
+        /// while this one settles the entry's held conflict.
+        #[arg(long, value_name = "TITLE", requires = "sidecar_at_key_request")]
+        sidecar_create: Option<String>,
+        /// Which session-key request of the update `--sidecar-create` lands
+        /// on (1 is the first).
+        #[arg(long, value_name = "N", requires = "sidecar_create")]
+        sidecar_at_key_request: Option<NonZeroUsize>,
     },
     /// Save an entry the way a GUI editor's Save does: read its FULL current
     /// state, apply the overrides you pass, and hand the whole state to
@@ -964,6 +977,8 @@ async fn main() -> Result<()> {
             entry_password,
             url,
             notes,
+            sidecar_create,
+            sidecar_at_key_request,
         } => {
             anyhow::ensure!(
                 title.is_some()
@@ -984,6 +999,10 @@ async fn main() -> Result<()> {
             };
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
+            if let (Some(title), Some(nth)) = (sidecar_create, sidecar_at_key_request) {
+                let vault = vault.clone();
+                adapters::on_key_request(nth, move || sidecar_create_entry(&vault, title));
+            }
             session.update_entry(&uuid, update)?;
             session.finish().await?;
         }
@@ -1815,13 +1834,7 @@ impl Session {
 
     /// UUID of the vault's root group (the parentless node).
     fn root_uuid(&self) -> Result<String> {
-        self.engine
-            .group_tree()
-            .map_err(|e| anyhow::anyhow!("group_tree: {e:?}"))?
-            .into_iter()
-            .find(|g| g.parent_uuid.is_none())
-            .map(|g| g.uuid)
-            .ok_or_else(|| anyhow::anyhow!("vault has no root group"))
+        root_group_uuid(&self.engine)
     }
 
     /// Create an entry under `group` (root if `None`) and persist it.
@@ -1832,26 +1845,7 @@ impl Session {
         entry_password: String,
         group: Option<String>,
     ) -> Result<()> {
-        let group_uuid = match group {
-            Some(g) => g,
-            None => self.root_uuid()?,
-        };
-        let uuid = self
-            .engine
-            .create_entry(
-                group_uuid,
-                NewEntryFields {
-                    title,
-                    username,
-                    url: String::new(),
-                    notes: String::new(),
-                    password: entry_password,
-                    icon: IconRef::Builtin { index: 0 },
-                    custom_fields: Vec::new(),
-                    tags: Vec::new(),
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("create_entry: {e:?}"))?;
+        let uuid = create_entry_in(&self.engine, title, username, entry_password, group)?;
         println!("created entry {uuid}");
         Ok(())
     }
@@ -2628,6 +2622,65 @@ struct WhileResolverOpen {
     create: Option<String>,
     /// Notes to set on the held entry.
     notes: Option<String>,
+}
+
+/// UUID of `engine`'s root group (the parentless node).
+fn root_group_uuid(engine: &Engine) -> Result<String> {
+    engine
+        .group_tree()
+        .map_err(|e| anyhow::anyhow!("group_tree: {e:?}"))?
+        .into_iter()
+        .find(|g| g.parent_uuid.is_none())
+        .map(|g| g.uuid)
+        .ok_or_else(|| anyhow::anyhow!("vault has no root group"))
+}
+
+/// Create an entry in `engine` under `group` (root if `None`); returns its
+/// UUID.
+fn create_entry_in(
+    engine: &Engine,
+    title: String,
+    username: String,
+    entry_password: String,
+    group: Option<String>,
+) -> Result<String> {
+    let group_uuid = match group {
+        Some(g) => g,
+        None => root_group_uuid(engine)?,
+    };
+    engine
+        .create_entry(
+            group_uuid,
+            NewEntryFields {
+                title,
+                username,
+                url: String::new(),
+                notes: String::new(),
+                password: entry_password,
+                icon: IconRef::Builtin { index: 0 },
+                custom_fields: Vec::new(),
+                tags: Vec::new(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("create_entry: {e:?}"))
+}
+
+/// Create an entry titled `title` through a second engine opened on
+/// `vault`'s mirror, as another process sharing the mirror would, on its
+/// own connection. It writes the mirror only, never the file. A failure is
+/// a broken scenario, so it panics rather than letting the run pass without
+/// testing anything.
+fn sidecar_create_entry(vault: &Path, title: String) {
+    let sidecar = Engine::open(
+        mirror_db_for(vault).to_string_lossy().into_owned(),
+        Arc::new(FixedDbKey),
+        Arc::new(FixedProtector),
+        None,
+    )
+    .expect("open a second engine on the mirror");
+    let uuid = create_entry_in(&sidecar, title, String::new(), String::new(), None)
+        .expect("create an entry through the second engine");
+    eprintln!("note: a second engine on the mirror created entry {uuid}");
 }
 
 /// The vault's persistent mirror directory: `<vault-path>.mirror`.

@@ -32,7 +32,8 @@
 //! fall back to the default — a scenario that fat-fingers the key should
 //! see it, not a misleadingly-passing run.
 
-use std::path::{Path, PathBuf};
+use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -54,29 +55,69 @@ const FIELD_KEY_ENV: &str = "KEYHOLE_FIELD_KEY";
 /// the open-time sync. See [`arm_file_landing`].
 const LAND_FILE_ENV: &str = "KEYHOLE_LAND_FILE_AFTER_READ";
 
-/// The pending `(replacement, vault)` rename [`arm_file_landing`] armed.
-static PENDING_LANDING: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
+/// Something [`on_key_request`] armed: run `action` on the `remaining`-th
+/// session-key request from now.
+struct ArmedAction {
+    remaining: NonZeroUsize,
+    action: Box<dyn FnOnce() + Send>,
+}
+
+/// The one pending [`on_key_request`] action.
+static ARMED: Mutex<Option<ArmedAction>> = Mutex::new(None);
+
+/// Run `action` on the `nth` session-key request from now (1 is the next),
+/// once.
+///
+/// A session-key request is the one point a test double sees *inside* an
+/// engine call, so this is how a scenario lands something in a window the
+/// seam gives it no other way into: the engine asks for the key at fixed
+/// points in each call, so the timing is exact where a race would not be,
+/// and the action runs on a test double, so no production code carries a
+/// hook. Re-arming replaces a pending action.
+pub fn on_key_request(nth: NonZeroUsize, action: impl FnOnce() + Send + 'static) {
+    *ARMED.lock().unwrap() = Some(ArmedAction {
+        remaining: nth,
+        action: Box::new(action),
+    });
+}
+
+/// Count one session-key request against the armed action, running it if
+/// it is due. The lock is released first: the action may itself open an
+/// engine that asks for the key.
+fn count_key_request() {
+    let due = {
+        let mut armed = ARMED.lock().unwrap();
+        match armed.as_mut() {
+            Some(pending) => match NonZeroUsize::new(pending.remaining.get() - 1) {
+                Some(rest) => {
+                    pending.remaining = rest;
+                    None
+                }
+                None => armed.take(),
+            },
+            None => None,
+        }
+    };
+    if let Some(due) = due {
+        (due.action)();
+    }
+}
 
 /// Arm the [`LAND_FILE_ENV`] rename, if the env var is set: the next session
 /// key request moves that file over `vault`.
 ///
 /// This models another writer replacing the vault file while the engine is
 /// deriving. The open-time sync asks for the session key only once it has
-/// read the file, so the timing is exact where a race against a slow KDF
-/// would not be, and the rename runs on a test double, so no production code
-/// carries a hook. Arm it just before the sync: the open itself may ask for
-/// the key too, before anything has been read.
+/// read the file. Arm it just before the sync: the open itself may ask for
+/// the key too, before anything has been read. A failed rename is a broken
+/// scenario, so it's fatal rather than a run that passes without testing
+/// anything.
 pub fn arm_file_landing(vault: &Path) {
     if let Some(replacement) = std::env::var_os(LAND_FILE_ENV) {
-        *PENDING_LANDING.lock().unwrap() = Some((PathBuf::from(replacement), vault.to_owned()));
-    }
-}
-
-/// Perform the armed rename, once. A failed rename is a broken scenario, so
-/// it's fatal rather than a run that passes without testing anything.
-fn land_armed_file() {
-    if let Some((replacement, vault)) = PENDING_LANDING.lock().unwrap().take() {
-        std::fs::rename(&replacement, &vault).expect("rename the landing file over the vault");
+        let vault = vault.to_owned();
+        on_key_request(NonZeroUsize::MIN, move || {
+            std::fs::rename(replacement, vault).expect("rename the landing file over the vault");
+        });
     }
 }
 
@@ -198,7 +239,7 @@ pub struct FixedProtector;
 
 impl VaultFieldProtector for FixedProtector {
     fn acquire_session_key(&self) -> Result<Vec<u8>, VaultProtectorError> {
-        land_armed_file();
+        count_key_request();
         match key_override(FIELD_KEY_ENV) {
             Ok(Some(bytes)) => Ok(bytes.to_vec()),
             Ok(None) => Ok(MIRROR_SESSION_KEY.to_vec()),

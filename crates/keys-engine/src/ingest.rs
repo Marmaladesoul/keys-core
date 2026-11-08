@@ -64,10 +64,18 @@ pub(crate) fn ingest(
     // until the mirror is next written back — so this ingest leaves the
     // mirror owing that write.
     let stamped = crate::identity::assign_file_identity(&mut vault, kdbx);
-    ingest_vault_with_header(
-        conn,
+    let (session_key, tx) = begin_replace(conn, protector)?;
+    let state = PersistenceState::read(&tx)?;
+    if state.is_dirty() {
+        return Err(EngineError::MirrorOwesWrite {
+            mutation_seq: state.mutation_seq,
+            persisted_seq: state.persisted_seq,
+        });
+    }
+    replace_vault(
+        tx,
         fingerprint_key,
-        protector,
+        &session_key,
         &vault,
         Source::VaultFile {
             header: kdbx.outer_header(),
@@ -76,54 +84,44 @@ pub(crate) fn ingest(
     )
 }
 
-/// Re-ingest a pre-unwrapped [`Vault`] without going through a
-/// [`Kdbx`] envelope. Used by paths that have already mutated the
-/// in-memory vault (e.g. `clear_parked_conflict_marker`) and don't
-/// want to round-trip through KDBX encrypt + decrypt just to feed
-/// `ingest`.
+/// Whether [`ingest_projected_vault`] replaced the mirror.
+#[derive(Debug)]
+pub(crate) enum ProjectedIngest {
+    /// The mirror hadn't moved since the projection, and now holds the vault.
+    Landed,
+    /// The mirror's `mutation_seq` had moved since the projection: something
+    /// else wrote meanwhile, and replacing the mirror would have discarded
+    /// it. Nothing was written.
+    MirrorMoved,
+}
+
+/// Replace the mirror with `vault`, rebuilt in memory from a projection of
+/// this mirror taken when its `mutation_seq` was `projected_at_seq` — unless
+/// the mirror has moved since, because replacing it would discard whatever
+/// moved it. Other connections to the mirror can write at any time, so the
+/// check shares the replace's transaction.
+///
+/// This is the only way to replace the mirror from memory: a projection is
+/// a snapshot, so there is no unguarded form. Read `projected_at_seq` before
+/// projecting, so a write landing in between reads as moved.
 ///
 /// The outer-header facts (cipher / KDF / transform-rounds) carried
 /// in `meta.*` setting rows are left as the existing ingest wrote
 /// them; the database envelope hasn't changed, only its decoded
 /// content.
-pub(crate) fn ingest_vault(
-    conn: &mut Connection,
-    fingerprint_key: &[u8; 32],
-    protector: &dyn FieldProtector,
-    vault: &Vault,
-) -> Result<IngestOutcome, EngineError> {
-    ingest_vault_with_header(
-        conn,
-        fingerprint_key,
-        protector,
-        vault,
-        Source::InMemory {
-            projected_at_seq: None,
-        },
-    )
-}
-
-/// [`ingest_vault`] of a vault projected from this mirror when its
-/// `mutation_seq` was `projected_at_seq`: refused with
-/// [`EngineError::ResolutionMismatch`] if the mirror has changed since, because
-/// replacing it would discard that change. Other connections to the mirror can
-/// write at any time, so the check shares the ingest's transaction.
 pub(crate) fn ingest_projected_vault(
     conn: &mut Connection,
     fingerprint_key: &[u8; 32],
     protector: &dyn FieldProtector,
     vault: &Vault,
     projected_at_seq: i64,
-) -> Result<IngestOutcome, EngineError> {
-    ingest_vault_with_header(
-        conn,
-        fingerprint_key,
-        protector,
-        vault,
-        Source::InMemory {
-            projected_at_seq: Some(projected_at_seq),
-        },
-    )
+) -> Result<ProjectedIngest, EngineError> {
+    let (session_key, tx) = begin_replace(conn, protector)?;
+    if PersistenceState::read(&tx)?.mutation_seq != projected_at_seq {
+        return Ok(ProjectedIngest::MirrorMoved);
+    }
+    replace_vault(tx, fingerprint_key, &session_key, vault, Source::InMemory)?;
+    Ok(ProjectedIngest::Landed)
 }
 
 /// Where an ingested vault came from — which decides whether the ingest
@@ -144,49 +142,42 @@ enum Source<'a> {
     /// modified, content — it may hold changes no file has seen, so the
     /// watermark advances with the ingest's writes and stays owed. The
     /// envelope is unchanged, so the header-fact rows are left as the
-    /// originating ingest wrote them. `projected_at_seq`, when set, is the
-    /// `mutation_seq` it was projected at, and the ingest is refused if the
-    /// mirror has moved on.
-    InMemory { projected_at_seq: Option<i64> },
+    /// originating ingest wrote them.
+    InMemory,
 }
 
-fn ingest_vault_with_header(
-    conn: &mut Connection,
-    fingerprint_key: &[u8; 32],
+/// Open a replace's transaction, having fetched the session key it seals
+/// under: one fetch per ingest call, the same discipline as the
+/// keepass-core wrap pass.
+///
+/// IMMEDIATE: the write lock is held from the caller's check of the
+/// persistence state through [`replace_vault`]'s commit, so no other
+/// connection's mutation can land between the check and the wipe that
+/// relies on it.
+fn begin_replace<'c>(
+    conn: &'c mut Connection,
     protector: &dyn FieldProtector,
-    vault: &Vault,
-    source: Source<'_>,
-) -> Result<IngestOutcome, EngineError> {
-    // One session-key fetch per ingest call. Same discipline as the
-    // keepass-core wrap pass.
+) -> Result<(SessionKey, rusqlite::Transaction<'c>), EngineError> {
     let session_key = protector
         .acquire_session_key()
         .map_err(|e| EngineError::Ingest(IngestError::SessionKey(e.to_string())))?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    Ok((session_key, tx))
+}
 
+/// Wipe the mirror's vault content inside `tx`, opened by
+/// [`begin_replace`] and already checked by the caller, write `vault` in
+/// its place, and commit.
+fn replace_vault(
+    tx: rusqlite::Transaction<'_>,
+    fingerprint_key: &[u8; 32],
+    session_key: &SessionKey,
+    vault: &Vault,
+    source: Source<'_>,
+) -> Result<IngestOutcome, EngineError> {
     let recycle_bin_uuid = vault.meta.recycle_bin_uuid;
     let recycle_bin_enabled = vault.meta.recycle_bin_enabled;
 
-    // IMMEDIATE: the write lock is held from the watermark check through
-    // the commit, so no other connection's mutation can land between
-    // "the mirror owes nothing" and the wipe that relies on it.
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let state = PersistenceState::read(&tx)?;
-    match source {
-        Source::VaultFile { .. } if state.is_dirty() => {
-            return Err(EngineError::MirrorOwesWrite {
-                mutation_seq: state.mutation_seq,
-                persisted_seq: state.persisted_seq,
-            });
-        }
-        Source::InMemory {
-            projected_at_seq: Some(projected_at_seq),
-        } if state.mutation_seq != projected_at_seq => {
-            return Err(EngineError::ResolutionMismatch {
-                reason: "the vault changed after the resolver opened".to_owned(),
-            });
-        }
-        _ => {}
-    }
     clear_vault_tables(&tx)?;
     meta::clear_meta_tables(&tx)?;
 
@@ -203,7 +194,7 @@ fn ingest_vault_with_header(
     // rows so the engine doesn't have to hold a live `Kdbx` handle to
     // surface them.
     //
-    // Header-facts are absent on the [`ingest_vault`] code path —
+    // Header-facts are absent on the [`ingest_projected_vault`] code path —
     // that path mutates the in-memory vault without re-wrapping the
     // envelope, so the existing rows (written by the originating
     // ingest call) remain accurate.
@@ -244,7 +235,7 @@ fn ingest_vault_with_header(
         recycle_bin_uuid,
         false,
         fingerprint_key,
-        &session_key,
+        session_key,
         &binaries,
         &mut outcome,
     )?;
@@ -2535,7 +2526,7 @@ mod ingest_peer_tests {
     //! inspection of the `conflict_*` rows. Logic-level — the real-KDBX
     //! history-identity soak is the Phase-4 gate.
 
-    use super::{IngestPeerOutcome, ingest_peer, ingest_vault};
+    use super::{IngestPeerOutcome, ProjectedIngest, ingest_peer, ingest_projected_vault};
     use crate::conflict_rows;
     use crate::migrations;
     use keepass_core::model::{
@@ -2677,11 +2668,11 @@ mod ingest_peer_tests {
             params![id.to_string()],
         )
         .expect("another write");
-        let err = super::ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, &vault, at)
-            .expect_err("the mirror moved");
+        let refused =
+            ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, &vault, at).expect("ingest");
         assert!(
-            matches!(err, crate::error::EngineError::ResolutionMismatch { .. }),
-            "{err:?}"
+            matches!(refused, ProjectedIngest::MirrorMoved),
+            "{refused:?}"
         );
         let title: String = conn
             .query_row(
@@ -2698,14 +2689,23 @@ mod ingest_peer_tests {
         let now = super::PersistenceState::read(&conn)
             .expect("state")
             .mutation_seq;
-        super::ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, &vault, now)
-            .expect("an unmoved mirror takes the ingest");
+        let landed = ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, &vault, now)
+            .expect("ingest");
+        assert!(
+            matches!(landed, ProjectedIngest::Landed),
+            "an unmoved mirror takes the ingest: {landed:?}"
+        );
     }
 
     /// Seed the local mirror from `local`.
     fn seeded(local: &Vault) -> Connection {
         let mut conn = mem_conn();
-        ingest_vault(&mut conn, &FP_KEY, &TestProtector, local).expect("seed local");
+        let at = super::PersistenceState::read(&conn)
+            .expect("state")
+            .mutation_seq;
+        let seeded = ingest_projected_vault(&mut conn, &FP_KEY, &TestProtector, local, at)
+            .expect("seed local");
+        assert!(matches!(seeded, ProjectedIngest::Landed), "{seeded:?}");
         conn
     }
 

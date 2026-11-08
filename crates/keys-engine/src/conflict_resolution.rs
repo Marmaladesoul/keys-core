@@ -84,7 +84,7 @@ use crate::util::tree::find_entry;
 ///   whether the mirror has moved on from that snapshot.
 ///
 /// The apply path re-ingests the merged [`Vault`] directly via
-/// `Engine::ingest_vault`, so the context no longer carries a disk Kdbx
+/// `Engine::ingest_projected_vault`, so the context no longer carries a disk Kdbx
 /// envelope or the disk bytes — the owner-rows switch dropped the baseline
 /// refresh from these paths (the database envelope and its `meta.*` header
 /// rows are unchanged by an in-memory re-ingest).
@@ -171,11 +171,18 @@ pub(crate) fn apply_conflict_resolution(
 
     // 4. Re-ingest the merged vault directly. No KDBX envelope needed: the
     //    database header (cipher / KDF / `meta.*` rows) is unchanged by an
-    //    in-memory re-ingest, so `ingest_vault` reuses the existing rows.
+    //    in-memory re-ingest, so the replace reuses the existing rows.
     //    This also drops the baseline refresh the eager-merge path did — the
     //    owner-rows switch took `set_last_saved_kdbx_bytes` off this path
     //    (the caller saves the resolved projection out of band).
-    engine.ingest_projected_vault(&merged, projected_at_seq)?;
+    match engine.ingest_projected_vault(&merged, projected_at_seq)? {
+        crate::ingest::ProjectedIngest::Landed => {}
+        crate::ingest::ProjectedIngest::MirrorMoved => {
+            return Err(EngineError::ResolutionMismatch {
+                reason: "the vault changed after the resolver opened".to_owned(),
+            });
+        }
+    }
 
     // Drop the resolved entries' owner rows so the badge clears: their
     // conflicts have converged locally to the chosen values, so there is no
