@@ -28,9 +28,10 @@ for s in "$DIR"/*.sh; do
     # Both convergence fuzzers are full CI gates too: fuzz-convergence since
     # Findings #4 + #5 (timestamp flooring + dissolved-conflict badge
     # clearing), fuzz-attachments since Finding #8 (LCA generation
-    # disambiguation) — each soaked green at re-gate time. Interleaving varies
-    # run-to-run (fresh uuids), so a red there is a real convergence
-    # bug: the failure preserves both vaults + mirrors for post-mortem.
+    # disambiguation) — each soaked green at re-gate time. Timing varies
+    # run-to-run (wall-clock writes land on different whole-second
+    # boundaries), so a red there is a real convergence bug: the failure
+    # preserves both vaults + mirrors for post-mortem.
     printf '\n── %s ─────────────────────────\n' "$name"
     if bash "$s"; then
         pass=$((pass + 1))
