@@ -2611,7 +2611,7 @@ dependencies = [
 [[package]]
 name = "keepass-core"
 version = "0.0.0"
-source = "git+https://github.com/Marmaladesoul/keepass-core#0f71927f1aba0e0866f6e55b8a26a5861be94911"
+source = "git+https://github.com/Marmaladesoul/keepass-core#a28cff6f2cd6da543d6d3d00c53eaf9781b538d4"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm 0.11.0",
@@ -2637,7 +2637,7 @@ dependencies = [
 [[package]]
 name = "keepass-merge"
 version = "0.0.0"
-source = "git+https://github.com/Marmaladesoul/keepass-core#0f71927f1aba0e0866f6e55b8a26a5861be94911"
+source = "git+https://github.com/Marmaladesoul/keepass-core#a28cff6f2cd6da543d6d3d00c53eaf9781b538d4"
 dependencies = [
  "chrono",
  "keepass-core",
@@ -3769,9 +3769,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.245"
+version = "2.1.248"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46cce9bc841c0eeb395275a775d11e3cc91b904e6ab370a9a42369e111b3038e"
+checksum = "db58c388e851a5e62d8b5373b0f41135edac0bd43009832ba362691089d7367c"
 dependencies = [
  "psl-types",
 ]
