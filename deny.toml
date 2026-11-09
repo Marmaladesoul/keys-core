@@ -64,6 +64,19 @@ ignore = [
     # moving keys-ffi to 0.29 alone won't clear it: drop once every
     # uniffi_bindgen here sits on an askama_derive without basic-toml.
     "RUSTSEC-2026-0374",
+    # libsqlite3-sys: SQLite < 3.54 can return uninitialised page-cache
+    # memory when a database is opened with a sibling -wal file of a
+    # different page size. Local only: the victim has to open a db/-wal
+    # pair a less trusted party wrote. keys-engine builds SQLCipher
+    # (rusqlite `bundled-sqlcipher-vendored-openssl`), and the advisory
+    # says SQLCipher builds stay affected even on the patched
+    # libsqlite3-sys 0.39 (sqlcipher-src bundles SQLite 3.53.4), so no
+    # upgrade clears it today. The engine opens only its own keyed
+    # mirror, at a path its caller owns, so a crafted pair has to be
+    # planted where the caller keeps it. Drop this (and the matching
+    # ignore in ci.yml's audit job) once a rusqlite release bundles
+    # SQLCipher on SQLite >= 3.54, and upgrade to it.
+    "RUSTSEC-2026-0459",
 ]
 
 # ---------------------------------------------------------------------------
