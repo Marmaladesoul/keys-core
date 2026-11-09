@@ -27,11 +27,12 @@
 //! 4. Reconcile timestamps and re-ingest the merged [`Vault`] into
 //!    `SQLite` in a single transaction, refused if the mirror's
 //!    `mutation_seq` has moved since the stash: the merged vault is a
-//!    whole-vault snapshot and would discard whatever moved it.
-//! 5. Drop the resolved entries' owner (`conflict_*`) rows so the badge
-//!    clears, and emit
-//!    [`crate::events::ChangeEvent::ExternalChangeMerged`] with empty
-//!    `conflicts`.
+//!    whole-vault snapshot and would discard whatever moved it. In the
+//!    same transaction, drop only the owner (`conflict_*`) rows the
+//!    resolver read — the surfaced row and any other owner's row with the
+//!    same value, as stashed — so a row the user never saw stays parked.
+//! 5. Emit [`crate::events::ChangeEvent::ExternalChangeMerged`] with
+//!    empty `conflicts`.
 //!
 //! ## Atomicity
 //!
