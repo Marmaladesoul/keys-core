@@ -378,7 +378,10 @@ fn resolver_open_surfaces_a_live_owner_behind_a_dissolved_one() {
             .is_none()
     );
     assert_eq!(seed_title(&f), "seed-a", "a's title was never adopted");
-    assert!(f.engine.conflict_owners(f.seed).expect("owners").is_empty());
+    assert_eq!(
+        f.engine.conflict_owners(f.seed).expect("owners"),
+        Vec::<String>::new()
+    );
 }
 
 /// A settle decides on one projection which rows to drop as dissolved and
@@ -517,7 +520,10 @@ fn resolver_open_fails_rather_than_report_nothing_over_a_parked_row() {
             .is_none()
     );
     assert_eq!(seed_title(&f), "seed-a");
-    assert!(f.engine.entries_with_parked_conflict().unwrap().is_empty());
+    assert_eq!(
+        f.engine.entries_with_parked_conflict().unwrap(),
+        Vec::<uuid::Uuid>::new()
+    );
 }
 
 /// Owners that park the same peer value (peers that synced each other)

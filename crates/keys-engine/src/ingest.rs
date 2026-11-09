@@ -2850,10 +2850,9 @@ mod ingest_peer_tests {
             .expect("row");
         let dropped = super::drop_projected_rows(&mut conn, at, &[newer]).expect("drop");
         assert!(matches!(dropped, ProjectedIngest::Landed), "{dropped:?}");
-        assert!(
-            conflict_rows::parked_conflict_uuids(&conn)
-                .expect("badge")
-                .is_empty()
+        assert_eq!(
+            conflict_rows::parked_conflict_uuids(&conn).expect("badge"),
+            Vec::<uuid::Uuid>::new()
         );
     }
 
