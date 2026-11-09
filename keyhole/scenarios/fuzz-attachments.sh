@@ -11,7 +11,15 @@
 #
 # Names are device-prefixed: same-name both-sided attachment edits
 # stay on the conservative no-auto-pick path until the remaining 5c
-# slice (both-sided attachment park/resolve) lands.
+# slice (both-sided attachment park/resolve) lands. So every round must
+# auto-merge on BOTH replicas: a conflict parked on either one is a
+# failure (a one-sided park is the asymmetric-verdict shape — one replica
+# merges while the other holds the old content).
+#
+# Timing: writes run on the wall clock, so which ops share a whole second
+# (KDBX time resolution) varies run to run. That variation is deliberate
+# coverage — it is what found the same-second history-order bug pinned by
+# history-same-second-order.sh.
 #
 # Reproducibility: the op stream is a pure function of FUZZ_SEED. Both the
 # entry picker and the per-device op count draw from the MAIN-shell seeded
@@ -92,8 +100,10 @@ for round in $(seq 1 "$ROUNDS"); do
 
     "$KEYHOLE" ingest-peer "$A" "$B" --owner device-b >/dev/null
     "$KEYHOLE" ingest-peer "$B" "$A" --owner device-a >/dev/null
-    "$KEYHOLE" list-conflicts "$A" | grep '(no held conflicts)' >/dev/null \
-        || fail "attachment-only ops parked a conflict on A"
+    for v in "$A" "$B"; do
+        "$KEYHOLE" list-conflicts "$v" | grep '(no held conflicts)' >/dev/null \
+            || fail "attachment-only ops parked a conflict on $(basename "$v")"
+    done
 
     da="$("$KEYHOLE" digest "$A")"
     db="$("$KEYHOLE" digest "$B")"

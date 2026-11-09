@@ -2231,8 +2231,10 @@ fn fold_entry_history_into_mirror(
         ctx.now,
     )
     .map_err(|e| EngineError::Serialise(format!("prune_history_with_tombstones: {e}")))?;
-    // `fold_entry_history` compares snapshot *sets*, so a duplicate it
-    // collapsed inside `base` reads as unchanged; the length catches it.
+    // `fold_entry_history` compares the record sequence, so a record added,
+    // pruned, collapsed as a duplicate, or moved all read as changed. The
+    // length check keeps a collapsed duplicate counted here whatever the fold
+    // reports.
     let changed = folded || trimmed > 0 || merged.history.len() != base.history.len();
     if !changed {
         return Ok(false);
@@ -2242,22 +2244,19 @@ fn fold_entry_history_into_mirror(
     Ok(true)
 }
 
-/// Do the two sides hold the same history — equally many records, each with a
-/// twin on the other side (same whole-second mtime and [`same_content`])? The
-/// fold's cheap steady-state test: it never hashes, and it ignores order,
-/// because the fold keeps each side's own record first among same-second
-/// records. Any doubt reads as "different", which only costs running the fold.
+/// Do the two sides hold the same history — the same records (same
+/// whole-second mtime and [`same_content`]) in the same order? The fold's cheap
+/// steady-state test: it never hashes. Order counts, because it is what tells
+/// classify which version came first, and the fold settles both replicas on
+/// one order; a reorder must reach the fold to be persisted. Any doubt reads
+/// as "different", which only costs running the fold.
 fn histories_identical(a: (&Entry, &[Binary]), b: (&Entry, &[Binary])) -> bool {
-    let has_twin = |x: &Entry, x_bins: &[Binary], side: (&Entry, &[Binary])| {
-        side.0.history.iter().any(|y| {
+    a.0.history.len() == b.0.history.len()
+        && a.0.history.iter().zip(&b.0.history).all(|(x, y)| {
             x.times.last_modification_time.map(floor_to_second)
                 == y.times.last_modification_time.map(floor_to_second)
-                && same_content((x, x_bins), (y, side.1))
+                && same_content((x, a.1), (y, b.1))
         })
-    };
-    a.0.history.len() == b.0.history.len()
-        && a.0.history.iter().all(|x| has_twin(x, a.1, b))
-        && b.0.history.iter().all(|y| has_twin(y, b.1, a))
 }
 
 /// Persist `merged`'s history to the mirror: its `entry_history` rows and its
