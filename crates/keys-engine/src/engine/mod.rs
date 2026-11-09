@@ -1234,6 +1234,10 @@ impl Engine {
     ///
     /// - [`EngineError::Projection`] / [`EngineError::Sqlite`] on read failure;
     ///   [`EngineError::Serialise`] on a merge failure.
+    /// - [`EngineError::ResolutionMismatch`] if other writers to the mirror
+    ///   kept it moving while the held rows were being settled, so `None`
+    ///   can't be told from rows still to settle. Nothing was lost: open
+    ///   the resolver again.
     pub fn held_conflict_payload(
         &mut self,
         kdbx_path: &Path,

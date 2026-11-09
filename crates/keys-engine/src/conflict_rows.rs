@@ -126,6 +126,39 @@ pub(crate) fn conflict_owners_for(
     Ok(out)
 }
 
+/// One owner's conflict row for one entry, as read by [`read_peer_row`]:
+/// what [`reconstruct_peer_entry`] rebuilds "theirs" from, and what
+/// [`drop_peer_row_as_read`] drops only if it is still the stored row.
+pub(crate) struct ParkedRow {
+    /// The peer the row is held for.
+    pub(crate) owner: String,
+    /// The entry the row holds the peer's version of.
+    pub(crate) entry_uuid: Uuid,
+    /// The stored record, exactly as read. The row has no version column,
+    /// and a re-park rewrites it, so this is the row's identity.
+    entry_json: String,
+}
+
+/// Read `owner`'s conflict row for `uuid`, or `None` when there is none.
+pub(crate) fn read_peer_row(
+    conn: &Connection,
+    owner: &str,
+    uuid: Uuid,
+) -> Result<Option<ParkedRow>, EngineError> {
+    let entry_json: Option<String> = conn
+        .query_row(
+            "SELECT entry_json FROM conflict_entry WHERE owner = ?1 AND entry_uuid = ?2",
+            params![owner, uuid.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(entry_json.map(|entry_json| ParkedRow {
+        owner: owner.to_owned(),
+        entry_uuid: uuid,
+        entry_json,
+    }))
+}
+
 /// Rebuild one peer's ("theirs") [`Entry`] from its conflict row — the
 /// inverse of [`write_peer_entry`], returning the peer's entry exactly as
 /// the mirror would hold it: fields, tags, icon, times, `<CustomData>`,
@@ -137,26 +170,14 @@ pub(crate) fn conflict_owners_for(
 /// entry into. A blob that pool already holds is reused, so only divergent
 /// peer bytes grow it. A sha whose blob is gone (a future GC) skips, the
 /// history-snapshot posture.
-///
-/// Returns `None` when no `conflict_entry` row exists for `(owner, uuid)`.
 pub(crate) fn reconstruct_peer_entry(
     conn: &Connection,
-    owner: &str,
-    uuid: Uuid,
+    row: &ParkedRow,
     session_key: &SessionKey,
     binary_pool: &mut Vec<Binary>,
-) -> Result<Option<Entry>, EngineError> {
-    let json: Option<String> = conn
-        .query_row(
-            "SELECT entry_json FROM conflict_entry WHERE owner = ?1 AND entry_uuid = ?2",
-            params![owner, uuid.to_string()],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(json) = json else {
-        return Ok(None);
-    };
-    let record: PeerEntryIo = serde_json::from_str(&json)
+) -> Result<Entry, EngineError> {
+    let uuid = row.entry_uuid;
+    let record: PeerEntryIo = serde_json::from_str(&row.entry_json)
         .map_err(|e| EngineError::Projection(ProjectionError::Json(e)))?;
 
     // Seed with the caller's pool so bytes it already holds are reused.
@@ -189,7 +210,7 @@ pub(crate) fn reconstruct_peer_entry(
         .iter()
         .map(&mut rebuild)
         .collect::<Result<_, _>>()?;
-    Ok(Some(entry))
+    Ok(entry)
 }
 
 /// Drop every owner's conflict rows for one `entry_uuid` (across all peers),
@@ -237,6 +258,35 @@ pub(crate) fn drop_conflict_rows_for_owner(
     Ok(())
 }
 
+/// Drop `row` if it is still the stored row for its owner and entry,
+/// returning whether it was. A row re-parked since `row` was read (the
+/// peer's newer version) stays: whoever read `row` decided only on what it
+/// held, and must not discard a value it never saw.
+///
+/// Whoever read `row` decided on a projection of the vault, so the drop
+/// takes the transaction that checked the mirror still holds that
+/// projection ([`crate::ingest::AtProjection`]).
+pub(crate) fn drop_peer_row_as_read(
+    at: &crate::ingest::AtProjection<'_, '_>,
+    row: &ParkedRow,
+) -> Result<bool, EngineError> {
+    let conn = at.conn();
+    let uuid_str = row.entry_uuid.to_string();
+    // Children first, parent last, as everywhere in this module; the
+    // children only while the parent is still the row as read.
+    conn.execute(
+        "DELETE FROM conflict_entry_blob_ref WHERE owner = ?1 AND entry_uuid = ?2 \
+         AND EXISTS (SELECT 1 FROM conflict_entry \
+                     WHERE owner = ?1 AND entry_uuid = ?2 AND entry_json = ?3)",
+        params![row.owner, uuid_str, row.entry_json],
+    )?;
+    let removed = conn.execute(
+        "DELETE FROM conflict_entry WHERE owner = ?1 AND entry_uuid = ?2 AND entry_json = ?3",
+        params![row.owner, uuid_str, row.entry_json],
+    )?;
+    Ok(removed == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,9 +324,10 @@ mod tests {
     }
 
     fn rebuild(conn: &Connection, owner: &str, uuid: Uuid, pool: &mut Vec<Binary>) -> Entry {
-        reconstruct_peer_entry(conn, owner, uuid, &sk(), pool)
-            .expect("reconstruct")
-            .expect("peer row present")
+        let row = read_peer_row(conn, owner, uuid)
+            .expect("read row")
+            .expect("peer row present");
+        reconstruct_peer_entry(conn, &row, &sk(), pool).expect("reconstruct")
     }
 
     /// One comparable record per version (live first, then history): the
@@ -507,11 +558,11 @@ mod tests {
     }
 
     #[test]
-    fn reconstruct_unknown_entry_returns_none() {
+    fn read_unknown_entry_returns_none() {
         let conn = mem_conn();
         assert!(
-            reconstruct_peer_entry(&conn, "peerB", Uuid::new_v4(), &sk(), &mut Vec::new())
-                .expect("reconstruct")
+            read_peer_row(&conn, "peerB", Uuid::new_v4())
+                .expect("read row")
                 .is_none()
         );
     }

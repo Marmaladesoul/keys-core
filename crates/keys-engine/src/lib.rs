@@ -24,6 +24,8 @@ pub mod reads;
 pub mod reconcile;
 pub mod reveal;
 pub mod save;
+#[cfg(test)]
+mod settle_tests;
 pub mod smart_folder;
 pub mod strength;
 pub mod syllable_generator;

@@ -1316,8 +1316,8 @@ fn apply_resolution_emits_external_change_merged() {
 }
 
 /// The owner-rows switch took `set_last_saved_kdbx_bytes` off the apply path
-/// (Keys-Mac saves the resolved projection out of band). Apply now just
-/// converges `SQLite` to the chosen value via a direct `ingest_vault`; this
+/// (the caller saves the resolved projection out of band). Apply now just
+/// converges `SQLite` to the chosen value via a direct in-memory re-ingest; this
 /// pins that convergence (the baseline-refresh assertion the eager path had is
 /// retired).
 #[test]

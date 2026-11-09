@@ -1571,7 +1571,10 @@ impl Engine {
     /// survives relaunch but the rich payload does not, so Keys-Mac calls
     /// this when the user opens the resolver. Returns `None` when no conflict
     /// remains (e.g. a peer resolved it and the resolution record has synced
-    /// in). See [`keys_engine::Engine::held_conflict_payload`].
+    /// in). Fails with `ResolutionMismatch` when other writers kept the
+    /// mirror moving while the held rows were being settled; nothing was
+    /// lost, so the client should open the resolver again rather than treat
+    /// it as fatal. See [`keys_engine::Engine::held_conflict_payload`].
     pub async fn held_conflict_payload(
         &self,
         kdbx_path: String,
