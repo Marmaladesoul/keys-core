@@ -37,7 +37,7 @@ use crate::strength;
 use crate::totp;
 use crate::util::PASSWORD_FIELD;
 use crate::util::codec::{b64_decode, b64_encode, bytes_to_hex, hex_to_bytes};
-use crate::util::sql::{entry_exists, group_exists, parse_host, upsert_tag};
+use crate::util::sql::{entry_exists, group_exists, parse_host, tombstone_exists, upsert_tag};
 
 /// Outcome of [`delete_entry`] — carries the pre-delete group so the
 /// engine can populate an [`crate::events::EntryDeletionInfo`].
@@ -1267,7 +1267,6 @@ pub(crate) fn recycle_entry(
     conn: &mut Connection,
     uuid: Uuid,
     now: i64,
-    bin_uuid: Uuid,
 ) -> Result<(), EngineError> {
     let uuid_str = uuid.to_string();
     let tx = conn.transaction()?;
@@ -1301,9 +1300,7 @@ pub(crate) fn recycle_entry(
     // entry under a "Move to Trash" label.
     let bin = match recycle_bin_uuid(&tx)? {
         Some(bin) => Some(bin),
-        None if crate::meta::read_recycle_bin_enabled(&tx)? => {
-            Some(create_recycle_bin_group(&tx, now, bin_uuid)?)
-        }
+        None if crate::meta::read_recycle_bin_enabled(&tx)? => Some(mint_recycle_bin(&tx, now)?),
         None => None,
     };
 
@@ -1332,26 +1329,58 @@ pub(crate) fn recycle_entry(
     Ok(())
 }
 
-/// Create the canonical "Recycle Bin" group at the vault root, flag it as
-/// the bin, and record it in meta (enabled + designation + the
-/// `recycle_bin_changed` stamp). Returns the new
-/// group UUID. Mirrors keepass-core's `find_or_create_recycle_bin` — same
-/// name and icon (43) — so a bin created here is indistinguishable from one
-/// the model layer would mint, and projects/syncs identically.
-fn create_recycle_bin_group(
-    tx: &Transaction<'_>,
-    now: i64,
-    bin_uuid: Uuid,
-) -> Result<String, EngineError> {
-    let root_uuid: String = tx.query_row(
+/// Domain tag for [`recycle_bin_candidate`], so a bin's derived uuid can't
+/// coincide with any other uuid derived from the root's.
+const RECYCLE_BIN_UUID_DOMAIN: &[u8] = b"keys.recycle-bin.v1:";
+
+/// The `n`th candidate uuid for a vault's recycle bin, derived from the root
+/// group's uuid (the vault's identity, shared by every copy of the file).
+fn recycle_bin_candidate(root: Uuid, n: u64) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(RECYCLE_BIN_UUID_DOMAIN);
+    hasher.update(root.as_bytes());
+    hasher.update(n.to_be_bytes());
+    crate::util::codec::uuid_from_sha256(&hasher.finalize().into())
+}
+
+/// Create the vault's recycle bin and designate it. Its uuid is the first
+/// [`recycle_bin_candidate`] that no group holds and no tombstone names, so
+/// replicas in the same state mint the same group: two copies of a vault
+/// that each mint a bin before they first sync end up holding ONE bin, where
+/// random uuids left the merge with two groups called "Recycle Bin" (the one
+/// the meta merge didn't designate lingering as an ordinary folder).
+/// Skipping occupied and tombstoned candidates means a bin kept as an
+/// ordinary group (bin disabled) is never silently made the bin again, and a
+/// deleted bin's uuid is never brought back to life under its own tombstone.
+///
+/// The group sits at the vault root with keepass-core's
+/// `find_or_create_recycle_bin` name and icon (43), so it projects and syncs
+/// like a bin the model layer would make. Records it in meta (enabled +
+/// designation + the `recycle_bin_changed` stamp). Returns the bin's uuid.
+fn mint_recycle_bin(tx: &Transaction<'_>, now: i64) -> Result<String, EngineError> {
+    let root_str: String = tx.query_row(
         "SELECT uuid FROM \"group\" WHERE parent_uuid IS NULL LIMIT 1",
         [],
         |r| r.get(0),
     )?;
-    let new_uuid = bin_uuid.to_string();
+    let root = Uuid::parse_str(&root_str).map_err(|e| {
+        EngineError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(e),
+        ))
+    })?;
+    let mut n = 0;
+    let uuid = loop {
+        let candidate = recycle_bin_candidate(root, n).to_string();
+        if !tombstone_exists(tx, &candidate)? && !group_exists(tx, &candidate)? {
+            break candidate;
+        }
+        n += 1;
+    };
     let next_sort_order: i64 = tx.query_row(
         "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM \"group\" WHERE parent_uuid = ?1",
-        params![root_uuid],
+        params![root_str],
         |r| r.get(0),
     )?;
     // is_recycle_bin starts 0 here; `write_recycle_bin_group` sets it to 1
@@ -1361,36 +1390,32 @@ fn create_recycle_bin_group(
             uuid, parent_uuid, name, icon_index, icon_custom_uuid, notes, \
             created_at, modified_at, expires_at, is_recycle_bin, sort_order\
          ) VALUES (?1, ?2, 'Recycle Bin', 43, NULL, '', ?3, ?3, NULL, 0, ?4)",
-        params![new_uuid, root_uuid, now, next_sort_order],
+        params![uuid, root_str, now, next_sort_order],
     )?;
-    crate::meta::write_recycle_bin_group(tx, &new_uuid)?;
+    crate::meta::write_recycle_bin_group(tx, &uuid)?;
     crate::meta::write_recycle_bin_enabled(tx, true)?;
-    // Repointing the bin is a bin-config change: stamp its LWW arbiter, or
-    // two replicas that each mint a bin keep the timestamp the vault arrived
-    // with, tie in the meta merge, and each keep their own bin.
+    // Repointing the bin is a bin-config change: stamp its LWW arbiter, so the
+    // meta merge settles the designation like any other bin-config edit.
     crate::meta::write_recycle_bin_changed(tx, now)?;
-    Ok(new_uuid)
+    Ok(uuid)
 }
 
 /// Ensure a recycle bin group exists when the bin is enabled but none is
-/// present. Idempotent: a no-op when a bin already exists or the bin is
+/// designated. Idempotent: a no-op when a bin is designated or the bin is
 /// disabled. Returns the bin's uuid if one exists/was created, else `None`.
 ///
 /// Called when a vault is first added so Keys never carries an
-/// enabled-but-binless vault into normal use — fixing the bin's uuid up
-/// front (before sync) avoids two peers each lazily minting their own bin.
-/// `recycle_entry`'s lazy-create remains the last-ditch safety net.
+/// enabled-but-binless vault into normal use. Replicas mint the same bin
+/// ([`mint_recycle_bin`]), so doing this on several devices before they pair
+/// is harmless. `recycle_entry`'s lazy mint is the other path in.
 pub(crate) fn ensure_recycle_bin(
     conn: &mut Connection,
     now: i64,
-    bin_uuid: Uuid,
 ) -> Result<Option<String>, EngineError> {
     let tx = conn.transaction()?;
     let bin = match recycle_bin_uuid(&tx)? {
         Some(bin) => Some(bin),
-        None if crate::meta::read_recycle_bin_enabled(&tx)? => {
-            Some(create_recycle_bin_group(&tx, now, bin_uuid)?)
-        }
+        None if crate::meta::read_recycle_bin_enabled(&tx)? => Some(mint_recycle_bin(&tx, now)?),
         None => None,
     };
     tx.commit()?;

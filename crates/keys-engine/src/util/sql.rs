@@ -84,6 +84,15 @@ pub(crate) fn group_exists(conn: &Connection, uuid: &str) -> Result<bool, rusqli
     row_exists(conn, "SELECT 1 FROM \"group\" WHERE uuid = ?1", uuid)
 }
 
+/// Whether `<DeletedObjects>` holds a tombstone for `uuid` (entry or group).
+pub(crate) fn tombstone_exists(conn: &Connection, uuid: &str) -> Result<bool, rusqlite::Error> {
+    row_exists(
+        conn,
+        "SELECT 1 FROM meta_deleted_object WHERE uuid = ?1",
+        uuid,
+    )
+}
+
 fn row_exists(conn: &Connection, sql: &str, uuid: &str) -> Result<bool, rusqlite::Error> {
     conn.query_row(sql, params![uuid], |_| Ok(()))
         .optional()

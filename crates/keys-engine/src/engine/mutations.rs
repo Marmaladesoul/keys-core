@@ -244,18 +244,20 @@ impl Engine {
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn recycle_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
         let now = self.now_ms();
-        let bin_uuid = self.next_uuid();
-        mutations::recycle_entry(&mut self.conn, uuid, now, bin_uuid)?;
+        mutations::recycle_entry(&mut self.conn, uuid, now)?;
         crate::reconcile::reconcile_conflict_rows(self, uuid)?;
         self.emit(ChangeEvent::EntriesRecycled(vec![uuid]));
         Ok(())
     }
 
     /// Ensure a recycle bin group exists when the bin is enabled but none
-    /// is present — call this once when a vault is first added so Keys
-    /// never carries an enabled-but-binless vault into use or sync.
-    /// Idempotent: a no-op when a bin already exists or the bin is
-    /// disabled. Returns the bin uuid if one exists/was created.
+    /// is designated — call this once when a vault is first added so Keys
+    /// never carries an enabled-but-binless vault into use or sync. Replicas
+    /// of a vault in the same state mint the same bin group (its uuid derives
+    /// from the root group's), so devices that each add the vault before
+    /// pairing end up with one bin. Idempotent: a no-op when a bin is
+    /// designated or the bin is disabled. Returns the bin uuid if one
+    /// exists/was created.
     ///
     /// # Errors
     ///
@@ -263,8 +265,7 @@ impl Engine {
     pub fn ensure_recycle_bin(&mut self) -> Result<Option<String>, EngineError> {
         let before = self.recycle_bin_uuid()?;
         let now = self.now_ms();
-        let bin_uuid = self.next_uuid();
-        let bin = mutations::ensure_recycle_bin(&mut self.conn, now, bin_uuid)?;
+        let bin = mutations::ensure_recycle_bin(&mut self.conn, now)?;
         // Emit only when we actually created the group (it was absent before).
         if before.is_none() {
             if let Some(uuid) = bin.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
