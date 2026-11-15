@@ -58,7 +58,7 @@ fn surface_methods_compile_against_real_engine() {
     // Compile-only smoke test: never actually calls the stubs. Confirms
     // the public surface is callable shape-wise from a downstream
     // crate without `unimplemented!()` panicking.
-    fn _shapes(engine: &Engine, uuid: Uuid) {
+    fn shapes(engine: &Engine, uuid: Uuid) {
         let _: Result<_, _> = engine.list_entries(None, Pagination::all());
         let _: Result<_, _> = engine.list_entries(
             Some(uuid),
@@ -84,5 +84,5 @@ fn surface_methods_compile_against_real_engine() {
         let _: Result<_, _> = engine.attachment_bytes(uuid, "att.pdf");
         let _: Result<_, _> = engine.history(uuid);
     }
-    let _ = _shapes; // suppress dead-code warnings without running
+    let _ = shapes; // reference it (no dead-code warning) without running it
 }
