@@ -463,8 +463,9 @@ impl Engine {
 
     /// See [`keys_engine::Engine::ensure_recycle_bin`]. Call once when a
     /// vault is first added so an enabled-but-binless vault gets its bin
-    /// group created up front (before sync). Idempotent; returns the bin
-    /// uuid if one exists/was created.
+    /// group created up front. Replicas of a vault in the same state mint
+    /// the same bin group, so devices that each add the vault before pairing
+    /// end up with one bin. Idempotent; returns the bin uuid if one exists/was created.
     pub fn ensure_recycle_bin(&self) -> Result<Option<String>, EngineError> {
         self.with_engine_mut(|e| Ok(e.ensure_recycle_bin()?))
     }
