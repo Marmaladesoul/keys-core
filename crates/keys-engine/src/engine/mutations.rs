@@ -236,16 +236,21 @@ impl Engine {
     }
 
     /// Soft-delete an entry: set `is_recycled = 1` and move to the
-    /// recycle bin group (if one exists).
+    /// recycle bin group. When the bin is enabled but none is designated,
+    /// the bin group is minted first and announced with
+    /// [`ChangeEvent::GroupsAdded`] ahead of
+    /// [`ChangeEvent::EntriesRecycled`].
     ///
     /// # Errors
     ///
     /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn recycle_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
+        let bin_before = self.recycle_bin_uuid()?;
         let now = self.now_ms();
         mutations::recycle_entry(&mut self.conn, uuid, now)?;
         crate::reconcile::reconcile_conflict_rows(self, uuid)?;
+        self.announce_minted_bin(bin_before.as_deref())?;
         self.emit(ChangeEvent::EntriesRecycled(vec![uuid]));
         Ok(())
     }
@@ -263,16 +268,28 @@ impl Engine {
     ///
     /// - [`EngineError::Sqlite`] on insert/update failure.
     pub fn ensure_recycle_bin(&mut self) -> Result<Option<String>, EngineError> {
-        let before = self.recycle_bin_uuid()?;
+        let bin_before = self.recycle_bin_uuid()?;
         let now = self.now_ms();
         let bin = mutations::ensure_recycle_bin(&mut self.conn, now)?;
-        // Emit only when we actually created the group (it was absent before).
-        if before.is_none() {
-            if let Some(uuid) = bin.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
-                self.emit(ChangeEvent::GroupsAdded(vec![uuid]));
-            }
-        }
+        self.announce_minted_bin(bin_before.as_deref())?;
         Ok(bin)
+    }
+
+    /// Emit [`ChangeEvent::GroupsAdded`] for the recycle bin when a mutation
+    /// just minted it: the vault had no designated bin before (`bin_before`)
+    /// and has one now.
+    fn announce_minted_bin(&mut self, bin_before: Option<&str>) -> Result<(), EngineError> {
+        if bin_before.is_some() {
+            return Ok(());
+        }
+        if let Some(uuid) = self
+            .recycle_bin_uuid()?
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            self.emit(ChangeEvent::GroupsAdded(vec![uuid]));
+        }
+        Ok(())
     }
 
     /// Restore a recycled entry: clear `is_recycled` AND move it out of
