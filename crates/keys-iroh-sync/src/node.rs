@@ -27,12 +27,15 @@ use iroh_blobs::{
     provider::events::{
         ConnectMode, EventMask, EventSender, ObserveMode, RequestMode, ThrottleMode,
     },
-    store::fs::FsStore,
+    store::{
+        GcConfig,
+        fs::{FsStore, options::Options as BlobStoreOptions},
+    },
 };
 use iroh_docs::{
     ALPN as DOCS_ALPN, DocTicket, NamespaceId, PeerIdBytes,
     api::Doc,
-    engine::{LiveEvent, Origin},
+    engine::{LiveEvent, Origin, ProtectCallbackHandler},
     protocol::Docs,
 };
 use iroh_gossip::{ALPN as GOSSIP_ALPN, net::Gossip};
@@ -81,6 +84,29 @@ const BLOBS_PROVIDER_MASK: EventMask = EventMask {
     observe: ObserveMode::None,
     throttle: ThrottleMode::None,
 };
+
+/// How often the blob store deletes content that no doc refers to any
+/// more. Each save stores the vault file as a new blob and leaves the
+/// one it replaced referred to by nothing, so without a sweep the store
+/// grows by a whole vault file per save, for as long as the node is
+/// used. What a sweep keeps: every hash in every doc this node holds
+/// (iroh-docs hands the sweep that list), this node's own latest saves
+/// (see [`own_head_tag`]), and content a download or a fetch holds.
+/// The first sweep comes one interval after bind, and a mobile node
+/// is shut down on every trip to the background, so the interval has
+/// to be short enough to fall inside a typical foreground session. A
+/// sweep lists the store's blobs and the docs' hashes, which for a
+/// handful of vaults is cheap.
+const BLOB_GC_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The blob store's database file inside `blob_dir`: the name
+/// `FsStore::load` uses, so stores made before the sweep was switched
+/// on open unchanged.
+const BLOB_STORE_DB_FILE: &str = "blobs.db";
+
+/// Prefix of the blob tags that hold this node's own latest saves; see
+/// [`own_head_tag`].
+const OWN_HEAD_TAG_PREFIX: &[u8] = b"keys-iroh-sync/own-head/";
 
 /// The default deadline [`IrohNode::fetch_blob`] waits for content to
 /// arrive before giving up; [`IrohNode::fetch_blob_with_deadline`] lets
@@ -196,6 +222,45 @@ impl std::fmt::Debug for NodeConfig {
 /// `Mutex` so callers can clone the `Arc` and dispatch from multiple
 /// tasks without juggling `&mut`. The mutex is held briefly across the
 /// HashMap mutation only, not across the long-running iroh calls.
+/// The tag prefix shared by every own-head tag of `namespace`, so
+/// [`IrohNode::drop_doc`] can delete them together.
+fn own_head_tag_prefix(namespace: NamespaceId) -> Vec<u8> {
+    let mut prefix = OWN_HEAD_TAG_PREFIX.to_vec();
+    prefix.extend_from_slice(namespace.as_bytes());
+    prefix.push(b'/');
+    prefix
+}
+
+/// The blob tag that holds this node's latest save under `key` in
+/// `namespace`. A save is imported under this tag, replacing the
+/// previous save's, so the content is held from the moment it is
+/// written. The doc's own hold isn't enough on its own: iroh-blobs
+/// takes the docs' list of hashes before it forgets which blobs were
+/// written since the last sweep, so a save that lands between the two
+/// would be in neither and be swept while the doc still names it. A
+/// peer's content lost that way comes back from the peer; this node's
+/// own save has nowhere to come back from.
+fn own_head_tag(namespace: NamespaceId, key: &[u8]) -> Vec<u8> {
+    let mut tag = own_head_tag_prefix(namespace);
+    tag.extend_from_slice(key);
+    tag
+}
+
+/// Undo what a failed join or resume of `doc` opened, so no handle
+/// outlives the attempt: a leftover handle keeps the doc open in the
+/// store until the node stops, and [`IrohNode::drop_doc`] can't delete
+/// an open doc. `was_joined` says a joined entry already relies on the
+/// doc syncing, in which case only the attempt's own handle is closed.
+/// Best effort: the attempt's error is what the caller hears.
+async fn release_failed_attempt(doc: &Doc, was_joined: bool) {
+    if !was_joined && let Err(e) = doc.leave().await {
+        tracing::warn!(doc = %doc.id().fmt_short(), error = ?e, "leaving a doc after a failed join");
+    }
+    if let Err(e) = doc.close().await {
+        tracing::warn!(doc = %doc.id().fmt_short(), error = ?e, "closing a doc after a failed join");
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct IrohNode {
     endpoint: Endpoint,
@@ -445,105 +510,7 @@ impl IrohNode {
     /// receive connections.
     #[uniffi::constructor]
     pub async fn bind(config: NodeConfig) -> Result<Arc<Self>> {
-        let secret = config.identity.to_secret_key()?;
-
-        let blob_dir = PathBuf::from(&config.blob_dir);
-        let doc_dir = PathBuf::from(&config.doc_dir);
-
-        // Caller owns directory lifecycle but we create the leaf if it
-        // doesn't exist — saves every consumer writing the same
-        // `create_dir_all` dance.
-        tokio::fs::create_dir_all(&blob_dir)
-            .await
-            .with_context(|| format!("create blob_dir {}", blob_dir.display()))
-            .map_err(SyncError::from)?;
-        tokio::fs::create_dir_all(&doc_dir)
-            .await
-            .with_context(|| format!("create doc_dir {}", doc_dir.display()))
-            .map_err(SyncError::from)?;
-
-        let mut builder = endpoint_builder(secret);
-        if !config.relay_urls.is_empty() {
-            let urls = config
-                .relay_urls
-                .iter()
-                .map(|s| {
-                    s.parse::<RelayUrl>()
-                        .with_context(|| format!("invalid relay url: {s}"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()
-                .map_err(SyncError::from)?;
-            let map: RelayMap = urls.into_iter().collect();
-            builder = builder.relay_mode(RelayMode::Custom(map));
-        }
-
-        let endpoint = builder
-            .bind()
-            .await
-            .context("bind endpoint")
-            .map_err(SyncError::from)?;
-
-        let blobs_store = FsStore::load(blob_dir)
-            .await
-            .context("load fs blob store")
-            .map_err(SyncError::from)?;
-
-        let gossip = Gossip::builder().spawn(endpoint.clone());
-
-        let docs = Docs::persistent(doc_dir)
-            .spawn(endpoint.clone(), (*blobs_store).clone(), gossip.clone())
-            .await
-            .context("spawn docs")
-            .map_err(SyncError::from)?;
-
-        let router = Router::builder(endpoint.clone())
-            .accept(
-                BLOBS_ALPN,
-                BlobsProtocol::new(
-                    &blobs_store,
-                    // A custom mask can only ride on a sender with a sink
-                    // behind it. Every notification is off, so upstream's
-                    // tracing sink sees nothing but connection-closed
-                    // notices.
-                    Some(EventSender::DEFAULT.tracing(BLOBS_PROVIDER_MASK)),
-                ),
-            )
-            .accept(GOSSIP_ALPN, gossip)
-            .accept(DOCS_ALPN, docs.clone())
-            .spawn();
-
-        // Wait for DERP registration but cap the wait at 30s. Without
-        // a cap, an unreachable relay (network outage, captive portal,
-        // misconfigured custom DERP list) hangs `bind()` indefinitely
-        // — and the caller has no way to recover except killing the
-        // process. 30s is generous compared to a working DERP (~1-3s)
-        // and short enough that a stuck network surfaces as an error.
-        if tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            endpoint.home_relay_status().initialized(),
-        )
-        .await
-        .is_err()
-        {
-            // Clean up the half-bound endpoint before bailing —
-            // leaving it live would leak QUIC sockets and a
-            // background DERP-retry task.
-            endpoint.close().await;
-            return Err(SyncError::Generic(
-                "DERP home-relay registration did not complete within 30s — \
-                 check network reachability and the configured relay_urls"
-                    .into(),
-            ));
-        }
-
-        Ok(Arc::new(Self {
-            endpoint,
-            router,
-            blobs_store,
-            docs,
-            joined: Mutex::new(HashMap::new()),
-            shutdown_cell: tokio::sync::OnceCell::new(),
-        }))
+        Self::bind_with_gc_interval(config, BLOB_GC_INTERVAL).await
     }
 
     /// Join a doc described by `ticket` with the given download policy.
@@ -562,6 +529,7 @@ impl IrohNode {
             .context("parse doc ticket")
             .map_err(SyncError::from)?;
 
+        let was_joined = self.joined.lock().await.contains_key(&capability.id());
         let doc = self
             .docs
             .api()
@@ -569,48 +537,23 @@ impl IrohNode {
             .await
             .context("import doc")
             .map_err(SyncError::from)?;
-
-        doc.set_download_policy(policy.into_iroh())
-            .await
-            .context("set download policy")
-            .map_err(SyncError::from)?;
-
-        let joined = JoinedDoc::watch(doc.clone()).await?;
-        // Wait for the first sync round so the caller observes the
-        // entry log on return, not 200ms later.
-        let mut events = doc
-            .subscribe()
-            .await
-            .context("subscribe for initial sync")
-            .map_err(SyncError::from)?;
-        doc.start_sync(nodes)
-            .await
-            .context("start sync on joined doc")
-            .map_err(SyncError::from)?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            match tokio::time::timeout_at(deadline, events.next()).await {
-                Ok(Some(Ok(LiveEvent::SyncFinished(_)))) => break,
-                Ok(Some(Ok(_))) => {} // ignore non-sync events while waiting
-                Ok(Some(Err(e))) => {
-                    return Err(SyncError::from(e.context("sync stream")));
+        match self.finish_join(&doc, policy, nodes).await {
+            Ok(joined) => {
+                let id = doc.id();
+                // A re-join replaces the entry; the doc handle the old
+                // entry held is closed, or it would stay open for good.
+                if let Some(old) = self.joined.lock().await.insert(id, joined)
+                    && let Err(e) = old.doc.close().await
+                {
+                    tracing::warn!(doc = %id.fmt_short(), error = ?e, "closing the replaced doc handle");
                 }
-                Ok(None) => {
-                    return Err(SyncError::Generic(
-                        "doc event stream ended before initial sync".into(),
-                    ));
-                }
-                Err(_) => {
-                    return Err(SyncError::Generic(
-                        "initial sync timed out after 30s".into(),
-                    ));
-                }
+                Ok(id.to_string())
+            }
+            Err(e) => {
+                release_failed_attempt(&doc, was_joined).await;
+                Err(e)
             }
         }
-
-        let id = doc.id();
-        self.joined.lock().await.insert(id, joined);
-        Ok(id.to_string())
     }
 
     /// List every entry visible in the named doc. Reads from the local
@@ -742,6 +685,16 @@ impl IrohNode {
             .context("subscribe doc events")
             .map_err(SyncError::from)?;
 
+        // Hold the content for the length of the call: once a newer
+        // entry replaces the one naming it, a sweep could otherwise
+        // delete it between the status check and the read.
+        let _hold = self
+            .blobs_store
+            .tags()
+            .temp_tag(hash)
+            .await
+            .context("hold blob")
+            .map_err(SyncError::from)?;
         let deadline_at = tokio::time::Instant::now() + deadline;
         // A transfer this call requested itself; dropping it (whichever way
         // the call returns) aborts it. The first request waits an interval,
@@ -1061,34 +1014,16 @@ impl IrohNode {
         else {
             return Ok(false);
         };
-        let joined = JoinedDoc::watch(doc.clone()).await?;
-        // Which peers the resume will dial — the first thing to know when
-        // a resumed doc never reaches its peer. Diagnostic only, so a
-        // failed lookup doesn't fail the resume, and the lookup is skipped
-        // unless something will record it.
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            match doc.get_sync_peers().await {
-                Ok(peers) => tracing::debug!(
-                    doc = %namespace.fmt_short(),
-                    peers = ?short_peer_ids(&peers.unwrap_or_default()),
-                    "resuming doc with persisted sync peers"
-                ),
-                Err(e) => tracing::debug!(
-                    doc = %namespace.fmt_short(),
-                    error = ?e,
-                    "persisted sync peers unavailable"
-                ),
+        match Self::resume(&doc, namespace).await {
+            Ok(joined) => {
+                self.joined.lock().await.insert(namespace, joined);
+                Ok(true)
+            }
+            Err(e) => {
+                release_failed_attempt(&doc, false).await;
+                Err(e)
             }
         }
-        // Enable live sync. Empty peer list — iroh-docs supplies the
-        // persisted per-doc peers from its own store and handles
-        // address rediscovery.
-        doc.start_sync(Vec::new())
-            .await
-            .context("start sync on resumed doc")
-            .map_err(SyncError::from)?;
-        self.joined.lock().await.insert(namespace, joined);
-        Ok(true)
     }
 
     /// Stop re-dialling `node_id` for `doc_id` after rounds with it fail —
@@ -1115,6 +1050,77 @@ impl IrohNode {
             .await?
             .context("re-dial watch for the doc has ended")
             .map_err(SyncError::from)
+    }
+
+    /// Stop syncing a doc but keep it: leave live sync and the doc's
+    /// gossip swarm, and stop re-dialling its peers, so the node no
+    /// longer exchanges entries for it. The entries, the capability and
+    /// the content stay; `open_existing_doc` resumes the doc. Blob reads
+    /// by hash are still answered (see `BLOBS_PROVIDER_MASK`).
+    ///
+    /// Idempotent: a doc that isn't joined isn't syncing. Errors if
+    /// `doc_id` isn't a doc id or iroh-docs refuses the leave; the doc is
+    /// no longer joined either way.
+    pub async fn leave_doc(&self, doc_id: String) -> Result<()> {
+        let namespace: NamespaceId = doc_id
+            .parse()
+            .context("parse doc id (NamespaceId)")
+            .map_err(SyncError::from)?;
+        let Some(doc) = self.take_joined(namespace).await else {
+            return Ok(());
+        };
+        doc.leave()
+            .await
+            .context("leave doc")
+            .map_err(SyncError::from)?;
+        doc.close()
+            .await
+            .context("close doc")
+            .map_err(SyncError::from)
+    }
+
+    /// Delete a doc from this node: stop syncing it and remove its
+    /// entries, its namespace secret (the capability to write to it) and
+    /// its persisted peers from the store. The blobs only it referred to
+    /// go at the next blob sweep. For a doc the caller no longer wants on
+    /// this device; peers keep their copies. Afterwards
+    /// `open_existing_doc` of the id returns `false`.
+    ///
+    /// Idempotent: a doc this node doesn't hold is already gone. Errors
+    /// if `doc_id` isn't a doc id or the store can't delete it; the doc
+    /// is no longer joined either way. The caller doesn't resume or join
+    /// the doc while the drop runs.
+    pub async fn drop_doc(&self, doc_id: String) -> Result<()> {
+        let namespace: NamespaceId = doc_id
+            .parse()
+            .context("parse doc id (NamespaceId)")
+            .map_err(SyncError::from)?;
+        // The joined entry's doc handle stays open for the drop to close;
+        // a doc that isn't joined is opened first.
+        if self.take_joined(namespace).await.is_none() {
+            if !self.holds_doc(namespace).await? {
+                return Ok(());
+            }
+            self.docs
+                .api()
+                .open(namespace)
+                .await
+                .context("open doc to drop")
+                .map_err(SyncError::from)?;
+        }
+        self.docs
+            .api()
+            .drop_doc(namespace)
+            .await
+            .context("drop doc")
+            .map_err(SyncError::from)?;
+        self.blobs_store
+            .tags()
+            .delete_prefix(own_head_tag_prefix(namespace))
+            .await
+            .context("delete the doc's own-head tags")
+            .map_err(SyncError::from)?;
+        Ok(())
     }
 
     /// Mint a ticket for a doc this node holds. `writable` selects
@@ -1163,10 +1169,19 @@ impl IrohNode {
             .await
             .context("default author")
             .map_err(SyncError::from)?;
-        let hash = doc
-            .set_bytes(author, key, value)
+        let size = value.len() as u64;
+        let tag = own_head_tag(doc.id(), &key);
+        let hash = self
+            .blobs_store
+            .add_bytes(value)
+            .with_named_tag(tag)
             .await
-            .context("set_bytes")
+            .context("store entry content")
+            .map_err(SyncError::from)?
+            .hash;
+        doc.set_hash(author, key, hash, size)
+            .await
+            .context("set_hash")
             .map_err(SyncError::from)?;
         // Deliver the write whatever state the live mesh is in. A local
         // insert travels to the doc's gossip neighbours — and there may be
@@ -1221,6 +1236,209 @@ impl IrohNode {
 }
 
 impl IrohNode {
+    /// The part of [`IrohNode::join_doc`] after the import: set the
+    /// policy, watch for owed rounds, start sync and wait for the first
+    /// round. On error the caller releases what this opened.
+    async fn finish_join(
+        &self,
+        doc: &Doc,
+        policy: DownloadPolicy,
+        nodes: Vec<EndpointAddr>,
+    ) -> Result<JoinedDoc> {
+        doc.set_download_policy(policy.into_iroh())
+            .await
+            .context("set download policy")
+            .map_err(SyncError::from)?;
+
+        let joined = JoinedDoc::watch(doc.clone()).await?;
+        // Wait for the first sync round so the caller observes the
+        // entry log on return, not 200ms later.
+        let mut events = doc
+            .subscribe()
+            .await
+            .context("subscribe for initial sync")
+            .map_err(SyncError::from)?;
+        doc.start_sync(nodes)
+            .await
+            .context("start sync on joined doc")
+            .map_err(SyncError::from)?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match tokio::time::timeout_at(deadline, events.next()).await {
+                Ok(Some(Ok(LiveEvent::SyncFinished(_)))) => break,
+                Ok(Some(Ok(_))) => {} // ignore non-sync events while waiting
+                Ok(Some(Err(e))) => {
+                    return Err(SyncError::from(e.context("sync stream")));
+                }
+                Ok(None) => {
+                    return Err(SyncError::Generic(
+                        "doc event stream ended before initial sync".into(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(SyncError::Generic(
+                        "initial sync timed out after 30s".into(),
+                    ));
+                }
+            }
+        }
+
+        Ok(joined)
+    }
+}
+
+impl IrohNode {
+    /// The part of [`IrohNode::open_existing_doc`] after the open: watch
+    /// for owed rounds and start sync. On error the caller releases what
+    /// this opened.
+    async fn resume(doc: &Doc, namespace: NamespaceId) -> Result<JoinedDoc> {
+        let joined = JoinedDoc::watch(doc.clone()).await?;
+        // Which peers the resume will dial — the first thing to know when
+        // a resumed doc never reaches its peer. Diagnostic only, so a
+        // failed lookup doesn't fail the resume, and the lookup is skipped
+        // unless something will record it.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            match doc.get_sync_peers().await {
+                Ok(peers) => tracing::debug!(
+                    doc = %namespace.fmt_short(),
+                    peers = ?short_peer_ids(&peers.unwrap_or_default()),
+                    "resuming doc with persisted sync peers"
+                ),
+                Err(e) => tracing::debug!(
+                    doc = %namespace.fmt_short(),
+                    error = ?e,
+                    "persisted sync peers unavailable"
+                ),
+            }
+        }
+        // Enable live sync. Empty peer list — iroh-docs supplies the
+        // persisted per-doc peers from its own store and handles
+        // address rediscovery.
+        doc.start_sync(Vec::new())
+            .await
+            .context("start sync on resumed doc")
+            .map_err(SyncError::from)?;
+        Ok(joined)
+    }
+}
+
+impl IrohNode {
+    /// [`IrohNode::bind`] with the blob sweep on a given schedule, so a
+    /// test can watch a sweep without waiting [`BLOB_GC_INTERVAL`].
+    async fn bind_with_gc_interval(config: NodeConfig, gc_interval: Duration) -> Result<Arc<Self>> {
+        let secret = config.identity.to_secret_key()?;
+
+        let blob_dir = PathBuf::from(&config.blob_dir);
+        let doc_dir = PathBuf::from(&config.doc_dir);
+
+        // Caller owns directory lifecycle but we create the leaf if it
+        // doesn't exist — saves every consumer writing the same
+        // `create_dir_all` dance.
+        tokio::fs::create_dir_all(&blob_dir)
+            .await
+            .with_context(|| format!("create blob_dir {}", blob_dir.display()))
+            .map_err(SyncError::from)?;
+        tokio::fs::create_dir_all(&doc_dir)
+            .await
+            .with_context(|| format!("create doc_dir {}", doc_dir.display()))
+            .map_err(SyncError::from)?;
+
+        let mut builder = endpoint_builder(secret);
+        if !config.relay_urls.is_empty() {
+            let urls = config
+                .relay_urls
+                .iter()
+                .map(|s| {
+                    s.parse::<RelayUrl>()
+                        .with_context(|| format!("invalid relay url: {s}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+                .map_err(SyncError::from)?;
+            let map: RelayMap = urls.into_iter().collect();
+            builder = builder.relay_mode(RelayMode::Custom(map));
+        }
+
+        let endpoint = builder
+            .bind()
+            .await
+            .context("bind endpoint")
+            .map_err(SyncError::from)?;
+
+        // The sweep asks the docs engine which content its docs still
+        // refer to before each run; the handler is that engine's end of
+        // the question.
+        let (protect_handler, protect_cb) = ProtectCallbackHandler::new();
+        let mut blob_options = BlobStoreOptions::new(&blob_dir);
+        blob_options.gc = Some(GcConfig {
+            interval: gc_interval,
+            add_protected: Some(protect_cb),
+        });
+        let blobs_store = FsStore::load_with_opts(blob_dir.join(BLOB_STORE_DB_FILE), blob_options)
+            .await
+            .context("load fs blob store")
+            .map_err(SyncError::from)?;
+
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+
+        let docs = Docs::persistent(doc_dir)
+            .protect_handler(protect_handler)
+            .spawn(endpoint.clone(), (*blobs_store).clone(), gossip.clone())
+            .await
+            .context("spawn docs")
+            .map_err(SyncError::from)?;
+
+        let router = Router::builder(endpoint.clone())
+            .accept(
+                BLOBS_ALPN,
+                BlobsProtocol::new(
+                    &blobs_store,
+                    // A custom mask can only ride on a sender with a sink
+                    // behind it. Every notification is off, so upstream's
+                    // tracing sink sees nothing but connection-closed
+                    // notices.
+                    Some(EventSender::DEFAULT.tracing(BLOBS_PROVIDER_MASK)),
+                ),
+            )
+            .accept(GOSSIP_ALPN, gossip)
+            .accept(DOCS_ALPN, docs.clone())
+            .spawn();
+
+        // Wait for DERP registration but cap the wait at 30s. Without
+        // a cap, an unreachable relay (network outage, captive portal,
+        // misconfigured custom DERP list) hangs `bind()` indefinitely
+        // — and the caller has no way to recover except killing the
+        // process. 30s is generous compared to a working DERP (~1-3s)
+        // and short enough that a stuck network surfaces as an error.
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            endpoint.home_relay_status().initialized(),
+        )
+        .await
+        .is_err()
+        {
+            // Clean up the half-bound endpoint before bailing —
+            // leaving it live would leak QUIC sockets and a
+            // background DERP-retry task.
+            endpoint.close().await;
+            return Err(SyncError::Generic(
+                "DERP home-relay registration did not complete within 30s — \
+                 check network reachability and the configured relay_urls"
+                    .into(),
+            ));
+        }
+
+        Ok(Arc::new(Self {
+            endpoint,
+            router,
+            blobs_store,
+            docs,
+            joined: Mutex::new(HashMap::new()),
+            shutdown_cell: tokio::sync::OnceCell::new(),
+        }))
+    }
+}
+
+impl IrohNode {
     /// Native Rust API for subscribing to doc events as a `Stream`.
     /// Not exposed via uniffi (the FFI path uses the listener trait).
     pub async fn subscribe_doc_events(
@@ -1244,6 +1462,36 @@ impl IrohNode {
     #[must_use]
     pub fn node_id(&self) -> String {
         self.endpoint.id().to_string()
+    }
+
+    /// Take `namespace`'s joined entry out of the map, stop its re-dial
+    /// watch and wait for it to end, so no re-dial reopens sync behind
+    /// whatever the caller does next. Returns the entry's doc, whose
+    /// handle is still open, or `None` if the doc isn't joined.
+    async fn take_joined(&self, namespace: NamespaceId) -> Option<Doc> {
+        let JoinedDoc { doc, redial, .. } = self.joined.lock().await.remove(&namespace)?;
+        redial.abort();
+        // An aborted task ends with a cancellation error: expected.
+        let _ = redial.await;
+        Some(doc)
+    }
+
+    /// Whether the doc store holds `namespace`, joined or not.
+    async fn holds_doc(&self, namespace: NamespaceId) -> Result<bool> {
+        let mut docs = self
+            .docs
+            .api()
+            .list()
+            .await
+            .context("list docs")
+            .map_err(SyncError::from)?;
+        while let Some(doc) = docs.next().await {
+            let (held, _) = doc.context("list docs").map_err(SyncError::from)?;
+            if held == namespace {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn get_doc(&self, doc_id: &str) -> Result<Doc> {
@@ -1366,15 +1614,309 @@ mod tests {
     async fn bind_test_node() -> (Arc<IrohNode>, tempfile::TempDir, tempfile::TempDir) {
         let blob_dir = tempfile::tempdir().expect("blob tempdir");
         let doc_dir = tempfile::tempdir().expect("doc tempdir");
-        let node = IrohNode::bind(NodeConfig {
-            identity: Identity::generate(),
-            blob_dir: blob_dir.path().to_string_lossy().into_owned(),
-            doc_dir: doc_dir.path().to_string_lossy().into_owned(),
-            relay_urls: vec![],
+        let node = bind_node_in(&blob_dir, &doc_dir, Identity::generate(), BLOB_GC_INTERVAL).await;
+        (node, blob_dir, doc_dir)
+    }
+
+    /// Bind a node on given store directories with the blob sweep on a
+    /// given schedule; binding twice on the same directories with the
+    /// same identity brings "the same device" back.
+    async fn bind_node_in(
+        blob_dir: &tempfile::TempDir,
+        doc_dir: &tempfile::TempDir,
+        identity: Identity,
+        gc_interval: Duration,
+    ) -> Arc<IrohNode> {
+        IrohNode::bind_with_gc_interval(
+            NodeConfig {
+                identity,
+                blob_dir: blob_dir.path().to_string_lossy().into_owned(),
+                doc_dir: doc_dir.path().to_string_lossy().into_owned(),
+                relay_urls: vec![],
+            },
+            gc_interval,
+        )
+        .await
+        .expect("bind")
+    }
+
+    /// A sweep schedule short enough to watch several sweeps in a test.
+    const TEST_GC_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// How long a test waits for a sweep to delete something: many
+    /// [`TEST_GC_INTERVAL`]s.
+    const SWEEP_WAIT: Duration = Duration::from_secs(10);
+
+    async fn holds_content(node: &IrohNode, hash: &str) -> bool {
+        let hash: iroh_blobs::Hash = hash.parse().expect("hash");
+        node.blobs_store
+            .has(hash)
+            .await
+            .expect("blob store answers")
+    }
+
+    /// Wait up to [`SWEEP_WAIT`] for a sweep to delete `hash`.
+    async fn swept(node: &IrohNode, hash: &str) -> bool {
+        tokio::time::timeout(SWEEP_WAIT, async {
+            while holds_content(node, hash).await {
+                tokio::time::sleep(TEST_GC_INTERVAL).await;
+            }
         })
         .await
-        .expect("bind");
-        (node, blob_dir, doc_dir)
+        .is_ok()
+    }
+
+    /// Each save replaces the vault's blob; the replaced one is referred
+    /// to by nothing and must be swept, or the store grows by a vault
+    /// file per save. The current one must survive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sweep_deletes_replaced_content_and_keeps_the_current() {
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        let doc_dir = tempfile::tempdir().expect("doc tempdir");
+        let node = bind_node_in(&blob_dir, &doc_dir, Identity::generate(), TEST_GC_INTERVAL).await;
+        let doc_id = node.create_doc().await.expect("create doc");
+        let replaced = node
+            .set_entry(doc_id.clone(), b"vault".to_vec(), b"first save".to_vec())
+            .await
+            .expect("first save");
+        let current = node
+            .set_entry(doc_id, b"vault".to_vec(), b"second save".to_vec())
+            .await
+            .expect("second save");
+
+        assert!(
+            swept(&node, &replaced).await,
+            "the replaced content is swept"
+        );
+        assert!(
+            holds_content(&node, &current).await,
+            "the current content stays"
+        );
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// A doc held in the store but not opened this run (a vault not yet
+    /// unlocked, say) still refers to its content, so no sweep may
+    /// delete it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sweep_keeps_content_of_a_doc_not_opened_this_run() {
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        let doc_dir = tempfile::tempdir().expect("doc tempdir");
+        let identity = Identity::generate();
+        let node = bind_node_in(&blob_dir, &doc_dir, identity.clone(), BLOB_GC_INTERVAL).await;
+        let doc_id = node.create_doc().await.expect("create doc");
+        let held = node
+            .set_entry(
+                doc_id.clone(),
+                b"vault".to_vec(),
+                b"saved last run".to_vec(),
+            )
+            .await
+            .expect("save");
+        node.shutdown().await.expect("shutdown");
+        drop(node);
+
+        let node = bind_node_in(&blob_dir, &doc_dir, identity, TEST_GC_INTERVAL).await;
+        // A doc opened this run, saved twice, shows the sweeps running.
+        let other = node.create_doc().await.expect("create doc");
+        let replaced_here = node
+            .set_entry(other.clone(), b"vault".to_vec(), b"first save".to_vec())
+            .await
+            .expect("save");
+        node.set_entry(other, b"vault".to_vec(), b"second save".to_vec())
+            .await
+            .expect("save");
+        assert!(swept(&node, &replaced_here).await, "sweeps are running");
+        assert!(
+            holds_content(&node, &held).await,
+            "the unopened doc's content stays"
+        );
+        assert!(
+            node.open_existing_doc(doc_id).await.expect("open"),
+            "the doc is still held"
+        );
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// The hashes this node's own-head tags hold for `doc_id`.
+    async fn own_head_hashes(node: &IrohNode, doc_id: &str) -> Vec<String> {
+        let namespace: NamespaceId = doc_id.parse().expect("doc id");
+        let mut tags = node
+            .blobs_store
+            .tags()
+            .list_prefix(own_head_tag_prefix(namespace))
+            .await
+            .expect("list tags");
+        let mut hashes = Vec::new();
+        while let Some(tag) = tags.next().await {
+            hashes.push(tag.expect("tag").hash.to_string());
+        }
+        hashes
+    }
+
+    /// A save is held by an own-head tag from the moment it is written,
+    /// one tag per key that moves to each new save, and a drop takes the
+    /// doc's tags with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn own_saves_are_held_by_one_tag_per_key_until_the_doc_is_dropped() {
+        let (node, _b, _d) = bind_test_node().await;
+        let doc_id = node.create_doc().await.expect("create doc");
+        node.set_entry(doc_id.clone(), b"vault".to_vec(), b"first save".to_vec())
+            .await
+            .expect("save");
+        let latest = node
+            .set_entry(doc_id.clone(), b"vault".to_vec(), b"second save".to_vec())
+            .await
+            .expect("save");
+        assert_eq!(own_head_hashes(&node, &doc_id).await, vec![latest]);
+
+        node.drop_doc(doc_id.clone()).await.expect("drop");
+        assert_eq!(own_head_hashes(&node, &doc_id).await, Vec::<String>::new());
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// Leaving a doc stops it being joined but keeps it: it resumes, and
+    /// a resumed doc can still be dropped, so the leave closed exactly
+    /// the handles it held. A second leave is a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_left_doc_is_kept_resumes_and_can_be_dropped() {
+        let (node, _b, _d) = bind_test_node().await;
+        let doc_id = node.create_doc().await.expect("create doc");
+        let saved = node
+            .set_entry(doc_id.clone(), b"vault".to_vec(), b"saved".to_vec())
+            .await
+            .expect("save");
+
+        node.leave_doc(doc_id.clone()).await.expect("leave");
+        assert!(
+            node.set_entry(doc_id.clone(), b"vault".to_vec(), b"x".to_vec())
+                .await
+                .is_err(),
+            "a left doc isn't joined"
+        );
+        node.leave_doc(doc_id.clone())
+            .await
+            .expect("a second leave is a no-op");
+        assert!(holds_content(&node, &saved).await, "the content stays");
+
+        assert!(
+            node.open_existing_doc(doc_id.clone())
+                .await
+                .expect("resume")
+        );
+        node.drop_doc(doc_id.clone()).await.expect("drop");
+        let namespace: NamespaceId = doc_id.parse().expect("doc id");
+        assert!(!node.holds_doc(namespace).await.expect("list"));
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// A doc joined twice from the same ticket can still be dropped: the
+    /// re-join must not leave the first join's handle open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_doc_joined_twice_can_be_dropped() {
+        let (publisher, _pb, _pd) = bind_test_node().await;
+        let (subscriber, _sb, _sd) = bind_test_node().await;
+        let body = async {
+            let doc_id = share_one_entry(
+                &publisher,
+                &subscriber,
+                b"vault",
+                b"shared vault",
+                true,
+                DownloadPolicy::Everything,
+            )
+            .await;
+            let ticket = publisher
+                .share_doc(doc_id.clone(), true)
+                .await
+                .expect("share");
+            subscriber
+                .join_doc(ticket, DownloadPolicy::Everything)
+                .await
+                .expect("join again");
+            subscriber.drop_doc(doc_id.clone()).await.expect("drop");
+            let namespace: NamespaceId = doc_id.parse().expect("doc id");
+            assert!(!subscriber.holds_doc(namespace).await.expect("list"));
+        };
+        tokio::time::timeout(Duration::from_secs(90), body)
+            .await
+            .expect("test finished in time");
+        publisher.shutdown().await.expect("shutdown");
+        subscriber.shutdown().await.expect("shutdown");
+    }
+
+    /// A join that fails (here the only peer is gone) releases what it
+    /// opened, so the half-joined doc can still be dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_doc_whose_join_failed_can_be_dropped() {
+        let (publisher, _pb, _pd) = bind_test_node().await;
+        let (subscriber, _sb, _sd) = bind_test_node().await;
+        let doc_id = publisher.create_doc().await.expect("create doc");
+        let ticket = publisher
+            .share_doc(doc_id.clone(), true)
+            .await
+            .expect("share");
+        publisher.shutdown().await.expect("shutdown");
+
+        let body = async {
+            assert!(
+                subscriber
+                    .join_doc(ticket, DownloadPolicy::Everything)
+                    .await
+                    .is_err(),
+                "the join fails with its only peer gone"
+            );
+            subscriber.drop_doc(doc_id.clone()).await.expect("drop");
+            let namespace: NamespaceId = doc_id.parse().expect("doc id");
+            assert!(!subscriber.holds_doc(namespace).await.expect("list"));
+        };
+        tokio::time::timeout(Duration::from_secs(90), body)
+            .await
+            .expect("test finished in time");
+        subscriber.shutdown().await.expect("shutdown");
+    }
+
+    /// Dropping a doc deletes it and, at the next sweep, the content only
+    /// it referred to, while another doc's content stays. A second drop
+    /// of the same doc is a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drop_doc_deletes_the_doc_and_its_content_only() {
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        let doc_dir = tempfile::tempdir().expect("doc tempdir");
+        let node = bind_node_in(&blob_dir, &doc_dir, Identity::generate(), TEST_GC_INTERVAL).await;
+        let dropped = node.create_doc().await.expect("create doc");
+        let kept = node.create_doc().await.expect("create doc");
+        let dropped_content = node
+            .set_entry(
+                dropped.clone(),
+                b"vault".to_vec(),
+                b"removed vault".to_vec(),
+            )
+            .await
+            .expect("save");
+        let kept_content = node
+            .set_entry(kept.clone(), b"vault".to_vec(), b"kept vault".to_vec())
+            .await
+            .expect("save");
+
+        node.drop_doc(dropped.clone()).await.expect("drop");
+        let namespace: NamespaceId = dropped.parse().expect("doc id");
+        assert!(
+            !node.holds_doc(namespace).await.expect("list"),
+            "the dropped doc is gone from the store"
+        );
+        assert!(swept(&node, &dropped_content).await, "its content is swept");
+        assert!(
+            holds_content(&node, &kept_content).await,
+            "the other doc's content stays"
+        );
+        node.set_entry(kept, b"vault".to_vec(), b"kept vault, saved again".to_vec())
+            .await
+            .expect("the other doc still syncs");
+        node.drop_doc(dropped)
+            .await
+            .expect("a second drop is a no-op");
+        node.shutdown().await.expect("shutdown");
     }
 
     /// Join `subscriber` to a doc of `publisher`'s that holds one entry

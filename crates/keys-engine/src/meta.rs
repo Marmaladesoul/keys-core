@@ -626,7 +626,7 @@ pub(crate) fn add_custom_icon_dedup(
     // UUID from the icon bytes makes dedup converge *across* devices
     // too — for every sync backend (iroh, Syncthing, manual copy),
     // not just one.
-    let uuid = content_addressed_icon_uuid(&incoming);
+    let uuid = crate::util::codec::uuid_from_sha256(&incoming);
     let now_ms = Utc::now().timestamp_millis();
     conn.execute(
         "INSERT INTO meta_custom_icon (uuid, name, bytes, last_modified_at) \
@@ -634,19 +634,6 @@ pub(crate) fn add_custom_icon_dedup(
         params![uuid.to_string(), bytes, now_ms],
     )?;
     Ok((uuid, true))
-}
-
-/// Deterministic UUID derived from a custom icon's SHA-256 content
-/// hash, so the same image yields the same UUID on every device.
-/// Uses the first 16 hash bytes with RFC-4122 version (8, "custom")
-/// and variant bits set so the result is a well-formed UUID. Collision
-/// requires a SHA-256 prefix collision — negligible.
-fn content_addressed_icon_uuid(sha256: &[u8; 32]) -> Uuid {
-    let mut b = [0u8; 16];
-    b.copy_from_slice(&sha256[..16]);
-    b[6] = (b[6] & 0x0F) | 0x80; // version 8 (custom)
-    b[8] = (b[8] & 0x3F) | 0x80; // RFC 4122 variant
-    Uuid::from_bytes(b)
 }
 
 /// Look up the raw bytes for a custom icon by UUID. Returns `Ok(None)`
@@ -1014,27 +1001,6 @@ fn deserialise_unknown_xml(json: &str) -> Result<Vec<UnknownElement>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn content_addressed_icon_uuid_is_deterministic_and_well_formed() {
-        use sha2::{Digest, Sha256};
-        let h1: [u8; 32] = Sha256::digest(b"icon-bytes-A").into();
-        let h2: [u8; 32] = Sha256::digest(b"icon-bytes-B").into();
-        // Same content hash → same UUID (cross-device convergence).
-        assert_eq!(
-            content_addressed_icon_uuid(&h1),
-            content_addressed_icon_uuid(&h1)
-        );
-        // Different content → different UUID.
-        assert_ne!(
-            content_addressed_icon_uuid(&h1),
-            content_addressed_icon_uuid(&h2)
-        );
-        // Well-formed: RFC-4122 variant + version 8 ("custom").
-        let u = content_addressed_icon_uuid(&h1);
-        assert_eq!(u.get_version_num(), 8);
-        assert_eq!(u.get_variant(), uuid::Variant::RFC4122);
-    }
 
     #[test]
     fn memory_protection_round_trips() {

@@ -146,6 +146,40 @@ fn recycle_then_restore_emits_correct_events() {
 }
 
 #[test]
+fn first_recycle_on_a_binless_vault_announces_the_minted_bin() {
+    let (mut engine, root, _dir) = engine_with_empty_vault();
+    engine.set_recycle_bin(true, None).expect("enable bin");
+    assert_eq!(
+        engine.recycle_bin_uuid().expect("bin"),
+        None,
+        "fixture must start binless"
+    );
+    let uuid = engine.create_entry(root, new_entry("a", "p")).expect("ce");
+    let observer = install_observer(&mut engine);
+
+    engine.recycle_entry(uuid).expect("recycle");
+
+    let bin = engine
+        .recycle_bin_uuid()
+        .expect("bin")
+        .expect("recycle minted a bin");
+    let bin = Uuid::parse_str(&bin).expect("bin uuid");
+    let events = observer.snapshot();
+    assert_eq!(events.len(), 2, "events: {events:?}");
+    // The bin is announced before the entry that moved into it.
+    assert!(matches!(events[0], ChangeEvent::GroupsAdded(ref v) if v == &vec![bin]));
+    assert!(matches!(events[1], ChangeEvent::EntriesRecycled(ref v) if v == &vec![uuid]));
+
+    // Once the bin exists, a later recycle announces only the entry.
+    let second = engine.create_entry(root, new_entry("b", "p")).expect("ce");
+    let observer = install_observer(&mut engine);
+    engine.recycle_entry(second).expect("recycle");
+    let events = observer.snapshot();
+    assert_eq!(events.len(), 1, "events: {events:?}");
+    assert!(matches!(events[0], ChangeEvent::EntriesRecycled(ref v) if v == &vec![second]));
+}
+
+#[test]
 fn delete_entry_emits_with_previous_group() {
     let (mut engine, root, _dir) = engine_with_empty_vault();
     let uuid = engine.create_entry(root, new_entry("a", "p")).expect("ce");

@@ -236,42 +236,60 @@ impl Engine {
     }
 
     /// Soft-delete an entry: set `is_recycled = 1` and move to the
-    /// recycle bin group (if one exists).
+    /// recycle bin group. When the bin is enabled but none is designated,
+    /// the bin group is minted first and announced with
+    /// [`ChangeEvent::GroupsAdded`] ahead of
+    /// [`ChangeEvent::EntriesRecycled`].
     ///
     /// # Errors
     ///
     /// - [`EngineError::NotFound`] (`entity = "entry"`) if no row matches.
     /// - [`EngineError::Sqlite`] on update failure.
     pub fn recycle_entry(&mut self, uuid: Uuid) -> Result<(), EngineError> {
+        let bin_before = self.recycle_bin_uuid()?;
         let now = self.now_ms();
-        let bin_uuid = self.next_uuid();
-        mutations::recycle_entry(&mut self.conn, uuid, now, bin_uuid)?;
+        mutations::recycle_entry(&mut self.conn, uuid, now)?;
         crate::reconcile::reconcile_conflict_rows(self, uuid)?;
+        self.announce_minted_bin(bin_before.as_deref())?;
         self.emit(ChangeEvent::EntriesRecycled(vec![uuid]));
         Ok(())
     }
 
     /// Ensure a recycle bin group exists when the bin is enabled but none
-    /// is present — call this once when a vault is first added so Keys
-    /// never carries an enabled-but-binless vault into use or sync.
-    /// Idempotent: a no-op when a bin already exists or the bin is
-    /// disabled. Returns the bin uuid if one exists/was created.
+    /// is designated — call this once when a vault is first added so Keys
+    /// never carries an enabled-but-binless vault into use or sync. Replicas
+    /// of a vault in the same state mint the same bin group (its uuid derives
+    /// from the root group's), so devices that each add the vault before
+    /// pairing end up with one bin. Idempotent: a no-op when a bin is
+    /// designated or the bin is disabled. Returns the bin uuid if one
+    /// exists/was created.
     ///
     /// # Errors
     ///
     /// - [`EngineError::Sqlite`] on insert/update failure.
     pub fn ensure_recycle_bin(&mut self) -> Result<Option<String>, EngineError> {
-        let before = self.recycle_bin_uuid()?;
+        let bin_before = self.recycle_bin_uuid()?;
         let now = self.now_ms();
-        let bin_uuid = self.next_uuid();
-        let bin = mutations::ensure_recycle_bin(&mut self.conn, now, bin_uuid)?;
-        // Emit only when we actually created the group (it was absent before).
-        if before.is_none() {
-            if let Some(uuid) = bin.as_deref().and_then(|s| Uuid::parse_str(s).ok()) {
-                self.emit(ChangeEvent::GroupsAdded(vec![uuid]));
-            }
-        }
+        let bin = mutations::ensure_recycle_bin(&mut self.conn, now)?;
+        self.announce_minted_bin(bin_before.as_deref())?;
         Ok(bin)
+    }
+
+    /// Emit [`ChangeEvent::GroupsAdded`] for the recycle bin when a mutation
+    /// just minted it: the vault had no designated bin before (`bin_before`)
+    /// and has one now.
+    fn announce_minted_bin(&mut self, bin_before: Option<&str>) -> Result<(), EngineError> {
+        if bin_before.is_some() {
+            return Ok(());
+        }
+        if let Some(uuid) = self
+            .recycle_bin_uuid()?
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            self.emit(ChangeEvent::GroupsAdded(vec![uuid]));
+        }
+        Ok(())
     }
 
     /// Restore a recycled entry: clear `is_recycled` AND move it out of

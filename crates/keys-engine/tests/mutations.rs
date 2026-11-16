@@ -531,6 +531,114 @@ fn ensure_recycle_bin_creates_when_enabled_and_is_idempotent() {
     assert_eq!(again.as_deref(), Some(bin.as_str()), "idempotent");
 }
 
+/// An engine with `kdbx` ingested — call it twice on one `Kdbx` for two
+/// replicas of the same vault (same root group). Returns `(engine, tempdir)`.
+fn engine_for(kdbx: &Kdbx<Unlocked>) -> (Engine, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut engine = Engine::open(
+        &dir.path().join("keys.db"),
+        &FixedKey(DB_KEY_BYTES),
+        protector(),
+        None,
+    )
+    .expect("open");
+    engine.ingest_from_kdbx(kdbx).expect("ingest");
+    engine
+        .set_recycle_bin(true, None)
+        .expect("enable bin without a group");
+    (engine, dir)
+}
+
+#[test]
+fn replicas_of_a_vault_mint_the_same_recycle_bin() {
+    // Copies of one enabled-but-binless vault each mint a bin before they
+    // ever sync — by `ensure` on add, or lazily on a first recycle. They must
+    // mint the SAME group, or the merge keeps two "Recycle Bin" groups.
+    let kdbx = fresh_kdbx(protector());
+    let root = kdbx.vault().root.id.0;
+    let (mut a, _da) = engine_for(&kdbx);
+    let (mut b, _db) = engine_for(&kdbx);
+    let (mut c, _dc) = engine_for(&kdbx);
+
+    let bin_a = a.ensure_recycle_bin().expect("ensure").expect("bin");
+    let bin_b = b.ensure_recycle_bin().expect("ensure").expect("bin");
+    let entry = c.create_entry(root, new_entry("x", "p")).expect("create");
+    c.recycle_entry(entry).expect("recycle");
+    let bin_c = c.recycle_bin_uuid().unwrap().expect("lazy bin");
+
+    assert_eq!(bin_a, bin_b, "two ensure mints agree");
+    assert_eq!(bin_a, bin_c, "an ensure mint and a lazy mint agree");
+    assert_ne!(bin_a, root.to_string());
+
+    // A different vault gets a different bin.
+    let (mut other, _do) = engine_for(&fresh_kdbx(protector()));
+    let bin_other = other.ensure_recycle_bin().expect("ensure").expect("bin");
+    assert_ne!(bin_a, bin_other, "the bin is per vault");
+}
+
+#[test]
+fn re_enabling_the_bin_mints_a_new_one_beside_the_kept_group() {
+    // Disabling keeps the bin as an ordinary group, which may hold live entries
+    // by the time the bin is re-enabled — it must never silently become the bin
+    // again. Re-enabling mints a new bin, and replicas agree on it.
+    let kdbx = fresh_kdbx(protector());
+    let (mut a, dir) = engine_for(&kdbx);
+    let (mut b, _db) = engine_for(&kdbx);
+    let re_enable = |engine: &mut Engine| {
+        let kept = engine.ensure_recycle_bin().expect("ensure").expect("bin");
+        engine.set_recycle_bin(false, None).expect("disable");
+        engine.set_recycle_bin(true, None).expect("enable");
+        let new = engine
+            .ensure_recycle_bin()
+            .expect("ensure again")
+            .expect("bin");
+        (kept, new)
+    };
+    let (kept, new_a) = re_enable(&mut a);
+    let (_, new_b) = re_enable(&mut b);
+
+    assert_ne!(new_a, kept, "the kept group is not made the bin again");
+    assert_eq!(new_a, new_b, "replicas mint the same new bin");
+    let kept_is_bin: Option<i64> = raw_open(&dir.path().join("keys.db"))
+        .query_row(
+            "SELECT is_recycle_bin FROM \"group\" WHERE uuid = ?1",
+            params![kept],
+            |r| r.get(0),
+        )
+        .ok();
+    assert_eq!(
+        kept_is_bin,
+        Some(0),
+        "the kept group survives as an ordinary group"
+    );
+}
+
+#[test]
+fn a_deleted_bins_uuid_is_not_reused() {
+    // Deleting the bin tombstones its uuid. Minting that uuid again would put a
+    // live group under its own tombstone, which deletes an empty group on
+    // every replica holding the tombstone — so the next mint moves on.
+    let kdbx = fresh_kdbx(protector());
+    let (mut a, _da) = engine_for(&kdbx);
+    let (mut b, _db) = engine_for(&kdbx);
+    let delete_and_remint = |engine: &mut Engine| {
+        let bin = engine.ensure_recycle_bin().expect("ensure").expect("bin");
+        engine
+            .delete_group(Uuid::parse_str(&bin).unwrap())
+            .expect("delete bin");
+        let again = engine.ensure_recycle_bin().expect("ensure").expect("bin");
+        (bin, again)
+    };
+    let (deleted, again_a) = delete_and_remint(&mut a);
+    let (_, again_b) = delete_and_remint(&mut b);
+
+    assert_ne!(again_a, deleted, "the deleted bin's uuid is skipped");
+    assert_eq!(
+        again_a, again_b,
+        "replicas in the same state mint the same bin"
+    );
+}
+
 #[test]
 fn ensure_recycle_bin_noop_when_disabled() {
     // Disabled vault → ensure creates nothing (a permanent-delete vault by
