@@ -55,7 +55,7 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
 
       - name: fmt check
         run: cargo fmt --all -- --check
@@ -97,7 +97,7 @@ jobs:
         with:
           toolchain: stable
           targets: aarch64-apple-ios
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
       - name: cargo check (aarch64-apple-ios)
         run: cargo check --target aarch64-apple-ios -p keys-ffi -p keys-iroh-sync
 
