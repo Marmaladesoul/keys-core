@@ -810,6 +810,10 @@ pub struct IngestPeerOutcome {
     /// this is reconciled out-of-band like the location pass. (The name
     /// predates the fold.) The local side changed → the caller must persist.
     pub history_pruned: Vec<Uuid>,
+    /// Shared entries whose classify verdict this build doesn't know (the
+    /// enum is `#[non_exhaustive]`). Left untouched locally; a caller must not
+    /// treat the pass as proof the other side can be overwritten with local.
+    pub unrecognised: Vec<Uuid>,
     /// Count of entries the peer agreed on outright — nothing written.
     pub in_sync: usize,
 }
@@ -937,7 +941,7 @@ pub(crate) fn ingest_peer(
         // history pass below folds from. Held until an arm says otherwise —
         // the conservative default for a verdict this code doesn't know.
         let mut history_base = HistoryBase::Held;
-        match classify(
+        let verdict = classify(
             local_entry,
             peer_entry,
             &local.binaries,
@@ -949,7 +953,17 @@ pub(crate) fn ingest_peer(
             // unproven. Flip back to Granularity::Item if field auto-merge
             // misbehaves.)
             Granularity::Field,
-        ) {
+        );
+        let peer_behind = merge_leaves_local_unchanged(&verdict, local_entry);
+        match verdict {
+            // The peer is merely behind: local edited since the copy the peer
+            // holds, so classify returns an auto-merge whose result IS local.
+            // Nothing to advance. Settling it as in sync keeps a pull of a stale
+            // copy from bumping the watermark and re-saving local unchanged on
+            // every pull; the peer catches up by pulling local's head.
+            _ if peer_behind => {
+                history_base = settle_in_sync(&tx, owner, uuid, &mut outcome)?;
+            }
             Classification::InSync => {
                 if std::env::var_os("KEYS_DEBUG_ADOPTION").is_some() {
                     eprintln!(
@@ -961,9 +975,7 @@ pub(crate) fn ingest_peer(
                         peer.binaries.len(),
                     );
                 }
-                conflict_rows::drop_conflict_rows_for_owner(&tx, owner, uuid)?;
-                outcome.in_sync += 1;
-                history_base = HistoryBase::Local;
+                history_base = settle_in_sync(&tx, owner, uuid, &mut outcome)?;
             }
             Classification::AutoMerged {
                 merged,
@@ -1100,8 +1112,10 @@ pub(crate) fn ingest_peer(
             // `Classification` is `#[non_exhaustive]`; a future verdict variant
             // must be handled explicitly above. Until one exists, conservatively
             // do nothing for this entry — never silently advance (and thus
-            // overwrite) the local side on a verdict we don't understand.
-            _ => {}
+            // overwrite) the local side on a verdict we don't understand —
+            // and record it, so the caller doesn't overwrite the other side
+            // with local either.
+            _ => outcome.unrecognised.push(uuid),
         }
 
         // Location LWW (Phase 5d), orthogonal to the content verdict above:
@@ -2003,6 +2017,32 @@ fn reconcile_entry_history_tombstones(
     }
     persist_entry_history(tx, &merged, session_key, base_bin_refs)?;
     Ok(true)
+}
+
+/// The bookkeeping for an entry whose verdict leaves local as it is: drop
+/// `owner`'s stale conflict rows for it and count it in sync. Its history stays
+/// local's, so the history pass folds the peer's snapshots into that.
+fn settle_in_sync(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &str,
+    uuid: Uuid,
+    outcome: &mut IngestPeerOutcome,
+) -> Result<HistoryBase, EngineError> {
+    conflict_rows::drop_conflict_rows_for_owner(tx, owner, uuid)?;
+    outcome.in_sync += 1;
+    Ok(HistoryBase::Local)
+}
+
+/// Is `verdict` an auto-merge whose result is exactly `local`, with no adopted
+/// attachment change riding beside it? That is the shape of a peer that is
+/// merely behind (local's one-sided edit "merges" to local itself). A merge
+/// that differs from local in anything, the icon included, is not this.
+fn merge_leaves_local_unchanged(verdict: &Classification, local: &Entry) -> bool {
+    matches!(
+        verdict,
+        Classification::AutoMerged { merged, attachment_changes }
+            if attachment_changes.is_empty() && **merged == *local
+    )
 }
 
 /// Which history a verdict arm of [`ingest_peer`] left in the mirror for an
