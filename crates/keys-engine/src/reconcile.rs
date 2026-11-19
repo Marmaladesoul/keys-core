@@ -111,11 +111,16 @@ pub struct MergeStats {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ParkConflictsResult {
-    /// Engine state and disk were already equivalent. The ancestor
-    /// is refreshed; nothing else changes.
+    /// Nothing to take from the ingested file, and nothing it must be
+    /// given: it holds local's content or is a peer that is merely behind
+    /// (which catches up by pulling local's head). Nothing changes.
     NoChange,
     /// Non-conflicting changes applied; any conflicts the merge
-    /// surfaced were parked rather than reported.
+    /// surfaced were parked rather than reported. On the disk path this
+    /// is also the answer, with empty `applied` stats and
+    /// `needs_write_back: true`, when nothing came in but the vault file
+    /// lacks what a clean mirror holds (an older copy put back), so the
+    /// client rewrites it.
     Applied {
         /// Per-bucket counts of merge mutations applied to `SQLite`.
         applied: MergeStats,
@@ -704,7 +709,10 @@ fn swap_entry_in_tree(
 /// `deleted` all empty ⇒ `NoChange`; any non-empty (a real local advance — a
 /// merged edit, a peer-only add, or a propagated cross-peer delete) ⇒
 /// `Applied`. This structural guarantee replaces the old `park_merge_is_no_op`
-/// tree-compare guard.
+/// tree-compare guard. One addition, loop-safe because it writes only what
+/// the file lacks: a clean mirror over a file that holds less than it (an
+/// older copy put back, no conflict parked) ⇒ `Applied` with empty stats and
+/// `needs_write_back: true`, so the file is rewritten rather than settled on.
 ///
 /// The badge ([`entries_with_parked_conflict`]) and the resolver's "theirs"
 /// ([`held_conflict_payload`]) both read the owner rows directly — no derived
@@ -969,7 +977,7 @@ fn ingest_kdbx_as_owner(
     // history fold is idempotent once both sides hold the same union, so the
     // re-saved value matches what the peer holds → the peer's next pull sees
     // nothing newer → the loop settles.
-    if outcome.auto_merged.is_empty()
+    let local_advanced = !(outcome.auto_merged.is_empty()
         && outcome.added.is_empty()
         && outcome.deleted.is_empty()
         && outcome.moved.is_empty()
@@ -977,8 +985,32 @@ fn ingest_kdbx_as_owner(
         && outcome.groups_updated.is_empty()
         && outcome.groups_moved.is_empty()
         && outcome.groups_deleted.is_empty()
-        && outcome.history_pruned.is_empty()
-    {
+        && outcome.history_pruned.is_empty());
+    if !local_advanced {
+        // Nothing came in, but the vault FILE may still hold less than the
+        // mirror: an older copy put back underneath it (a sync tool or a
+        // file-hosting client restoring a previous version, a backup restore).
+        // The mirror is ahead, so the pass changes nothing locally, yet the
+        // file must be rewritten or the next fresh read (another app, another
+        // device, a rebuilt mirror) undoes whatever the mirror holds beyond it
+        // — a recycle or delete comes back. Only for the file: a peer that's
+        // behind catches up by pulling local's head. Only over a clean mirror:
+        // a dirty one already owes the file a write, which stays the save
+        // orchestrator's to flush (and a re-ingest refuses it meanwhile). A
+        // pass that only parked conflicts keeps the park model's no-save rule
+        // (see above).
+        if owner == FILE_OWNER
+            && outcome.conflicted.is_empty()
+            && outcome.unrecognised.is_empty()
+            && !engine.persistence_state()?.is_dirty()
+            && keepass_merge::vault_content_digest(&remote_vault) != engine.content_digest()?
+        {
+            return Ok(ParkConflictsResult::Applied {
+                applied: MergeStats::default(),
+                parked: ParkedConflictsSummary::default(),
+                needs_write_back: true,
+            });
+        }
         return Ok(ParkConflictsResult::NoChange);
     }
 
