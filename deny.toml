@@ -77,6 +77,14 @@ ignore = [
     # ignore in ci.yml's audit job) once a rusqlite release bundles
     # SQLCipher on SQLite >= 3.54, and upgrade to it.
     "RUSTSEC-2026-0459",
+    # chrono unmaintained, no safe upgrade (all versions affected). An
+    # end-of-life notice, not a vulnerability. chrono is the date type
+    # across the KDBX model (keepass-core, keepass-merge), keys-engine
+    # and keys-ffi, and iroh-blobs pulls it too, so replacing it (jiff or
+    # time) is a cross-crate migration, not a lockfile bump. Drop once
+    # keepass-core, keys-engine and keys-ffi have moved off chrono and no
+    # iroh crate in the tree still depends on it.
+    "RUSTSEC-2026-0543",
 ]
 
 # ---------------------------------------------------------------------------
