@@ -791,15 +791,6 @@ impl AbsentReader {
     }
 }
 
-/// Whether `node` holds an entry under `key` in `doc_id`.
-async fn holds_entry(node: &IrohNode, doc_id: &str, key: &[u8]) -> bool {
-    node.list_entries(doc_id.to_owned())
-        .await
-        .expect("list")
-        .iter()
-        .any(|e| e.key == key)
-}
-
 /// Wait up to `wait` for `node` to hold every key in `keys` in `doc_id`.
 async fn wait_for_entries(node: &IrohNode, doc_id: &str, keys: &[&[u8]], wait: Duration) -> bool {
     tokio::time::timeout(wait, async {
@@ -855,19 +846,16 @@ async fn a_write_made_while_the_peer_is_away_reaches_it_once_back() {
         .expect("test exceeded 300s — likely a hang, not a slow DERP");
 }
 
-/// How long a forgotten peer is left waiting for a write it missed. Spans
-/// the node's first two re-dial delays (`REDIAL_BACKOFF` in `src/node.rs`:
-/// 5 s, then 15 s) with headroom, so a re-dial would have reached the peer
-/// well inside it. Retune this with that schedule.
-const FORGOTTEN_PEER_WAIT: Duration = Duration::from_secs(45);
-
-/// A peer the writer has forgotten is not re-dialled after a failed round,
-/// so a write made while it was away stays undelivered until another
-/// write dials it. The closing write proves the reader was reachable all
-/// along, so the wait wasn't vacuous: a write still dials the doc's known
-/// peers, forgotten or not.
+/// Forgetting a peer stops only its re-dials: a write still dials the
+/// doc's known peers, forgotten or not, and delivers what they missed.
+///
+/// That no re-dial happens is asserted on the re-dial watch itself
+/// (`src/node.rs`), not here by waiting for nothing to arrive: the write
+/// made while the peer was away started dials of its own (a sync round's
+/// and the gossip swarm's), and one still under way when the peer returns
+/// delivers it with no re-dial.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_forgotten_peer_is_not_redialled() {
+async fn a_write_reaches_a_forgotten_peer_once_back() {
     if is_network_test_skipped() {
         eprintln!("skipping: KEYS_IROH_SYNC_SKIP_NETWORK_TESTS set");
         return;
@@ -882,12 +870,6 @@ async fn a_forgotten_peer_is_not_redialled() {
             .expect("forget the reader");
 
         let reader = away.bring_back().await;
-        tokio::time::sleep(FORGOTTEN_PEER_WAIT).await;
-        assert!(
-            !holds_entry(&reader, &away.doc_id, WHILE_AWAY).await,
-            "the writer re-dialled the peer it forgot"
-        );
-
         let once_back: &[u8] = b"once-back";
         away.writer
             .set_entry(away.doc_id.clone(), once_back.to_vec(), b"2".to_vec())
@@ -908,10 +890,9 @@ async fn a_forgotten_peer_is_not_redialled() {
         reader.shutdown().await.expect("reader shutdown");
     };
 
-    // Its waits alone can reach 255 s (failure, forgotten wait, delivery).
-    tokio::time::timeout(Duration::from_secs(360), body)
+    tokio::time::timeout(Duration::from_secs(300), body)
         .await
-        .expect("test exceeded 360s — likely a hang, not a slow DERP");
+        .expect("test exceeded 300s — likely a hang, not a slow DERP");
 }
 
 // Store-and-forward: a peer that fetches what a doc names but never merges
