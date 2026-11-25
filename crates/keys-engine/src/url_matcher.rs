@@ -489,6 +489,16 @@ mod tests {
 
     /// Saving the origin must not change which domain the store and the
     /// lookup walk key on.
+    /// A `blob:` URL names no site of its own, however deeply nested, so
+    /// it has no origin: answering must not recurse into what it wraps.
+    #[test]
+    fn origin_of_a_blob_url_is_none() {
+        assert_eq!(origin("blob:https://example.com/0a1b"), None);
+        assert_eq!(origin("blob://example.com/blob:https://example.com/"), None);
+        let nested = format!("{}https://example.com/", "blob:".repeat(10_000));
+        assert_eq!(origin(&nested), None);
+    }
+
     #[test]
     fn origin_keys_on_the_same_domains_as_the_page() {
         for page in [
