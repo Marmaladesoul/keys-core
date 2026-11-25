@@ -108,6 +108,9 @@ const BLOB_STORE_DB_FILE: &str = "blobs.db";
 /// [`own_head_tag`].
 const OWN_HEAD_TAG_PREFIX: &[u8] = b"keys-iroh-sync/own-head/";
 
+/// How long [`IrohNode::join_doc`] waits for its first sync round.
+const FIRST_ROUND_DEADLINE: Duration = Duration::from_secs(30);
+
 /// The default deadline [`IrohNode::fetch_blob`] waits for content to
 /// arrive before giving up; [`IrohNode::fetch_blob_with_deadline`] lets
 /// a caller pick another bound per call. Callers block on that future,
@@ -548,36 +551,8 @@ impl IrohNode {
     /// started: no content is fetched under iroh-docs' default "download
     /// everything" policy, and no round finishes unobserved.
     pub async fn join_doc(&self, ticket: String, policy: DownloadPolicy) -> Result<String> {
-        let DocTicket { capability, nodes } = ticket
-            .parse()
-            .context("parse doc ticket")
-            .map_err(SyncError::from)?;
-
-        let was_joined = self.joined.lock().await.contains_key(&capability.id());
-        let doc = self
-            .docs
-            .api()
-            .import_namespace(capability)
+        self.join_doc_within(ticket, policy, FIRST_ROUND_DEADLINE)
             .await
-            .context("import doc")
-            .map_err(SyncError::from)?;
-        match self.finish_join(&doc, policy, nodes).await {
-            Ok(joined) => {
-                let id = doc.id();
-                // A re-join replaces the entry; the doc handle the old
-                // entry held is closed, or it would stay open for good.
-                if let Some(old) = self.joined.lock().await.insert(id, joined)
-                    && let Err(e) = old.doc.close().await
-                {
-                    tracing::warn!(doc = %id.fmt_short(), error = ?e, "closing the replaced doc handle");
-                }
-                Ok(id.to_string())
-            }
-            Err(e) => {
-                release_failed_attempt(&doc, was_joined).await;
-                Err(e)
-            }
-        }
     }
 
     /// Hex `AuthorId` this node signs its entries with ([`Self::set_entry`]).
@@ -1267,6 +1242,46 @@ impl IrohNode {
 }
 
 impl IrohNode {
+    /// [`IrohNode::join_doc`] with a given wait for the first round, so a
+    /// test can time out well before a dial of an absent peer gives up.
+    async fn join_doc_within(
+        &self,
+        ticket: String,
+        policy: DownloadPolicy,
+        deadline: Duration,
+    ) -> Result<String> {
+        let DocTicket { capability, nodes } = ticket
+            .parse()
+            .context("parse doc ticket")
+            .map_err(SyncError::from)?;
+
+        let was_joined = self.joined.lock().await.contains_key(&capability.id());
+        let doc = self
+            .docs
+            .api()
+            .import_namespace(capability)
+            .await
+            .context("import doc")
+            .map_err(SyncError::from)?;
+        match self.finish_join(&doc, policy, nodes, deadline).await {
+            Ok(joined) => {
+                let id = doc.id();
+                // A re-join replaces the entry; the doc handle the old
+                // entry held is closed, or it would stay open for good.
+                if let Some(old) = self.joined.lock().await.insert(id, joined)
+                    && let Err(e) = old.doc.close().await
+                {
+                    tracing::warn!(doc = %id.fmt_short(), error = ?e, "closing the replaced doc handle");
+                }
+                Ok(id.to_string())
+            }
+            Err(e) => {
+                release_failed_attempt(&doc, was_joined).await;
+                Err(e)
+            }
+        }
+    }
+
     /// The part of [`IrohNode::join_doc`] after the import: set the
     /// policy, watch for owed rounds, start sync and wait for the first
     /// round. On error the caller releases what this opened.
@@ -1275,6 +1290,7 @@ impl IrohNode {
         doc: &Doc,
         policy: DownloadPolicy,
         nodes: Vec<EndpointAddr>,
+        deadline: Duration,
     ) -> Result<JoinedDoc> {
         doc.set_download_policy(policy.into_iroh())
             .await
@@ -1293,9 +1309,9 @@ impl IrohNode {
             .await
             .context("start sync on joined doc")
             .map_err(SyncError::from)?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let give_up_at = tokio::time::Instant::now() + deadline;
         loop {
-            match tokio::time::timeout_at(deadline, events.next()).await {
+            match tokio::time::timeout_at(give_up_at, events.next()).await {
                 Ok(Some(Ok(LiveEvent::SyncFinished(_)))) => break,
                 Ok(Some(Ok(_))) => {} // ignore non-sync events while waiting
                 Ok(Some(Err(e))) => {
@@ -1307,9 +1323,10 @@ impl IrohNode {
                     ));
                 }
                 Err(_) => {
-                    return Err(SyncError::Generic(
-                        "initial sync timed out after 30s".into(),
-                    ));
+                    return Err(SyncError::Generic(format!(
+                        "initial sync timed out after {}s",
+                        deadline.as_secs()
+                    )));
                 }
             }
         }
@@ -2079,6 +2096,10 @@ mod tests {
         subscriber.shutdown().await.expect("shutdown");
     }
 
+    /// Well short of the ~30s a dial of an absent peer takes to fail: a
+    /// failed round would count as the join's first.
+    const ABSENT_PEER_JOIN_WAIT: Duration = Duration::from_secs(3);
+
     /// A join that fails (here the only peer is gone) releases what it
     /// opened, so the half-joined doc can still be dropped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2095,7 +2116,7 @@ mod tests {
         let body = async {
             assert!(
                 subscriber
-                    .join_doc(ticket, DownloadPolicy::Everything)
+                    .join_doc_within(ticket, DownloadPolicy::Everything, ABSENT_PEER_JOIN_WAIT)
                     .await
                     .is_err(),
                 "the join fails with its only peer gone"
