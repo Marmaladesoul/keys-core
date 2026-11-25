@@ -304,8 +304,17 @@ impl JoinedDoc {
             .context("subscribe for re-dial watch")
             .map_err(SyncError::from)?;
         let (forget, forgotten) = mpsc::unbounded_channel();
-        let redial =
-            AbortOnDropHandle::new(tokio::spawn(watch_redial(doc.clone(), events, forgotten)));
+        let redialled = doc.clone();
+        let start_sync = move |owed| {
+            let doc = redialled.clone();
+            async move { doc.start_sync(owed).await }
+        };
+        let redial = AbortOnDropHandle::new(tokio::spawn(watch_redial(
+            doc.id(),
+            start_sync,
+            events,
+            forgotten,
+        )));
         Ok(Self {
             doc,
             redial,
@@ -314,8 +323,9 @@ impl JoinedDoc {
     }
 }
 
-/// Keep re-dialling `doc`'s peers while the doc owes any of them a sync
-/// round, on the [`REDIAL_BACKOFF`] schedule.
+/// Keep re-dialling a doc's peers while the doc owes any of them a sync
+/// round, on the [`REDIAL_BACKOFF`] schedule. `start_sync` runs the doc's
+/// own `start_sync` with the peers it is given.
 ///
 /// iroh-docs dials a doc's peers only when told to (`start_sync`: a
 /// join, a resume, and — since every write calls it — a write). A round
@@ -358,11 +368,14 @@ impl JoinedDoc {
 ///
 /// Ends when the doc's event stream does (the node shut down), or when
 /// aborted; the in-flight re-dial is aborted with it.
-async fn watch_redial(
-    doc: Doc,
+async fn watch_redial<F>(
+    doc_id: NamespaceId,
+    start_sync: impl Fn(Vec<EndpointAddr>) -> F,
     mut events: impl Stream<Item = anyhow::Result<LiveEvent>> + Unpin,
     mut forgotten: mpsc::UnboundedReceiver<PublicKey>,
-) {
+) where
+    F: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
     let mut peers = RedialSet::default();
     let mut attempt = 0;
     let mut next_redial: Option<tokio::time::Instant> = None;
@@ -393,7 +406,7 @@ async fn watch_redial(
             Some(peer) = forgotten.recv() => peers.forget(peer),
             () = redial_due => {
                 tracing::info!(
-                    doc = %doc.id(),
+                    doc = %doc_id,
                     owed = peers.owed.len(),
                     attempt,
                     "re-dialling peers owed a sync round"
@@ -401,10 +414,10 @@ async fn watch_redial(
                 // Not awaited here: the live actor awaits room in this
                 // task's event queue, so waiting on its reply while not
                 // draining that queue could deadlock both.
-                let doc = doc.clone();
                 let owed = peers.owed.iter().copied().map(EndpointAddr::new).collect();
+                let dial = start_sync(owed);
                 _in_flight = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                    if let Err(e) = doc.start_sync(owed).await {
+                    if let Err(e) = dial.await {
                         tracing::warn!(error = ?e, "re-dial of peers owed a round failed to start");
                     }
                 })));
@@ -1031,7 +1044,9 @@ impl IrohNode {
     /// device. Without this, a peer a round we dialled failed to reach is
     /// re-dialled every few minutes for as long as the node runs.
     ///
-    /// Only the re-dial stops. iroh-docs still runs a round with every
+    /// Only the re-dial stops, and a dial already under way is not
+    /// cancelled: a peer that returns before it gives up is still reached.
+    /// iroh-docs still runs a round with every
     /// peer in the doc's persisted peer list when a write (or a re-dial
     /// owed to another peer) starts one; such a round with a forgotten
     /// peer fails as before but leaves nothing owed. A round with the
@@ -1548,6 +1563,10 @@ pub fn node_id(node: Arc<IrohNode>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use iroh_docs::engine::SyncEvent;
+    use iroh_docs::net::{SyncFinished, Timings};
+    use iroh_docs::sync::SyncOutcome;
+
     use super::*;
 
     /// N0 brings a pkarr publisher and a DNS lookup; the HTTPS pkarr
@@ -1609,6 +1628,196 @@ mod tests {
         peers.record_round(p, &Origin::Accept, true);
         assert!(peers.record_round(p, &DIALLED, false));
         assert!(peers.owed.contains(&p));
+    }
+
+    /// A finished round with `peer`, as the live engine reports it.
+    fn round(peer: PublicKey, origin: Origin, succeeded: bool) -> LiveEvent {
+        let at = std::time::SystemTime::UNIX_EPOCH;
+        let finished = SyncFinished {
+            namespace: TEST_NAMESPACE.into(),
+            peer,
+            outcome: SyncOutcome::default(),
+            timings: Timings::default(),
+        };
+        LiveEvent::SyncFinished(SyncEvent {
+            peer,
+            origin,
+            started: at,
+            finished: at,
+            result: if succeeded {
+                Ok((&finished).into())
+            } else {
+                Err("unreachable".to_owned())
+            },
+        })
+    }
+
+    fn failed_dial(peer: PublicKey) -> LiveEvent {
+        round(peer, DIALLED, false)
+    }
+
+    fn accepted_round(peer: PublicKey) -> LiveEvent {
+        round(peer, Origin::Accept, true)
+    }
+
+    /// The doc a [`TestWatch`] stands for. No doc has this id.
+    const TEST_NAMESPACE: [u8; 32] = [0; 32];
+
+    /// Long enough for every step of the re-dial schedule to fall due,
+    /// and two steady intervals after that. Tests run it on a paused
+    /// clock, so it costs no time.
+    fn whole_redial_schedule() -> Duration {
+        REDIAL_BACKOFF.iter().sum::<Duration>() + REDIAL_STEADY_INTERVAL * 3
+    }
+
+    /// A re-dial watch on a doc whose rounds and dials are the test's own:
+    /// no node, no network. Dials are recorded, never made, so nothing
+    /// but the watch itself can produce one.
+    struct TestWatch {
+        events: mpsc::UnboundedSender<anyhow::Result<LiveEvent>>,
+        forget: mpsc::UnboundedSender<PublicKey>,
+        dials: mpsc::UnboundedReceiver<(Duration, HashSet<PublicKey>)>,
+        _watch: AbortOnDropHandle<()>,
+    }
+
+    impl TestWatch {
+        fn start() -> Self {
+            let (events, rounds) = mpsc::unbounded_channel();
+            let (forget, forgotten) = mpsc::unbounded_channel();
+            let (dialled, dials) = mpsc::unbounded_channel();
+            let started = tokio::time::Instant::now();
+            let start_sync = move |owed: Vec<EndpointAddr>| {
+                let peers = owed.into_iter().map(|addr| addr.id).collect();
+                dialled
+                    .send((started.elapsed(), peers))
+                    .expect("the test outlives the watch");
+                std::future::ready(Ok(()))
+            };
+            let rounds = Box::pin(futures_util::stream::unfold(rounds, async |mut rounds| {
+                rounds.recv().await.map(|event| (event, rounds))
+            }));
+            let watch = tokio::spawn(watch_redial(
+                TEST_NAMESPACE.into(),
+                start_sync,
+                rounds,
+                forgotten,
+            ));
+            Self {
+                events,
+                forget,
+                dials,
+                _watch: AbortOnDropHandle::new(watch),
+            }
+        }
+
+        /// Hand the watch an event and let it act on it.
+        async fn report(&self, event: LiveEvent) {
+            self.events.send(Ok(event)).expect("watch is running");
+            settle().await;
+        }
+
+        /// Forget `peer` and let the watch act on it.
+        async fn forget(&self, peer: PublicKey) {
+            self.forget.send(peer).expect("watch is running");
+            settle().await;
+        }
+
+        /// Run the clock over the whole re-dial schedule and return every
+        /// dial made: how long after the watch started, and to whom.
+        async fn dials_over_the_schedule(&mut self) -> Vec<(Duration, HashSet<PublicKey>)> {
+            tokio::time::sleep(whole_redial_schedule()).await;
+            let mut dials = Vec::new();
+            while let Ok(dial) = self.dials.try_recv() {
+                dials.push(dial);
+            }
+            dials
+        }
+    }
+
+    /// Let the watch drain its queues. On a paused clock a sleep returns
+    /// only once every other task is idle.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_owed_peer_is_redialled_on_the_whole_schedule() {
+        let mut watch = TestWatch::start();
+        let away = peer();
+        watch.report(failed_dial(away)).await;
+
+        let mut due = Duration::ZERO;
+        let expected: Vec<_> = REDIAL_BACKOFF
+            .into_iter()
+            .chain([REDIAL_STEADY_INTERVAL; 2])
+            .map(|delay| {
+                due += delay;
+                (due, HashSet::from([away]))
+            })
+            .collect();
+        let dials = watch.dials_over_the_schedule().await;
+        assert_eq!(dials[..expected.len()], expected);
+    }
+
+    /// Forgetting a peer already owed a round stops its re-dials, later
+    /// failed rounds start none, and a round with it that succeeds makes
+    /// it worth re-dialling again.
+    #[tokio::test(start_paused = true)]
+    async fn a_forgotten_peer_is_not_redialled_until_it_syncs_again() {
+        let mut watch = TestWatch::start();
+        let gone = peer();
+        watch.report(failed_dial(gone)).await;
+        watch.forget(gone).await;
+        assert_eq!(watch.dials_over_the_schedule().await, []);
+
+        watch.report(failed_dial(gone)).await;
+        assert_eq!(watch.dials_over_the_schedule().await, []);
+
+        watch.report(accepted_round(gone)).await;
+        watch.report(failed_dial(gone)).await;
+        assert_ne!(watch.dials_over_the_schedule().await, []);
+    }
+
+    /// Forgetting one peer leaves the others' re-dials alone, and the
+    /// forgotten one out of them.
+    #[tokio::test(start_paused = true)]
+    async fn forgetting_one_peer_keeps_redialling_the_others() {
+        let mut watch = TestWatch::start();
+        let (gone, away) = (peer(), peer());
+        watch.report(failed_dial(gone)).await;
+        watch.report(failed_dial(away)).await;
+        watch.forget(gone).await;
+
+        let dials = watch.dials_over_the_schedule().await;
+        assert_ne!(dials, []);
+        assert!(dials.iter().all(|(_, to)| *to == HashSet::from([away])));
+    }
+
+    /// The node hands a forgotten peer to the watch of the doc it names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forget_peer_reaches_the_docs_redial_watch() {
+        let (node, _blobs, _docs) = bind_test_node().await;
+        let doc_id = node.create_doc().await.expect("create doc");
+        let other_doc = node.create_doc().await.expect("create doc");
+        let namespace: NamespaceId = doc_id.parse().expect("doc id");
+        let (forget, mut forgotten) = mpsc::unbounded_channel();
+        node.joined
+            .lock()
+            .await
+            .get_mut(&namespace)
+            .expect("joined")
+            .forget = forget;
+
+        let (gone, elsewhere) = (peer(), peer());
+        node.forget_peer(other_doc, elsewhere.to_string())
+            .await
+            .expect("forget in the other doc");
+        node.forget_peer(doc_id, gone.to_string())
+            .await
+            .expect("forget");
+        assert_eq!(forgotten.try_recv().expect("handed over"), gone);
+        assert!(forgotten.try_recv().is_err(), "and nothing else");
+        node.shutdown().await.expect("shutdown");
     }
 
     async fn bind_test_node() -> (Arc<IrohNode>, tempfile::TempDir, tempfile::TempDir) {
