@@ -107,6 +107,21 @@ jobs:
       - name: cargo check (aarch64-apple-ios)
         run: cargo check --target aarch64-apple-ios -p keys-ffi
 
+  msrv:
+    name: MSRV build
+    runs-on: ubuntu-latest
+    # The workspace's `rust-version` is a promise; this keeps it true. A
+    # dependency update that needs a newer compiler fails here, and the fix is
+    # to raise `rust-version` (in Cargo.toml) and this toolchain together.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.91"
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
+      - name: cargo check (MSRV)
+        run: cargo check --workspace --all-features --all-targets --locked
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest

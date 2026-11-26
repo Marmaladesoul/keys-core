@@ -45,10 +45,10 @@ use crate::model::StrengthBucket;
 use crate::predicate::Predicate;
 
 /// Window length for [`recently_modified`]: 30 days.
-pub const RECENTLY_MODIFIED_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub const RECENTLY_MODIFIED_WINDOW: Duration = Duration::from_hours(30 * 24);
 
 /// Window length for [`expiring_soon`]: 7 days.
-pub const EXPIRING_SOON_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const EXPIRING_SOON_WINDOW: Duration = Duration::from_hours(7 * 24);
 
 /// "Weak Passwords" — entries whose password strength bucket is
 /// strictly below `Reasonable` (i.e. `VeryWeak` or `Weak`).
@@ -235,7 +235,7 @@ mod tests {
         let Predicate::ModifiedWithin { duration } = recently_modified() else {
             panic!("expected ModifiedWithin");
         };
-        assert_eq!(duration, Duration::from_secs(30 * 24 * 60 * 60));
+        assert_eq!(duration, Duration::from_hours(30 * 24));
     }
 
     #[test]
@@ -243,7 +243,7 @@ mod tests {
         let Predicate::ExpiringWithin { duration } = expiring_soon() else {
             panic!("expected ExpiringWithin");
         };
-        assert_eq!(duration, Duration::from_secs(7 * 24 * 60 * 60));
+        assert_eq!(duration, Duration::from_hours(7 * 24));
     }
 
     #[test]
