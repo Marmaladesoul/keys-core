@@ -11,9 +11,10 @@
 # from the header alone, before deriving anything.
 #
 # The forged blobs come from `forge-kdf`: a real replica with only the
-# header's KDF parameters rewritten. Its header HMAC no longer verifies, so
-# no key could open it — what's under test is whether the reader runs the
-# KDF before finding that out.
+# header's KDF parameters rewritten (and a KDBX4 header's unkeyed SHA-256
+# recomputed, as any forger could). Its keyed header HMAC (KDBX4) or payload
+# (KDBX3) no longer verifies, so no key could open it — what's under test is
+# whether the reader runs the KDF before finding that out.
 #
 # Assertions:
 #   1. HOSTILE ARGON2 → a replica demanding 6 GiB × u32::MAX passes is

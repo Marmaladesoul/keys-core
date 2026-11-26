@@ -293,7 +293,21 @@ pub(crate) fn check_unrecorded_file(
 ) -> Result<(), crate::VaultError> {
     let cost =
         KdfCost::of_header(read).map_err(|e| crate::VaultError::Unexpected(e.to_string()))?;
-    kdf_cost::check_vault_file(&cost, None, policy(approved))
+    check_unrecorded_cost(&cost, approved)
+}
+
+/// As [`check_unrecorded_file`], for a file whose KDF `cost` the caller has
+/// already decoded from its header.
+///
+/// # Errors
+///
+/// [`crate::VaultError::KdfApprovalRequired`] (carrying the file's settings)
+/// when the gate refuses.
+pub(crate) fn check_unrecorded_cost(
+    cost: &KdfCost,
+    approved: Option<&KdfCost>,
+) -> Result<(), crate::VaultError> {
+    kdf_cost::check_vault_file(cost, None, policy(approved))
         .map_err(|_| crate::VaultError::KdfApprovalRequired(cost.to_string()))
 }
 

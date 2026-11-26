@@ -6,16 +6,17 @@
 //! cost under a fresh salt still merges.
 //!
 //! The refused blobs are real replicas with only the header's KDF
-//! parameters rewritten, as a doc writer could plant: their header HMAC no
-//! longer verifies, so a reader that derived first would fail as a wrong
-//! key instead. The hostile-cost shape (gigabytes, billions of passes) is
+//! parameters rewritten, as a doc writer could plant, and the header's
+//! unkeyed SHA-256 recomputed to match, as any forger could: their keyed
+//! header HMAC no longer verifies, so a reader that derived first would fail
+//! as a wrong key instead. The hostile-cost shape (gigabytes, billions of passes) is
 //! the keyhole scenario `peer-kdf-cost-refused.sh`, under a watchdog; here
 //! the difference is kept cheap so a regression fails rather than hangs.
 
 use std::sync::Arc;
 
 use keepass_core::CompositeKey;
-use keepass_core::format::{FileSignature, KdfParams, VersionFields};
+use keepass_core::format::{FileSignature, KdfParams, VersionFields, compute_header_hash};
 use keepass_core::kdbx::Kdbx;
 use keepass_core::model::NewEntry;
 use keys_ffi::{
@@ -139,8 +140,9 @@ fn replica_with_entry(vault: &std::path::Path, title: &str) -> Kdbx<keepass_core
     kdbx
 }
 
-/// `bytes` with the outer header's Argon2 pass count raised by one — the
-/// salt, the rest of the header and the payload byte-for-byte as they were.
+/// `bytes` with the outer header's Argon2 pass count raised by one and the
+/// header's unkeyed SHA-256 recomputed to match — the salt, the rest of the
+/// header and the rest of the payload byte-for-byte as they were.
 fn with_one_more_pass(bytes: Vec<u8>) -> Vec<u8> {
     let read = Kdbx::open_from_bytes(bytes)
         .expect("open")
@@ -158,7 +160,9 @@ fn with_one_more_pass(bytes: Vec<u8>) -> Vec<u8> {
     *kdf_parameters = params.to_var_dictionary_blob().expect("encode kdf");
     let mut forged = read.header_bytes()[..FileSignature::LEN].to_vec();
     forged.extend(header.write().expect("write header"));
-    forged.extend_from_slice(read.payload_bytes());
+    let hash = compute_header_hash(&forged);
+    forged.extend_from_slice(&hash);
+    forged.extend_from_slice(&read.payload_bytes()[hash.len()..]);
     forged
 }
 

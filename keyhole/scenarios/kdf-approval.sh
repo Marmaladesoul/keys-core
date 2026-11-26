@@ -16,8 +16,8 @@
 #
 # Real setting changes come from `set-kdf` (a re-key under the same
 # password, as another client would make); hostile ones from `forge-kdf`
-# (header rewritten, so no key opens it — what's under test is whether the
-# reader derives before finding out).
+# (header rewritten, its unkeyed hash recomputed, so no key opens it — what's
+# under test is whether the reader derives before finding out).
 #
 # Assertions:
 #   1. FIRST OPEN PAST THE CEILING → a vault whose Argon2 memory is past the
