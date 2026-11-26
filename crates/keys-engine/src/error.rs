@@ -52,6 +52,17 @@ pub enum EngineError {
     #[error("wrong database key — supplied key does not decrypt this database")]
     WrongKey,
 
+    /// A KDBX file (the vault file, or a peer's copy of it) did not open
+    /// under the supplied composite key: the password or keyfile is wrong,
+    /// or the part of the file that proves the key (a KDBX4 header, a KDBX3
+    /// file's first block) is damaged. `keepass-core` reports these as one
+    /// decryption failure and so does this: the message is fixed and
+    /// carries nothing about which. Damage past that point is a format
+    /// error, not this. Distinct from [`Self::WrongKey`], which is the
+    /// mirror's own key.
+    #[error("the password or keyfile doesn't open this vault file, or the file is corrupt")]
+    VaultKeyRefused,
+
     /// The [`KeyProvider`](crate::KeyProvider) failed to materialise the
     /// database key.
     #[error("db key provider failed: {0}")]
@@ -196,7 +207,8 @@ pub enum EngineError {
     /// anything is written: the mirror and the file are untouched.
     ///
     /// Raised only after the file has decrypted under the supplied key
-    /// factors — a wrong password or keyfile fails first, as itself.
+    /// factors — a wrong password or keyfile fails first, as
+    /// [`Self::VaultKeyRefused`].
     #[error(
         "the vault file is a different vault (root group {found}, mirror holds \
          {expected}); refusing to touch it"
@@ -302,6 +314,30 @@ pub enum EngineError {
     },
 }
 
+/// True when a `keepass-core` unlock failed because the composite key
+/// didn't open the file (`keepass-core` reports a wrong key and a damaged
+/// key check as one decryption failure), as opposed to a KDF, I/O or
+/// structural failure. The one test for [`EngineError::VaultKeyRefused`],
+/// shared with the FFI.
+#[must_use]
+pub fn is_key_refusal(err: &keepass_core::Error) -> bool {
+    matches!(
+        err,
+        keepass_core::Error::Crypto(keepass_core::crypto::CryptoError::Decrypt)
+    )
+}
+
+/// What a failed `unlock` of a KDBX file means: [`EngineError::VaultKeyRefused`]
+/// when the key didn't open it ([`is_key_refusal`]), otherwise
+/// [`EngineError::Serialise`] naming `context` and the cause.
+pub(crate) fn unlock_failure(context: &str, err: &keepass_core::Error) -> EngineError {
+    if is_key_refusal(err) {
+        EngineError::VaultKeyRefused
+    } else {
+        EngineError::Serialise(format!("{context}: {err}"))
+    }
+}
+
 /// The " (this vault's is …)" tail of a `KdfApprovalRequired` message,
 /// when a cost is recorded — shared with the FFI's display-string variant.
 pub fn recorded_kdf_suffix<T: std::fmt::Display + ?Sized>(recorded: Option<&T>) -> String {
@@ -345,7 +381,7 @@ impl EngineError {
     ///   same hazard the `Wrap` exclusion guards against.
     /// - wrong master password / corrupt KDBX: never reach this classifier
     ///   at all — they surface at the ingest / reconcile (KDBX) layer, a
-    ///   rung below the sidecar.
+    ///   rung below the sidecar, as [`VaultKeyRefused`](Self::VaultKeyRefused).
     /// - [`Sqlite`](Self::Sqlite), [`Migration`](Self::Migration),
     ///   [`Random`](Self::Random), [`Io`](Self::Io) and the rest: genuine
     ///   faults that must be surfaced, never silently healed.
@@ -476,7 +512,7 @@ mod tests {
             EngineError::Ingest(IngestError::SessionKey("se gone".into())),
             // The disk-KDBX layer: wrong password / corruption surface here,
             // never as a sidecar failure.
-            EngineError::Serialise("unlock disk kdbx: decryption failed".into()),
+            EngineError::VaultKeyRefused,
             // Producer mismatch / genuine corruption of the sidecar shape.
             EngineError::Projection(ProjectionError::SchemaInvariant("no root group".into())),
             // Plain faults that must be surfaced.
@@ -490,5 +526,25 @@ mod tests {
                 "{err:?} must NOT be self-healed",
             );
         }
+    }
+
+    #[test]
+    fn only_a_decrypt_failure_is_a_key_refusal() {
+        use keepass_core::crypto::CryptoError;
+        assert!(is_key_refusal(&CryptoError::Decrypt.into()));
+        // A derivation that couldn't run says nothing about the key.
+        assert!(!is_key_refusal(&CryptoError::Kdf.into()));
+        assert!(!is_key_refusal(&std::io::Error::other("disk").into()));
+
+        assert!(matches!(
+            unlock_failure("unlock disk kdbx", &CryptoError::Decrypt.into()),
+            EngineError::VaultKeyRefused
+        ));
+        let EngineError::Serialise(msg) =
+            unlock_failure("unlock disk kdbx", &CryptoError::Kdf.into())
+        else {
+            panic!("a KDF failure must stay a Serialise error");
+        };
+        assert!(msg.starts_with("unlock disk kdbx: "), "{msg}");
     }
 }

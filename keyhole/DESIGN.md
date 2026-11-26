@@ -1136,8 +1136,8 @@ GUI) instead of one — short-term effort bought for compounding payoff.
     opens+mutates+saves under a deliberately-wrong password. **The decisive
     result:** the open is accepted (skip, no verify) and the mutation lands in
     the mirror, but the trailing `save_to_kdbx(wrong)` **fails closed** —
-    `Internal("open kdbx: decryption failed (wrong key or corrupt data)")` —
-    because it must `open_unlocked(path, wrong)` the on-disk file FIRST (as the
+    `VaultKeyRefused` (an `Internal` carrying keepass-core's text when first
+    characterised) — because it must `open_unlocked(path, wrong)` the on-disk file FIRST (as the
     crypto-envelope template) and a wrong password is rejected there. The
     on-disk kdbx is left untouched: it still opens under the correct password,
     rejects the wrong one, and the wrong-password write never reaches disk.
@@ -1150,8 +1150,8 @@ GUI) instead of one — short-term effort bought for compounding payoff.
     disk-touching candidates under a wrong password — `ingest-peer`
     (per-device-key transport merge), `reconcile_with_disk_park_conflicts` (the
     disk-watcher path a sync write to the file triggers), and `create` on a
-    fresh path — and pins that the first two **fail closed** (`unlock disk kdbx:
-    decryption failed`), leaving both replicas openable only under the correct
+    fresh path — and pins that the first two **fail closed**
+    (`VaultKeyRefused`), leaving both replicas openable only under the correct
     password, while only `create` on a *non-existent* path keys a vault from a
     raw, caller-supplied password. The structural reason is the open-first
     invariant above: `create_empty` is the sole entry point that keys a vault

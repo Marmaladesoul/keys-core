@@ -68,6 +68,7 @@ v1="$(KEYHOLE_PASSWORD="$W" "$KEYHOLE" ingest-peer "$A" "$B" 2>&1)"; v1rc=$?
 set -e
 echo "note: vector 1 (ingest-peer, wrong pw) rc=$v1rc :: $v1"
 [ "$v1rc" -ne 0 ] || { echo "FAIL: ingest-peer SUCCEEDED under the wrong password"; exit 1; }
+[[ "$v1" == *"VaultKeyRefused"* ]] || { echo "FAIL: ingest-peer's wrong-password refusal isn't VaultKeyRefused: $v1"; exit 1; }
 
 # --- VECTOR 2: reconcile (disk signature mismatch) under WRONG pw ----
 # Bump A's mtime to a fixed far-future stamp so the mirror's recorded
@@ -80,6 +81,7 @@ v2="$(KEYHOLE_PASSWORD="$W" "$KEYHOLE" inspect "$A" 2>&1)"; v2rc=$?
 set -e
 echo "note: vector 2 (reconcile, wrong pw) rc=$v2rc :: $v2"
 [ "$v2rc" -ne 0 ] || { echo "FAIL: reconcile-path open SUCCEEDED under the wrong password"; exit 1; }
+[[ "$v2" == *"VaultKeyRefused"* ]] || { echo "FAIL: the reconcile path's wrong-password refusal isn't VaultKeyRefused: $v2"; exit 1; }
 
 # --- the assertion: neither A nor B was re-keyed --------------------
 opens_with "$A" "$P" || { echo "FAIL: local vault no longer opens under the correct password"; exit 1; }

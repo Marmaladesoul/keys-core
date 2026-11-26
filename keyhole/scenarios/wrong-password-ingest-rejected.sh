@@ -1,23 +1,18 @@
 #!/usr/bin/env bash
 #
-# Scenario: "a fresh ingest rejects a wrong master password, and the
-# error carries a marker a consumer can recognise as wrong-password."
+# Scenario: "a fresh ingest rejects a wrong master password, as the typed
+# `VaultKeyRefused` error."
 #
 # Two things this pins:
-#   1. The slow path (no mirror → full `ingest_from_kdbx`) actually
+#   1. The slow path (no mirror → full ingest from the file) actually
 #      REJECTS a wrong password. This is the correctness a consumer's
 #      unlock fast-path falls through to: when it can't cheaply verify the
 #      typed password, it does a full ingest and relies on *this*
 #      rejection to catch a wrong password.
-#   2. The rejection message contains a stable marker substring a consumer
-#      can match to classify the failure as wrong-password rather than a
-#      generic open failure. The FFI collapses kdbx-open failures into
-#      `EngineError.Internal("open kdbx: …")` carrying keepass-core's
-#      message verbatim, so a keepass-core reword would silently break
-#      that classification. This is the canary for that drift.
-#
-# Keep these markers in sync with whatever substrings a consumer matches
-# to classify a wrong-password unlock failure.
+#   2. The rejection is `EngineError::VaultKeyRefused`, the variant a
+#      consumer branches on to say "wrong password", rather than an
+#      `Internal` error carrying keepass-core's wording. A consumer never
+#      matches error text, so a keepass-core reword can't break it.
 #
 # Self-contained: keyhole's own `create` / `inspect`, no keepassxc-cli.
 
@@ -50,16 +45,13 @@ if [ "$rc" -eq 0 ]; then
     exit 1
 fi
 
-# Teeth + canary: the message must carry a marker a consumer's classifier
-# recognises. If keepass-core rewords its wrong-key error, this fails
-# loudly here (a cheap Rust-side red) instead of silently degrading a
-# consumer's unlock UX to a generic error.
-if echo "$out" | grep -qiE "wrong password|header hmac mismatch|wrong key or corrupt|decryption failed"; then
-    echo "PASS: wrong-password ingest is rejected and carries a marker a consumer can classify on"
+# Teeth: keyhole prints the FFI error's variant, so the typed refusal must
+# be what came back (not, say, an Internal wrapping keepass-core's text).
+if echo "$out" | grep -q "VaultKeyRefused"; then
+    echo "PASS: wrong-password ingest is rejected as VaultKeyRefused"
 else
-    echo "FAIL: wrong-password ingest was rejected, but the message lacks ANY marker a consumer's"
-    echo "      wrong-password classifier would match — a consumer would show a generic error."
-    echo "      Update the markers here and in any consumer classifier to the new wording."
+    echo "FAIL: wrong-password ingest was rejected, but not as VaultKeyRefused — a"
+    echo "      consumer branching on the variant would show a generic error."
     exit 1
 fi
 
