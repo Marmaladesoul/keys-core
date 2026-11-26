@@ -97,6 +97,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "conflict_entry_whole",
         sql: include_str!("migrations/0013_conflict_entry_whole.sql"),
     },
+    Migration {
+        version: 14,
+        name: "peer_applied_head",
+        sql: include_str!("migrations/0014_peer_applied_head.sql"),
+    },
 ];
 
 /// Errors surfaced by the migration runner.
@@ -253,9 +258,10 @@ mod tests {
             "attachment_blob", // content-addressed pool; save-time GC must not re-dirty
             "conflict_entry",
             "conflict_entry_blob_ref",
-            "smart_folder",   // engine-local sidebar state
-            "schema_version", // migration bookkeeping
-            "setting",        // handled by the conditional meta.% triggers
+            "peer_applied_head", // the peer copy last merged per owner; describes this mirror
+            "smart_folder",      // engine-local sidebar state
+            "schema_version",    // migration bookkeeping
+            "setting",           // handled by the conditional meta.% triggers
         ];
 
         let mut conn = fresh_conn();
