@@ -149,7 +149,7 @@ fn key_override(env_var: &str) -> Result<Option<[u8; 32]>, String> {
         ));
     }
     let mut bytes = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         // Both nibbles are 0..=15, so `(hi << 4) | lo` fits a u8 with no
         // truncation — and working in u8 keeps the cast-lint quiet.
         bytes[i] = (hex_nibble(chunk[0], env_var)? << 4) | hex_nibble(chunk[1], env_var)?;
