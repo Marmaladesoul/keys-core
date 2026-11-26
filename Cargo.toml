@@ -5,7 +5,6 @@ members = [
     "crates/keys-ffi",
     "crates/keys-iroh-sync",
     "crates/uniffi-bindgen-swift",
-    "crates/uniffi-bindgen-swift-029",
     "keyhole",
 ]
 

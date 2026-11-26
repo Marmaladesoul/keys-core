@@ -1,0 +1,6 @@
+# This crate's uniffi exports ship inside keys-ffi's library, whose Swift
+# bindings declare one C module for both crates' headers. The header keeps
+# its own filename so it doesn't overwrite keys-ffi's.
+[bindings.swift]
+ffi_module_name = "keys_ffiFFI"
+ffi_module_filename = "keys_iroh_syncFFI"

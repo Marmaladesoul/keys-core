@@ -8,7 +8,7 @@ build scripts rely on. Sort the libraries (and each slice's architecture
 list) into a fixed order and re-serialise with sorted keys, so identical
 inputs always yield byte-identical output.
 
-Used by both `build-swift.sh` and `build-swift-iroh-sync.sh`.
+Used by `build-swift.sh`.
 """
 
 import plistlib

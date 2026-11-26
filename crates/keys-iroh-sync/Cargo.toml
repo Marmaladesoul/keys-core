@@ -9,10 +9,10 @@ license.workspace = true
 publish.workspace = true
 
 [lib]
-# staticlib + cdylib for the future xcframework / Windows DLL build paths
-# that Keys-iOS and keys-windows will drive; rlib so other workspace
-# crates (and integration tests) can consume the Rust API directly.
-crate-type = ["staticlib", "cdylib", "rlib"]
+# rlib only: its uniffi exports ship inside keys-ffi's library (one native
+# component per client), and other workspace crates and the integration
+# tests consume the Rust API directly.
+crate-type = ["rlib"]
 
 [lints]
 workspace = true
@@ -32,11 +32,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry"] }
 n0-future = "0.3"
 futures-util = "0.3"
-# uniffi 0.29 in this crate (rest of KeysCore is on 0.28). The Keys-iOS
-# spike validated 0.29's async + stream story end-to-end; bumping the
-# transport library alone keeps the surface modern without forcing a
-# coordinated bump of keys-ffi. Each crate generates its own scaffolding,
-# so the versions don't conflict at link time.
+# uniffi 0.29, matching keys-ffi: the two crates' scaffolding share one
+# library, so they must be on one uniffi version.
 uniffi = { version = "0.29", features = ["tokio"] }
 # Zeroize the heap allocation holding the caller's 32-byte ed25519
 # secret on drop, matching the bridge-layer scrub pattern already in

@@ -287,7 +287,7 @@ impl ConflictEntrySnapshotFfi {
 /// auto-applicable path.
 ///
 /// Flat `Vec<...>` rather than nested `HashMap<EntryId, ...>` because
-/// uniffi 0.28 handles `HashMap<String, T>` cleanly but nested
+/// uniffi handles `HashMap<String, T>` cleanly but nested
 /// non-string-keyed maps are dicey across the FFI; the marshal layer
 /// rebuilds the upstream `HashMap` shape internally.
 #[derive(uniffi::Record, Debug, Clone)]

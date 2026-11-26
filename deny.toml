@@ -34,17 +34,12 @@ yanked = "deny"
 # iroh / uniffi / bao-tree. Tracked here with rationale; revisit when
 # the upstream replaces them.
 ignore = [
-    # iroh's bao-tree (via genawaiter-proc-macro) and uniffi 0.28
-    # (via uniffi_bindgen) pull this in. Both are tracking newer
-    # replacements; nothing we can do at this layer.
+    # iroh's bao-tree (via genawaiter-proc-macro) pulls this in. It is
+    # tracking newer replacements; nothing we can do at this layer.
     "RUSTSEC-2024-0370", # proc-macro-error unmaintained
-    # paste — same story, pulled in by netdev (via iroh) and by
-    # uniffi 0.28. Drops out when iroh moves off netdev and when
-    # keys-ffi catches up to uniffi 0.29+.
+    # paste — same story, pulled in by netlink-packet-core <- netdev
+    # (via iroh). Drops out when iroh moves off netdev.
     "RUSTSEC-2024-0436",
-    # bincode unmaintained — iroh-docs uses it. Bincode 2.x exists
-    # but the iroh crates haven't migrated. No exploit, just lifecycle.
-    "RUSTSEC-2025-0141",
     # quick-xml < 0.41 DoS pair (quadratic duplicate-attribute check;
     # unbounded NsReader namespace allocation). The KDBX parsing path
     # (keepass-core) is on the patched 0.41; the only remaining
@@ -57,12 +52,11 @@ ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
     # basic-toml unmaintained, no safe upgrade. Build-time only: pulled
-    # in by askama_derive (a proc-macro) <- uniffi_bindgen 0.28 / 0.29,
+    # in by askama_derive (a proc-macro) <- uniffi_bindgen 0.29,
     # where it parses askama's template config during bindings
     # generation. Never linked into the runtime, never touches vault
-    # data or the network. Both uniffi lines in the tree pull it, so
-    # moving keys-ffi to 0.29 alone won't clear it: drop once every
-    # uniffi_bindgen here sits on an askama_derive without basic-toml.
+    # data or the network. Drop once uniffi_bindgen sits on an
+    # askama_derive without basic-toml.
     "RUSTSEC-2026-0374",
     # libsqlite3-sys: SQLite < 3.54 can return uninitialised page-cache
     # memory when a database is opened with a sibling -wal file of a

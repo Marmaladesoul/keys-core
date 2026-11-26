@@ -69,6 +69,10 @@ pub use vault_create::{create_vault, create_vault_deterministic};
 
 uniffi::setup_scaffolding!();
 
+// Links the transport's uniffi exports into this crate's library, so one
+// native component carries both `Engine` and `IrohNode`.
+pub use keys_iroh_sync;
+
 /// Smoke-test entry point exercised by the Swift harness from slice 1.
 ///
 /// Stable through the rest of Phase 2 so the harness has a trivial

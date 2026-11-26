@@ -31,8 +31,10 @@ device sync, fleet sync, and friendship sync.
   layer on top of "many concurrent docs per node".
 - **Identity storage.** Callers own the secret bytes and keep them
   in their platform keychain.
-- **Platform binary builds.** xcframework / Windows DLL builds live
-  in the consuming app's repo.
+- **Platform binary builds.** Its uniffi exports ship inside
+  `keys-ffi`'s library, so a client links one native component
+  (`KeysCoreFFI` on Apple platforms) holding the engine and the
+  transport.
 
 ## Stability promise
 
