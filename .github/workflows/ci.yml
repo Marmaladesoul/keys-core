@@ -143,3 +143,26 @@ jobs:
         with:
           command: check
           arguments: --all-features
+
+  vet:
+    name: cargo vet
+    runs-on: ubuntu-latest
+    # Every crates.io crate version in Cargo.lock must carry a recorded
+    # review: our own (supply-chain/audits.toml), one imported from a trusted
+    # organisation's published audits, keepass-core's included
+    # (supply-chain/imports.lock), or an exemption for a crate already here
+    # before vetting began (supply-chain/config.toml). A new crate or
+    # version with none of those fails, so no dependency change merges
+    # unreviewed. Review procedure: "Reviewing an update" in keepass-core's
+    # SUPPLY_CHAIN.md.
+    env:
+      CARGO_VET_VERSION: "0.10.3"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
+      - run: cargo install cargo-vet --version "$CARGO_VET_VERSION" --locked
+      # --locked: use the imports already recorded in imports.lock, so a
+      # change in someone else's published audits can't pass or fail a
+      # build without a commit here.
+      - run: cargo vet --locked
