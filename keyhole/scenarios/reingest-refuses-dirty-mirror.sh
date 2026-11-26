@@ -66,8 +66,9 @@ if out="$(KEYHOLE_PASSWORD="not-the-password" "$KEYHOLE" reingest "$VAULT" 2>&1)
 fi
 [[ "$out" != *"mirror owes"* ]] \
     || fail "wrong password produced the mirror-owes refusal — the refusal must imply a verified key: $out"
-[[ "$out" == *"decryption failed"* ]] \
-    || fail "wrong password should fail on the key (decrypt), got: $out"
+# reingest prints the error's Display; VaultKeyRefused's is fixed.
+[[ "$out" == *"doesn't open this vault file"* ]] \
+    || fail "wrong password should fail on the key (VaultKeyRefused), got: $out"
 [[ "$(state)" == *"dirty=true"* ]] || fail "wrong-password reingest changed the watermark"
 
 # 4. The owed write survives: flush persists it to the file.

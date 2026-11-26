@@ -935,7 +935,7 @@ pub(crate) fn adopt_peer_kdf(
     // projects the mirror over its contents.
     let mut template = template
         .unlock(composite_key)
-        .map_err(|e| EngineError::Serialise(format!("unlock vault kdbx: {e}")))?;
+        .map_err(|e| crate::error::unlock_failure("unlock vault kdbx", &e))?;
     engine.ensure_same_replica(
         crate::identity::file_identity(&template),
         &template.vault().meta.custom_data,
@@ -1004,7 +1004,7 @@ fn unlock_kdbx(
 ) -> Result<Kdbx<Unlocked>, EngineError> {
     header_read
         .unlock_with_protector(composite_key, Some(engine.field_protector_arc()))
-        .map_err(|e| EngineError::Serialise(format!("unlock disk kdbx: {e}")))
+        .map_err(|e| crate::error::unlock_failure("unlock disk kdbx", &e))
 }
 
 /// What [`ingest_kdbx_as_owner`] did with one copy.

@@ -1548,12 +1548,11 @@ async fn open_vault_self_healing_wrong_password_fails_closed() {
     )
     .await
     .expect_err("stale key + wrong password must fail closed, not open");
-    // The surfaced error is the KDBX unlock failure (the re-ingest), never
-    // a silent success.
-    let msg = format!("{err:?}");
+    // The surfaced error is the KDBX unlock's refusal (the re-ingest),
+    // never a silent success.
     assert!(
-        msg.to_lowercase().contains("kdbx"),
-        "wrong-password failure must surface the KDBX unlock error, got: {msg}",
+        matches!(err, EngineError::VaultKeyRefused),
+        "wrong-password failure must surface the KDBX key refusal, got: {err:?}",
     );
 }
 

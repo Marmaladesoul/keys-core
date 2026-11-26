@@ -84,7 +84,7 @@ pub enum EngineError {
     ///
     /// Contract: the ingest verbs return this only AFTER the file has
     /// decrypted under the supplied key factors — a wrong password or
-    /// keyfile fails first, as itself. So a caller that receives it also
+    /// keyfile fails first, as [`Self::VaultKeyRefused`]. So a caller that receives it also
     /// knows the key factors are correct. Bring the mirror current with a
     /// reconcile, or persist it with a save, instead of re-ingesting.
     #[error("mirror owes the vault file a write; refusing to re-ingest over it")]
@@ -113,7 +113,7 @@ pub enum EngineError {
     ///
     /// Contract: returned only AFTER the file has decrypted under the
     /// supplied key factors — a wrong password or keyfile fails first, as
-    /// itself. The actionable reading is "the file at this path is not
+    /// [`Self::VaultKeyRefused`]. The actionable reading is "the file at this path is not
     /// this vault any more": surface it and let the user re-point the
     /// vault (e.g. a Locate flow gated on `verify_vault_identity`); don't
     /// retry. Saves to that path keep refusing until it is re-pointed, so
@@ -212,6 +212,18 @@ pub enum EngineError {
     /// retry" — collapses to this variant.
     #[error("internal engine error: {0}")]
     Internal(String),
+
+    /// The vault file, or a peer's copy of it, didn't open under the
+    /// password and keyfile given: they're wrong, or the part of the file
+    /// that proves the key is damaged (one failure, by design, so the error
+    /// says nothing about the key). Distinct from [`Self::WrongKey`], the
+    /// SQLite key. Last in the enum so no earlier variant's wire index moves.
+    ///
+    /// Contract: for the vault file, ask for the password again; if the
+    /// right password keeps being refused, the file itself may be damaged.
+    /// For a peer's copy, nothing a retry of the same bytes can fix.
+    #[error("the password or keyfile doesn't open this vault file, or the file is corrupt")]
+    VaultKeyRefused,
 }
 
 impl From<keys_engine::EngineError> for EngineError {
@@ -219,6 +231,7 @@ impl From<keys_engine::EngineError> for EngineError {
         use keys_engine::EngineError as E;
         match err {
             E::WrongKey => Self::WrongKey,
+            E::VaultKeyRefused => Self::VaultKeyRefused,
             E::NotFound { entity } => Self::NotFound {
                 entity: entity.to_owned(),
             },

@@ -252,8 +252,8 @@ pub(crate) fn summary(cost: &KdfCost) -> Result<KdfSummary, EngineError> {
 /// # Errors
 ///
 /// [`EngineError::KdfApprovalRequired`] from the header alone when the gate
-/// refuses; [`EngineError::Internal`] for an unreadable / undecryptable
-/// file, as before the gate.
+/// refuses; [`EngineError::VaultKeyRefused`] when the password or keyfile
+/// doesn't open it; [`EngineError::Internal`] for an unreadable file.
 pub(crate) fn open_vault_file(
     path: &Path,
     password: &SecretString,
@@ -269,9 +269,13 @@ pub(crate) fn open_vault_file(
         .and_then(Kdbx::read_header)
         .map_err(|e| EngineError::Internal(format!("open kdbx: {e}")))?;
     kdf_cost::check_vault_header(&read, recorded, policy(approved))?;
-    let unlocked = read
-        .unlock(&composite)
-        .map_err(|e| EngineError::Internal(format!("open kdbx: {e}")))?;
+    let unlocked = read.unlock(&composite).map_err(|e| {
+        if keys_engine::error::is_key_refusal(&e) {
+            EngineError::VaultKeyRefused
+        } else {
+            EngineError::Internal(format!("open kdbx: {e}"))
+        }
+    })?;
     Ok((unlocked, signature))
 }
 
