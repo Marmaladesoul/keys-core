@@ -2546,7 +2546,7 @@ dependencies = [
 [[package]]
 name = "keepass-core"
 version = "0.0.0"
-source = "git+https://github.com/Marmaladesoul/keepass-core#76e62d064bb2001741ec0909e35e1d533c148e62"
+source = "git+https://github.com/Marmaladesoul/keepass-core#1eb78e9b5e6a4a33fdb2696aa7aa16f73f884aa7"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm 0.11.0",
@@ -2572,7 +2572,7 @@ dependencies = [
 [[package]]
 name = "keepass-merge"
 version = "0.0.0"
-source = "git+https://github.com/Marmaladesoul/keepass-core#76e62d064bb2001741ec0909e35e1d533c148e62"
+source = "git+https://github.com/Marmaladesoul/keepass-core#1eb78e9b5e6a4a33fdb2696aa7aa16f73f884aa7"
 dependencies = [
  "chrono",
  "keepass-core",
