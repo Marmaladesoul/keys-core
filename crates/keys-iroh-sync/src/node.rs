@@ -165,7 +165,7 @@ const REDIAL_BACKOFF: [Duration; 3] = [
 
 /// The re-dial interval once [`REDIAL_BACKOFF`] is spent, for as long as
 /// the doc still owes a peer a round.
-const REDIAL_STEADY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const REDIAL_STEADY_INTERVAL: Duration = Duration::from_mins(5);
 
 /// The delay before re-dial number `attempt` (counting from 0) of one
 /// owed stretch.

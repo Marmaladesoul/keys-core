@@ -232,7 +232,7 @@ fn stored_predicate_round_trips_through_db() {
         },
         Predicate::Expired,
         Predicate::ExpiringWithin {
-            duration: Duration::from_secs(86_400 * 30),
+            duration: Duration::from_hours(30 * 24),
         },
         Predicate::StrengthBelow {
             bucket: StrengthBucket::Reasonable,
