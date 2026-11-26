@@ -265,11 +265,12 @@ impl FileWatcherObserver for EngineFileWatcherObserver {
                 // we always proceed (no self-write can have happened on
                 // a cloud-managed file from our process anyway).
                 let mut guard = self.shared.lock().unwrap();
-                if let (Some(mt), Some(sz), Some(sig)) = (mtime, size, guard.last_self_write) {
-                    if mt == sig.mtime && sz == sig.size {
-                        guard.last_self_write = None;
-                        return;
-                    }
+                if let (Some(mt), Some(sz), Some(sig)) = (mtime, size, guard.last_self_write)
+                    && mt == sig.mtime
+                    && sz == sig.size
+                {
+                    guard.last_self_write = None;
+                    return;
                 }
                 guard.pending_reconcile_calls += 1;
                 // Fire the frontend-registered reconcile trigger, if

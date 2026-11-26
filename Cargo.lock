@@ -48,6 +48,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpubits",
  "cpufeatures 0.3.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -76,6 +77,7 @@ dependencies = [
  "ctr 0.10.1",
  "ghash 0.6.0",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -189,6 +191,7 @@ dependencies = [
  "blake2",
  "cpufeatures 0.2.17",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -487,6 +490,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -601,6 +605,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -636,6 +641,7 @@ dependencies = [
  "block-buffer 0.12.1",
  "crypto-common 0.2.2",
  "inout 0.2.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1089,6 +1095,7 @@ dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -1813,6 +1820,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9155a582abd142abc056962c29e3ce5ff2ad5469f4246b537ed42c5deba857da"
 dependencies = [
  "typenum",
+ "zeroize",
 ]
 
 [[package]]
@@ -2547,7 +2555,7 @@ dependencies = [
 [[package]]
 name = "keepass-core"
 version = "0.0.0"
-source = "git+https://github.com/Marmaladesoul/keepass-core#ffefe0e7e3499531f9eb5b09eef99a465a7b16d2"
+source = "git+https://github.com/Marmaladesoul/keepass-core#d83aafafc4c73422539ed9a81b072397057d8298"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm 0.11.0",
@@ -2573,7 +2581,7 @@ dependencies = [
 [[package]]
 name = "keepass-merge"
 version = "0.0.0"
-source = "git+https://github.com/Marmaladesoul/keepass-core#ffefe0e7e3499531f9eb5b09eef99a465a7b16d2"
+source = "git+https://github.com/Marmaladesoul/keepass-core#d83aafafc4c73422539ed9a81b072397057d8298"
 dependencies = [
  "chrono",
  "keepass-core",

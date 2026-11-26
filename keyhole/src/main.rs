@@ -1988,12 +1988,10 @@ impl Session {
                 .engine
                 .recycle_bin_uuid()
                 .map_err(|e| anyhow::anyhow!("recycle_bin_uuid: {e:?}"))?;
-            if delete_contents {
-                if let Some(bin) = &old {
-                    self.engine
-                        .delete_group(bin.clone())
-                        .map_err(|e| anyhow::anyhow!("delete_group(bin): {e:?}"))?;
-                }
+            if delete_contents && let Some(bin) = &old {
+                self.engine
+                    .delete_group(bin.clone())
+                    .map_err(|e| anyhow::anyhow!("delete_group(bin): {e:?}"))?;
             }
             self.engine
                 .set_recycle_bin(false, None)
