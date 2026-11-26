@@ -16,7 +16,7 @@ uniffi = "0.29"
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 authors = ["Marmaladesoul"]
 license = "GPL-3.0-only"
 # Not published to crates.io — consumed by the Keys client apps (and via

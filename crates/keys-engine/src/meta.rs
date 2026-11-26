@@ -702,13 +702,13 @@ pub(crate) fn read_meta_into(conn: &Connection, meta: &mut Meta) -> Result<(), E
         meta.maintenance_history_days = v;
     }
 
-    if let Some(v) = get_blob(conn, KEY_MEMORY_PROTECTION)? {
-        if v.len() == 1 {
-            meta.memory_protection = unpack_memory_protection(v[0]);
-        }
-        // Other shapes left as default — corrupt row, not worth poisoning
-        // the projection over.
+    if let Some(v) = get_blob(conn, KEY_MEMORY_PROTECTION)?
+        && v.len() == 1
+    {
+        meta.memory_protection = unpack_memory_protection(v[0]);
     }
+    // Other shapes left as default — corrupt row, not worth poisoning
+    // the projection over.
 
     if let Some(json) = get_text(conn, KEY_UNKNOWN_XML)? {
         meta.unknown_xml = deserialise_unknown_xml(&json).map_err(|e| {
