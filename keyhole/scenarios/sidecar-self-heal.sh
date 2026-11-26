@@ -104,10 +104,10 @@ if [ "$wp_rc" -eq 0 ]; then
     printf '%s\n' "$wp_out" | sed 's/^/    /'
     exit 1
 fi
-# The surfaced error must be the KDBX unlock failure (the re-ingest), not
-# a swallowed success.
-printf '%s\n' "$wp_out" | grep -qi 'kdbx' \
-    || { echo "FAIL: wrong-password failure did not surface a KDBX unlock error"; printf '%s\n' "$wp_out" | sed 's/^/    /'; exit 1; }
+# The surfaced error must be the KDBX unlock's refusal (the re-ingest),
+# not a swallowed success.
+printf '%s\n' "$wp_out" | grep -q 'VaultKeyRefused' \
+    || { echo "FAIL: wrong-password failure did not surface the KDBX key refusal"; printf '%s\n' "$wp_out" | sed 's/^/    /'; exit 1; }
 # The canonical KDBX is untouched: it still opens under the CORRECT
 # password (a fresh re-ingest), proving the failed heal harmed nothing.
 recover="$(KEYHOLE_DB_KEY="$ALT_DB_KEY" "$KEYHOLE" list "$VAULT_WP" 2>&1)" \

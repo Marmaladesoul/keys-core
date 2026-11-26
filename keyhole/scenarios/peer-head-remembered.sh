@@ -53,7 +53,7 @@ derives() {
     if out="$(wrong "$@")"; then
         fail "$label" "a copy that must be merged was skipped: $out"
     fi
-    case "$out" in *"wrong key or corrupt data"*) : ;; *) fail "$label" "failed, but not at the key derivation: $out";; esac
+    case "$out" in *"VaultKeyRefused"*) : ;; *) fail "$label" "failed, but not at the key derivation: $out";; esac
     echo "  ok($label): derived (the wrong password failed)"
 }
 
