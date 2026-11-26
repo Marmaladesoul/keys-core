@@ -291,9 +291,17 @@ pub struct IrohNode {
 struct JoinedDoc {
     doc: Doc,
     redial: AbortOnDropHandle<()>,
-    /// Peers to stop re-dialling, handed to the re-dial task (see
-    /// [`IrohNode::forget_peer`]).
-    forget: mpsc::UnboundedSender<PublicKey>,
+    /// What the caller tells the re-dial task (see [`RedialCommand`]).
+    commands: mpsc::UnboundedSender<RedialCommand>,
+}
+
+/// What a doc's re-dial task ([`watch_redial`]) is told by its node.
+#[derive(Debug, PartialEq, Eq)]
+enum RedialCommand {
+    /// Stop re-dialling this peer ([`IrohNode::forget_peer`]).
+    Forget(PublicKey),
+    /// The network may have changed ([`IrohNode::network_change`]).
+    NetworkChanged,
 }
 
 impl JoinedDoc {
@@ -306,7 +314,7 @@ impl JoinedDoc {
             .await
             .context("subscribe for re-dial watch")
             .map_err(SyncError::from)?;
-        let (forget, forgotten) = mpsc::unbounded_channel();
+        let (commands, received) = mpsc::unbounded_channel();
         let redialled = doc.clone();
         let start_sync = move |owed| {
             let doc = redialled.clone();
@@ -316,12 +324,12 @@ impl JoinedDoc {
             doc.id(),
             start_sync,
             events,
-            forgotten,
+            received,
         )));
         Ok(Self {
             doc,
             redial,
-            forget,
+            commands,
         })
     }
 }
@@ -369,16 +377,32 @@ impl JoinedDoc {
 /// that only closes again, for no delivery — a write already re-dials
 /// on its own (see [`IrohNode::set_entry`]).
 ///
+/// A network change ([`RedialCommand::NetworkChanged`]) dials at once,
+/// owed peers or not, and starts the schedule over from that dial: the
+/// paths the later steps were waiting out are gone, and a dial that beat
+/// the endpoint's own recovery is retried after the first short step.
+///
 /// Ends when the doc's event stream does (the node shut down), or when
 /// aborted; the in-flight re-dial is aborted with it.
 async fn watch_redial<F>(
     doc_id: NamespaceId,
     start_sync: impl Fn(Vec<EndpointAddr>) -> F,
     mut events: impl Stream<Item = anyhow::Result<LiveEvent>> + Unpin,
-    mut forgotten: mpsc::UnboundedReceiver<PublicKey>,
+    mut commands: mpsc::UnboundedReceiver<RedialCommand>,
 ) where
     F: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
+    // Not awaited: the live actor awaits room in this task's event queue,
+    // so waiting on its reply while not draining that queue could deadlock
+    // both.
+    let dial = |owed: &HashSet<PublicKey>| {
+        let dial = start_sync(owed.iter().copied().map(EndpointAddr::new).collect());
+        AbortOnDropHandle::new(tokio::spawn(async move {
+            if let Err(e) = dial.await {
+                tracing::warn!(error = ?e, "re-dial of a doc's peers failed to start");
+            }
+        }))
+    };
     let mut peers = RedialSet::default();
     let mut attempt = 0;
     let mut next_redial: Option<tokio::time::Instant> = None;
@@ -406,7 +430,15 @@ async fn watch_redial<F>(
                 Some(Ok(_) | Err(_)) => {}
                 None => return,
             },
-            Some(peer) = forgotten.recv() => peers.forget(peer),
+            Some(command) = commands.recv() => match command {
+                RedialCommand::Forget(peer) => peers.forget(peer),
+                RedialCommand::NetworkChanged => {
+                    tracing::info!(doc = %doc_id, owed = peers.owed.len(), "re-dialling peers after a network change");
+                    _in_flight = Some(dial(&peers.owed));
+                    attempt = 0;
+                    next_redial = Some(tokio::time::Instant::now() + redial_delay(attempt));
+                }
+            },
             () = redial_due => {
                 tracing::info!(
                     doc = %doc_id,
@@ -414,16 +446,7 @@ async fn watch_redial<F>(
                     attempt,
                     "re-dialling peers owed a sync round"
                 );
-                // Not awaited here: the live actor awaits room in this
-                // task's event queue, so waiting on its reply while not
-                // draining that queue could deadlock both.
-                let owed = peers.owed.iter().copied().map(EndpointAddr::new).collect();
-                let dial = start_sync(owed);
-                _in_flight = Some(AbortOnDropHandle::new(tokio::spawn(async move {
-                    if let Err(e) = dial.await {
-                        tracing::warn!(error = ?e, "re-dial of peers owed a round failed to start");
-                    }
-                })));
+                _in_flight = Some(dial(&peers.owed));
                 attempt += 1;
                 next_redial = Some(tokio::time::Instant::now() + redial_delay(attempt));
             },
@@ -1058,10 +1081,12 @@ impl IrohNode {
             .parse()
             .context("parse node id")
             .map_err(SyncError::from)?;
-        self.with_joined(&doc_id, |joined| joined.forget.send(peer))
-            .await?
-            .context("re-dial watch for the doc has ended")
-            .map_err(SyncError::from)
+        self.with_joined(&doc_id, |joined| {
+            joined.commands.send(RedialCommand::Forget(peer))
+        })
+        .await?
+        .context("re-dial watch for the doc has ended")
+        .map_err(SyncError::from)
     }
 
     /// Stop syncing a doc but keep it: leave live sync and the doc's
@@ -1204,6 +1229,32 @@ impl IrohNode {
             tracing::warn!(error = ?e, "re-dial of known peers after a write failed");
         }
         Ok(hash.to_string())
+    }
+
+    /// Tell the node the network may have changed: an interface came up or
+    /// went away, the machine woke, a VPN cycled. Returns without waiting
+    /// for any dial, and does nothing once the node is shutting down.
+    ///
+    /// The endpoint re-checks its addresses and paths (iroh's own
+    /// handling, which may have noticed already). Every joined doc then
+    /// dials its persisted peers and any it owes a round, as a write does,
+    /// so a mesh whose connections closed while the network was down comes
+    /// back and whatever either side wrote meanwhile is exchanged; and its
+    /// re-dial schedule starts over, so a peer still unreachable is tried
+    /// again within seconds rather than after a long step.
+    ///
+    /// Each call dials every persisted peer of every joined doc, forgotten
+    /// ones included, so a caller fed by a chatty path monitor should
+    /// debounce. The node, its joined docs, owed re-dials and forgotten
+    /// peers all carry on, which a caller loses by shutting the node down
+    /// and binding it again instead.
+    pub async fn network_change(&self) {
+        self.endpoint.network_change().await;
+        for joined in self.joined.lock().await.values() {
+            // Shutdown ends each doc's watch first; a doc whose watch has
+            // ended has nothing left to dial.
+            let _ = joined.commands.send(RedialCommand::NetworkChanged);
+        }
     }
 
     /// Gracefully shut the node down: stop accepting new connections,
@@ -1717,7 +1768,7 @@ mod tests {
     /// but the watch itself can produce one.
     struct TestWatch {
         events: mpsc::UnboundedSender<anyhow::Result<LiveEvent>>,
-        forget: mpsc::UnboundedSender<PublicKey>,
+        commands: mpsc::UnboundedSender<RedialCommand>,
         dials: mpsc::UnboundedReceiver<(Duration, HashSet<PublicKey>)>,
         _watch: AbortOnDropHandle<()>,
     }
@@ -1725,7 +1776,7 @@ mod tests {
     impl TestWatch {
         fn start() -> Self {
             let (events, rounds) = mpsc::unbounded_channel();
-            let (forget, forgotten) = mpsc::unbounded_channel();
+            let (commands, received) = mpsc::unbounded_channel();
             let (dialled, dials) = mpsc::unbounded_channel();
             let started = tokio::time::Instant::now();
             let start_sync = move |owed: Vec<EndpointAddr>| {
@@ -1742,11 +1793,11 @@ mod tests {
                 TEST_NAMESPACE.into(),
                 start_sync,
                 rounds,
-                forgotten,
+                received,
             ));
             Self {
                 events,
-                forget,
+                commands,
                 dials,
                 _watch: AbortOnDropHandle::new(watch),
             }
@@ -1760,19 +1811,34 @@ mod tests {
 
         /// Forget `peer` and let the watch act on it.
         async fn forget(&self, peer: PublicKey) {
-            self.forget.send(peer).expect("watch is running");
+            self.command(RedialCommand::Forget(peer)).await;
+        }
+
+        /// Tell the watch the network changed and let it act on it.
+        async fn network_changed(&self) {
+            self.command(RedialCommand::NetworkChanged).await;
+        }
+
+        async fn command(&self, command: RedialCommand) {
+            self.commands.send(command).expect("watch is running");
             settle().await;
+        }
+
+        /// Every dial made so far: how long after the watch started, and
+        /// to whom.
+        fn dials_so_far(&mut self) -> Vec<(Duration, HashSet<PublicKey>)> {
+            let mut dials = Vec::new();
+            while let Ok(dial) = self.dials.try_recv() {
+                dials.push(dial);
+            }
+            dials
         }
 
         /// Run the clock over the whole re-dial schedule and return every
         /// dial made: how long after the watch started, and to whom.
         async fn dials_over_the_schedule(&mut self) -> Vec<(Duration, HashSet<PublicKey>)> {
             tokio::time::sleep(whole_redial_schedule()).await;
-            let mut dials = Vec::new();
-            while let Ok(dial) = self.dials.try_recv() {
-                dials.push(dial);
-            }
-            dials
+            self.dials_so_far()
         }
     }
 
@@ -1835,6 +1901,86 @@ mod tests {
         assert!(dials.iter().all(|(_, to)| *to == HashSet::from([away])));
     }
 
+    /// A network change dials straight away, with no peer owed: the doc's
+    /// persisted peers are what `start_sync` re-joins.
+    #[tokio::test(start_paused = true)]
+    async fn a_network_change_dials_at_once_with_nothing_owed() {
+        let mut watch = TestWatch::start();
+        watch.network_changed().await;
+        assert_eq!(watch.dials_so_far(), [(Duration::ZERO, HashSet::new())]);
+        assert_eq!(
+            watch.dials_over_the_schedule().await,
+            [],
+            "and no re-dials follow"
+        );
+    }
+
+    /// A network change re-dials an owed peer at once and starts the
+    /// schedule over, so a peer deep in the steady interval is tried again
+    /// after the first short step, not minutes later.
+    #[tokio::test(start_paused = true)]
+    async fn a_network_change_starts_the_schedule_over() {
+        let mut watch = TestWatch::start();
+        let away = peer();
+        watch.report(failed_dial(away)).await;
+        tokio::time::sleep(whole_redial_schedule()).await;
+        watch.dials_so_far();
+        let changed_at = whole_redial_schedule() + Duration::from_millis(1);
+
+        watch.network_changed().await;
+        watch.report(failed_dial(away)).await;
+        tokio::time::sleep(REDIAL_BACKOFF[0]).await;
+
+        let since: Vec<_> = watch
+            .dials_so_far()
+            .into_iter()
+            .map(|(at, to)| {
+                (
+                    at.checked_sub(changed_at)
+                        .expect("dialled after the change"),
+                    to,
+                )
+            })
+            .collect();
+        let owed = HashSet::from([away]);
+        assert_eq!(
+            since,
+            [
+                (Duration::ZERO, owed.clone()),
+                (REDIAL_BACKOFF[0] + Duration::from_millis(1), owed)
+            ]
+        );
+    }
+
+    /// The node hands a network change to every joined doc's watch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn network_change_reaches_every_docs_redial_watch() {
+        let (node, _blobs, _docs) = bind_test_node().await;
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let doc_id = node.create_doc().await.expect("create doc");
+            let namespace: NamespaceId = doc_id.parse().expect("doc id");
+            let (commands, rx) = mpsc::unbounded_channel();
+            node.joined
+                .lock()
+                .await
+                .get_mut(&namespace)
+                .expect("joined")
+                .commands = commands;
+            received.push(rx);
+        }
+
+        node.network_change().await;
+        for rx in &mut received {
+            assert_eq!(
+                rx.try_recv().expect("handed over"),
+                RedialCommand::NetworkChanged
+            );
+        }
+        node.shutdown().await.expect("shutdown");
+        node.network_change().await;
+    }
+
     /// The node hands a forgotten peer to the watch of the doc it names.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn forget_peer_reaches_the_docs_redial_watch() {
@@ -1842,13 +1988,13 @@ mod tests {
         let doc_id = node.create_doc().await.expect("create doc");
         let other_doc = node.create_doc().await.expect("create doc");
         let namespace: NamespaceId = doc_id.parse().expect("doc id");
-        let (forget, mut forgotten) = mpsc::unbounded_channel();
+        let (commands, mut forgotten) = mpsc::unbounded_channel();
         node.joined
             .lock()
             .await
             .get_mut(&namespace)
             .expect("joined")
-            .forget = forget;
+            .commands = commands;
 
         let (gone, elsewhere) = (peer(), peer());
         node.forget_peer(other_doc, elsewhere.to_string())
@@ -1857,7 +2003,10 @@ mod tests {
         node.forget_peer(doc_id, gone.to_string())
             .await
             .expect("forget");
-        assert_eq!(forgotten.try_recv().expect("handed over"), gone);
+        assert_eq!(
+            forgotten.try_recv().expect("handed over"),
+            RedialCommand::Forget(gone)
+        );
         assert!(forgotten.try_recv().is_err(), "and nothing else");
         node.shutdown().await.expect("shutdown");
     }
