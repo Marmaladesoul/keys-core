@@ -373,6 +373,13 @@ enum Command {
         /// Owner id the peer's rows land under (its device id in real sync).
         #[arg(long, default_value = "keyhole-peer")]
         owner: String,
+        /// Name of an environment variable holding the password to open the
+        /// peer copy with, instead of this vault's. Replicas share the
+        /// vault's password, so a different one fails at the key derivation:
+        /// a scenario uses that to tell an ingest that derived from one that
+        /// didn't.
+        #[arg(long)]
+        peer_password_env: Option<String>,
     },
     /// Adopt a peer replica whose KDF settings changed — the deliberate
     /// path past `ingest-peer`'s KDF refusal. Requires `--approve-kdf` with
@@ -1131,10 +1138,21 @@ async fn main() -> Result<()> {
             vault,
             peer_kdbx,
             owner,
+            peer_password_env,
         } => {
+            let peer_password = peer_password_env
+                .as_deref()
+                .map(read_password)
+                .transpose()?;
             let session =
                 Session::open(&vault, &password, clock_ms, uuid_seed, keyfile.clone()).await?;
-            session.ingest_peer(owner, &peer_kdbx).await?;
+            session
+                .ingest_peer(
+                    owner,
+                    &peer_kdbx,
+                    peer_password.unwrap_or_else(|| password.clone()),
+                )
+                .await?;
             session.finish().await?;
         }
         Command::AdoptPeerKdf {
@@ -2084,16 +2102,18 @@ impl Session {
         Ok(())
     }
 
-    /// Merge a peer's KDBX into the mirror under `owner`, park any
-    /// divergences as held conflicts, persist the merged result.
-    async fn ingest_peer(&self, owner: String, peer: &Path) -> Result<()> {
+    /// Merge the peer copy at `peer` into the mirror under `owner`, opening
+    /// it with `peer_password` (the vault's own, unless a scenario says
+    /// otherwise); divergences park as held conflicts, and the session's
+    /// teardown persists the merged result.
+    async fn ingest_peer(&self, owner: String, peer: &Path, peer_password: String) -> Result<()> {
         anyhow::ensure!(peer.exists(), "peer vault not found: {}", peer.display());
         let result = self
             .engine
             .ingest_peer_kdbx(
                 owner.clone(),
                 peer.to_string_lossy().into_owned(),
-                self.password.clone(),
+                peer_password,
                 self.keyfile.clone(),
             )
             .await

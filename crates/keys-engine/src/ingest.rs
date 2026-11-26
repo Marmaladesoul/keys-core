@@ -265,6 +265,12 @@ fn replace_vault(
 
     clear_vault_tables(&tx)?;
     meta::clear_meta_tables(&tx)?;
+    if matches!(source, Source::VaultFile { .. }) {
+        // The vault now holds its file's content alone, so the peer copies
+        // the mirror had merged must be merged again: forget which they were.
+        // A replace from the mirror's own projection keeps them.
+        tx.execute("DELETE FROM peer_applied_head", [])?;
+    }
 
     // Persist the full `Meta` block and `Vault::deleted_objects`. After
     // this, SQLite is a complete representation of the vault — the save

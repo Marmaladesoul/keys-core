@@ -1119,6 +1119,13 @@ impl Engine {
     /// path). Distinct owners → distinct conflict rows → multi-peer `N`-way
     /// resolution. Same park-conflicts owner-rows engine underneath.
     ///
+    /// The exact bytes last merged from `owner` are answered
+    /// [`ParkConflictsResult::NoChange`] before anything below runs, with no
+    /// key derivation: the mirror records them (per owner, by SHA-256) once
+    /// a merge takes all they hold, parking no conflict, and loses the
+    /// record when rebuilt or re-ingested from its vault file, which must
+    /// merge each peer again.
+    ///
     /// # Errors
     ///
     /// [`EngineError::KdfParametersMismatch`] if the blob's outer header

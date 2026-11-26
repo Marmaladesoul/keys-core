@@ -33,6 +33,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use keepass_core::CompositeKey;
 use keepass_core::format::{KdfParams, Version};
 use keepass_core::kdbx::{HeaderRead, Kdbx, Unlocked};
+use rusqlite::{OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 use crate::conflict_rows;
 use crate::engine::Engine;
@@ -744,7 +746,7 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
     let disk = parse_kdbx_header(bytes)?;
     kdf_cost::check_vault_header(&disk, recorded_kdf_cost(engine)?.as_ref(), kdf)?;
     let disk = unlock_kdbx(engine, disk, composite_key)?;
-    let result = ingest_kdbx_as_owner(engine, &disk, FILE_OWNER)?;
+    let result = ingest_kdbx_as_owner(engine, &disk, FILE_OWNER)?.result;
     // This mirror now saves under this file's envelope, so its recorded
     // cipher / KDF cost follow the file — recorded only once the file has
     // decrypted and passed the replica gate inside the ingest.
@@ -758,16 +760,74 @@ pub(crate) fn reconcile_with_disk_park_conflicts(
 /// owner-rows engine; the owner string is the only difference — plus the
 /// KDF-cost gate, which runs on the blob's unauthenticated outer header before
 /// any key derivation ([`ensure_same_kdf_cost`]).
+///
+/// The bytes last merged from `owner` are answered [`ParkConflictsResult::NoChange`]
+/// before any gate or derivation ([`PeerHead`]): this mirror already holds
+/// everything they carry.
 pub(crate) fn ingest_peer_from_kdbx(
     engine: &mut Engine,
     kdbx_path: &Path,
     composite_key: &CompositeKey,
     owner: &str,
 ) -> Result<ParkConflictsResult, EngineError> {
-    let peer = read_kdbx_header(kdbx_path)?;
+    let bytes = std::fs::read(kdbx_path)?;
+    let head = PeerHead::of(owner, &bytes);
+    if head.already_applied(engine)? {
+        return Ok(ParkConflictsResult::NoChange);
+    }
+    let peer = parse_kdbx_header(bytes)?;
     ensure_same_kdf_cost(engine, &peer)?;
     let peer = unlock_kdbx(engine, peer, composite_key)?;
-    ingest_kdbx_as_owner(engine, &peer, owner)
+    let ingested = ingest_kdbx_as_owner(engine, &peer, owner)?;
+    if ingested.fully_merged {
+        head.record(engine)?;
+    }
+    Ok(ingested.result)
+}
+
+/// A peer's copy as this mirror remembers merging it: the owner it came
+/// from and the SHA-256 of its exact bytes (`peer_applied_head`, one row
+/// per owner, migration 0014). Recorded once a merge of those bytes
+/// takes all they hold ([`OwnerIngest::fully_merged`]), so merging them
+/// again would change nothing; a refused or failed ingest, or one that
+/// parked a conflict, records nothing. The row lives in the mirror it
+/// describes: a mirror rebuilt from its vault file has none and merges
+/// each peer's copy again.
+struct PeerHead<'a> {
+    owner: &'a str,
+    content_sha256: [u8; 32],
+}
+
+impl<'a> PeerHead<'a> {
+    fn of(owner: &'a str, bytes: &[u8]) -> Self {
+        Self {
+            owner,
+            content_sha256: Sha256::digest(bytes).into(),
+        }
+    }
+
+    /// Whether these are the bytes last merged from this owner.
+    fn already_applied(&self, engine: &Engine) -> Result<bool, EngineError> {
+        let recorded: Option<Vec<u8>> = engine
+            .conn()
+            .query_row(
+                "SELECT content_sha256 FROM peer_applied_head WHERE owner = ?1",
+                params![self.owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(recorded.as_deref() == Some(self.content_sha256.as_slice()))
+    }
+
+    /// Remember these as the bytes last merged from this owner.
+    fn record(&self, engine: &Engine) -> Result<(), EngineError> {
+        engine.conn().execute(
+            "INSERT INTO peer_applied_head (owner, content_sha256) VALUES (?1, ?2) \
+             ON CONFLICT(owner) DO UPDATE SET content_sha256 = excluded.content_sha256",
+            params![self.owner, self.content_sha256.as_slice()],
+        )?;
+        Ok(())
+    }
 }
 
 /// The KDF-cost gate: refuse a peer replica whose outer header demands a
@@ -829,7 +889,9 @@ pub(crate) fn adopt_peer_kdf(
     vault_path: &Path,
     temp_dir: Option<&Path>,
 ) -> Result<ParkConflictsResult, EngineError> {
-    let peer = read_kdbx_header(peer_path)?;
+    let peer_bytes = std::fs::read(peer_path)?;
+    let head = PeerHead::of(owner, &peer_bytes);
+    let peer = parse_kdbx_header(peer_bytes)?;
     let peer_cost = KdfCost::of_header(&peer)?;
     if peer_cost != *approved {
         // The approval was for other settings — the peer has moved on since
@@ -888,7 +950,7 @@ pub(crate) fn adopt_peer_kdf(
             ))
         })?;
     ensure_vault_file_current(engine, vault_path)?;
-    let result = ingest_kdbx_as_owner(engine, &peer, owner)?;
+    let ingested = ingest_kdbx_as_owner(engine, &peer, owner)?;
     crate::save::save(engine, vault_path, &mut template, temp_dir)?;
     // The adopted settings become the recorded ones. The fact rows are
     // mirror state, so the file just written still corresponds: settle the
@@ -897,8 +959,12 @@ pub(crate) fn adopt_peer_kdf(
     let settled = engine.persistence_state()?.mutation_seq;
     engine
         .record_kdbx_correspondence(crate::KdbxStateSignature::from_path(vault_path)?, settled)?;
+    // Only now, so a failed save leaves this copy to be asked about again.
+    if ingested.fully_merged {
+        head.record(engine)?;
+    }
     engine.emit(ChangeEvent::SaveCompleted);
-    Ok(result)
+    Ok(ingested.result)
 }
 
 /// Refuse with [`EngineError::VaultFileChanged`] unless the file at
@@ -921,13 +987,8 @@ fn ensure_corresponds(
     }
 }
 
-/// Read and parse a KDBX file up to its outer header — everything that
-/// can be known about it before a key derivation.
-fn read_kdbx_header(kdbx_path: &Path) -> Result<Kdbx<HeaderRead>, EngineError> {
-    parse_kdbx_header(std::fs::read(kdbx_path)?)
-}
-
-/// Parse a KDBX file's bytes up to its outer header.
+/// Parse a KDBX file's bytes up to its outer header — everything that can
+/// be known about it before a key derivation.
 fn parse_kdbx_header(bytes: Vec<u8>) -> Result<Kdbx<HeaderRead>, EngineError> {
     Kdbx::open_from_bytes(bytes)
         .map_err(|e| EngineError::Serialise(format!("open disk kdbx: {e}")))?
@@ -946,11 +1007,22 @@ fn unlock_kdbx(
         .map_err(|e| EngineError::Serialise(format!("unlock disk kdbx: {e}")))
 }
 
+/// What [`ingest_kdbx_as_owner`] did with one copy.
+struct OwnerIngest {
+    result: ParkConflictsResult,
+    /// The merge took everything the copy holds: it parked no conflict and
+    /// met no classify verdict this build doesn't know. Only then is the
+    /// copy done with ([`PeerHead`]): a parked peer value lives only in
+    /// conflict rows, which dismissing the badge drops, and an unrecognised
+    /// verdict leaves its entry for a build that understands it.
+    fully_merged: bool,
+}
+
 fn ingest_kdbx_as_owner(
     engine: &mut Engine,
     disk_kdbx: &Kdbx<Unlocked>,
     owner: &str,
-) -> Result<ParkConflictsResult, EngineError> {
+) -> Result<OwnerIngest, EngineError> {
     // Project the remote vault — the same prefix the eager-merge path used.
     let mut remote_vault = disk_kdbx
         .vault_with_unwrapped_protected()
@@ -964,6 +1036,11 @@ fn ingest_kdbx_as_owner(
     // on auto-merge and writes owner rows on a held conflict, committing its
     // own transaction.
     let outcome = engine.ingest_peer(owner, &remote_vault)?;
+    let fully_merged = outcome.conflicted.is_empty() && outcome.unrecognised.is_empty();
+    let done = |result| OwnerIngest {
+        result,
+        fully_merged,
+    };
 
     // Loop-safety discriminator: only an advanced local side (a non-empty
     // `auto_merged`, `added`, `deleted`, `moved`, or `history_pruned`) is
@@ -1005,13 +1082,13 @@ fn ingest_kdbx_as_owner(
             && !engine.persistence_state()?.is_dirty()
             && keepass_merge::vault_content_digest(&remote_vault) != engine.content_digest()?
         {
-            return Ok(ParkConflictsResult::Applied {
+            return Ok(done(ParkConflictsResult::Applied {
                 applied: MergeStats::default(),
                 parked: ParkedConflictsSummary::default(),
                 needs_write_back: true,
-            });
+            }));
         }
-        return Ok(ParkConflictsResult::NoChange);
+        return Ok(done(ParkConflictsResult::NoChange));
     }
 
     let stats = MergeStats {
@@ -1050,11 +1127,11 @@ fn ingest_kdbx_as_owner(
         applied: stats.clone(),
     });
 
-    Ok(ParkConflictsResult::Applied {
+    Ok(done(ParkConflictsResult::Applied {
         applied: stats,
         parked,
         needs_write_back,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------

@@ -1452,6 +1452,14 @@ impl Engine {
     /// [`EngineError::VaultIdentityMismatch`], and one whose test-vault
     /// marker differs from this vault's with
     /// [`EngineError::TestVaultMarkerMismatch`] — all before anything merges.
+    ///
+    /// The mirror remembers the exact bytes it last merged from each owner,
+    /// so the same copy again is `NoChange` before any of those checks and
+    /// without a key derivation, in this process or a later one. A client
+    /// that re-reads every peer's copy at launch can hand them all over. A
+    /// mirror rebuilt from the vault file has no such record and merges each
+    /// copy again. A refused or failed ingest records nothing, nor does one
+    /// that parked a conflict, which merges again until it's resolved.
     pub async fn ingest_peer_kdbx(
         &self,
         owner_id: String,
