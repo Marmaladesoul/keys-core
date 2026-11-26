@@ -11,15 +11,19 @@
 # vault's identity is its root-group UUID — minted once and preserved across
 # every save / sync / RE-KEY — so "same vault?" == "same root-group UUID?".
 #
-# The verb returns a THREE-WAY verdict (stdout + exit code), so a consumer
-# keying off either can't read a reject as success:
+# The verb returns a verdict (stdout + exit code), so a consumer keying off
+# either can't read a reject as success:
 #   * match         (exit 0) — same vault; proceed.
 #   * mismatch      (exit 1) — decrypts but a DIFFERENT vault; reject.
 #   * undecryptable (exit 1) — won't open under the supplied credential.
-#                              AMBIGUOUS: wrong file, corrupt, OR the genuine
-#                              vault re-keyed since the credential was cached —
-#                              so a real consumer re-derives, it is NOT a
+#                              AMBIGUOUS: wrong file, damage that can't be
+#                              told from a wrong key, OR the genuine vault
+#                              re-keyed since the credential was cached — so a
+#                              real consumer re-derives, it is NOT a
 #                              "different vault" verdict.
+#   * unreadable    (exit 1) — a KDBX4 file damaged past its header HMAC, or
+#                              header damage found without the key; pinned in
+#                              vault-identity-unreadable.sh.
 #
 # Assertions:
 #   1. SAME vault → match.

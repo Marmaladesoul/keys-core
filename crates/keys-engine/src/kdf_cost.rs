@@ -1,12 +1,14 @@
 //! The KDF cost a KDBX envelope demands of whoever opens it.
 //!
 //! A KDBX file's outer header names its own KDF parameters, and the KDF
-//! has to run before anything else about the file can be checked: the
-//! header HMAC (KDBX4) and the decrypted payload (KDBX3) are both keyed
-//! by its output. The parameters themselves are unauthenticated until
-//! then. So a file can make its reader allocate and spin for whatever it
-//! asks, before the reader learns whether the file is even the right
-//! vault under the right key.
+//! has to run before the file can be authenticated: the header HMAC
+//! (KDBX4) and the decrypted payload (KDBX3) are both keyed by its output.
+//! A KDBX4 header's unkeyed SHA-256, checked first, catches accidental
+//! damage but not tampering, since anyone can recompute it. The parameters
+//! themselves are unauthenticated until the KDF has run. So a file can
+//! make its reader allocate and spin for whatever it asks, before the
+//! reader learns whether the file is even the right vault under the right
+//! key.
 //!
 //! The replicas of one vault share their KDF parameters — only the salt
 //! (KDBX4) or transform seed (KDBX3) is per-envelope, and a save may

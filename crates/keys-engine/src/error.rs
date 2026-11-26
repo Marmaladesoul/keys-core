@@ -54,11 +54,13 @@ pub enum EngineError {
 
     /// A KDBX file (the vault file, or a peer's copy of it) did not open
     /// under the supplied composite key: the password or keyfile is wrong,
-    /// or the part of the file that proves the key (a KDBX4 header, a KDBX3
-    /// file's first block) is damaged. `keepass-core` reports these as one
-    /// decryption failure and so does this: the message is fixed and
-    /// carries nothing about which. Damage past that point is a format
-    /// error, not this. Distinct from [`Self::WrongKey`], which is the
+    /// or the part of the file that proves the key is damaged — a KDBX4
+    /// file's keyed header HMAC, or a KDBX3 file's payload up to and
+    /// including its block-hash verification. `keepass-core` reports these
+    /// as one decryption failure and so does this: the message is fixed and
+    /// carries nothing about which. Other damage (a KDBX4 header failing its
+    /// unkeyed hash, a KDBX4 payload past the HMAC) is a format error, not
+    /// this. Distinct from [`Self::WrongKey`], which is the
     /// mirror's own key.
     #[error("the password or keyfile doesn't open this vault file, or the file is corrupt")]
     VaultKeyRefused,

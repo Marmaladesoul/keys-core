@@ -621,10 +621,12 @@ enum Command {
     /// ADVERSARIAL: write a copy of the vault to `out` whose outer header
     /// demands different KDF work — the hostile peer blob anyone holding a
     /// doc's write capability could plant. Only the header's KDF parameters
-    /// change (the salt is kept); the payload is copied verbatim, so the
-    /// copy's header HMAC no longer verifies and no key opens it. What it
-    /// probes is what a reader does BEFORE that check: the KDF must run
-    /// first, at whatever cost the header names. Needs no password (the
+    /// change (the salt is kept), and a KDBX4 header's unkeyed SHA-256 is
+    /// recomputed as any forger could, so the copy reads as an intact header;
+    /// the rest of the payload is copied verbatim, so its keyed header HMAC
+    /// (KDBX4) or payload (KDBX3) no longer verifies and no key opens it.
+    /// What it probes is what a reader does BEFORE that check: the KDF must
+    /// run first, at whatever cost the header names. Needs no password (the
     /// outer header is plaintext). Not a client capability, so it bypasses
     /// the seam and edits the bytes with keepass-core directly.
     ForgeKdf {
@@ -886,10 +888,16 @@ enum Command {
     ///
     /// - `match`          → exit 0   — the same vault; proceed.
     /// - `mismatch`       → exit 1   — decrypts but a DIFFERENT vault; reject.
-    /// - `undecryptable`  → exit 1   — won't open under the supplied
-    ///   credential. AMBIGUOUS (wrong file, corrupt, or the genuine vault
-    ///   re-keyed since this credential was cached), NOT a "different vault"
+    /// - `undecryptable`  → exit 1   — the supplied credential didn't open
+    ///   it. AMBIGUOUS (wrong file, the genuine vault re-keyed since this
+    ///   credential was cached, or damage that can't be told from a wrong key:
+    ///   a KDBX4 header HMAC, or a KDBX3 payload), NOT a "different vault"
     ///   verdict — a real consumer re-derives / re-prompts before rejecting.
+    /// - `unreadable`     → exit 1   — a KDBX4 file damaged past its keyed
+    ///   header HMAC, header damage detected without the key, or a KDBX3
+    ///   header field that parses but holds the wrong value (noticed once the
+    ///   key is proven); a real consumer asks for another copy rather than
+    ///   re-prompting.
     ///
     /// Only `match` exits 0. A missing / non-KDBX file errors (exit 1, message
     /// on stderr). This is a pure read: no mirror is created or touched.
@@ -3023,9 +3031,10 @@ fn purge_vault(vault: &Path) -> Result<()> {
 }
 
 /// The `forge-kdf` verb: copy `vault` to `out` with the outer header's KDF
-/// work parameters replaced, everything else — salt, payload, header HMAC —
-/// byte-for-byte. Refuses an override for the other KDF family, so a typo
-/// can't produce a copy that differs in nothing.
+/// work parameters replaced and a KDBX4 header's unkeyed SHA-256 recomputed
+/// to match; everything else — salt, payload, header HMAC — byte-for-byte.
+/// Refuses an override for the other KDF family, so a typo can't produce a
+/// copy that differs in nothing.
 fn forge_kdf(
     vault: &Path,
     out: &Path,
@@ -3033,7 +3042,7 @@ fn forge_kdf(
     argon2_iterations: Option<u64>,
     aes_rounds: Option<u64>,
 ) -> Result<()> {
-    use keepass_core::format::{FileSignature, KdfParams, VersionFields};
+    use keepass_core::format::{FileSignature, KdfParams, VersionFields, compute_header_hash};
     use keepass_core::kdbx::Kdbx;
 
     let read = Kdbx::open(vault)
@@ -3089,7 +3098,14 @@ fn forge_kdf(
 
     let mut bytes = read.header_bytes()[..FileSignature::LEN].to_vec();
     bytes.extend(header.write().context("write outer header")?);
-    bytes.extend_from_slice(read.payload_bytes());
+    let mut payload = read.payload_bytes();
+    if matches!(header.version_fields, VersionFields::V4 { .. }) {
+        // A KDBX4 payload opens with the header's unkeyed SHA-256.
+        let hash = compute_header_hash(&bytes);
+        payload = &payload[hash.len()..];
+        bytes.extend_from_slice(&hash);
+    }
+    bytes.extend_from_slice(payload);
     std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
     println!("forged {} (KDF: {params:?})", out.display());
     Ok(())
@@ -3149,15 +3165,19 @@ fn ensure_keyfile(path: &Path) -> Result<Vec<u8>> {
 
 /// Verify a picked KDBX file against an `expected` root-group UUID — the
 /// recovery-flow guard, headless. Calls the `keys-ffi` `verify_vault_identity`
-/// seam (a pure read — no mirror) and surfaces its three-way verdict on stdout
+/// seam (a pure read — no mirror) and surfaces its verdict on stdout
 /// + the exit code:
 ///
 /// - `match`         → prints `match`, exits 0 (the same vault; proceed);
 /// - `mismatch`      → prints `mismatch`, exits non-zero (a DIFFERENT vault);
 /// - `undecryptable` → prints `undecryptable`, exits non-zero — ambiguous
-///   (wrong file, corrupt, or a genuine vault re-keyed since this credential
-///   was cached), which a real consumer resolves by re-deriving, not by
-///   declaring a different vault.
+///   (wrong file, a genuine vault re-keyed since this credential was cached,
+///   or damage that can't be told from a wrong key), which a real consumer
+///   resolves by re-deriving, not by declaring a different vault;
+/// - `unreadable`    → prints `unreadable`, exits non-zero — a KDBX4 file
+///   damaged past its keyed header HMAC, header damage detected without the
+///   key, or a KDBX3 header field holding the wrong value, which no
+///   credential will open.
 ///
 /// Only `match` exits 0, so a consumer keying off the exit code can never read
 /// a reject as success. A missing / non-KDBX file errors (exit non-zero).
@@ -3193,8 +3213,13 @@ fn verify_identity(
             println!("undecryptable");
             anyhow::bail!(
                 "picked file did not decrypt under the supplied credential — wrong file, \
-                 corrupt, or a genuine vault re-keyed since this credential was cached"
+                 damage that can't be told from a wrong key, or a genuine vault re-keyed \
+                 since this credential was cached"
             );
+        }
+        VaultIdentityVerdict::Unreadable => {
+            println!("unreadable");
+            anyhow::bail!("picked file is a KDBX file that couldn't be read: damaged or malformed");
         }
     }
 }
