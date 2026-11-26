@@ -1153,7 +1153,7 @@ dependencies = [
  "ed25519",
  "rand_core 0.10.1",
  "serde",
- "sha2 0.11.0",
+ "sha2",
  "signature",
  "subtle",
  "zeroize",
@@ -1752,15 +1752,6 @@ dependencies = [
 
 [[package]]
 name = "hmac"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
-dependencies = [
- "digest 0.10.7",
-]
-
-[[package]]
-name = "hmac"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
@@ -2191,7 +2182,7 @@ dependencies = [
  "n0-error",
  "rand 0.10.1",
  "serde",
- "sha2 0.11.0",
+ "sha2",
  "url",
  "zeroize",
  "zeroize_derive",
@@ -2566,11 +2557,11 @@ dependencies = [
  "chrono",
  "flate2",
  "getrandom 0.4.3",
- "hmac 0.13.0",
+ "hmac",
  "quick-xml 0.41.0",
  "salsa20",
  "secrecy",
- "sha2 0.11.0",
+ "sha2",
  "subtle",
  "thiserror",
  "uuid",
@@ -2587,7 +2578,7 @@ dependencies = [
  "keepass-core",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2",
  "subtle",
  "thiserror",
  "tracing",
@@ -2614,7 +2605,7 @@ dependencies = [
  "base64",
  "chrono",
  "getrandom 0.2.17",
- "hmac 0.12.1",
+ "hmac",
  "keepass-core",
  "keepass-merge",
  "notify",
@@ -2625,7 +2616,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
- "sha2 0.10.9",
+ "sha2",
  "tempfile",
  "thiserror",
  "url",
@@ -2643,7 +2634,6 @@ dependencies = [
  "keys-engine",
  "keys-iroh-sync",
  "secrecy",
- "sha2 0.10.9",
  "tempfile",
  "thiserror",
  "tokio",
@@ -4287,13 +4277,13 @@ dependencies = [
 
 [[package]]
 name = "sha1"
-version = "0.10.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -4301,17 +4291,6 @@ name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
-
-[[package]]
-name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
 
 [[package]]
 name = "sha2"

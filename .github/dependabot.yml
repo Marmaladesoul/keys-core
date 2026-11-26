@@ -24,7 +24,7 @@ updates:
       # it); moving to 0.30+ is a deliberate manual migration, not an auto-bump.
       - dependency-name: "uniffi*"
       # The crypto / RNG / storage cohort is held at its current line. The next
-      # release of each is a breaking API change — RustCrypto digest 0.11
+      # release of each is a breaking API change — RustCrypto digest 0.12
       # (hmac/sha1/sha2), rand 0.9, getrandom 0.3, rusqlite 0.40, notify 8,
       # aes-gcm 0.11 (the AEAD crate: `Array::from_slice` deprecated-to-error in
       # favour of `TryFrom`, so the nonce/key construction in keys-engine must be
