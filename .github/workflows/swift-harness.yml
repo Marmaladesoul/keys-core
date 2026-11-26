@@ -29,6 +29,10 @@ on:
   #   # 04:07 UTC Monday — off-peak, off-:00 to spread fleet load.
   #   - cron: '7 4 * * 1'
 
+# Read-only: the harness builds and tests, and writes nothing back.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
