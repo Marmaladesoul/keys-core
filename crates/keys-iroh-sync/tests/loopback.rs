@@ -617,6 +617,54 @@ async fn a_write_runs_a_sync_round_with_known_peers() {
         .expect("test exceeded 120s — likely a hang, not a slow DERP");
 }
 
+/// A network change runs a sync round with each joined doc's known peers,
+/// so a mesh that went quiet while the network was down comes back without
+/// rebinding the node; and once the node is shut down it does nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_network_change_runs_a_sync_round_with_known_peers() {
+    if is_network_test_skipped() {
+        eprintln!("skipping: KEYS_IROH_SYNC_SKIP_NETWORK_TESTS set");
+        return;
+    }
+    init_tracing();
+
+    let body = async {
+        let (node, _nb, _nd) = spin_up_node().await;
+        let (peer, _pb, _pd) = spin_up_node().await;
+        let doc_id = node.create_doc().await.expect("create_doc");
+        node.set_entry(doc_id.clone(), b"seed".to_vec(), b"1".to_vec())
+            .await
+            .expect("write");
+        let mut events = node.subscribe_doc_events(&doc_id).await.expect("events");
+        let ticket = node.share_doc(doc_id.clone(), true).await.expect("share");
+        peer.join_doc(ticket, DownloadPolicy::Everything)
+            .await
+            .expect("join");
+        assert!(
+            wait_for_entries(&peer, &doc_id, &[b"seed"], DELIVERY_WAIT).await,
+            "the join didn't deliver the first entry"
+        );
+        // Let the join's rounds finish before the change.
+        while tokio::time::timeout(QUIET_PERIOD, events.next())
+            .await
+            .is_ok()
+        {}
+
+        node.network_change().await;
+        wait_for_round_with(&mut events, &peer.node_id()).await;
+
+        node.shutdown().await.expect("node shutdown");
+        tokio::time::timeout(Duration::from_secs(5), node.network_change())
+            .await
+            .expect("a network change on a shut-down node hung");
+        peer.shutdown().await.expect("peer shutdown");
+    };
+
+    tokio::time::timeout(Duration::from_secs(120), body)
+        .await
+        .expect("test exceeded 120s — likely a hang, not a slow DERP");
+}
+
 /// Bind a node with a given identity on given store directories, so a
 /// test can bring "the same device" back after shutting it down.
 async fn bind_node_at(
