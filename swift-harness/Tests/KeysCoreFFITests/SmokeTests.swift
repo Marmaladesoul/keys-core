@@ -8,4 +8,10 @@ final class SmokeTests: XCTestCase {
     func testPingRoundTrip() throws {
         XCTAssertEqual(ping(), "keys-ffi alive")
     }
+
+    /// The transport's exports ship in the same component as the engine's:
+    /// one import reaches both.
+    func testTransportSharesTheComponent() throws {
+        XCTAssertEqual(identityGenerate().secretKeyBytes.count, 32)
+    }
 }

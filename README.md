@@ -17,7 +17,7 @@ keys-core/
 │   ├── keys-engine/        vault model + SQLCipher-backed query/mutation engine
 │   ├── keys-ffi/           uniffi FFI facade consumed by the Keys clients
 │   ├── keys-iroh-sync/     iroh-based device-to-device sync transport
-│   └── uniffi-bindgen-*/   uniffi binding generators (Swift)
+│   └── uniffi-bindgen-swift/  uniffi Swift binding generator
 ├── keyhole/                headless test driver for the FFI seam
 └── bindgen/                binding-regeneration scripts
 ```

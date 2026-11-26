@@ -1,6 +1,7 @@
 // swift-tools-version:5.9
 //
-// Swift harness for the `keys-ffi` uniffi facade. Slice 1 of FFI_PHASE2.
+// Swift harness for the `keys-ffi` uniffi facade, which also carries
+// `keys-iroh-sync`'s exports (one native component).
 //
 // `KeysCoreFFI.xcframework` and `Sources/KeysCoreFFI/` are produced by
 // `../bindgen/build-swift.sh` and are gitignored — run that script before
@@ -19,8 +20,7 @@ let package = Package(
     // ios-arm64_x86_64-simulator slices alongside the macOS one (see
     // ../bindgen/build-swift.sh), so the manifest declares iOS too —
     // without it SwiftPM refuses to resolve the package for an iOS
-    // consumer regardless of what the binary contains. Kept in step
-    // with ../swift-harness-iroh-sync/Package.swift.
+    // consumer regardless of what the binary contains.
     platforms: [.macOS(.v13), .iOS(.v17)],
     products: [
         .library(name: "KeysCoreFFI", targets: ["KeysCoreFFI"]),
@@ -33,7 +33,16 @@ let package = Package(
         .target(
             name: "KeysCoreFFI",
             dependencies: ["KeysCoreFFIBinary"],
-            path: "Sources/KeysCoreFFI"
+            path: "Sources/KeysCoreFFI",
+            // The library carries keys-iroh-sync, and iroh's transitive
+            // `system_configuration` crate links the SystemConfiguration
+            // framework for home-network detection. The Rust crate emits
+            // `#[link(name = "SystemConfiguration", kind = "framework")]`,
+            // but staticlibs don't carry link directives into the SwiftPM
+            // consumer — the framework has to be declared explicitly here.
+            linkerSettings: [
+                .linkedFramework("SystemConfiguration"),
+            ]
         ),
         .testTarget(
             name: "KeysCoreFFITests",

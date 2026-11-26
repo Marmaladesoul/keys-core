@@ -15,8 +15,8 @@ updates:
       cargo-dependencies:
         patterns: ["*"]
     ignore:
-      # uniffi is intentionally held at 0.28 (the generated FFI bindings target
-      # it); moving to 0.29+ is a deliberate manual migration, not an auto-bump.
+      # uniffi is intentionally held at 0.29 (the generated FFI bindings target
+      # it); moving to 0.30+ is a deliberate manual migration, not an auto-bump.
       - dependency-name: "uniffi*"
       # The crypto / RNG / storage cohort is held at its current line. The next
       # release of each is a breaking API change — RustCrypto digest 0.11

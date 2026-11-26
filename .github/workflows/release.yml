@@ -61,7 +61,6 @@ jobs:
           PROFILE: release
         run: |
           bindgen/build-swift.sh
-          bindgen/build-swift-iroh-sync.sh
 
       - name: Package + checksum
         run: |
@@ -70,7 +69,6 @@ jobs:
           # Swift wrapper sources — together they are what the SwiftPM package
           # needs. Static-lib xcframeworks carry no symlinks, so tar is fine.
           tar -czf dist/KeysCoreFFI-bindings.tar.gz -C swift-harness KeysCoreFFI.xcframework Sources/KeysCoreFFI
-          tar -czf dist/KeysIrohSyncFFI-bindings.tar.gz -C swift-harness-iroh-sync KeysIrohSyncFFI.xcframework Sources/KeysIrohSyncFFI
           ( cd dist && shasum -a 256 *.tar.gz | tee checksums.txt )
 
       - name: Attest build provenance (SLSA)
@@ -84,7 +82,6 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             dist/KeysCoreFFI-bindings.tar.gz
-            dist/KeysIrohSyncFFI-bindings.tar.gz
             dist/checksums.txt
           generate_release_notes: true
           fail_on_unmatched_files: true

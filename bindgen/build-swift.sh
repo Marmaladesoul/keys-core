@@ -5,7 +5,7 @@
 #   target/universal-apple-darwin/<profile>/libkeys_ffi.a       (macOS universal)
 #   target/universal-apple-iossimulator/<profile>/libkeys_ffi.a (iOS sim universal)
 #   target/aarch64-apple-ios/<profile>/libkeys_ffi.a            (iOS device)
-#   swift-harness/Sources/KeysCoreFFI/KeysCoreFFI.swift
+#   swift-harness/Sources/KeysCoreFFI/{keys_ffi,keys_iroh_sync}.swift
 #   swift-harness/KeysCoreFFI.xcframework/
 #
 # The xcframework carries three slices — macOS universal, iOS device
@@ -41,11 +41,14 @@ cd "$REPO_ROOT"
 
 CRATE=keys-ffi
 LIB_NAME=libkeys_ffi.a
-# C_MODULE: name of the C-shim module emitted by uniffi-bindgen-swift.
-# The generated Swift sources do `import keys_ffiFFI` based on the crate's
-# uniffi namespace (`keys_ffi`) plus an `FFI` suffix — so the modulemap
-# must declare that exact name. The Swift-facing module that consumers
-# `import` is `KeysCoreFFI`, defined by the SwiftPM target.
+# The library carries two crates' uniffi exports, keys-ffi's and
+# keys-iroh-sync's (re-exported by keys-ffi), so library mode emits a
+# Swift file and a header for each.
+# C_MODULE: name of the one C-shim module holding both headers. Each
+# generated Swift file does `import keys_ffiFFI`: keys-ffi's from its
+# uniffi namespace plus `FFI`, keys-iroh-sync's from the
+# `ffi_module_name` in its uniffi.toml. The Swift-facing module that
+# consumers `import` is `KeysCoreFFI`, defined by the SwiftPM target.
 C_MODULE=keys_ffiFFI
 SWIFT_MODULE=KeysCoreFFI
 

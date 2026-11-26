@@ -1,0 +1,5 @@
+[bindings.swift]
+# Without this, uniffi 0.29 makes every error type LocalizedError with
+# String(reflecting:) as its description, which puts the whole case and its
+# payload into `localizedDescription`. Clients choose what an error says.
+omit_localized_error_conformance = true

@@ -4,7 +4,9 @@
 # or by building locally. Drop-in replacement for calling build-swift*.sh
 # directly from an app's pre-build phase.
 #
-#   ./provision-swift.sh [keys-ffi|keys-iroh-sync]
+#   ./provision-swift.sh [keys-ffi]
+#
+# keys-ffi's bindings carry keys-iroh-sync's too: one native component.
 #
 # Behaviour (env-driven):
 #   KEYS_CORE_VERSION   release tag to fetch a prebuilt artifact for (e.g.
@@ -27,9 +29,10 @@ cd "$REPO_ROOT"
 
 CRATE="${1:-keys-ffi}"
 case "$CRATE" in
-  keys-ffi)       FW=KeysCoreFFI;     HARNESS=swift-harness;           BUILD=bindgen/build-swift.sh ;;
-  keys-iroh-sync) FW=KeysIrohSyncFFI; HARNESS=swift-harness-iroh-sync; BUILD=bindgen/build-swift-iroh-sync.sh ;;
-  *) echo "provision-swift: unknown crate '$CRATE' (expected keys-ffi|keys-iroh-sync)" >&2; exit 2 ;;
+  keys-ffi) FW=KeysCoreFFI; HARNESS=swift-harness; BUILD=bindgen/build-swift.sh ;;
+  keys-iroh-sync)
+    echo "provision-swift: keys-iroh-sync's bindings now ship inside keys-ffi's (KeysCoreFFI); provision keys-ffi" >&2; exit 2 ;;
+  *) echo "provision-swift: unknown crate '$CRATE' (expected keys-ffi)" >&2; exit 2 ;;
 esac
 
 REPO_SLUG="Marmaladesoul/keys-core"
