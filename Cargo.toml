@@ -8,6 +8,11 @@ members = [
     "keyhole",
 ]
 
+# keys-ffi's library carries keys-iroh-sync's uniffi scaffolding too, and the
+# one bindgen reads both, so every crate takes uniffi from here.
+[workspace.dependencies]
+uniffi = "0.29"
+
 [workspace.package]
 version = "0.0.0"
 edition = "2024"

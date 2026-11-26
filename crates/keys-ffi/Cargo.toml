@@ -25,11 +25,11 @@ keys-engine = { path = "../keys-engine" }
 # client links one native component holding both `Engine` and `IrohNode`.
 keys-iroh-sync = { path = "../keys-iroh-sync" }
 
-# uniffi 0.29, proc-macro path, the one uniffi version in the workspace.
+# uniffi, proc-macro path; the version is set once in the workspace manifest.
 # No build.rs needed — `setup_scaffolding!()` emits everything inline. The
 # Swift bindgen ships as a separate `uniffi-bindgen-swift` binary; see
 # `bindgen/build-swift.sh`.
-uniffi = { version = "0.29", features = ["tokio"] }
+uniffi = { workspace = true, features = ["tokio"] }
 # Tokio is needed by uniffi's async dispatch (`async_runtime = "tokio"`)
 # for the engine's slow ops (ingest_from_kdbx, save_to_kdbx,
 # reconcile_with_disk). Multi-thread runtime so a Swift caller can keep

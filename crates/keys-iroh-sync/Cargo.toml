@@ -32,9 +32,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry"] }
 n0-future = "0.3"
 futures-util = "0.3"
-# uniffi 0.29, matching keys-ffi: the two crates' scaffolding share one
-# library, so they must be on one uniffi version.
-uniffi = { version = "0.29", features = ["tokio"] }
+# uniffi from the workspace manifest, like keys-ffi: the two crates'
+# scaffolding share one library, so they must be on one uniffi version.
+uniffi = { workspace = true, features = ["tokio"] }
 # Zeroize the heap allocation holding the caller's 32-byte ed25519
 # secret on drop, matching the bridge-layer scrub pattern already in
 # keys-ffi. Without this, dropped Identity allocations sit in the

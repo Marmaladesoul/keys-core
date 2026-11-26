@@ -89,8 +89,9 @@ jobs:
     runs-on: macos-latest
     # The build job compiles for the host only, so code that is cfg-gated per
     # Apple platform (in this crate graph or a dependency's) can break the iOS
-    # staticlib while every other check stays green. Type-check the two crates
-    # the iOS app links, for the device target.
+    # staticlib while every other check stays green. Type-check the crate the
+    # iOS app links (keys-ffi, which carries keys-iroh-sync), for the device
+    # target.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -99,7 +100,7 @@ jobs:
           targets: aarch64-apple-ios
       - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
       - name: cargo check (aarch64-apple-ios)
-        run: cargo check --target aarch64-apple-ios -p keys-ffi -p keys-iroh-sync
+        run: cargo check --target aarch64-apple-ios -p keys-ffi
 
   audit:
     name: cargo audit

@@ -5,7 +5,7 @@
 #   target/universal-apple-darwin/<profile>/libkeys_ffi.a       (macOS universal)
 #   target/universal-apple-iossimulator/<profile>/libkeys_ffi.a (iOS sim universal)
 #   target/aarch64-apple-ios/<profile>/libkeys_ffi.a            (iOS device)
-#   swift-harness/Sources/KeysCoreFFI/KeysCoreFFI.swift
+#   swift-harness/Sources/KeysCoreFFI/{keys_ffi,keys_iroh_sync}.swift
 #   swift-harness/KeysCoreFFI.xcframework/
 #
 # The xcframework carries three slices — macOS universal, iOS device
