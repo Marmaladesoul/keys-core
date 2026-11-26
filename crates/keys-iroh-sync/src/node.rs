@@ -33,7 +33,7 @@ use iroh_blobs::{
     },
 };
 use iroh_docs::{
-    ALPN as DOCS_ALPN, DocTicket, NamespaceId, PeerIdBytes,
+    ALPN as DOCS_ALPN, AuthorId, DocTicket, NamespaceId, PeerIdBytes,
     api::Doc,
     engine::{LiveEvent, Origin, ProtectCallbackHandler},
     protocol::Docs,
@@ -507,13 +507,24 @@ fn short_peer_ids(peers: &[PeerIdBytes]) -> Vec<String> {
         .collect()
 }
 
-/// One entry in a joined doc — key, content hash, content size. Cheap:
-/// served from the local entry-log replica, no network. Callers use
-/// this to apply receiver-side size policy before deciding which blobs
-/// to actually fetch.
+/// One entry in a joined doc. Cheap: served from the local entry-log
+/// replica, no network. Callers use this to apply receiver-side size
+/// policy before deciding which blobs to actually fetch.
+///
+/// A doc holds one entry per key *and author*, and any holder of the
+/// doc's write capability may write any key under its own author. So a
+/// key says nothing about who wrote the entry, and one key can list more
+/// than once: identify a writer by `author`, and this node's own entries
+/// by [`IrohNode::author_id`].
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct EntryInfo {
     pub key: Vec<u8>,
+    /// Hex `AuthorId` of the key that signed the entry.
+    pub author: String,
+    /// When the author stamped the entry, in microseconds since the Unix
+    /// epoch. It is the author's own clock, so it isn't evidence of when
+    /// the write happened.
+    pub timestamp_micros: u64,
     pub hash_hex: String,
     pub size_bytes: u64,
 }
@@ -544,8 +555,17 @@ impl IrohNode {
             .await
     }
 
-    /// List every entry visible in the named doc. Reads from the local
-    /// entry-log replica only — never touches the network.
+    /// Hex `AuthorId` this node signs its entries with ([`Self::set_entry`]).
+    /// It is kept in the doc store, so it survives a restart, but it isn't
+    /// derived from the [`Identity`]: a node bound on a new `doc_dir` has a
+    /// new author, and its earlier entries sync back as another's.
+    pub async fn author_id(&self) -> Result<String> {
+        Ok(self.default_author().await?.to_string())
+    }
+
+    /// List every entry visible in the named doc, deleted ones excepted.
+    /// Reads from the local entry-log replica only — never touches the
+    /// network.
     pub async fn list_entries(&self, doc_id: String) -> Result<Vec<EntryInfo>> {
         use iroh_docs::store::Query;
         let doc = self.get_doc(&doc_id).await?;
@@ -562,6 +582,8 @@ impl IrohNode {
                 .map_err(SyncError::from)?;
             out.push(EntryInfo {
                 key: entry.key().to_vec(),
+                author: entry.author().to_string(),
+                timestamp_micros: entry.timestamp(),
                 hash_hex: entry.content_hash().to_string(),
                 size_bytes: entry.content_len(),
             });
@@ -1152,13 +1174,7 @@ impl IrohNode {
     /// write still reaches it once it is back.
     pub async fn set_entry(&self, doc_id: String, key: Vec<u8>, value: Vec<u8>) -> Result<String> {
         let doc = self.get_doc(&doc_id).await?;
-        let author = self
-            .docs
-            .api()
-            .author_default()
-            .await
-            .context("default author")
-            .map_err(SyncError::from)?;
+        let author = self.default_author().await?;
         let size = value.len() as u64;
         let tag = own_head_tag(doc.id(), &key);
         let hash = self
@@ -1524,6 +1540,15 @@ impl IrohNode {
             }
         }
         Ok(false)
+    }
+
+    async fn default_author(&self) -> Result<AuthorId> {
+        self.docs
+            .api()
+            .author_default()
+            .await
+            .context("default author")
+            .map_err(SyncError::from)
     }
 
     async fn get_doc(&self, doc_id: &str) -> Result<Doc> {
@@ -2169,7 +2194,7 @@ mod tests {
                 .await
                 .expect("set_entry");
         } else {
-            let author = publisher.docs.api().author_default().await.expect("author");
+            let author = publisher.default_author().await.expect("author");
             publisher
                 .get_doc(&doc_id)
                 .await
@@ -2190,6 +2215,101 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// The entries `node` lists under `key`, once there are `count` of them.
+    async fn entries_under(
+        node: &IrohNode,
+        doc_id: &str,
+        key: &[u8],
+        count: usize,
+    ) -> Vec<EntryInfo> {
+        loop {
+            let mut entries = node.list_entries(doc_id.to_owned()).await.expect("list");
+            entries.retain(|e| e.key == key);
+            if entries.len() >= count {
+                return entries;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Another writer's entry under a key this node also writes is listed
+    /// beside this node's own, each under the author that signed it, and
+    /// this node's own head stays the one it wrote.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_foreign_entry_under_our_key_is_listed_under_its_own_author() {
+        let (ours, _ob, _od) = bind_test_node().await;
+        let (theirs, _tb, _td) = bind_test_node().await;
+        let key = b"our head";
+        let payload = b"our content";
+
+        let body = async {
+            let doc_id = share_one_entry(
+                &ours,
+                &theirs,
+                key,
+                payload,
+                true,
+                DownloadPolicy::Everything,
+            )
+            .await;
+            let before = entries_under(&ours, &doc_id, key, 1).await.remove(0);
+            // A later stamp than ours: the newest entry under the key is
+            // the foreign one.
+            let foreign_hash = theirs
+                .set_entry(doc_id.clone(), key.to_vec(), b"foreign content".to_vec())
+                .await
+                .expect("foreign write");
+
+            let our_author = ours.author_id().await.expect("author");
+            let their_author = theirs.author_id().await.expect("author");
+            assert_ne!(our_author, their_author);
+            for node in [&ours, &theirs] {
+                let entries = entries_under(node, &doc_id, key, 2).await;
+                assert_eq!(entries.len(), 2, "one entry per author");
+                let by = |author: &str| {
+                    entries
+                        .iter()
+                        .find(|e| e.author == author)
+                        .expect("an entry by each author")
+                };
+                assert_eq!(by(&our_author).hash_hex, before.hash_hex);
+                assert_eq!(by(&our_author).timestamp_micros, before.timestamp_micros);
+                assert_eq!(by(&their_author).hash_hex, foreign_hash);
+                assert!(by(&their_author).timestamp_micros > before.timestamp_micros);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), body)
+            .await
+            .expect("both nodes list both entries");
+        ours.shutdown().await.expect("shutdown");
+        theirs.shutdown().await.expect("shutdown");
+    }
+
+    /// The author survives a restart on the same store, so entries written
+    /// before it are still recognised as this node's own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_author_survives_a_restart() {
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        let doc_dir = tempfile::tempdir().expect("doc tempdir");
+        let identity = Identity::generate();
+        let node = bind_node_in(&blob_dir, &doc_dir, identity.clone(), BLOB_GC_INTERVAL).await;
+        let author = node.author_id().await.expect("author");
+        let doc_id = node.create_doc().await.expect("create doc");
+        node.set_entry(doc_id.clone(), b"vault".to_vec(), b"content".to_vec())
+            .await
+            .expect("save");
+        node.shutdown().await.expect("shutdown");
+        drop(node);
+
+        let node = bind_node_in(&blob_dir, &doc_dir, identity, BLOB_GC_INTERVAL).await;
+        assert!(node.open_existing_doc(doc_id.clone()).await.expect("open"));
+        assert_eq!(node.author_id().await.expect("author"), author);
+        let entries = node.list_entries(doc_id).await.expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].author, author);
+        node.shutdown().await.expect("shutdown");
     }
 
     /// A blob the doc engine recorded as missing — here because its author
