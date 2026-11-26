@@ -31,9 +31,10 @@
 //!    …) implementing RFC 6238 on top of RFC 4226, validated against
 //!    the RFC 6238 Appendix B test vectors.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use sha2::{Sha256, Sha512};
+use zeroize::Zeroizing;
 
 // ────────────────────────────────────────────────────────────────────────
 // Presence detection
@@ -121,27 +122,24 @@ pub fn progress(period: u32, unix_seconds: u64) -> f64 {
     f64::from(elapsed) / f64::from(period)
 }
 
+/// The MAC of `message` under the TOTP `secret`, wiped when dropped.
+///
+/// The tag is keyed with the shared secret, so it is copied straight out of
+/// the MAC's output (which wipes itself on drop) into a [`Zeroizing`] buffer
+/// rather than through an unwiped intermediate.
+fn secret_keyed_tag<M: Mac + KeyInit>(secret: &[u8], message: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut mac =
+        <M as KeyInit>::new_from_slice(secret).expect("HMAC accepts arbitrary key length");
+    mac.update(message);
+    Zeroizing::new(mac.finalize().as_bytes().to_vec())
+}
+
 fn generate_hotp(secret: &[u8], counter: u64, digits: u32, algorithm: TotpAlgorithm) -> String {
     let counter_bytes = counter.to_be_bytes();
     let hmac = match algorithm {
-        TotpAlgorithm::Sha1 => {
-            let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(secret)
-                .expect("HMAC accepts arbitrary key length");
-            mac.update(&counter_bytes);
-            mac.finalize().into_bytes().to_vec()
-        }
-        TotpAlgorithm::Sha256 => {
-            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
-                .expect("HMAC accepts arbitrary key length");
-            mac.update(&counter_bytes);
-            mac.finalize().into_bytes().to_vec()
-        }
-        TotpAlgorithm::Sha512 => {
-            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(secret)
-                .expect("HMAC accepts arbitrary key length");
-            mac.update(&counter_bytes);
-            mac.finalize().into_bytes().to_vec()
-        }
+        TotpAlgorithm::Sha1 => secret_keyed_tag::<Hmac<Sha1>>(secret, &counter_bytes),
+        TotpAlgorithm::Sha256 => secret_keyed_tag::<Hmac<Sha256>>(secret, &counter_bytes),
+        TotpAlgorithm::Sha512 => secret_keyed_tag::<Hmac<Sha512>>(secret, &counter_bytes),
     };
 
     // RFC 4226 dynamic truncation.

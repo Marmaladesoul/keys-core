@@ -12,7 +12,7 @@
 //! differently across two distinct databases — leaking a fingerprint
 //! from one vault does not let an attacker test it against another.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -31,9 +31,11 @@ type HmacSha256 = Hmac<Sha256>;
 pub fn fingerprint(key: &[u8; 32], plaintext: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(plaintext);
-    let tag = mac.finalize().into_bytes();
+    // Copy straight out of the MAC output, which wipes itself on drop, so no
+    // unwiped copy of the keyed tag is left behind.
+    let tag = mac.finalize();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&tag);
+    out.copy_from_slice(tag.as_bytes());
     out
 }
 
@@ -58,5 +60,18 @@ mod tests {
 
         assert_eq!(&got[..], &expected[..]);
         assert_eq!(got.len(), 32);
+    }
+
+    /// Pin the output itself, not just agreement with the same crates: a
+    /// stored fingerprint must keep matching across dependency upgrades,
+    /// or duplicate-password matching silently breaks between old and new
+    /// rows. Value computed independently (openssl HMAC-SHA-256).
+    #[test]
+    fn fingerprint_output_is_stable() {
+        let got = fingerprint(&[0x0b; 32], b"Hi There");
+        assert_eq!(
+            crate::util::codec::bytes_to_hex(&got),
+            "198a607eb44bfbc69903a0f1cf2bbdc5ba0aa3f3d9ae3c1c7a3b1696a0b68cf7"
+        );
     }
 }

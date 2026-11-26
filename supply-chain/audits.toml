@@ -1,4 +1,8 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.sha1]]
+who = "Marmalade Soul"
+criteria = "safe-to-deploy"
+delta = "0.10.6 -> 0.11.0"
+notes = "Reviewed the full 0.10.6→0.11.0 diff (two independent reviewers): byte-identical to tag sha1-v0.11.0 @ 2f00175a; no build script, proc-macro, FFI or I/O; x86 SHA-NI and aarch64 sha2 intrinsics gated by cpufeatures on exactly their target features, bounds-safe unaligned loads; FIPS 180 constants and standard test vectors; zeroize feature wipes state on drop."
