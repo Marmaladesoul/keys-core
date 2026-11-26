@@ -444,7 +444,7 @@ mod tests {
                     tag: "banking".into(),
                 },
                 Predicate::ModifiedWithin {
-                    duration: Duration::from_secs(86_400 * 7),
+                    duration: Duration::from_hours(7 * 24),
                 },
             ],
         };
@@ -502,7 +502,7 @@ mod tests {
             },
             Predicate::Expired,
             Predicate::ExpiringWithin {
-                duration: Duration::from_secs(86_400 * 30),
+                duration: Duration::from_hours(30 * 24),
             },
             Predicate::StrengthBelow {
                 bucket: StrengthBucket::Reasonable,

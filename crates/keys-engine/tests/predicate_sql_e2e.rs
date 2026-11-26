@@ -286,7 +286,7 @@ fn compiled_sql_executes_against_real_db() {
     let got = engine
         .compiled_predicate_uuids_for_test(
             &Predicate::ExpiringWithin {
-                duration: Duration::from_secs(86_400),
+                duration: Duration::from_hours(24),
             },
             now_ms,
         )

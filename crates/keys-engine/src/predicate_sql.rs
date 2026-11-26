@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn compile_expiring_within() {
         let p = Predicate::ExpiringWithin {
-            duration: Duration::from_secs(86_400),
+            duration: Duration::from_hours(24),
         };
         let c = compile(&p, NOW).expect("compile");
         assert!(c.where_sql.contains("expires_at IS NOT NULL"));
