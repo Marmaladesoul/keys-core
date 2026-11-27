@@ -1,0 +1,5 @@
+(* What the key-set signature of protocol version 1 covers, besides its
+   label and the three public keys: the signer's role, CI (version, kind
+   and both endpoint ids in their roles), sid and both CPace shares. *)
+letfun keySetBinding(r: role, ci: bitstring, sessionId: bitstring, yD: G, yT: G) =
+  (r, ci, sessionId, yD, yT).

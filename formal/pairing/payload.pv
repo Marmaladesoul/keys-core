@@ -1,0 +1,27 @@
+(* Payload authenticity. Same world as agreement.pv. *)
+
+(* P1. A trusted device enrols only device keys the new device sent in that
+   run; once each. *)
+query c: code, p: bitstring, dk: bitstring;
+  inj-event(Enrolled(c, p, dk)) ==> inj-event(KeysSent(c, p, dk)) || event(Lucky(c)).
+
+(* P2. A new device installs only a bundle the trusted device sent in that
+   run; once each. *)
+query c: code, p: bitstring, b: bitstring;
+  inj-event(Installed(c, p, b)) ==> inj-event(BundleSent(c, p, b)) || event(Lucky(c)).
+
+(* P3. An invitee installs only the friendship the inviter sent in that
+   run; once each. *)
+query c: code, p: bitstring, f: bitstring;
+  inj-event(FriendshipInstalled(c, p, f)) ==> inj-event(FriendshipSent(c, p, f))
+    || event(Lucky(c)) || event(AdversaryPeer(c)).
+
+(* P4. An inviter installs only the profile the invitee sent in that run;
+   once each. *)
+query c: code, p: bitstring, x: bitstring;
+  inj-event(ProfileInstalled(c, p, x)) ==> inj-event(ProfileSent(c, p, x))
+    || event(Lucky(c)) || event(AdversaryPeer(c)).
+
+process
+  new shut: channel;
+  World(net, net, shut, net)

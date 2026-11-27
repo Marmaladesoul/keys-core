@@ -1,0 +1,42 @@
+(* Identity misbinding (unknown key-share) in a Person pairing.
+
+   The question: can the attacker, as a legitimate counterparty, end up
+   holding the session of a run in which an honest side has recorded
+   another honest account's keys as its peer's?
+
+   World: no lucky guesses and no leaks. The attacker may be the
+   counterparty any Person code was shown to, and any honest device may
+   type such a code.
+
+   With the protocol's key-set signature (binding-current.pvl) it cannot,
+   under either transport. With both shares left out of the signature
+   (binding-noshares.pvl) it can under the claimed transport, which is why
+   the shares are signed; expected.txt records each combination. *)
+
+query c: code, p: bitstring, i: pkey, r: pkey, e: pkey, k: aeadkey, j: aeadkey;
+
+  (* U1. The typing side has recorded honest account i as its peer, and
+     the attacker holds the key the typing side sends under. *)
+  attacker(j) && event(TypeRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i)) ==> false;
+
+  (* U2. The displaying side has recorded honest account i as its peer,
+     and the attacker holds the key the displaying side sends under. *)
+  attacker(k) && event(DisplayRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i)) ==> false.
+
+(* I1. The positive form: a typing side that records honest account i as
+   its peer is in a run in which a displaying device of account i sealed
+   that key set, with the same code and parameters; once each. *)
+query c: code, p: bitstring, i: pkey, r: pkey, e: pkey, k: aeadkey, j: aeadkey;
+  inj-event(TypeRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i))
+    ==> inj-event(KeySetSent(c, p, roleDisplay, i, r, e)).
+
+(* I2. A displaying side that records honest account i as its peer is in a
+   run in which a typing device of account i sealed that key set, with the
+   same code and parameters; once each. *)
+query c: code, p: bitstring, i: pkey, r: pkey, e: pkey, k: aeadkey, j: aeadkey;
+  inj-event(DisplayRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i))
+    ==> inj-event(KeySetSent(c, p, roleType, i, r, e)).
+
+process
+  new shut: channel;
+  World(shut, net, shut, shut)

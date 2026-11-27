@@ -1,0 +1,35 @@
+(* Secrecy, with forward secrecy against a code leaked after use.
+
+   World: as agreement.pv (lucky guesses, adversary counterparties,
+   long-term compromise), and in a second phase, after every run has ended,
+   the attacker is handed every code. A `Lucky` guess can only happen while
+   the code is live. *)
+
+query a: pkey, i: skey, e: xsk, fk: aeadkey, ft: bitstring, c: code,
+      t: bitstring, p: bitstring, k: aeadkey, j: aeadkey;
+
+  (* S1-S4. The bundle's secrets (account identity private key, account
+     encryption private key, fleet key, fleet ticket) stay secret unless
+     the attacker guessed the code of a device pairing of that very
+     account, or took them from a compromised device of that account. *)
+  attacker(i) && event(AccountSecrets(a, i, e, fk, ft)) ==> (event(Lucky(c)) && event(TrustedCode(a, c))) || event(LongTermLeaked(a));
+  attacker(e) && event(AccountSecrets(a, i, e, fk, ft)) ==> (event(Lucky(c)) && event(TrustedCode(a, c))) || event(LongTermLeaked(a));
+  attacker(fk) && event(AccountSecrets(a, i, e, fk, ft)) ==> (event(Lucky(c)) && event(TrustedCode(a, c))) || event(LongTermLeaked(a));
+  attacker(ft) && event(AccountSecrets(a, i, e, fk, ft)) ==> (event(Lucky(c)) && event(TrustedCode(a, c))) || event(LongTermLeaked(a));
+
+  (* S5-S6. A friendship's ticket and pairwise key stay secret unless the
+     attacker guessed that run's code or was the counterparty it was shown
+     to. Long-term compromise of either account earns no exception. *)
+  attacker(t) && event(FriendshipSecrets(c, t, k)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
+  attacker(k) && event(FriendshipSecrets(c, t, k)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
+
+  (* S7-S10. Both session keys, as each side holds them, stay secret under
+     the same condition. *)
+  attacker(k) && event(DisplayKeys(c, p, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
+  attacker(j) && event(DisplayKeys(c, p, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
+  attacker(k) && event(TypeKeys(c, p, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
+  attacker(j) && event(TypeKeys(c, p, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c)).
+
+process
+  new shut: channel;
+  World(net, net, net, net)

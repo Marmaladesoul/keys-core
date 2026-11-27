@@ -1,0 +1,39 @@
+(* An account's signed key set is released only to a party that proved the
+   code.
+
+   In a Person pairing nothing about an account travels during the
+   exchange. Each side seals its key set, with a fresh identity-key
+   signature, into the session, and only after it has verified the other
+   side's key confirmation.
+
+   What this is and is not about: the three public keys are public values
+   here, as they are to anyone the account has ever paired with. What must
+   not happen is an unproven peer being handed a fresh signature by the
+   account over a run of that peer's choosing.
+
+   World: lucky guesses, adversary counterparties and the after-use leak
+   open. Long-term compromise is shut: an attacker that holds an account's
+   identity key signs for itself. *)
+
+query c: code, c2: code, i: pkey, s: bitstring, p: bitstring, r: role, rk: pkey, ek: pkey;
+
+  (* Q1. A key-set signature an account released in a run stays secret
+     unless the attacker guessed that run's code or was the counterparty it
+     was shown to (or stole the identity key through a guessed device
+     pairing of that account). *)
+  attacker(s) && event(KeySetSigned(c, i, s))
+    ==> event(Lucky(c)) || event(AdversaryPeer(c)) || (event(Lucky(c2)) && event(TrustedCode(i, c2)));
+
+  (* Q2. A typing side seals its key set only in a run the displaying side
+     accepted, so only for a peer that proved the code. *)
+  event(KeySetSent(c, p, roleType, i, rk, ek))
+    ==> event(DisplayAccepted(c, p)) || event(Lucky(c)) || event(AdversaryPeer(c));
+
+  (* Q3. A displaying side seals its key set only in a run the typing side
+     replied to. *)
+  event(KeySetSent(c, p, roleDisplay, i, rk, ek))
+    ==> event(TypeReplied(c, p)) || event(Lucky(c)) || event(AdversaryPeer(c)).
+
+process
+  new shut: channel;
+  World(net, net, net, shut)

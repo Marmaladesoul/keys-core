@@ -1,0 +1,230 @@
+(* Symbolic primitives shared by every keys-pairing model.
+
+   Everything here is an idealisation: hashes, HMAC, the AEAD and signatures
+   are perfect, terms carry no lengths, and the group is an abstract
+   Diffie-Hellman group with a hash-to-group function. See ../README.md for
+   the full list of abstractions. *)
+
+(* ─── the network ─────────────────────────────────────────────────────── *)
+
+free net: channel.
+
+(* A value the attacker sends to pull a lever the environment offers it
+   (see the gates in protocol.pvl). *)
+const go: bitstring.
+
+(* ─── protocol constants ──────────────────────────────────────────────── *)
+
+type version.
+const v1: version.
+
+type kind.
+const device: kind.
+const person: kind.
+
+type role.
+const roleDisplay: role.
+const roleType: role.
+
+(* ─── the code, nonces and the session id ─────────────────────────────── *)
+
+type code.
+type nonce.
+
+(* sid = nonce_T || nonce_D *)
+fun mksid(nonce, nonce): bitstring [data].
+
+(* ─── transport endpoints ─────────────────────────────────────────────── *)
+
+type esk.
+type ep.
+fun epk(esk): ep.
+
+(* An endpoint's authentication of one message to one destination. The two
+   transport libraries decide whether a receiver checks it. *)
+fun tsig(esk, ep, bitstring): bitstring.
+
+(* What an endpoint puts on the wire: its id, the message, the
+   authentication. *)
+letfun wrap(k: esk, dst: ep, m: bitstring) = (epk(k), m, tsig(k, dst, m)).
+
+(* CI = lv_cat("keys-pairing", version, kind, "display", endpoint_D,
+                "type", endpoint_T).
+   The label and the two role strings are fixed, so the argument order
+   stands for them. *)
+fun mkci(version, kind, ep, ep): bitstring [data].
+
+(* ─── CPace: an abstract Diffie-Hellman group ─────────────────────────── *)
+
+(* `gen` is a password-derived generator, g = H2C(PRS, CI, sid); `G` is a
+   group element as it travels: a share Y = g^y. `dh` is the second
+   exponentiation, K = Y_peer^y. Keeping the two exponentiations apart keeps
+   the equational theory finite; see the README for what that leaves out. *)
+type gen.
+type G.
+type scalar.
+
+fun h2c(code, bitstring, bitstring): gen.
+
+fun exp(gen, scalar): G.
+fun dh(G, scalar): G.
+equation forall g: gen, x: scalar, y: scalar; dh(exp(g, x), y) = dh(exp(g, y), x).
+
+(* ISK = H("CPaceRistretto255_ISK", sid, K, Y_D, AD_D, Y_T, AD_T) *)
+type isk.
+fun hisk(bitstring, G, G, bitstring, G, bitstring): isk.
+
+(* ─── key confirmation ────────────────────────────────────────────────── *)
+
+type mackey.
+type tag.
+
+(* mac_key = H("CPaceMac", sid, ISK) *)
+fun hmackey(bitstring, isk): mackey.
+(* tag_X = HMAC(mac_key, lv_cat(Y_X, AD_X)) *)
+fun hmac(mackey, G, bitstring): tag.
+
+(* ─── the verified session ────────────────────────────────────────────── *)
+
+type direction.
+const displayToType: direction.
+const typeToDisplay: direction.
+
+type aeadkey.
+fun sessionKey(isk, direction): aeadkey.
+
+(* A frame's sequence number is its nonce and is authenticated; a receiver
+   opens only the number it expects next. *)
+type seqno.
+const seq0: seqno.
+const seq1: seqno.
+
+fun aead(aeadkey, seqno, bitstring): bitstring.
+reduc forall k: aeadkey, s: seqno, m: bitstring; adec(k, s, aead(k, s, m)) = m.
+
+(* ─── signatures and account keys ─────────────────────────────────────── *)
+
+type skey.
+type xsk.
+type pkey.
+
+fun spk(skey): pkey.
+fun xpk(xsk): pkey.
+
+fun sign(skey, bitstring): bitstring.
+reduc forall k: skey, m: bitstring; checksign(spk(k), m, sign(k, m)) = true.
+(* Signatures hide nothing. *)
+reduc forall k: skey, m: bitstring; signedMessage(sign(k, m)) = m.
+
+(* ─── credentials ─────────────────────────────────────────────────────── *)
+
+(* What a side brings to a run: nothing for a device pairing, its account's
+   identity private key and recovery and encryption public keys for a Person
+   pairing. *)
+const deviceCred: bitstring.
+fun personCred(skey, pkey, pkey): bitstring [data].
+
+(* The exchange's associated data is empty for both kinds: nothing about an
+   account travels before the code is proved. The constant keeps AD's place
+   in the transcript hash and the tags. *)
+const emptyAD: bitstring.
+
+(* What a run learnt about the other account. *)
+fun peerAccount(pkey, pkey, pkey): bitstring [data].
+
+(* ─── wire messages ───────────────────────────────────────────────────── *)
+
+fun hello(version, kind, nonce): bitstring [data].
+fun share(nonce, G): bitstring [data].
+fun reply(G, tag): bitstring [data].
+fun confirm(tag): bitstring [data].
+
+(* ─── payloads carried by the verified session ────────────────────────── *)
+
+(* A new device's public keys: signing, relay, vault, author id. *)
+fun deviceKeys(pkey, pkey, pkey, bitstring): bitstring [data].
+(* The pairing bundle: account identity and encryption private keys, the
+   recovery public key, the fleet document ticket and the fleet key. *)
+fun bundle(skey, xsk, pkey, bitstring, aeadkey): bitstring [data].
+(* What a trusted device holds: the account identity key to sign an
+   enrolment with, and the bundle. *)
+fun trustedSide(skey, bitstring): bitstring [data].
+(* The enrolment of a new device's keys, signed by the account identity key. *)
+fun enrolment(bitstring): bitstring [data].
+(* The frame a typing trusted device opens with when the new device
+   displays. *)
+const opening: bitstring.
+(* An account's signed key set, each side's first frame in a Person
+   pairing: identity, recovery and encryption public keys and the identity
+   key's signature. *)
+fun keySet(pkey, pkey, pkey, bitstring): bitstring [data].
+(* What the identity key signs: a label (this constructor), the fields the
+   binding library chooses, and the three public keys. *)
+fun keySetMsg(bitstring, pkey, pkey, pkey): bitstring [data].
+(* A friendship's bootstrap: its document ticket and pairwise key. *)
+fun friendship(bitstring, aeadkey): bitstring [data].
+(* What the invitee sends back: its display name and the like. *)
+fun profile(bitstring): bitstring [data].
+const nothing: bitstring.
+
+(* Everything a run agrees on: kind, both endpoint ids in their roles, sid,
+   both shares. The version is a constant and both ADs are empty. *)
+fun params(kind, ep, ep, bitstring, G, G): bitstring [data].
+
+(* ─── the three flows ─────────────────────────────────────────────────── *)
+
+type flow.
+(* Device pairing, the default: the trusted device displays, the new one
+   types. *)
+const deviceTrustedDisplays: flow.
+(* Device pairing, direction flipped: the new device displays, the trusted
+   one types. *)
+const deviceNewDisplays: flow.
+(* Person pairing: the invitee displays, the inviter types. *)
+const personFlow: flow.
+
+(* ─── events ──────────────────────────────────────────────────────────── *)
+
+(* The attacker's one correct online guess at a code. *)
+event Lucky(code).
+(* An honest party ran with this code against a counterparty the attacker
+   controls: its person showed the attacker the code, or typed the code the
+   attacker gave. *)
+event AdversaryPeer(code).
+
+(* The exchange. *)
+event TypeReplied(code, bitstring).
+event DisplayAccepted(code, bitstring).
+event TypeAccepted(code, bitstring).
+(* code, params, the two session keys (display to type, type to display). *)
+event DisplayKeys(code, bitstring, aeadkey, aeadkey).
+event TypeKeys(code, bitstring, aeadkey, aeadkey).
+
+(* Person key sets. *)
+(* code, params, the signer's role, its three public keys: a side sealed
+   its key set into the session. *)
+event KeySetSent(code, bitstring, role, pkey, pkey, pkey).
+(* code, the signer's identity, the signature it released. *)
+event KeySetSigned(code, pkey, bitstring).
+(* code, params, the peer account recorded, the two session keys: a side
+   opened the other's key set, verified it and recorded the account. *)
+event DisplayRecorded(code, bitstring, bitstring, aeadkey, aeadkey).
+event TypeRecorded(code, bitstring, bitstring, aeadkey, aeadkey).
+
+(* Payloads. *)
+event KeysSent(code, bitstring, bitstring).
+event Enrolled(code, bitstring, bitstring).
+event BundleSent(code, bitstring, bitstring).
+event Installed(code, bitstring, bitstring).
+event FriendshipSent(code, bitstring, bitstring).
+event FriendshipInstalled(code, bitstring, bitstring).
+event FriendshipSecrets(code, bitstring, aeadkey).
+event ProfileSent(code, bitstring, bitstring).
+event ProfileInstalled(code, bitstring, bitstring).
+event Completed(flow).
+
+(* Accounts. *)
+event HonestAccount(pkey).
+event AccountSecrets(pkey, skey, xsk, aeadkey, bitstring).
+event TrustedCode(pkey, code).
+event LongTermLeaked(pkey).

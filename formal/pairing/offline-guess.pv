@@ -1,0 +1,25 @@
+(* No offline dictionary attack.
+
+   One code, used for any number of displaying and typing runs of both
+   kinds by honest devices (more reuse than keys-pairing allows). The
+   attacker is active throughout, gets no lucky guess, and afterwards
+   tries to tell the real code from a fresh one using everything it saw,
+   the typing side's tag included, which is sent before the displaying
+   side has proved anything. *)
+
+free theCode: code [private].
+weaksecret theCode.
+
+(* O2. EXPECTED FALSE: a typing side does accept a run in this world, so
+   O1 is about transcripts of complete runs. *)
+query p: bitstring; event(TypeAccepted(theCode, p)) ==> false.
+
+process
+  ! new idsk: skey; new recsk: skey; new encsk: xsk;
+    new displayEsk: esk; new typeEsk: esk;
+    let cred = personCred(idsk, spk(recsk), xpk(encsk)) in
+    out(net, (spk(idsk), spk(recsk), xpk(encsk), epk(displayEsk), epk(typeEsk)));
+    ( (! Display(personFlow, theCode, displayEsk, cred, nothing))
+    | (! Type(personFlow, theCode, typeEsk, cred, nothing))
+    | (! Display(deviceNewDisplays, theCode, displayEsk, deviceCred, nothing))
+    | (! Type(deviceTrustedDisplays, theCode, typeEsk, deviceCred, nothing)) )

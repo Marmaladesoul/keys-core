@@ -1,0 +1,17 @@
+(* Sanity checks. EVERY QUERY HERE IS EXPECTED TO BE FALSE: each shows
+   that a flow can run to completion in the full world, so the other files
+   are not proving their properties about runs that can never happen.
+
+   World: the full one, with every lever shut. *)
+
+(* Run with preciseActions (the manifest says so): without it ProVerif
+   finds the derivations but can't always turn them into a trace. *)
+
+(* R1-R3. Each flow can run to completion. *)
+query event(Completed(deviceTrustedDisplays));
+      event(Completed(deviceNewDisplays));
+      event(Completed(personFlow)).
+
+process
+  new shut: channel;
+  World(shut, shut, shut, shut)
