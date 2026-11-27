@@ -1,0 +1,23 @@
+(* misbinding.pv again, with the lucky-guess oracle open: does a correct
+   guess let the attacker sit in the middle of a Person pairing while both
+   honest sides record each other's real keys? *)
+
+query c: code, c2: code, p: bitstring, i: pkey, r: pkey, e: pkey, k: aeadkey, j: aeadkey;
+
+  (* G1, G2: U1 and U2 of misbinding.pv. The exception is the attacker
+     having guessed the code of one of account i's own device pairings: it
+     then holds i's identity key outright and i is no longer honest. *)
+  attacker(j) && event(TypeRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i))
+    ==> event(Lucky(c2)) && event(TrustedCode(i, c2));
+  attacker(k) && event(DisplayRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i))
+    ==> event(Lucky(c2)) && event(TrustedCode(i, c2));
+
+  (* G3, G4: I1 and I2 of misbinding.pv, with the same exception. *)
+  event(TypeRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i))
+    ==> event(KeySetSent(c, p, roleDisplay, i, r, e)) || (event(Lucky(c2)) && event(TrustedCode(i, c2)));
+  event(DisplayRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i))
+    ==> event(KeySetSent(c, p, roleType, i, r, e)) || (event(Lucky(c2)) && event(TrustedCode(i, c2))).
+
+process
+  new shut: channel;
+  World(net, net, shut, shut)

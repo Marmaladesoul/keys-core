@@ -1,0 +1,4 @@
+(* Transport variant (a), conservative: the endpoint id a party is told for
+   its peer is whatever the attacker claims. Nothing is checked. *)
+reduc forall src: ep, dst: ep, m: bitstring, a: bitstring;
+  transportAccepts(src, dst, m, a) = true.
