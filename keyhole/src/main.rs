@@ -22,6 +22,7 @@
 
 mod adapters;
 mod kdf;
+mod pairing;
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -908,6 +909,63 @@ enum Command {
         #[arg(long)]
         expect: String,
     },
+    /// Generate a fresh account key set (identity, recovery, encryption) and
+    /// a device key set (signing, relay, vault) through the pairing seam, and
+    /// print their public halves as `<set> <role> <hex>` lines. Nothing is
+    /// stored. Needs no vault and no password.
+    PairKeygen,
+    /// Run a scripted pairing between two in-process sheets: one displays the
+    /// code, the other types it, and keyhole carries the messages and plays
+    /// the person. Prints one `side: event` line per step and a final
+    /// `result: verified` or `result: not-verified`; never prints the code.
+    /// Needs no vault and no password.
+    PairSim {
+        /// What is being paired.
+        #[arg(long, value_enum, default_value_t = pairing::SimKind::Device)]
+        kind: pairing::SimKind,
+        /// Type a wrong code on this many attempts before typing it right.
+        #[arg(long, default_value_t = 0)]
+        typos: u32,
+        /// Let the shown code expire before typing it on the first attempt.
+        #[arg(long)]
+        expire_before_typing: bool,
+        /// Let the shown code expire, let the sheet replace it (a status
+        /// poll, as a sheet on screen does), then type the stale one on the
+        /// first attempt.
+        #[arg(long)]
+        expire_then_poll: bool,
+        /// Press New Code after reading the code, then type the stale one on
+        /// the first attempt.
+        #[arg(long)]
+        reroll_then_type_stale: bool,
+        /// Before the genuine typer, an impostor on another endpoint makes
+        /// this many wrong guesses against the displaying sheet.
+        #[arg(long, default_value_t = 0)]
+        impostor_guesses: u32,
+        /// The displaying side sees a relay's endpoint id instead of the
+        /// typer's (a spliced connection).
+        #[arg(long)]
+        relay: bool,
+        /// Person pairings: the identity the displaying side pins.
+        #[arg(long, value_enum, default_value_t = pairing::SimPin::None)]
+        pin: pairing::SimPin,
+        /// Stall the first run past the run timeout.
+        #[arg(long)]
+        stall: bool,
+        /// Deliver the first run's Share, and then its Confirm, each just
+        /// inside the run timeout: slower than the timeout end to end.
+        #[arg(long)]
+        slow_legs: bool,
+        /// Corrupt one message of the first attempt.
+        #[arg(long, value_enum)]
+        tamper: Option<pairing::SimTamper>,
+        /// Run an active attack on the exchange.
+        #[arg(long, value_enum)]
+        attack: Option<pairing::SimAttack>,
+        /// After verifying, send this payload both ways down the session.
+        #[arg(long)]
+        payload: Option<String>,
+    },
 }
 
 // Flat verb dispatch: one match arm per CLI verb, growing linearly
@@ -947,6 +1005,43 @@ async fn main() -> Result<()> {
         CeilingArg::Standard => KdfCeilingProfile::Standard,
         CeilingArg::MemoryConstrained => KdfCeilingProfile::MemoryConstrained,
     });
+    // The pairing verbs touch no vault, so they run before the password is
+    // read.
+    match &cli.command {
+        Command::PairKeygen => return pairing::keygen(),
+        Command::PairSim {
+            kind,
+            typos,
+            expire_before_typing,
+            expire_then_poll,
+            reroll_then_type_stale,
+            impostor_guesses,
+            relay,
+            pin,
+            stall,
+            slow_legs,
+            tamper,
+            attack,
+            payload,
+        } => {
+            return pairing::simulate(&pairing::SimScript {
+                kind: *kind,
+                typos: *typos,
+                expire_before_typing: *expire_before_typing,
+                expire_then_poll: *expire_then_poll,
+                reroll_then_type_stale: *reroll_then_type_stale,
+                impostor_guesses: *impostor_guesses,
+                relay: *relay,
+                pin: *pin,
+                stall: *stall,
+                slow_legs: *slow_legs,
+                tamper: *tamper,
+                attack: *attack,
+                payload: payload.clone(),
+            });
+        }
+        _ => {}
+    }
     let password = read_password(&cli.password_env)?;
     let clock_ms = cli.clock_ms;
     let uuid_seed = cli.uuid_seed;
@@ -1496,6 +1591,9 @@ async fn main() -> Result<()> {
         }
         Command::VerifyIdentity { picked, expect } => {
             verify_identity(&picked, &expect, &password, keyfile.clone())?;
+        }
+        Command::PairKeygen | Command::PairSim { .. } => {
+            unreachable!("dispatched before the password read")
         }
     }
     Ok(())

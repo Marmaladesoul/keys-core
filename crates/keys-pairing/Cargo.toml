@@ -1,0 +1,39 @@
+[package]
+name = "keys-pairing"
+description = "Code-authenticated pairing for the Keys password manager: CPace (ristretto255, SHA-512) over a six-digit code, key confirmation, a transcript-bound verified session, and the account and device key sets the pairing binds."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Every dependency here is already in the workspace lockfile (via keepass-core
+# or the sync transport); this crate adds no new crate to the tree.
+[dependencies]
+# ristretto255 group arithmetic and RFC 9496 element derivation for CPace,
+# and the X25519 base-point multiplication for the encryption key pairs.
+curve25519-dalek = { version = "5.0.0-pre.6", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+# Account identity, recovery and device signing keys.
+ed25519-dalek = { version = "3.0.0-pre.7", default-features = false, features = ["fast", "zeroize"] }
+sha2 = { version = "0.11", features = ["zeroize"] }
+hmac = { version = "0.13", features = ["zeroize"] }
+# The verified session's frames.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# Not used directly: aes-gcm's own `zeroize` feature doesn't forward to these,
+# so they are named here to wipe a frame cipher's active AES key schedule and
+# its GHASH key (and POLYVAL state) when it is dropped. A cipher lives only
+# for one frame: the session keeps raw keys in wiped allocations of their
+# own, never a cipher (see `session.rs`).
+aes = { version = "0.9", default-features = false, features = ["zeroize"] }
+ghash = { version = "0.6", default-features = false, features = ["zeroize"] }
+getrandom = { version = "0.2", features = ["std"] }
+thiserror = "2"
+zeroize = "1"
+
+[dev-dependencies]
+# Constant-time comparison of codes in the tests.
+subtle = "2"

@@ -14,12 +14,20 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [lints]
 workspace = true
 
+[features]
+# Test scaffolding for the headless driver: a pairing clock that moves only
+# when told to. Off by default, so client builds don't carry it.
+pairing-test-clock = []
+
 [dependencies]
 # Git deps on the public keepass-core repo so a clean clone builds without a
 # side-by-side checkout. Flip to crates.io version deps once keepass-core ships there.
 keepass-core = { git = "https://github.com/Marmaladesoul/keepass-core" }
 keepass-merge = { git = "https://github.com/Marmaladesoul/keepass-core" }
 keys-engine = { path = "../keys-engine" }
+# Code-authenticated pairing (CPace over a six-digit code), surfaced as uniffi
+# objects in `pairing.rs`.
+keys-pairing = { path = "../keys-pairing" }
 
 # The sync transport. Its uniffi exports ride in this crate's library, so a
 # client links one native component holding both `Engine` and `IrohNode`.

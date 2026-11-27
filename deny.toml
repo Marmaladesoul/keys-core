@@ -106,6 +106,16 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
+# The libfuzzer-sys exception only applies to the fuzz lockfile, so the
+# root run would otherwise warn that it went unused.
+unused-license-exception = "allow"
+# Per-crate allowances, narrower than widening `allow` for everyone.
+exceptions = [
+    # libfuzzer-sys bundles LLVM's libFuzzer, which is under NCSA (a
+    # permissive, BSD-style licence). Only the fuzz crate (fuzz/, never
+    # published or shipped) depends on it.
+    { crate = "libfuzzer-sys", allow = ["NCSA"] },
+]
 # Workspace crates are GPL-3.0-only with `publish = false` (consumed via
 # git deps, not the registry). The allow-list above governs DEPENDENCIES,
 # which must stay permissive — our own GPL crates are excluded from that
