@@ -22,20 +22,31 @@
 //!   [`RUN_TIMEOUT`], on the side that is waiting and from the moment that
 //!   wait began: the displaying side from the Hello to the Reply, the typing
 //!   side from its Hello to the Share and then afresh from its Reply to the
-//!   Confirm. No wait is measured across the two devices' clocks, so a slow
-//!   first message can't make the typing side give up on a Confirm the
-//!   displaying side sent in good time.
+//!   Confirm. In a Person pairing each side then waits once more, for the
+//!   other's key set: the displaying side from its Confirm, the typing side
+//!   from its own key set. No wait is measured across the two devices'
+//!   clocks, so a slow first message can't make the typing side give up on
+//!   a Confirm the displaying side sent in good time.
 //! - **Nothing moves until both confirmations verify.** A side gets its
 //!   [`VerifiedSession`] only once it has checked the other side's tag. The
 //!   displaying side checks first, so it holds a session before it can know
 //!   the typing side has one: its status says so
 //!   ([`DisplayStatus::VerifiedAwaitingPeer`]) and its session won't send
 //!   until the typing side has spoken.
+//! - **A Person pairing verifies on the key sets, not on the code alone.**
+//!   After the confirmations each side sends its account's signed key set
+//!   inside the session, the typing side first, and a sheet reports the
+//!   pairing verified (and hands over the session) only once it has checked
+//!   the other side's. Until then the run is still in flight. A key set
+//!   that doesn't check out fails the run like a wrong code. The displaying
+//!   side sends its key set last, so here too it is "verified, awaiting
+//!   peer" until the typing side's next frame.
 //! - **A guess is counted once it is spent.** The typing side's Reply carries
 //!   its confirmation tag, which lets whoever receives it test one guess at
-//!   the code. So from the moment the Reply is sent, anything but a valid
-//!   Confirm counts as a failed run on the typing side, unauthenticated
-//!   refusals included. Before the Reply, a refusal that says no run took
+//!   the code. So from the moment the Reply is sent, anything but the
+//!   message the run is waiting for (a valid Confirm, then in a Person
+//!   pairing a valid key set) counts as a failed run on the typing side,
+//!   unauthenticated refusals included. Before the Reply, a refusal that says no run took
 //!   place (the code had expired, the sheet was busy, the Hello wasn't
 //!   understood) costs nothing. Everything else that ends a run counts on
 //!   the side it ends on even before the Reply (a "run failed" refusal,
@@ -71,9 +82,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::code::PairingCode;
 use crate::protocol::{
-    Credentials, DisplayAwaitingReply, HelloRejection, MessageType, RefuseReason, RunFailure,
-    TypeAwaitingConfirm, TypeAwaitingShare, decode_refuse, display_finish, display_share,
-    encode_refuse, parse_hello, type_finish, type_hello, type_reply,
+    Credentials, DisplayAwaitingReply, DisplayingKeyExchange, DisplayingStep, HelloRejection,
+    MessageType, RefuseReason, RunFailure, TypeAwaitingConfirm, TypeAwaitingShare,
+    TypingKeyExchange, TypingStep, decode_refuse, display_finish, display_share, encode_refuse,
+    parse_hello, type_finish, type_hello, type_reply,
 };
 use crate::session::VerifiedSession;
 use crate::{EndpointId, PairingError};
@@ -206,7 +218,8 @@ pub enum DisplayStatus {
     /// This side verified the typing side and handed out its session, but
     /// has not yet heard from the typing side on it, so it can't tell
     /// whether the typing side verified too. **Not yet paired.** If the
-    /// typing side stays silent (its confirmation was lost, say), the client
+    /// typing side stays silent (this side's confirmation was lost, say, or
+    /// in a Person pairing its key set was lost or refused), the client
     /// gives up on the pairing; the session can't send in this state.
     VerifiedAwaitingPeer,
     /// Both sides verified: the session has opened a frame from the typing
@@ -247,8 +260,9 @@ pub enum Outcome {
     /// The run failed and the sheet is spent.
     DeadEnd { failure: Failure },
     /// This side verified the other and holds a session. On the typing
-    /// side both confirmations have now verified. On the displaying side
-    /// the typing side's has; see [`DisplayStatus::VerifiedAwaitingPeer`].
+    /// side everything has now verified. On the displaying side the typing
+    /// side's part has, and its own last message is on its way; see
+    /// [`DisplayStatus::VerifiedAwaitingPeer`].
     Verified(Box<VerifiedSession>),
     /// The message isn't one this sheet answers from that sender, in its
     /// present state: on the typing side, anything not from the displaying
@@ -313,10 +327,12 @@ enum DisplayState {
         reason: CodeReason,
         issued_at: Duration,
     },
+    /// A run is in flight with `peer`, waiting since `waiting_since` for
+    /// its next message.
     Running {
-        run: Box<DisplayAwaitingReply>,
+        run: DisplayRun,
         peer: EndpointId,
-        started_at: Duration,
+        waiting_since: Duration,
     },
     /// The session is out. The flag is the session's own: true once it has
     /// opened a frame from the typing side.
@@ -324,6 +340,14 @@ enum DisplayState {
         peer_confirmed: Arc<AtomicBool>,
     },
     DeadEnd,
+}
+
+/// What a displaying side's run in flight is waiting for.
+enum DisplayRun {
+    /// The Share is out: the typing side's Reply.
+    AwaitingReply(Box<DisplayAwaitingReply>),
+    /// A Person pairing whose Confirm is out: the typing side's key set.
+    AwaitingPeerKeys(Box<DisplayingKeyExchange>),
 }
 
 /// The sheet on the side that shows the code: for a device pairing, the
@@ -385,8 +409,8 @@ impl DisplaySheet {
             return Ok(None);
         }
         match &self.state {
-            DisplayState::Running { started_at, .. }
-                if now.saturating_sub(*started_at) >= RUN_TIMEOUT =>
+            DisplayState::Running { waiting_since, .. }
+                if now.saturating_sub(*waiting_since) >= RUN_TIMEOUT =>
             {
                 Ok(Some(self.fail_run(Failure::TimedOut, now)?))
             }
@@ -480,7 +504,8 @@ impl DisplaySheet {
     ///
     /// The sheet answers two things only: a Hello, from anyone (with a Share
     /// or a refusal), and whatever the peer of the run in flight sends next
-    /// (taken as its Reply). Everything else is [`Outcome::Ignored`].
+    /// (taken as what the run is waiting for: its Reply, then in a Person
+    /// pairing its key set). Everything else is [`Outcome::Ignored`].
     ///
     /// # Errors
     /// [`PairingError::Random`] if the system random source fails.
@@ -497,7 +522,7 @@ impl DisplaySheet {
                 self.handle_hello(peer, message, expired_before, now)
             }
             DisplayState::Running { .. } if is_hello => Ok(Self::refusal(RefuseReason::Busy)),
-            DisplayState::Running { .. } if from_run_peer => self.handle_reply(message, now),
+            DisplayState::Running { .. } if from_run_peer => self.handle_run_message(message, now),
             DisplayState::Verified { .. } | DisplayState::DeadEnd if is_hello => {
                 Ok(Self::refusal(RefuseReason::DeadEnd))
             }
@@ -512,7 +537,7 @@ impl DisplaySheet {
     ///   told so;
     /// - otherwise a Hello, even the run's own peer trying again, is turned
     ///   away with no run of its own counted (the code it was typed from is
-    ///   gone either way), and the run's own peer's late Reply is told the
+    ///   gone either way), and the run's own peer's late message is told the
     ///   run failed;
     /// - anyone else gets nothing.
     fn after_timeout(timed_out: Outcome, is_hello: bool, from_run_peer: bool) -> Response {
@@ -571,9 +596,9 @@ impl DisplaySheet {
         ) {
             Ok((run, share)) => {
                 self.state = DisplayState::Running {
-                    run: Box::new(run),
+                    run: DisplayRun::AwaitingReply(Box::new(run)),
                     peer,
-                    started_at: now,
+                    waiting_since: now,
                 };
                 Ok(Response {
                     reply: Some(share),
@@ -584,22 +609,45 @@ impl DisplaySheet {
         }
     }
 
-    /// The next message from the peer of the run in flight: its Reply, or
-    /// something that fails the run for not being one.
-    fn handle_reply(&mut self, message: &[u8], now: Duration) -> Result<Response, PairingError> {
-        let DisplayState::Running { run, .. } =
+    /// The next message from the peer of the run in flight: what the run is
+    /// waiting for, or something that fails the run for not being that.
+    fn handle_run_message(
+        &mut self,
+        message: &[u8],
+        now: Duration,
+    ) -> Result<Response, PairingError> {
+        let DisplayState::Running { run, peer, .. } =
             std::mem::replace(&mut self.state, DisplayState::DeadEnd)
         else {
-            unreachable!("handle_reply is called only while a run is in flight");
+            unreachable!("handle_run_message is called only while a run is in flight");
         };
-        match display_finish(*run, message) {
-            Ok((session, confirm)) => {
+        let step = match run {
+            DisplayRun::AwaitingReply(run) => display_finish(*run, message),
+            DisplayRun::AwaitingPeerKeys(keys) => keys
+                .finish(message)
+                .map(|(session, own_keys)| (DisplayingStep::Verified(session), own_keys)),
+        };
+        match step {
+            Ok((DisplayingStep::Verified(session), reply)) => {
                 self.state = DisplayState::Verified {
                     peer_confirmed: session.peer_confirmed_flag(),
                 };
                 Ok(Response {
-                    reply: Some(confirm),
+                    reply: Some(reply),
                     outcome: Outcome::Verified(Box::new(session)),
+                })
+            }
+            Ok((DisplayingStep::AwaitingPeerKeys(keys), confirm)) => {
+                // A new wait starts with the Confirm: the typing side's key
+                // set is timed from here.
+                self.state = DisplayState::Running {
+                    run: DisplayRun::AwaitingPeerKeys(Box::new(keys)),
+                    peer,
+                    waiting_since: now,
+                };
+                Ok(Response {
+                    reply: Some(confirm),
+                    outcome: Outcome::Continue,
                 })
             }
             Err(failure) => self.failed_run_response(Failure::Exchange(failure), now),
@@ -657,6 +705,12 @@ enum TypeState {
         run: Box<TypeAwaitingConfirm>,
         waiting_since: Duration,
     },
+    /// A Person pairing: waiting for the displaying side's key set since
+    /// this side's was sent.
+    AwaitingPeerKeys {
+        keys: Box<TypingKeyExchange>,
+        waiting_since: Duration,
+    },
     Verified,
     DeadEnd,
 }
@@ -707,7 +761,8 @@ impl TypeSheet {
     fn refresh(&mut self, now: Duration) -> Option<Outcome> {
         let waiting_since = match &self.state {
             TypeState::AwaitingShare { waiting_since, .. }
-            | TypeState::AwaitingConfirm { waiting_since, .. } => *waiting_since,
+            | TypeState::AwaitingConfirm { waiting_since, .. }
+            | TypeState::AwaitingPeerKeys { waiting_since, .. } => *waiting_since,
             _ => return None,
         };
         (now.saturating_sub(waiting_since) >= RUN_TIMEOUT).then(|| self.fail_run(Failure::TimedOut))
@@ -730,9 +785,9 @@ impl TypeSheet {
             TypeState::AwaitingCode => TypeStatus::AwaitingCode {
                 runs_left: MAX_RUNS_PER_SHEET - self.failed_runs,
             },
-            TypeState::AwaitingShare { .. } | TypeState::AwaitingConfirm { .. } => {
-                TypeStatus::Running
-            }
+            TypeState::AwaitingShare { .. }
+            | TypeState::AwaitingConfirm { .. }
+            | TypeState::AwaitingPeerKeys { .. } => TypeStatus::Running,
             TypeState::Verified => TypeStatus::Verified,
             TypeState::DeadEnd => TypeStatus::DeadEnd,
         }
@@ -797,10 +852,24 @@ impl TypeSheet {
                 Err(failure) => Response::quiet(self.fail_run(Failure::Exchange(failure))),
             },
             TypeState::AwaitingConfirm { run, .. } => match type_finish(*run, message) {
-                Ok(session) => {
-                    self.state = TypeState::Verified;
-                    Response::quiet(Outcome::Verified(Box::new(session)))
+                Ok(TypingStep::Verified(session)) => self.verified(session),
+                Ok(TypingStep::AwaitingPeerKeys { own_keys, exchange }) => {
+                    // The displaying side proved the code, so this side's
+                    // key set goes out, inside the session. The displaying
+                    // side's is timed from here.
+                    self.state = TypeState::AwaitingPeerKeys {
+                        keys: Box::new(exchange),
+                        waiting_since: now,
+                    };
+                    Response {
+                        reply: Some(own_keys),
+                        outcome: Outcome::Continue,
+                    }
                 }
+                Err(failure) => Response::quiet(self.fail_run(Failure::Exchange(failure))),
+            },
+            TypeState::AwaitingPeerKeys { keys, .. } => match keys.finish(message) {
+                Ok(session) => self.verified(session),
                 Err(failure) => Response::quiet(self.fail_run(Failure::Exchange(failure))),
             },
             idle_or_done => {
@@ -812,10 +881,15 @@ impl TypeSheet {
         }
     }
 
+    fn verified(&mut self, session: VerifiedSession) -> Response {
+        self.state = TypeState::Verified;
+        Response::quiet(Outcome::Verified(Box::new(session)))
+    }
+
     fn handle_refuse(&mut self, reason: RefuseReason) -> Response {
         let reply_sent = match self.state {
             TypeState::AwaitingShare { .. } => false,
-            TypeState::AwaitingConfirm { .. } => true,
+            TypeState::AwaitingConfirm { .. } | TypeState::AwaitingPeerKeys { .. } => true,
             TypeState::AwaitingCode | TypeState::Verified | TypeState::DeadEnd => {
                 return Response::quiet(Outcome::NoRun(reason));
             }
@@ -850,9 +924,9 @@ impl TypeSheet {
     /// [`PairingError::WrongState`] if no run is in flight.
     pub fn abandon_run(&mut self) -> Result<Outcome, PairingError> {
         match self.state {
-            TypeState::AwaitingShare { .. } | TypeState::AwaitingConfirm { .. } => {
-                Ok(self.fail_run(Failure::Abandoned))
-            }
+            TypeState::AwaitingShare { .. }
+            | TypeState::AwaitingConfirm { .. }
+            | TypeState::AwaitingPeerKeys { .. } => Ok(self.fail_run(Failure::Abandoned)),
             _ => Err(PairingError::WrongState),
         }
     }
@@ -861,6 +935,7 @@ impl TypeSheet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::{AccountKeys, AccountPublicKeys};
 
     const DISPLAY: EndpointId = [0xd1; 32];
     const TYPING: EndpointId = [0x71; 32];
@@ -917,9 +992,81 @@ mod tests {
         let Outcome::Continue = reply.outcome else {
             return (Outcome::Continue, reply.outcome);
         };
+        finish_run(display, typing, &reply.reply.unwrap())
+    }
+
+    /// Carries a run from the typing side's Reply to its end: the Confirm
+    /// and, for a Person pairing, the two key sets. Returns (display
+    /// outcome, typing outcome).
+    fn finish_run(
+        display: &mut DisplaySheet,
+        typing: &mut TypeSheet,
+        reply: &[u8],
+    ) -> (Outcome, Outcome) {
+        let mut from_display = display.handle(TYPING, reply).unwrap();
+        let mut from_typing = typing.handle(DISPLAY, &from_display.reply.take().unwrap());
+        if let Some(typing_keys) = from_typing.reply.take() {
+            from_display = display.handle(TYPING, &typing_keys).unwrap();
+            from_typing = typing.handle(DISPLAY, &from_display.reply.take().unwrap());
+        }
+        (from_display.outcome, from_typing.outcome)
+    }
+
+    /// A displaying and a typing sheet for a Person pairing between two
+    /// fresh accounts, with what each side expects of the other's identity.
+    fn person_sheets(
+        clock: &Arc<ManualClock>,
+        display_expects: impl FnOnce(&AccountPublicKeys) -> Option<[u8; 32]>,
+        typing_expects: impl FnOnce(&AccountPublicKeys) -> Option<[u8; 32]>,
+    ) -> (
+        DisplaySheet,
+        TypeSheet,
+        AccountPublicKeys,
+        AccountPublicKeys,
+    ) {
+        let displaying_account = Arc::new(AccountKeys::generate().unwrap().0);
+        let typing_account = Arc::new(AccountKeys::generate().unwrap().0);
+        let (display_keys, typing_keys) = (
+            displaying_account.public_keys(),
+            typing_account.public_keys(),
+        );
+        let display = DisplaySheet::open(
+            Credentials::Person {
+                account: displaying_account,
+                expected_peer_identity: display_expects(&typing_keys),
+            },
+            DISPLAY,
+            clock.clone() as Arc<dyn Clock>,
+        )
+        .unwrap();
+        let typing = TypeSheet::open(
+            Credentials::Person {
+                account: typing_account,
+                expected_peer_identity: typing_expects(&display_keys),
+            },
+            TYPING,
+            DISPLAY,
+            clock.clone() as Arc<dyn Clock>,
+        );
+        (display, typing, display_keys, typing_keys)
+    }
+
+    /// A Person run up to the point where the typing side has verified the
+    /// Confirm and its key set is on its way: returns that key-set frame.
+    fn person_run_to_typing_keys(display: &mut DisplaySheet, typing: &mut TypeSheet) -> Vec<u8> {
+        let (code, _) = shown_code(display);
+        let hello = typing.submit_code(code).unwrap();
+        let share = display.handle(TYPING, &hello).unwrap();
+        let reply = typing.handle(DISPLAY, &share.reply.unwrap());
         let confirm = display.handle(TYPING, &reply.reply.unwrap()).unwrap();
-        let typing_outcome = typing.handle(DISPLAY, &confirm.reply.unwrap()).outcome;
-        (confirm.outcome, typing_outcome)
+        // The code is proved to the displaying side, but a Person pairing
+        // isn't verified until the key sets are.
+        assert!(matches!(confirm.outcome, Outcome::Continue));
+        assert!(matches!(display.status().unwrap(), DisplayStatus::Running));
+        let keys = typing.handle(DISPLAY, &confirm.reply.unwrap());
+        assert!(matches!(keys.outcome, Outcome::Continue));
+        assert_eq!(typing.status(), TypeStatus::Running);
+        keys.reply.unwrap()
     }
 
     #[test]
@@ -1638,35 +1785,241 @@ mod tests {
 
     #[test]
     fn a_person_pairing_verifies_through_the_sheets() {
-        use crate::keys::AccountKeys;
         let clock = Arc::new(ManualClock::default());
-        let displaying_account = Arc::new(AccountKeys::generate().unwrap().0);
-        let typing_account = Arc::new(AccountKeys::generate().unwrap().0);
-        let mut display = DisplaySheet::open(
-            Credentials::Person {
-                account: Arc::clone(&displaying_account),
-                expected_peer_identity: Some(typing_account.public_keys().identity),
-            },
-            DISPLAY,
-            clock.clone() as Arc<dyn Clock>,
-        )
-        .unwrap();
-        let mut typing = TypeSheet::open(
-            Credentials::Person {
-                account: Arc::clone(&typing_account),
-                expected_peer_identity: None,
-            },
-            TYPING,
-            DISPLAY,
-            clock as Arc<dyn Clock>,
-        );
+        let (mut display, mut typing, display_keys, typing_keys) =
+            person_sheets(&clock, |typer| Some(typer.identity), |_| None);
         let (code, _) = shown_code(&mut display);
         let (d, t) = run(&mut display, &mut typing, code);
-        let (Outcome::Verified(d), Outcome::Verified(t)) = (d, t) else {
+        let (Outcome::Verified(mut d), Outcome::Verified(mut t)) = (d, t) else {
             panic!("both sides verify");
         };
-        assert_eq!(d.peer_account(), Some(typing_account.public_keys()));
-        assert_eq!(t.peer_account(), Some(displaying_account.public_keys()));
+        assert_eq!(d.peer_account(), Some(typing_keys));
+        assert_eq!(t.peer_account(), Some(display_keys));
+        // The displaying side sent its key set last, so it waits to hear
+        // the typing side accepted it before it sends anything more.
+        assert!(matches!(
+            display.status().unwrap(),
+            DisplayStatus::VerifiedAwaitingPeer
+        ));
+        assert!(d.seal(b"too early").is_err());
+        let frame = t.seal(b"opening frame").unwrap();
+        d.open(TYPING, &frame).unwrap();
+        assert!(matches!(display.status().unwrap(), DisplayStatus::Verified));
+        d.seal(b"answer").unwrap();
+    }
+
+    #[test]
+    fn a_person_whose_identity_is_not_the_expected_one_fails_the_run_on_the_side_that_expected() {
+        // The displaying side pinned an identity (from an invite) that the
+        // typer doesn't have: its run fails when the typer's key set
+        // arrives, and it sends no key set of its own.
+        let clock = Arc::new(ManualClock::default());
+        let (mut display, mut typing, ..) =
+            person_sheets(&clock, |typer| Some(typer.encryption), |_| None);
+        let typing_keys = person_run_to_typing_keys(&mut display, &mut typing);
+        let refused = display.handle(TYPING, &typing_keys).unwrap();
+        assert!(matches!(
+            refused.outcome,
+            Outcome::RunFailed {
+                failure: Failure::Exchange(RunFailure::UnexpectedPeerIdentity),
+                runs_left: 2
+            }
+        ));
+        let told = typing.handle(DISPLAY, &refused.reply.unwrap());
+        assert!(matches!(
+            told.outcome,
+            Outcome::RunFailed {
+                failure: Failure::RefusedByPeer,
+                runs_left: 2
+            }
+        ));
+
+        // The typing side pinned one the displaying side doesn't have: the
+        // displaying side has verified and waits, the typing side fails
+        // its run, and the displaying side's session never gets to send.
+        let clock = Arc::new(ManualClock::default());
+        let (mut display, mut typing, ..) =
+            person_sheets(&clock, |_| None, |displayer| Some(displayer.encryption));
+        let typing_keys = person_run_to_typing_keys(&mut display, &mut typing);
+        let accepted = display.handle(TYPING, &typing_keys).unwrap();
+        let Outcome::Verified(mut display_session) = accepted.outcome else {
+            panic!("the displaying side accepts the typing side's key set");
+        };
+        let refused = typing.handle(DISPLAY, &accepted.reply.unwrap());
+        assert!(matches!(
+            refused.outcome,
+            Outcome::RunFailed {
+                failure: Failure::Exchange(RunFailure::UnexpectedPeerIdentity),
+                runs_left: 2
+            }
+        ));
+        assert!(matches!(
+            display.status().unwrap(),
+            DisplayStatus::VerifiedAwaitingPeer
+        ));
+        assert!(display_session.seal(b"anything").is_err());
+    }
+
+    #[test]
+    fn each_side_times_its_wait_for_the_others_key_set() {
+        // The displaying side, from its Confirm.
+        let clock = Arc::new(ManualClock::default());
+        let (mut display, mut typing, ..) = person_sheets(&clock, |_| None, |_| None);
+        let typing_keys = person_run_to_typing_keys(&mut display, &mut typing);
+        clock.advance(RUN_TIMEOUT);
+        let late = display.handle(TYPING, &typing_keys).unwrap();
+        assert!(matches!(
+            late.outcome,
+            Outcome::RunFailed {
+                failure: Failure::TimedOut,
+                runs_left: 2
+            }
+        ));
+        // The typing side, from its own key set: the same stretch of
+        // silence has cost it the run too, its Reply having been spent.
+        assert_eq!(typing.status(), TypeStatus::AwaitingCode { runs_left: 2 });
+        assert_eq!(typing.last_failure(), Some(Failure::TimedOut));
+
+        // Each wait just inside the timeout: the run verifies, though end
+        // to end it took far longer than one timeout.
+        let just_inside = RUN_TIMEOUT.checked_sub(Duration::from_millis(1)).unwrap();
+        let clock = Arc::new(ManualClock::default());
+        let (mut display, mut typing, ..) = person_sheets(&clock, |_| None, |_| None);
+        let (code, _) = shown_code(&mut display);
+        let hello = typing.submit_code(code).unwrap();
+        clock.advance(just_inside);
+        let share = display.handle(TYPING, &hello).unwrap();
+        let reply = typing.handle(DISPLAY, &share.reply.unwrap());
+        clock.advance(just_inside);
+        let confirm = display.handle(TYPING, &reply.reply.unwrap()).unwrap();
+        let typing_keys = typing.handle(DISPLAY, &confirm.reply.unwrap());
+        clock.advance(just_inside);
+        let display_keys = display.handle(TYPING, &typing_keys.reply.unwrap()).unwrap();
+        assert!(matches!(display_keys.outcome, Outcome::Verified(_)));
+        // The typing side has been waiting since it sent its key set, the
+        // same stretch the displaying side just waited through.
+        let done = typing.handle(DISPLAY, &display_keys.reply.unwrap());
+        assert!(matches!(done.outcome, Outcome::Verified(_)));
+    }
+
+    #[test]
+    fn any_refusal_while_waiting_for_the_key_set_costs_the_typing_side_a_run() {
+        // The Reply is long gone by then, so a guess is spent: a refusal
+        // that says "no run took place" can't hand it back.
+        for reason in [
+            RefuseReason::Busy,
+            RefuseReason::CodeExpired,
+            RefuseReason::Unsupported,
+            RefuseReason::RunFailed,
+        ] {
+            let clock = Arc::new(ManualClock::default());
+            let (mut display, mut typing, ..) = person_sheets(&clock, |_| None, |_| None);
+            let _typing_keys = person_run_to_typing_keys(&mut display, &mut typing);
+            let refused = typing.handle(DISPLAY, &encode_refuse(reason));
+            assert!(
+                matches!(
+                    refused.outcome,
+                    Outcome::RunFailed {
+                        failure: Failure::RefusedByPeer,
+                        runs_left: 2
+                    }
+                ),
+                "{reason:?}"
+            );
+            assert_eq!(typing.status(), TypeStatus::AwaitingCode { runs_left: 2 });
+        }
+        let clock = Arc::new(ManualClock::default());
+        let (mut display, mut typing, ..) = person_sheets(&clock, |_| None, |_| None);
+        let _typing_keys = person_run_to_typing_keys(&mut display, &mut typing);
+        let refused = typing.handle(DISPLAY, &encode_refuse(RefuseReason::DeadEnd));
+        assert!(matches!(
+            refused.outcome,
+            Outcome::DeadEnd {
+                failure: Failure::PeerDeadEnd
+            }
+        ));
+    }
+
+    #[test]
+    fn giving_up_while_waiting_for_a_key_set_counts_as_a_failed_run() {
+        let clock = Arc::new(ManualClock::default());
+        let (mut display, mut typing, ..) = person_sheets(&clock, |_| None, |_| None);
+        let _typing_keys = person_run_to_typing_keys(&mut display, &mut typing);
+        for outcome in [
+            display.abandon_run().unwrap(),
+            typing.abandon_run().unwrap(),
+        ] {
+            assert!(matches!(
+                outcome,
+                Outcome::RunFailed {
+                    failure: Failure::Abandoned,
+                    runs_left: 2
+                }
+            ));
+        }
+        let (_, reason) = shown_code(&mut display);
+        assert_eq!(reason, CodeReason::RunFailed);
+        assert_eq!(typing.status(), TypeStatus::AwaitingCode { runs_left: 2 });
+    }
+
+    #[test]
+    fn messages_out_of_place_in_the_key_set_wait_are_turned_away_or_fail_the_run() {
+        let clock = Arc::new(ManualClock::default());
+        let (mut display, mut typing, ..) = person_sheets(&clock, |_| None, |_| None);
+        let (code, _) = shown_code(&mut display);
+        let hello = typing.submit_code(code).unwrap();
+        let share = display.handle(TYPING, &hello).unwrap();
+        let reply = typing.handle(DISPLAY, &share.reply.unwrap()).reply.unwrap();
+        let confirm = display.handle(TYPING, &reply).unwrap().reply.unwrap();
+        let _typing_keys = typing.handle(DISPLAY, &confirm).reply.unwrap();
+
+        // A Hello, even from the run's own peer: busy, and the run goes on.
+        let busy = display.handle(TYPING, &hello).unwrap();
+        assert!(matches!(busy.outcome, Outcome::NoRun(RefuseReason::Busy)));
+        assert!(matches!(display.status().unwrap(), DisplayStatus::Running));
+        // The Reply again, where the key set belongs: the run fails.
+        let failed = display.handle(TYPING, &reply).unwrap();
+        assert!(matches!(
+            failed.outcome,
+            Outcome::RunFailed {
+                failure: Failure::Exchange(RunFailure::MalformedMessage),
+                runs_left: 2
+            }
+        ));
+        // The Confirm again, where the displaying side's key set belongs.
+        let failed = typing.handle(DISPLAY, &confirm);
+        assert!(matches!(
+            failed.outcome,
+            Outcome::RunFailed {
+                failure: Failure::Exchange(RunFailure::MalformedMessage),
+                runs_left: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn a_tampered_key_set_fails_the_run_and_a_refusal_then_costs_the_typing_side() {
+        let clock = Arc::new(ManualClock::default());
+        let (mut display, mut typing, ..) = person_sheets(&clock, |_| None, |_| None);
+        let mut typing_keys = person_run_to_typing_keys(&mut display, &mut typing);
+        *typing_keys.last_mut().unwrap() ^= 1;
+        let refused = display.handle(TYPING, &typing_keys).unwrap();
+        assert!(matches!(
+            refused.outcome,
+            Outcome::RunFailed {
+                failure: Failure::Exchange(RunFailure::InvalidPeerKeys),
+                runs_left: 2
+            }
+        ));
+        // The displaying side shows a new code; nothing of the old run is
+        // left to answer.
+        let (_, reason) = shown_code(&mut display);
+        assert_eq!(reason, CodeReason::RunFailed);
+        let told = typing.handle(DISPLAY, &refused.reply.unwrap());
+        assert!(matches!(
+            told.outcome,
+            Outcome::RunFailed { runs_left: 2, .. }
+        ));
     }
 
     #[test]
@@ -1798,6 +2151,13 @@ mod tests {
         Abandoned,
         /// The sheets are simply dropped with the Reply still in flight.
         DroppedMidRun,
+        /// The Confirm reaches the typing side and then both sides give up:
+        /// in a Person pairing each is waiting for the other's key set,
+        /// its session inside the sheet; in a device pairing both have
+        /// verified, and the sessions are dropped unused.
+        AbandonedAfterConfirm,
+        /// The same, with the sheets simply dropped.
+        DroppedAfterConfirm,
     }
 
     /// Runs one pairing with this thread's frees watched, registering the
@@ -1810,7 +2170,6 @@ mod tests {
     /// side's scalar.
     fn secrets_left_in_freed_memory(person: bool, ending: WatchedEnding) -> usize {
         use crate::heap_watch;
-        use crate::keys::AccountKeys;
 
         heap_watch::start();
         {
@@ -1848,7 +2207,11 @@ mod tests {
 
             let hello = typing.submit_code(typed).unwrap();
             let share = display.handle(TYPING, &hello).unwrap();
-            let DisplayState::Running { run, .. } = &display.state else {
+            let DisplayState::Running {
+                run: DisplayRun::AwaitingReply(run),
+                ..
+            } = &display.state
+            else {
                 panic!("a run is in flight");
             };
             run.watch_secrets();
@@ -1861,13 +2224,10 @@ mod tests {
 
             match ending {
                 WatchedEnding::Verified => {
-                    let confirm = display.handle(TYPING, &reply.reply.unwrap()).unwrap();
-                    let Outcome::Verified(display_session) = confirm.outcome else {
-                        panic!("the displaying side verifies");
-                    };
-                    let finish = typing.handle(DISPLAY, &confirm.reply.unwrap());
-                    let Outcome::Verified(typing_session) = finish.outcome else {
-                        panic!("the typing side verifies");
+                    let (Outcome::Verified(display_session), Outcome::Verified(typing_session)) =
+                        finish_run(&mut display, &mut typing, &reply.reply.unwrap())
+                    else {
+                        panic!("both sides verify");
                     };
                     // Out of their boxes, as a caller is free to do.
                     let (mut display_session, mut typing_session) =
@@ -1888,6 +2248,16 @@ mod tests {
                     typing.abandon_run().unwrap();
                 }
                 WatchedEnding::DroppedMidRun => {}
+                WatchedEnding::AbandonedAfterConfirm | WatchedEnding::DroppedAfterConfirm => {
+                    let confirm = display.handle(TYPING, &reply.reply.unwrap()).unwrap();
+                    let after_confirm = typing.handle(DISPLAY, &confirm.reply.unwrap());
+                    assert_eq!(after_confirm.reply.is_some(), person);
+                    if matches!(ending, WatchedEnding::AbandonedAfterConfirm) {
+                        // Only a Person pairing still has a run in flight.
+                        assert_eq!(display.abandon_run().is_ok(), person);
+                        assert_eq!(typing.abandon_run().is_ok(), person);
+                    }
+                }
             }
         }
         heap_watch::finish()
@@ -1901,6 +2271,8 @@ mod tests {
                 WatchedEnding::WrongCode,
                 WatchedEnding::Abandoned,
                 WatchedEnding::DroppedMidRun,
+                WatchedEnding::AbandonedAfterConfirm,
+                WatchedEnding::DroppedAfterConfirm,
             ] {
                 assert_eq!(
                     secrets_left_in_freed_memory(person, ending),

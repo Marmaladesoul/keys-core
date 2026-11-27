@@ -8,8 +8,8 @@
 //! ```text
 //!   typing (T)                                displaying (D)
 //!   Hello   { version, kind, nonce_T }   ──▶
-//!                                        ◀──  Share   { nonce_D, Y_D, AD_D }
-//!   Reply   { Y_T, tag_T, AD_T }         ──▶
+//!                                        ◀──  Share   { nonce_D, Y_D }
+//!   Reply   { Y_T, tag_T }               ──▶
 //!                                        ◀──  Confirm { tag_D }   (or Refuse)
 //! ```
 //!
@@ -23,37 +23,50 @@
 //!   Identities in CI with their roles is the draft's preferred placement
 //!   (§10.1.1). A relay that splices two connections presents the wrong
 //!   endpoint id to at least one side, so the two ends' CIs differ and so do
-//!   their keys.
+//!   their keys. The kind in CI is what keeps a device run from completing
+//!   as a Person run: nothing else in the exchange differs between them.
 //! - **sid** is `nonce_T || nonce_D`, one fresh random contribution from each
 //!   side (§10.9).
-//! - **AD** is empty for a device pairing. For a Person pairing it carries the
-//!   side's account identity, recovery and encryption public keys and an
-//!   identity-key signature over them, bound to this run's CI, sid and role
-//!   and to the signer's own `CPace` share:
-//!   `lv_cat(identity, recovery, encryption, sig)`, with `sig` over
-//!   `lv_cat("keys-pairing person keys", role, CI, sid, identity, recovery, encryption, share)`.
-//!   The receiver checks the signature against the share that arrived in
-//!   the same message (and, if it was given one, that the identity is the
-//!   one it expected) before it accepts the run (§10.1.1). Signing the
-//!   share ties a key set to the one exchange it was made for by the
-//!   signature itself, so that tie doesn't rest on the transport having
-//!   authenticated the endpoint ids in CI.
-//!   **AD is not confidential** (the draft says as much): a Person sheet's
-//!   key set and signature go to whoever is at the other endpoint before
-//!   that party has proved it knows the code. So an endpoint that reaches an
-//!   open Person sheet learns which account is behind it, and holds a
-//!   signature saying so, for the price of one burnt code. The signature
-//!   can't be replayed (it covers role, both endpoints, kind, version, both
-//!   nonces and the signer's share), and the keys are public values; what
-//!   leaks is the link
-//!   between an endpoint and an account.
+//! - **AD** is empty, on both sides and for both kinds.
+//!
+//! **A Person pairing has one more step, inside the session.** Each side's
+//! first frame of the verified session is its account's key set, the typing
+//! side's first:
+//!
+//! ```text
+//!   Frame 0 { identity, recovery, encryption, sig_T }   ──▶
+//!                                        ◀──  Frame 0 { identity, recovery, encryption, sig_D }
+//! ```
+//!
+//! The frame's plaintext is `lv_cat(identity, recovery, encryption, sig)`,
+//! with `sig` the identity key's signature over
+//! `lv_cat("keys-pairing person keys", role, CI, sid, Y_D, Y_T, identity, recovery, encryption)`.
+//! The receiver checks the signature, the keys themselves and, if it was
+//! given one, that the identity is the one it expected; only then does it
+//! record the account, and only then does the displaying side send its own
+//! key set. So an account's keys, and its signature over them, reach only a
+//! party that has proved it knows the code: an endpoint that merely reaches
+//! an open Person sheet learns nothing about whose it is. Both shares are
+//! signed so that a key set can't be carried into another session whose sid
+//! was made to match, and the role so that a side's own key set doesn't
+//! verify when handed back to it. The typing side seals its key set only
+//! after verifying the displaying side's confirmation; the displaying side
+//! seals its own only after opening the typing side's.
+//!
+//! One consequence of the order: a typing side that expects a particular
+//! identity can check it only after its own key set has gone, so a
+//! displaying party that proved the code but isn't the expected account
+//! does see the typing side's key set before the typing side fails the
+//! run. The displaying side's expectation is checked before its key set
+//! leaves. (It is the displaying side, the invite's opener, that normally
+//! holds an expected identity.)
 //!
 //! **Key confirmation** follows §10.4: `mac_key = SHA-512("CPaceMac" || sid || ISK)`
 //! and each side's tag is `HMAC-SHA-512(mac_key, lv_cat(Y, AD))` over the
 //! message it sent. D checks T's tag before it sends its own, so a wrong code
 //! is detected by the side that made it, and nothing from D proves anything to
 //! a guesser. Each side holds a [`VerifiedSession`] only after it has checked
-//! the other's tag.
+//! the other's tag and, in a Person pairing, the other's key set.
 //!
 //! Every failure of a run is final for that run: the caller burns the code.
 
@@ -70,7 +83,7 @@ use crate::keys::{
     AccountKeys, AccountPublicKeys, PUBLIC_KEY_BYTES, SIGNATURE_BYTES, verify_signature,
 };
 use crate::secret::Secret;
-use crate::session::{SESSION_KEY_BYTES, SessionKeys, SessionRole, VerifiedSession};
+use crate::session::{SESSION_KEY_BYTES, SessionError, SessionKeys, SessionRole, VerifiedSession};
 use crate::wire::Reader;
 
 /// The pairing protocol version. Bound into CI, so two sides that disagree
@@ -91,6 +104,10 @@ const CPACE_MAC_LABEL: &[u8] = b"CPaceMac";
 const SESSION_KEY_LABEL: &[u8] = b"keys-pairing session key";
 const DIRECTION_DISPLAY_TO_TYPE: &[u8] = b"display to type";
 const DIRECTION_TYPE_TO_DISPLAY: &[u8] = b"type to display";
+/// The exchange's associated data, for both sides and both kinds: none. The
+/// draft's AD fields are still there, empty, so the transcript and the tags
+/// are exactly the draft's.
+const NO_ASSOCIATED_DATA: &[u8] = &[];
 /// The single HKDF-Expand block counter (RFC 5869 §2.3, `T(1)`).
 const HKDF_FIRST_BLOCK: u8 = 0x01;
 
@@ -127,9 +144,10 @@ pub enum Credentials {
     /// A device pairing. The device keys travel later, inside the verified
     /// session, so nothing is bound up front.
     Device,
-    /// A Person pairing: this account's keys, whose public halves go into the
-    /// transcript with a signature, and optionally the identity key this side
-    /// expects the other account to have (from an invite it holds).
+    /// A Person pairing: this account's keys, whose public halves go to the
+    /// other side with a signature once the code is proved, and optionally
+    /// the identity key this side expects the other account to have (from
+    /// an invite it holds).
     Person {
         account: Arc<AccountKeys>,
         expected_peer_identity: Option<[u8; PUBLIC_KEY_BYTES]>,
@@ -269,88 +287,208 @@ fn session_id(nonce_t: &[u8; NONCE_BYTES], nonce_d: &[u8; NONCE_BYTES]) -> Vec<u
     sid
 }
 
-/// What a Person's identity key signs: its key set, for one role in one run,
-/// beside the one `CPace` share (`share`, the signer's own) it travels with.
+/// What an exchange fixed, for the key sets that follow it to be signed
+/// against.
+pub(crate) struct Transcript {
+    ci: Vec<u8>,
+    sid: Vec<u8>,
+    display_share: [u8; SHARE_BYTES],
+    typing_share: [u8; SHARE_BYTES],
+}
+
+/// What a Person's identity key signs: its key set, as one role of one
+/// exchange. Each field is there for a reason a machine-checked model of the
+/// protocol found by removing it (`formal/pairing`): without both shares, a
+/// party at one end of two sessions can make their session ids equal and
+/// carry a signed key set from one into the other; without the role, a
+/// side's own key set verifies when reflected back at it.
 fn person_keys_message(
-    role: &[u8],
-    ci: &[u8],
-    sid: &[u8],
+    role: SessionRole,
+    transcript: &Transcript,
     keys: &AccountPublicKeys,
-    share: &[u8; SHARE_BYTES],
 ) -> Vec<u8> {
     lv_cat(&[
         PERSON_KEYS_LABEL,
-        role,
-        ci,
-        sid,
+        role_label(role),
+        &transcript.ci,
+        &transcript.sid,
+        &transcript.display_share,
+        &transcript.typing_share,
         &keys.identity,
         &keys.recovery,
         &keys.encryption,
-        share,
     ])
 }
 
-/// This side's AD: empty for a device pairing, the signed key set for a
-/// Person pairing. `own_share` is the share this side sends with it.
-fn own_ad(
-    credentials: &Credentials,
-    role: &[u8],
-    ci: &[u8],
-    sid: &[u8],
-    own_share: &[u8; SHARE_BYTES],
-) -> Vec<u8> {
-    match credentials {
-        Credentials::Device => Vec::new(),
-        Credentials::Person { account, .. } => {
-            let keys = account.public_keys();
-            let signature = account.sign(&person_keys_message(role, ci, sid, &keys, own_share));
-            lv_cat(&[&keys.identity, &keys.recovery, &keys.encryption, &signature])
-        }
+fn role_label(role: SessionRole) -> &'static [u8] {
+    match role {
+        SessionRole::Displaying => ROLE_DISPLAY,
+        SessionRole::Typing => ROLE_TYPE,
     }
 }
 
-/// Checks the other side's AD against what this side's credentials call for,
-/// and returns the account keys it carried (Person pairings only).
-/// `peer_share` is the share that arrived in the same message as `ad`.
-fn check_peer_ad(
-    credentials: &Credentials,
-    peer_role: &[u8],
-    ci: &[u8],
-    sid: &[u8],
-    peer_share: &[u8; SHARE_BYTES],
-    ad: &[u8],
-) -> Result<Option<AccountPublicKeys>, RunFailure> {
-    match credentials {
-        Credentials::Device => {
-            if ad.is_empty() {
-                Ok(None)
-            } else {
-                Err(RunFailure::MalformedMessage)
-            }
-        }
-        Credentials::Person {
-            expected_peer_identity,
-            ..
-        } => {
-            let mut reader = Reader::new(ad);
-            let keys = AccountPublicKeys {
-                identity: reader.lv_array::<PUBLIC_KEY_BYTES>()?,
-                recovery: reader.lv_array::<PUBLIC_KEY_BYTES>()?,
-                encryption: reader.lv_array::<PUBLIC_KEY_BYTES>()?,
-            };
-            let signature = reader.lv_array::<SIGNATURE_BYTES>()?;
-            reader.finish()?;
-            let message = person_keys_message(peer_role, ci, sid, &keys, peer_share);
-            if !verify_signature(&keys.identity, &message, &signature)
-                || !keys.recovery_and_encryption_are_well_formed()
-            {
-                return Err(RunFailure::InvalidPeerKeys);
-            }
-            if expected_peer_identity.is_some_and(|expected| expected != keys.identity) {
-                return Err(RunFailure::UnexpectedPeerIdentity);
-            }
-            Ok(Some(keys))
-        }
+fn other_role(role: SessionRole) -> SessionRole {
+    match role {
+        SessionRole::Displaying => SessionRole::Typing,
+        SessionRole::Typing => SessionRole::Displaying,
+    }
+}
+
+/// Where the typing side stands once it has verified the displaying side's
+/// confirmation.
+pub(crate) enum TypingStep {
+    /// A device pairing: the session is ready.
+    Verified(VerifiedSession),
+    /// A Person pairing: this side's key set is sealed (`own_keys`, to send
+    /// now), and the displaying side's is awaited.
+    AwaitingPeerKeys {
+        own_keys: Vec<u8>,
+        exchange: TypingKeyExchange,
+    },
+}
+
+/// Where the displaying side stands once it has verified the typing side's
+/// confirmation, or its key set.
+pub(crate) enum DisplayingStep {
+    /// The session is ready: a device pairing after the Reply, a Person
+    /// pairing after the typing side's key set.
+    Verified(VerifiedSession),
+    /// A Person pairing after the Reply: the typing side's key set is
+    /// awaited, and this side's own is not yet sealed.
+    AwaitingPeerKeys(DisplayingKeyExchange),
+}
+
+/// The last step of a Person pairing: each side sends its signed key set as
+/// its first frame of the session, the typing side first. Private to this
+/// module: the two sides reach it only through [`TypingKeyExchange`] and
+/// [`DisplayingKeyExchange`], each of which seals this side's key set once,
+/// at the one point its role allows, and gives up the session only by way
+/// of the other side's key set having been checked.
+struct PersonKeyExchange {
+    session: VerifiedSession,
+    account: Arc<AccountKeys>,
+    expected_peer_identity: Option<[u8; PUBLIC_KEY_BYTES]>,
+    transcript: Transcript,
+}
+
+impl PersonKeyExchange {
+    /// Seals this side's signed key set as the session's next frame.
+    fn seal_own_keys(&mut self) -> Vec<u8> {
+        let keys = self.account.public_keys();
+        let message = person_keys_message(self.session.role(), &self.transcript, &keys);
+        let signature = self.account.sign(&message);
+        let key_set = lv_cat(&[&keys.identity, &keys.recovery, &keys.encryption, &signature]);
+        // The typing side's session may always send, and seals this once,
+        // from `type_finish`. The displaying side's may send once it has
+        // opened the typing side's key set, which is where
+        // `DisplayingKeyExchange::finish` calls this from.
+        self.session
+            .seal(&key_set)
+            .expect("a session that has sent nothing seals its key set")
+    }
+
+    /// Opens the other side's key-set frame, checks the key set in it, and
+    /// records the account on the session.
+    fn open_peer_keys(&mut self, frame: &[u8]) -> Result<(), RunFailure> {
+        let peer = self.session.peer();
+        let key_set = self
+            .session
+            .open(peer, frame)
+            .map_err(|error| match error {
+                // Not a frame at all: an exchange message out of place, say.
+                SessionError::NotAFrame | SessionError::WrongSender => RunFailure::MalformedMessage,
+                // A frame that didn't authenticate, or wasn't the first.
+                SessionError::FrameRejected => RunFailure::InvalidPeerKeys,
+                SessionError::PayloadTooLarge
+                | SessionError::Exhausted
+                | SessionError::AwaitingPeer => {
+                    unreachable!("{error:?} is an error of sealing, not of opening")
+                }
+            })?;
+        let keys = check_key_set(
+            &key_set,
+            other_role(self.session.role()),
+            &self.transcript,
+            self.expected_peer_identity,
+        )?;
+        self.session.set_peer_account(keys);
+        Ok(())
+    }
+}
+
+/// Parses a key set (the plaintext of a key-set frame) and checks it: the
+/// signature, as `signer_role` of this exchange; the keys themselves; and
+/// the identity this side expected, if it expected one.
+fn check_key_set(
+    key_set: &[u8],
+    signer_role: SessionRole,
+    transcript: &Transcript,
+    expected_identity: Option<[u8; PUBLIC_KEY_BYTES]>,
+) -> Result<AccountPublicKeys, RunFailure> {
+    let mut reader = Reader::new(key_set);
+    let keys = AccountPublicKeys {
+        identity: reader.lv_array::<PUBLIC_KEY_BYTES>()?,
+        recovery: reader.lv_array::<PUBLIC_KEY_BYTES>()?,
+        encryption: reader.lv_array::<PUBLIC_KEY_BYTES>()?,
+    };
+    let signature = reader.lv_array::<SIGNATURE_BYTES>()?;
+    reader.finish()?;
+    let message = person_keys_message(signer_role, transcript, &keys);
+    if !verify_signature(&keys.identity, &message, &signature)
+        || !keys.recovery_and_encryption_are_well_formed()
+    {
+        return Err(RunFailure::InvalidPeerKeys);
+    }
+    if expected_identity.is_some_and(|expected| expected != keys.identity) {
+        return Err(RunFailure::UnexpectedPeerIdentity);
+    }
+    Ok(keys)
+}
+
+/// Fuzzing builds only (`--cfg fuzzing`): whether `key_set`, taken as the
+/// plaintext of a typing side's key-set frame, is accepted against a fixed
+/// transcript. A peer that knows the code chooses that plaintext freely, so
+/// its parser and checks are fuzzed directly; nothing a fuzzer makes should
+/// ever be accepted, since that takes a signature by the identity key the
+/// key set itself names.
+#[cfg(fuzzing)]
+#[must_use]
+pub fn key_set_is_accepted_for_fuzzing(key_set: &[u8]) -> bool {
+    let transcript = Transcript {
+        ci: channel_identifier(PairingKind::Person, &[0xd1; 32], &[0x7e; 32]),
+        sid: vec![0x5d; 2 * NONCE_BYTES],
+        display_share: [0x0d; SHARE_BYTES],
+        typing_share: [0x07; SHARE_BYTES],
+    };
+    check_key_set(key_set, SessionRole::Typing, &transcript, None).is_ok()
+}
+
+/// The typing side of a Person pairing, its own key set already sealed (by
+/// [`type_finish`], on verifying the displaying side's confirmation).
+pub(crate) struct TypingKeyExchange(PersonKeyExchange);
+
+impl TypingKeyExchange {
+    /// Checks the displaying side's key set and returns the session.
+    pub(crate) fn finish(mut self, frame: &[u8]) -> Result<VerifiedSession, RunFailure> {
+        self.0.open_peer_keys(frame)?;
+        Ok(self.0.session)
+    }
+}
+
+/// The displaying side of a Person pairing, its Confirm sent and its own
+/// key set not yet sealed.
+pub(crate) struct DisplayingKeyExchange(PersonKeyExchange);
+
+impl DisplayingKeyExchange {
+    /// Checks the typing side's key set, and only then seals this side's.
+    /// Returns the session and the frame to send. The session then waits to
+    /// hear from the typing side again before it will send anything else:
+    /// that next frame is what shows the typing side accepted this key set.
+    pub(crate) fn finish(mut self, frame: &[u8]) -> Result<(VerifiedSession, Vec<u8>), RunFailure> {
+        self.0.open_peer_keys(frame)?;
+        let own_keys = self.0.seal_own_keys();
+        self.0.session.await_peer_again();
+        Ok((self.0.session, own_keys))
     }
 }
 
@@ -368,31 +506,26 @@ fn confirmation_key(sid: &[u8], isk: &Isk) -> Secret<ISK_BYTES> {
 }
 
 /// The §10.4 tag computation, with no role label, exactly as the draft has
-/// it. The two sides' tags differ because their `(Y, AD)` differ, and a tag
+/// it. The two sides' tags differ because their shares differ, and a tag
 /// can't be reflected because the displaying side's share is fixed before
 /// the typing side's exists and the displaying side never sends its tag
 /// first. Both rest on the message order: keep it.
-fn confirmation_mac(mac_key: &[u8], share: &[u8], ad: &[u8]) -> HmacSha512 {
+fn confirmation_mac(mac_key: &[u8], share: &[u8]) -> HmacSha512 {
     let mut mac = HmacSha512::new_from_slice(mac_key).expect("HMAC accepts any key length");
-    mac.update(&lv_cat(&[share, ad]));
+    mac.update(&lv_cat(&[share, NO_ASSOCIATED_DATA]));
     mac
 }
 
-fn confirmation_tag(mac_key: &[u8], share: &[u8], ad: &[u8]) -> [u8; TAG_BYTES] {
-    confirmation_mac(mac_key, share, ad)
+fn confirmation_tag(mac_key: &[u8], share: &[u8]) -> [u8; TAG_BYTES] {
+    confirmation_mac(mac_key, share)
         .finalize()
         .into_bytes()
         .into()
 }
 
 /// Constant-time check of the other side's tag.
-fn verify_confirmation(
-    mac_key: &[u8],
-    share: &[u8],
-    ad: &[u8],
-    tag: &[u8],
-) -> Result<(), RunFailure> {
-    confirmation_mac(mac_key, share, ad)
+fn verify_confirmation(mac_key: &[u8], share: &[u8], tag: &[u8]) -> Result<(), RunFailure> {
+    confirmation_mac(mac_key, share)
         .verify_slice(tag)
         .map_err(|_| RunFailure::ConfirmationFailed)
 }
@@ -443,13 +576,12 @@ pub(crate) struct TypeAwaitingShare {
 
 /// The typing side after sending Reply, waiting for Confirm.
 pub(crate) struct TypeAwaitingConfirm {
+    credentials: Credentials,
     display_endpoint: EndpointId,
     mac_key: Secret<ISK_BYTES>,
-    display_share: [u8; SHARE_BYTES],
-    display_ad: Vec<u8>,
     keys: SessionKeys,
     kind: PairingKind,
-    peer_account: Option<AccountPublicKeys>,
+    transcript: Transcript,
 }
 
 #[cfg(test)]
@@ -513,68 +645,97 @@ pub(crate) fn type_reply(
     reader.expect_type(MessageType::Share)?;
     let nonce_d = reader.array::<NONCE_BYTES>()?;
     let display_share = reader.array::<SHARE_BYTES>()?;
-    let display_ad = reader.rest().to_vec();
+    reader.finish()?;
 
     let kind = credentials.kind();
     let ci = channel_identifier(kind, &display_endpoint, &own_endpoint);
     let sid = session_id(&nonce_t, &nonce_d);
-    let peer_account = check_peer_ad(
-        &credentials,
-        ROLE_DISPLAY,
-        &ci,
-        &sid,
-        &display_share,
-        &display_ad,
-    )?;
 
     let cpace = CpaceParty::start(code.prs(), &ci, &sid).map_err(|_| RunFailure::Random)?;
-    let own_share = *cpace.share();
-    let ad = own_ad(&credentials, ROLE_TYPE, &ci, &sid, &own_share);
+    let typing_share = *cpace.share();
     let isk = cpace
-        .finish(CpaceRole::Responder, &ad, &display_share, &display_ad)
+        .finish(
+            CpaceRole::Responder,
+            NO_ASSOCIATED_DATA,
+            &display_share,
+            NO_ASSOCIATED_DATA,
+        )
         .map_err(|_| RunFailure::InvalidShare)?;
     let mac_key = confirmation_key(&sid, &isk);
-    let tag = confirmation_tag(mac_key.as_bytes(), &own_share, &ad);
+    let tag = confirmation_tag(mac_key.as_bytes(), &typing_share);
 
     let mut reply = vec![MessageType::Reply as u8];
-    reply.extend_from_slice(&own_share);
+    reply.extend_from_slice(&typing_share);
     reply.extend_from_slice(&tag);
-    reply.extend_from_slice(&ad);
     let next = TypeAwaitingConfirm {
+        credentials,
         display_endpoint,
         mac_key,
-        display_share,
-        display_ad,
         keys: session_keys(&isk, false),
         kind,
-        peer_account,
+        transcript: Transcript {
+            ci,
+            sid,
+            display_share,
+            typing_share,
+        },
     };
     Ok((next, reply))
 }
 
-/// The typing side's last step: checks the displaying side's tag. Only now
-/// does it hold a session.
-pub(crate) fn type_finish(
+/// Checks the displaying side's tag and returns what the typing side then
+/// holds: its session, with nothing yet sealed on it.
+fn type_confirmed(
     state: TypeAwaitingConfirm,
     confirm_message: &[u8],
-) -> Result<VerifiedSession, RunFailure> {
+) -> Result<(VerifiedSession, Credentials, Transcript), RunFailure> {
     let mut reader = Reader::new(confirm_message);
     reader.expect_type(MessageType::Confirm)?;
     let tag = reader.array::<TAG_BYTES>()?;
     reader.finish()?;
     verify_confirmation(
         state.mac_key.as_bytes(),
-        &state.display_share,
-        &state.display_ad,
+        &state.transcript.display_share,
         &tag,
     )?;
-    Ok(VerifiedSession::new(
+    let session = VerifiedSession::new(
         SessionRole::Typing,
         state.kind,
         state.display_endpoint,
         state.keys,
-        state.peer_account,
-    ))
+    );
+    Ok((session, state.credentials, state.transcript))
+}
+
+/// The typing side's last step of the exchange: checks the displaying side's
+/// tag. Only now does it hold a session and, in a Person pairing, seal its
+/// key set.
+pub(crate) fn type_finish(
+    state: TypeAwaitingConfirm,
+    confirm_message: &[u8],
+) -> Result<TypingStep, RunFailure> {
+    let (session, credentials, transcript) = type_confirmed(state, confirm_message)?;
+    Ok(match credentials {
+        Credentials::Device => TypingStep::Verified(session),
+        Credentials::Person {
+            account,
+            expected_peer_identity,
+        } => {
+            let mut exchange = PersonKeyExchange {
+                session,
+                account,
+                expected_peer_identity,
+                transcript,
+            };
+            // The displaying side has just proved it knows the code: only
+            // now is this side's key set signed and sealed.
+            let own_keys = exchange.seal_own_keys();
+            TypingStep::AwaitingPeerKeys {
+                own_keys,
+                exchange: TypingKeyExchange(exchange),
+            }
+        }
+    })
 }
 
 // ─── the displaying side ────────────────────────────────────────────────────
@@ -620,7 +781,6 @@ pub(crate) struct DisplayAwaitingReply {
     cpace: CpaceParty,
     ci: Vec<u8>,
     sid: Vec<u8>,
-    own_ad: Vec<u8>,
     kind: PairingKind,
 }
 
@@ -637,71 +797,74 @@ pub(crate) fn display_share(
     let ci = channel_identifier(hello.kind, &own_endpoint, &typing_endpoint);
     let sid = session_id(&hello.nonce_t, &nonce_d);
     let cpace = CpaceParty::start(code.prs(), &ci, &sid).map_err(|_| RunFailure::Random)?;
-    let ad = own_ad(&credentials, ROLE_DISPLAY, &ci, &sid, cpace.share());
 
     let mut share = vec![MessageType::Share as u8];
     share.extend_from_slice(&nonce_d);
     share.extend_from_slice(cpace.share());
-    share.extend_from_slice(&ad);
     let state = DisplayAwaitingReply {
         credentials,
         typing_endpoint,
         cpace,
         ci,
         sid,
-        own_ad: ad,
         kind: hello.kind,
     };
     Ok((state, share))
 }
 
-/// The displaying side's last step: checks the typing side's keys and tag,
-/// and only if both hold returns the session and the Confirm to send.
+/// The displaying side's last step of the exchange: checks the typing side's
+/// tag, and only if it holds returns the confirmed exchange and the Confirm
+/// to send.
 pub(crate) fn display_finish(
     state: DisplayAwaitingReply,
     reply_message: &[u8],
-) -> Result<(VerifiedSession, Vec<u8>), RunFailure> {
+) -> Result<(DisplayingStep, Vec<u8>), RunFailure> {
     let mut reader = Reader::new(reply_message);
     reader.expect_type(MessageType::Reply)?;
     let typing_share = reader.array::<SHARE_BYTES>()?;
     let typing_tag = reader.array::<TAG_BYTES>()?;
-    let typing_ad = reader.rest().to_vec();
+    reader.finish()?;
 
-    let peer_account = check_peer_ad(
-        &state.credentials,
-        ROLE_TYPE,
-        &state.ci,
-        &state.sid,
-        &typing_share,
-        &typing_ad,
-    )?;
-    let own_share = *state.cpace.share();
+    let display_share = *state.cpace.share();
     let isk = state
         .cpace
         .finish(
             CpaceRole::Initiator,
-            &state.own_ad,
+            NO_ASSOCIATED_DATA,
             &typing_share,
-            &typing_ad,
+            NO_ASSOCIATED_DATA,
         )
         .map_err(|_| RunFailure::InvalidShare)?;
     let mac_key = confirmation_key(&state.sid, &isk);
-    verify_confirmation(mac_key.as_bytes(), &typing_share, &typing_ad, &typing_tag)?;
+    verify_confirmation(mac_key.as_bytes(), &typing_share, &typing_tag)?;
 
     let mut confirm = vec![MessageType::Confirm as u8];
-    confirm.extend_from_slice(&confirmation_tag(
-        mac_key.as_bytes(),
-        &own_share,
-        &state.own_ad,
-    ));
+    confirm.extend_from_slice(&confirmation_tag(mac_key.as_bytes(), &display_share));
     let session = VerifiedSession::new(
         SessionRole::Displaying,
         state.kind,
         state.typing_endpoint,
         session_keys(&isk, true),
-        peer_account,
     );
-    Ok((session, confirm))
+    let transcript = Transcript {
+        ci: state.ci,
+        sid: state.sid,
+        display_share,
+        typing_share,
+    };
+    let step = match state.credentials {
+        Credentials::Device => DisplayingStep::Verified(session),
+        Credentials::Person {
+            account,
+            expected_peer_identity,
+        } => DisplayingStep::AwaitingPeerKeys(DisplayingKeyExchange(PersonKeyExchange {
+            session,
+            account,
+            expected_peer_identity,
+            transcript,
+        })),
+    };
+    Ok((step, confirm))
 }
 
 #[cfg(test)]
@@ -743,9 +906,105 @@ mod tests {
             Err(failure) => return (Err(RunFailure::ConfirmationFailed), Err(failure)),
         };
         match display_finish(d1, &reply) {
-            Ok((display_session, confirm)) => (Ok(display_session), type_finish(t2, &confirm)),
+            Ok((display, confirm)) => match type_finish(t2, &confirm) {
+                Ok(typing) => finish(display, typing),
+                Err(failure) => (Err(RunFailure::ConfirmationFailed), Err(failure)),
+            },
             Err(failure) => (Err(failure), Err(RunFailure::ConfirmationFailed)),
         }
+    }
+
+    /// Finishes an exchange both sides have confirmed: nothing more for a
+    /// device pairing, the two key-set frames for a Person pairing.
+    fn finish(
+        display: DisplayingStep,
+        typing: TypingStep,
+    ) -> (
+        Result<VerifiedSession, RunFailure>,
+        Result<VerifiedSession, RunFailure>,
+    ) {
+        match (display, typing) {
+            (DisplayingStep::Verified(display), TypingStep::Verified(typing)) => {
+                (Ok(display), Ok(typing))
+            }
+            (
+                DisplayingStep::AwaitingPeerKeys(display),
+                TypingStep::AwaitingPeerKeys { own_keys, exchange },
+            ) => match display.finish(&own_keys) {
+                Ok((display, display_keys)) => (Ok(display), exchange.finish(&display_keys)),
+                Err(failure) => (Err(failure), Err(RunFailure::ConfirmationFailed)),
+            },
+            _ => panic!("the two sides ran different kinds"),
+        }
+    }
+
+    /// A Person exchange both sides have confirmed, with neither key set
+    /// sealed yet: (displaying side, typing side). The typing side is the
+    /// bare exchange, so a test can seal a key set of its own making as the
+    /// session's first frame.
+    fn person_exchanges(
+        display: Credentials,
+        typing: Credentials,
+    ) -> (DisplayingKeyExchange, PersonKeyExchange) {
+        let code = PairingCode::parse("314159").unwrap();
+        let (t1, hello) = type_hello(typing, TYPING, DISPLAY, code.clone()).unwrap();
+        let hello = parse_hello(&hello, PairingKind::Person).unwrap();
+        let (d1, share) = display_share(display, DISPLAY, TYPING, &hello, &code).unwrap();
+        let (t2, reply) = type_reply(t1, &share).unwrap();
+        let (DisplayingStep::AwaitingPeerKeys(display), confirm) =
+            display_finish(d1, &reply).unwrap()
+        else {
+            panic!("a Person exchange");
+        };
+        let (
+            session,
+            Credentials::Person {
+                account,
+                expected_peer_identity,
+            },
+            transcript,
+        ) = type_confirmed(t2, &confirm).unwrap()
+        else {
+            panic!("a Person exchange");
+        };
+        let typing = PersonKeyExchange {
+            session,
+            account,
+            expected_peer_identity,
+            transcript,
+        };
+        (display, typing)
+    }
+
+    /// A key-set frame sealed by `sender`'s session, carrying `keys` signed
+    /// by `signer` as `role` of `transcript`: what a peer that holds the
+    /// session, but signs something other than it should, would send.
+    fn key_set_frame(
+        sender: &mut PersonKeyExchange,
+        signer: &AccountKeys,
+        role: SessionRole,
+        transcript: &Transcript,
+        keys: AccountPublicKeys,
+    ) -> Vec<u8> {
+        let signature = signer.sign(&person_keys_message(role, transcript, &keys));
+        let key_set = lv_cat(&[&keys.identity, &keys.recovery, &keys.encryption, &signature]);
+        sender.session.seal(&key_set).unwrap()
+    }
+
+    fn copy_of(transcript: &Transcript) -> Transcript {
+        Transcript {
+            ci: transcript.ci.clone(),
+            sid: transcript.sid.clone(),
+            display_share: transcript.display_share,
+            typing_share: transcript.typing_share,
+        }
+    }
+
+    fn two_accounts() -> (Arc<AccountKeys>, Arc<AccountKeys>) {
+        (
+            Arc::new(AccountKeys::generate().unwrap().0),
+            Arc::new(AccountKeys::generate().unwrap().0),
+        )
     }
 
     #[test]
@@ -851,49 +1110,297 @@ mod tests {
         assert_eq!(display.err(), Some(RunFailure::UnexpectedPeerIdentity));
     }
 
+    /// One way of making a transcript a different exchange's.
+    type Alteration = fn(&mut Transcript);
+
     #[test]
-    fn person_keys_with_a_signature_from_another_run_are_refused() {
-        // A key set signed for one run can't be replayed into another: the
-        // signature covers that run's CI and sid.
-        let (a, _) = AccountKeys::generate().unwrap();
-        let (b, _) = AccountKeys::generate().unwrap();
-        let (a, b) = (Arc::new(a), Arc::new(b));
-        let code = PairingCode::generate().unwrap();
+    fn a_key_set_signed_for_another_exchange_is_refused() {
+        // The signature covers this exchange's channel identifier, session
+        // id and both shares. A key set signed against a transcript that
+        // differs in any one of them is refused, though it arrives inside
+        // the right session.
+        let (a, b) = two_accounts();
+        let alterations: [(&str, Alteration); 4] = [
+            ("channel identifier", |transcript| transcript.ci[0] ^= 1),
+            ("session id", |transcript| transcript.sid[0] ^= 1),
+            ("displaying side's share", |transcript| {
+                transcript.display_share[0] ^= 1;
+            }),
+            ("typing side's share", |transcript| {
+                transcript.typing_share[0] ^= 1;
+            }),
+        ];
+        for (what, alter) in alterations {
+            let (display, mut typing) = person_exchanges(person(&b, None), person(&a, None));
+            let mut other = copy_of(&typing.transcript);
+            alter(&mut other);
+            let frame = key_set_frame(
+                &mut typing,
+                &a,
+                SessionRole::Typing,
+                &other,
+                a.public_keys(),
+            );
+            assert_eq!(
+                display.finish(&frame).err(),
+                Some(RunFailure::InvalidPeerKeys),
+                "signed against another {what}"
+            );
+        }
+        // The same frame, signed against this exchange, is accepted.
+        let (display, mut typing) = person_exchanges(person(&b, None), person(&a, None));
+        let transcript = copy_of(&typing.transcript);
+        let frame = key_set_frame(
+            &mut typing,
+            &a,
+            SessionRole::Typing,
+            &transcript,
+            a.public_keys(),
+        );
+        let (session, _) = display.finish(&frame).unwrap();
+        assert_eq!(session.peer_account(), Some(a.public_keys()));
+    }
 
-        let (_, first_hello) = type_hello(person(&a, None), TYPING, DISPLAY, code.clone()).unwrap();
-        let first_hello = parse_hello(&first_hello, PairingKind::Person).unwrap();
-        let (_, first_share) =
-            display_share(person(&b, None), DISPLAY, TYPING, &first_hello, &code).unwrap();
-        let replayed_ad = &first_share[1 + NONCE_BYTES + SHARE_BYTES..];
-
-        let (t1, second_hello) =
-            type_hello(person(&a, None), TYPING, DISPLAY, code.clone()).unwrap();
-        let second_hello = parse_hello(&second_hello, PairingKind::Person).unwrap();
-        let (_, second_share) =
-            display_share(person(&b, None), DISPLAY, TYPING, &second_hello, &code).unwrap();
-        let mut forged = second_share[..1 + NONCE_BYTES + SHARE_BYTES].to_vec();
-        forged.extend_from_slice(replayed_ad);
+    #[test]
+    fn a_sides_own_key_set_reflected_back_at_it_is_refused() {
+        // The signature covers the signer's role. The displaying side's own
+        // key set, signed as the displaying side, doesn't pass as the
+        // typing side's: a side can't be made to record itself as its peer.
+        let (a, b) = two_accounts();
+        let (display, mut typing) = person_exchanges(person(&b, None), person(&a, None));
+        let transcript = copy_of(&typing.transcript);
+        let reflected = key_set_frame(
+            &mut typing,
+            &b,
+            SessionRole::Displaying,
+            &transcript,
+            b.public_keys(),
+        );
         assert_eq!(
-            type_reply(t1, &forged).err(),
+            display.finish(&reflected).err(),
             Some(RunFailure::InvalidPeerKeys)
         );
     }
 
     #[test]
-    fn a_device_run_refuses_person_ad() {
-        let (a, _) = AccountKeys::generate().unwrap();
-        let a = Arc::new(a);
-        let code = PairingCode::generate().unwrap();
-        let (t1, hello) = type_hello(Credentials::Device, TYPING, DISPLAY, code.clone()).unwrap();
-        let hello = parse_hello(&hello, PairingKind::Device).unwrap();
-        let (_, mut share) =
-            display_share(person(&a, None), DISPLAY, TYPING, &hello, &code).unwrap();
-        share.truncate(1 + NONCE_BYTES + SHARE_BYTES);
-        share.push(0); // any trailing AD byte on a device run
+    fn a_key_set_frame_that_does_not_open_or_parse_is_refused() {
+        let (a, b) = two_accounts();
+        let exchanges = || person_exchanges(person(&b, None), person(&a, None));
+
+        // A flipped bit in the sealed frame.
+        let (display, mut typing) = exchanges();
+        let mut frame = typing.seal_own_keys();
+        *frame.last_mut().unwrap() ^= 1;
         assert_eq!(
-            type_reply(t1, &share).err(),
+            display.finish(&frame).err(),
+            Some(RunFailure::InvalidPeerKeys)
+        );
+
+        // Something that isn't a frame at all: a second Confirm, say.
+        let (display, _) = exchanges();
+        let stray = [MessageType::Confirm as u8; 1 + TAG_BYTES];
+        assert_eq!(
+            display.finish(&stray).err(),
             Some(RunFailure::MalformedMessage)
         );
+
+        // A frame the session opens, holding a key set with a byte too many.
+        let (display, mut typing) = exchanges();
+        let keys = a.public_keys();
+        let signature = a.sign(&person_keys_message(
+            SessionRole::Typing,
+            &typing.transcript,
+            &keys,
+        ));
+        let mut key_set = lv_cat(&[&keys.identity, &keys.recovery, &keys.encryption, &signature]);
+        key_set.push(0);
+        let frame = typing.session.seal(&key_set).unwrap();
+        assert_eq!(
+            display.finish(&frame).err(),
+            Some(RunFailure::MalformedMessage)
+        );
+    }
+
+    #[test]
+    fn a_key_set_altered_after_signing_is_refused() {
+        // Each of the three keys is under the signature: swap any one for
+        // another account's and the key set no longer verifies.
+        let (a, b) = two_accounts();
+        let (genuine, other) = (a.public_keys(), b.public_keys());
+        let altered = [
+            AccountPublicKeys {
+                identity: other.identity,
+                ..genuine
+            },
+            AccountPublicKeys {
+                recovery: other.recovery,
+                ..genuine
+            },
+            AccountPublicKeys {
+                encryption: other.encryption,
+                ..genuine
+            },
+        ];
+        for sent in altered {
+            let (display, mut typing) = person_exchanges(person(&b, None), person(&a, None));
+            let signature = a.sign(&person_keys_message(
+                SessionRole::Typing,
+                &typing.transcript,
+                &genuine,
+            ));
+            let key_set = lv_cat(&[&sent.identity, &sent.recovery, &sent.encryption, &signature]);
+            let frame = typing.session.seal(&key_set).unwrap();
+            assert_eq!(
+                display.finish(&frame).err(),
+                Some(RunFailure::InvalidPeerKeys),
+                "{sent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_typing_side_refuses_a_key_set_signed_for_another_exchange_too() {
+        let (a, b) = two_accounts();
+        let (mut display, mut typing) = person_exchanges(person(&b, None), person(&a, None));
+        let typing_keys = typing.seal_own_keys();
+        display.0.open_peer_keys(&typing_keys).unwrap();
+        // The displaying side holds the session and may now send, but signs
+        // against a transcript whose typing-side share differs.
+        let mut other = copy_of(&display.0.transcript);
+        other.typing_share[0] ^= 1;
+        let frame = key_set_frame(
+            &mut display.0,
+            &b,
+            SessionRole::Displaying,
+            &other,
+            b.public_keys(),
+        );
+        assert_eq!(
+            TypingKeyExchange(typing).finish(&frame).err(),
+            Some(RunFailure::InvalidPeerKeys)
+        );
+    }
+
+    #[test]
+    fn a_key_set_that_is_not_exactly_four_fields_of_the_right_lengths_is_malformed() {
+        let (a, _) = two_accounts();
+        let transcript = Transcript {
+            ci: channel_identifier(PairingKind::Person, &DISPLAY, &TYPING),
+            sid: session_id(&[1; NONCE_BYTES], &[2; NONCE_BYTES]),
+            display_share: [3; SHARE_BYTES],
+            typing_share: [4; SHARE_BYTES],
+        };
+        let keys = a.public_keys();
+        let signature = a.sign(&person_keys_message(
+            SessionRole::Typing,
+            &transcript,
+            &keys,
+        ));
+        let key_set = lv_cat(&[&keys.identity, &keys.recovery, &keys.encryption, &signature]);
+        let check = |key_set: &[u8]| check_key_set(key_set, SessionRole::Typing, &transcript, None);
+        assert_eq!(check(&key_set), Ok(keys));
+
+        // Cut short anywhere, or with anything after it.
+        for len in 0..key_set.len() {
+            assert_eq!(
+                check(&key_set[..len]).err(),
+                Some(RunFailure::MalformedMessage),
+                "cut to {len} bytes"
+            );
+        }
+        let mut longer = key_set.clone();
+        longer.push(0);
+        assert_eq!(check(&longer).err(), Some(RunFailure::MalformedMessage));
+        // A field one byte short, with the length prefix to match.
+        let short_identity = lv_cat(&[
+            &keys.identity[1..],
+            &keys.recovery,
+            &keys.encryption,
+            &signature,
+        ]);
+        assert_eq!(
+            check(&short_identity).err(),
+            Some(RunFailure::MalformedMessage)
+        );
+    }
+
+    #[test]
+    fn the_displaying_side_sends_its_key_set_only_after_checking_the_typing_sides() {
+        let (a, b) = two_accounts();
+        let (mut display, mut typing) = person_exchanges(person(&b, None), person(&a, None));
+        // Before the typing side has spoken, the displaying side's session
+        // seals nothing: its key set can't leave first.
+        assert_eq!(
+            display.0.session.seal(b"anything").err(),
+            Some(SessionError::AwaitingPeer)
+        );
+        let typing_keys = typing.seal_own_keys();
+        let (mut display, display_keys) = display.finish(&typing_keys).unwrap();
+        // Its key set is out, and it can't yet tell whether the typing side
+        // accepted it: back to not sending.
+        assert!(!display.peer_confirmed());
+        assert_eq!(
+            display.seal(b"too early").err(),
+            Some(SessionError::AwaitingPeer)
+        );
+        let mut typing = TypingKeyExchange(typing).finish(&display_keys).unwrap();
+        let first = typing.seal(b"opening frame").unwrap();
+        assert_eq!(
+            display.open(TYPING, &first).unwrap().as_slice(),
+            b"opening frame"
+        );
+        assert!(display.peer_confirmed());
+        display.seal(b"answer").unwrap();
+    }
+
+    #[test]
+    fn the_typing_side_refuses_an_unexpected_identity_too() {
+        let (a, b) = two_accounts();
+        let (someone_else, _) = two_accounts();
+        let (display, typing) = run(
+            person(&b, None),
+            person(&a, Some(someone_else.public_keys().identity)),
+            &PairingCode::parse("314159").unwrap(),
+            &PairingCode::parse("314159").unwrap(),
+            TYPING,
+        );
+        // The displaying side accepted the typing side's key set and sent
+        // its own; the typing side refused that.
+        assert!(display.is_ok());
+        assert_eq!(typing.err(), Some(RunFailure::UnexpectedPeerIdentity));
+    }
+
+    #[test]
+    fn exchange_messages_carry_nothing_after_their_fields() {
+        // The exchange has no associated data, for either kind: a byte
+        // after a Share's share or a Reply's tag is refused.
+        let (a, _) = two_accounts();
+        for credentials in [Credentials::Device, person(&a, None)] {
+            let code = PairingCode::generate().unwrap();
+            let (t1, hello) =
+                type_hello(credentials.clone(), TYPING, DISPLAY, code.clone()).unwrap();
+            let hello = parse_hello(&hello, credentials.kind()).unwrap();
+            let (_, mut share) =
+                display_share(credentials.clone(), DISPLAY, TYPING, &hello, &code).unwrap();
+            assert_eq!(share.len(), 1 + NONCE_BYTES + SHARE_BYTES);
+            share.push(0);
+            assert_eq!(
+                type_reply(t1, &share).err(),
+                Some(RunFailure::MalformedMessage)
+            );
+
+            let (t1, hello) =
+                type_hello(credentials.clone(), TYPING, DISPLAY, code.clone()).unwrap();
+            let hello = parse_hello(&hello, credentials.kind()).unwrap();
+            let (d1, share) = display_share(credentials, DISPLAY, TYPING, &hello, &code).unwrap();
+            let (_, mut reply) = type_reply(t1, &share).unwrap();
+            assert_eq!(reply.len(), 1 + SHARE_BYTES + TAG_BYTES);
+            reply.push(0);
+            assert_eq!(
+                display_finish(d1, &reply).err(),
+                Some(RunFailure::MalformedMessage)
+            );
+        }
     }
 
     #[test]
@@ -958,44 +1465,42 @@ mod tests {
 
     #[test]
     fn person_keys_that_are_not_usable_keys_are_refused_even_when_signed() {
-        let (account, _) = AccountKeys::generate().unwrap();
-        let ci = channel_identifier(PairingKind::Person, &DISPLAY, &TYPING);
-        let sid = session_id(&[1; NONCE_BYTES], &[2; NONCE_BYTES]);
-        let verifier = person(&Arc::new(AccountKeys::generate().unwrap().0), None);
-        let share = [7u8; SHARE_BYTES];
-        let signed_ad = |keys: AccountPublicKeys| {
-            let signature =
-                account.sign(&person_keys_message(ROLE_DISPLAY, &ci, &sid, &keys, &share));
-            lv_cat(&[&keys.identity, &keys.recovery, &keys.encryption, &signature])
-        };
-        let good = account.public_keys();
-        assert_eq!(
-            check_peer_ad(&verifier, ROLE_DISPLAY, &ci, &sid, &share, &signed_ad(good)),
-            Ok(Some(good))
-        );
-
+        let (a, b) = two_accounts();
+        let good = a.public_keys();
         // u = 0 and u = 1 are X25519 points of small order; u = 2 is on the
         // twist. The Ed25519 identity point (y = 1) has order one.
         let mut one = [0u8; PUBLIC_KEY_BYTES];
         one[0] = 1;
         let mut two = [0u8; PUBLIC_KEY_BYTES];
         two[0] = 2;
-        for encryption in [[0u8; PUBLIC_KEY_BYTES], one, two] {
-            let bad = AccountPublicKeys { encryption, ..good };
+        let unusable = [
+            AccountPublicKeys {
+                encryption: [0u8; PUBLIC_KEY_BYTES],
+                ..good
+            },
+            AccountPublicKeys {
+                encryption: one,
+                ..good
+            },
+            AccountPublicKeys {
+                encryption: two,
+                ..good
+            },
+            AccountPublicKeys {
+                recovery: one,
+                ..good
+            },
+        ];
+        for keys in unusable {
+            let (display, mut typing) = person_exchanges(person(&b, None), person(&a, None));
+            let transcript = copy_of(&typing.transcript);
+            let frame = key_set_frame(&mut typing, &a, SessionRole::Typing, &transcript, keys);
             assert_eq!(
-                check_peer_ad(&verifier, ROLE_DISPLAY, &ci, &sid, &share, &signed_ad(bad)),
-                Err(RunFailure::InvalidPeerKeys),
-                "encryption key {encryption:?}"
+                display.finish(&frame).err(),
+                Some(RunFailure::InvalidPeerKeys),
+                "{keys:?}"
             );
         }
-        let bad = AccountPublicKeys {
-            recovery: one,
-            ..good
-        };
-        assert_eq!(
-            check_peer_ad(&verifier, ROLE_DISPLAY, &ci, &sid, &share, &signed_ad(bad)),
-            Err(RunFailure::InvalidPeerKeys)
-        );
     }
 
     /// Both sides up to the point where the displaying side holds the
@@ -1022,45 +1527,6 @@ mod tests {
         assert_eq!(
             display_finish(second_display, &first_reply).err(),
             Some(RunFailure::ConfirmationFailed)
-        );
-    }
-
-    #[test]
-    fn person_keys_beside_a_share_they_were_not_signed_with_are_refused() {
-        // The signature covers the signer's own share. So a genuine key
-        // set, in its own run, beside a different (perfectly valid) share
-        // is refused at the signature check, before any confirmation.
-        let (a, _) = AccountKeys::generate().unwrap();
-        let (b, _) = AccountKeys::generate().unwrap();
-        let (a, b) = (Arc::new(a), Arc::new(b));
-        let code = PairingCode::parse("314159").unwrap();
-        let (_, other_share, other_reply) = device_run_to_reply(&code);
-        let share_at = 1 + NONCE_BYTES;
-        let other_display_point = &other_share[share_at..share_at + SHARE_BYTES];
-        let other_typing_point = &other_reply[1..=SHARE_BYTES];
-        let run_to_share = || {
-            let (t1, hello) = type_hello(person(&a, None), TYPING, DISPLAY, code.clone()).unwrap();
-            let hello = parse_hello(&hello, PairingKind::Person).unwrap();
-            let (d1, share) =
-                display_share(person(&b, None), DISPLAY, TYPING, &hello, &code).unwrap();
-            (t1, d1, share)
-        };
-
-        // Y_D swapped in the Share: the typing side sends no Reply.
-        let (t1, _, mut share) = run_to_share();
-        share[share_at..share_at + SHARE_BYTES].copy_from_slice(other_display_point);
-        assert_eq!(
-            type_reply(t1, &share).err(),
-            Some(RunFailure::InvalidPeerKeys)
-        );
-
-        // Y_T swapped in the Reply: the displaying side sends no Confirm.
-        let (t1, d1, share) = run_to_share();
-        let (_t2, mut reply) = type_reply(t1, &share).unwrap();
-        reply[1..=SHARE_BYTES].copy_from_slice(other_typing_point);
-        assert_eq!(
-            display_finish(d1, &reply).err(),
-            Some(RunFailure::InvalidPeerKeys)
         );
     }
 
@@ -1153,20 +1619,36 @@ mod tests {
             let (d1, share) =
                 display_share(display_credentials, DISPLAY, TYPING, &parsed, &code).unwrap();
             let (t2, reply) = type_reply(t1, &share).unwrap();
-            let (mut display, confirm) = display_finish(d1, &reply).unwrap();
-            let mut typing = type_finish(t2, &confirm).unwrap();
-            let frame_t = typing.seal(b"from the typing side").unwrap();
-            display.open(TYPING, &frame_t).unwrap();
-            let frame_d = display.seal(b"from the displaying side").unwrap();
-            typing.open(DISPLAY, &frame_d).unwrap();
-            vec![
+            let (display, confirm) = display_finish(d1, &reply).unwrap();
+            let typing = type_finish(t2, &confirm).unwrap();
+            let mut messages = vec![
                 ("hello", hex(&hello)),
                 ("share", hex(&share)),
                 ("reply", hex(&reply)),
                 ("confirm", hex(&confirm)),
-                ("frame type to display", hex(&frame_t)),
-                ("frame display to type", hex(&frame_d)),
-            ]
+            ];
+            let (mut display, mut typing) = match (display, typing) {
+                (DisplayingStep::Verified(display), TypingStep::Verified(typing)) => {
+                    (display, typing)
+                }
+                (
+                    DisplayingStep::AwaitingPeerKeys(display),
+                    TypingStep::AwaitingPeerKeys { own_keys, exchange },
+                ) => {
+                    let (display, display_keys) = display.finish(&own_keys).unwrap();
+                    messages.push(("key set type to display", hex(&own_keys)));
+                    messages.push(("key set display to type", hex(&display_keys)));
+                    (display, exchange.finish(&display_keys).unwrap())
+                }
+                _ => panic!("the two sides ran different kinds"),
+            };
+            let frame_t = typing.seal(b"from the typing side").unwrap();
+            display.open(TYPING, &frame_t).unwrap();
+            let frame_d = display.seal(b"from the displaying side").unwrap();
+            typing.open(DISPLAY, &frame_d).unwrap();
+            messages.push(("frame type to display", hex(&frame_t)));
+            messages.push(("frame display to type", hex(&frame_d)));
+            messages
         })
     }
 
@@ -1236,48 +1718,60 @@ mod tests {
             "share",
             concat!(
                 "02b4a40434959d771e0dda939f975acf150e22b4926f3c9f622be2762611da30",
-                "4ba47aee98b375d7620af869291817d86420dd63c6d7b7e175567d444f97de5f",
-                "4dbd7aba6974e196b363c1a6d3171cd6eb0c201d7897bdb258ab3132016363fd",
-                "1fc6055d0a49f23bf9836bd57964c296d09c02200ba32a278f02a045a49d969c",
-                "52e4615a2271f2051e9ddfaba615aa04042db4754051d089cfceddaf66aa024d",
-                "42f5fb34c90655a60863b61a2429337d65c17b209b92aef06735aae8c99fec1e",
-                "e5bc767167d92db4a60ec095d6b0b5ff058a163307",
+                "4ba47aee98b375d7620af869291817d864",
             ),
         ),
         (
             "reply",
             concat!(
                 "03a4421f7f861a6897f2d38f965d18108802c2211d96b109a0d3b552c3d0162e",
-                "22035f3f3c82c58f2ea9e275b18e37c9e76cf72e9d6f027a6d65bf15eb0f2c6e",
-                "e7af11bcac56fcfcdd8c7d556ae7774793dd6b77e7c83def3b67d199882ce201",
-                "f620f3f285a275422bd9c133ea728878803efbaba5cee8993d71f85b2cb495f3",
-                "74ba2059c747c892791ac90117f1f10d9f5bf1ef0f30b7896cf60fc72e7a69ca",
-                "d84a2a20844f8087d391fcd922cdd2e4558c6948f072b302c812a4948258cf0d",
-                "0c2ac214409df47acb4064d7bbc0358c2d046416c515eee9061506b796ec4741",
-                "a790c27970b1ccf03f0c2a8ea7d8e16a1fd1c912fe5398c82bdf76226261b065",
-                "766be88d04",
+                "22be382f46f20c6b66c645fee854ea06cabdd7d3d59a1eebdfe5b2399bb7b0cf",
+                "fe0cdcd09106e1c2298290e10d61edb347f3fb151d96bc7f41aa8562ce59a703",
+                "5b",
             ),
         ),
         (
             "confirm",
             concat!(
-                "049514afe36c9d85686fb30bbc551101af037c9ba7a9278faaa175df258d76e3",
-                "7279f0a98bab6bd9e417b002bf89ca06e5d48d2c9519c1c1fb67b9e5e13df1e8",
-                "6a",
+                "0400154a4ecc8f7fbea05eff03382e7e8acf0ad3a14f276f6c2f64e23d8658a2",
+                "aed8ce64995caf53fc953ce05c349725e9f1e56d706a0f0fa57b15f74a1ad3b4",
+                "ae",
+            ),
+        ),
+        (
+            "key set type to display",
+            concat!(
+                "060000000000000000f55c4094ebc05268a5d7e13db25eef57655dd6adf9f1d1",
+                "baee4c78a32450cda6080ed8820db67b9d5835cdefd02e1dc3d5b52c824df57d",
+                "8fd4dec4665afe100abc39b46b524641e4d35e2873d85b65d2a471ca64dd2973",
+                "08fe03b64fd9efa753a93e3f396b32694d3694d514afe0c09a2361694d37ad55",
+                "36d6d43778717f319c152491ae80f5c9dab00ade61f36c5bc12a28e47038767b",
+                "e12ad9c43f2e74763757f871ac404df14c0776520d8dce019a86ab35bc",
+            ),
+        ),
+        (
+            "key set display to type",
+            concat!(
+                "060000000000000000981ba77452aae55562f3b8369785801b404d105a7a9abe",
+                "dd1c9aa5085e36ecca874fe9c0a45b77dc0453bfff463cd476e588418d90ffff",
+                "f1a6be6b957b861f9656d40992e381a511ea4a8732fa043dd5a20fc03b6245d5",
+                "faca98eb94b2fbe781c656d685b503bfefefd56c22ca10bb60a10c4de6cbebf6",
+                "8cb7dce6481ac6b3e290801249da1b251247de759dd3bfff262ac00e34167dd6",
+                "2dea3a7c4de74a58784a5fb9bf8a846465b196258049a108508f3ca265",
             ),
         ),
         (
             "frame type to display",
             concat!(
-                "060000000000000000a1a3be3d738ac3612fd9fdec458fbf940835d650e675e5",
-                "f1dfeef6721b074fee040b171e",
+                "060000000000000001e6457ff77d914265349419df197f106fa75de0374671fa",
+                "44646226b6d9e1f68f79c45c3b",
             ),
         ),
         (
             "frame display to type",
             concat!(
-                "0600000000000000003be315a06929c34963fb8b6ada8e8bc7057d3d71df6849",
-                "ea1c7cd8adb7b1f14abde1f507ae12e1ed",
+                "060000000000000001ce6b02990a35350f4fa0a2ec01c9982f50a83dfe226f6c",
+                "a584e1435bc757907115b118983b14a9e3",
             ),
         ),
     ];

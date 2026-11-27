@@ -14,9 +14,16 @@
 #      sides, a new code is shown, and the next run verifies. The displaying
 #      side, which only polls its status, can still say what the run was
 #      lost to.
-#   4. Each of the typing side's two waits is timed from when it began: a
-#      Share and then a Confirm that each arrive just inside the run
-#      timeout verify, though the run took nearly twice the timeout.
+#   4. Each wait is timed from when it began: a Share and then a Confirm
+#      that each arrive just inside the run timeout verify, though the run
+#      took nearly twice the timeout. In a Person pairing the displaying
+#      side's wait for the typing side's key set starts afresh at its
+#      Confirm, so the same slow run verifies there too.
+#   5. Person pairing: each side's wait for the other's key set times out
+#      like any other. A lost Confirm costs both sides the run (the
+#      displaying side was still waiting for a key set). A lost key set
+#      from the displaying side costs the typing side the run and leaves
+#      the displaying side "verified, awaiting peer", unable to send.
 
 set -euo pipefail
 source "$(dirname "$0")/pairing-common.inc"
@@ -52,4 +59,27 @@ expect "type: verified kind=device"
 expect "result: verified"
 refute "display: showing reason=run-failed runs-left=2"
 
-echo "PASS: an expired code is replaced; its Hello costs nothing before the replacement and one run after; a stalled run times out as a failure; each wait is timed afresh"
+sim --kind person --slow-legs
+[ "$(count "clock: just under run timeout")" = 2 ] \
+    || { echo "FAIL: expected two slow legs"; echo "$OUT"; exit 1; }
+expect_re "type: verified kind=person peer-identity=[0-9a-f]+"
+expect "result: verified"
+refute "display: showing reason=run-failed runs-left=2"
+
+sim --kind person --attack drop-confirm
+expect "wire: confirm dropped"
+expect "type: lost-run failure=timed-out runs-left=2"
+expect "display: lost-run failure=timed-out"
+expect "display: showing reason=run-failed runs-left=2"
+expect "result: verified"
+
+sim --kind person --attack drop-key-set
+expect "wire: displaying side's key set dropped"
+expect "type: lost-run failure=timed-out runs-left=2"
+expect "display: verified-awaiting-peer"
+expect "session: display peer-confirmed no"
+expect "session: display-sends-first refused"
+refute "display: verified"
+expect "result: not-verified"
+
+echo "PASS: an expired code is replaced; its Hello costs nothing before the replacement and one run after; a stalled run times out as a failure; each wait, a key set's included, is timed afresh"

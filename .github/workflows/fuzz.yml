@@ -47,6 +47,7 @@ jobs:
           - pairing_display
           - pairing_type
           - pairing_session
+          - pairing_key_set
           - pairing_sequence
           - pairing_code
     steps:

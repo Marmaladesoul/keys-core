@@ -949,6 +949,9 @@ enum Command {
         /// Person pairings: the identity the displaying side pins.
         #[arg(long, value_enum, default_value_t = pairing::SimPin::None)]
         pin: pairing::SimPin,
+        /// Person pairings: the identity the typing side pins.
+        #[arg(long, value_enum, default_value_t = pairing::SimPin::None)]
+        type_pin: pairing::SimPin,
         /// Stall the first run past the run timeout.
         #[arg(long)]
         stall: bool,
@@ -1018,6 +1021,7 @@ async fn main() -> Result<()> {
             impostor_guesses,
             relay,
             pin,
+            type_pin,
             stall,
             slow_legs,
             tamper,
@@ -1033,6 +1037,7 @@ async fn main() -> Result<()> {
                 impostor_guesses: *impostor_guesses,
                 relay: *relay,
                 pin: *pin,
+                type_pin: *type_pin,
                 stall: *stall,
                 slow_legs: *slow_legs,
                 tamper: *tamper,

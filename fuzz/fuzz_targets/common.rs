@@ -43,7 +43,7 @@ fn accounts() -> (Arc<AccountKeys>, Arc<AccountKeys>) {
 /// Both sides' credentials: a device pairing, or a Person pairing (with or
 /// without the typing side pinning the displaying side's identity).
 pub fn credentials(selector: u8) -> (Credentials, Credentials) {
-    match selector % 3 {
+    match selector % CREDENTIAL_CHOICES {
         0 => (Credentials::Device, Credentials::Device),
         pin => {
             let (display, typing) = accounts();
@@ -61,6 +61,22 @@ pub fn credentials(selector: u8) -> (Credentials, Credentials) {
         }
     }
 }
+
+/// How many kinds of credentials a selector byte picks between: a device
+/// pairing, a Person pairing, and a Person pairing whose typing side
+/// expects the displaying side's identity.
+const CREDENTIAL_CHOICES: u8 = 3;
+
+/// Whether `selector` picks a Person pairing.
+pub fn is_person(selector: u8) -> bool {
+    selector % CREDENTIAL_CHOICES != 0
+}
+
+/// Selector bits the two sheet targets share, above the credential choice:
+/// the honest run has got past its first message when the fuzzed message
+/// arrives, and (Person pairings) as far as the wait for a key set.
+pub const PAST_FIRST_MESSAGE: u8 = 0x80;
+pub const AWAITING_KEY_SET: u8 = 0x40;
 
 pub struct Pair {
     pub display: DisplaySheet,
@@ -124,6 +140,23 @@ impl Pair {
             .handle(DISPLAY_ENDPOINT, &share)
             .reply
             .expect("a Share is answered with a Reply")
+    }
+
+    /// Person pairings: delivers the honest Reply and then the honest
+    /// Confirm, and returns the typing side's honest key-set frame. Both
+    /// sides are then waiting for the other's key set.
+    pub fn typing_key_set(&mut self) -> Vec<u8> {
+        let reply = self.reply();
+        let confirm = self
+            .display
+            .handle(TYPE_ENDPOINT, &reply)
+            .expect("handle")
+            .reply
+            .expect("a Reply is answered with a Confirm");
+        self.typing
+            .handle(DISPLAY_ENDPOINT, &confirm)
+            .reply
+            .expect("in a Person pairing a Confirm is answered with a key set")
     }
 }
 
