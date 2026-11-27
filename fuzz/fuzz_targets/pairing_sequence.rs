@@ -17,15 +17,18 @@
 //!   displaying side or starts anything there, unless the stranger's own
 //!   Hello started the run in flight (a Hello is all it takes to be a run's
 //!   peer, and a run's peer is answered);
+//! - a session handed out for a Person pairing has the other account
+//!   recorded on it, and one for a device pairing has none;
 //! - the typing side verifies only if the displaying side did, and a run
 //!   verifies a side only if the code typed is the very code the displaying
 //!   side's run consumed;
 //! - nothing panics.
 //!
-//! And once per process, before any script: an honest, undisturbed run does
-//! verify, the displaying side moves from "awaiting peer" to "verified" on
-//! the typing side's first frame, and a frame travels each way. A sheet
-//! that refused everything would pass every check above.
+//! And once per process, before any script: an honest, undisturbed run of
+//! each kind does verify (a Person pairing by way of both key sets), the
+//! displaying side moves from "awaiting peer" to "verified" on the typing
+//! side's first frame, and a frame travels each way. A sheet that refused
+//! everything would pass every check above.
 //!
 //! The random stream is scripted, so the honest messages of a given script
 //! are fixed byte strings. Don't seed the corpus with real transcripts: an
@@ -43,17 +46,19 @@ use std::time::Duration;
 use libfuzzer_sys::fuzz_target;
 
 use keys_pairing::sheet::MAX_RUNS_PER_SHEET as MAX_RUNS;
-use keys_pairing::{DisplayStatus, Outcome, PairingCode, TypeStatus};
+use keys_pairing::{DisplayStatus, Outcome, PairingCode, TypeStatus, VerifiedSession};
 
-use common::{DISPLAY_ENDPOINT, Pair, STRANGER_ENDPOINT, TYPE_ENDPOINT, open_pair};
+use common::{DISPLAY_ENDPOINT, Pair, STRANGER_ENDPOINT, TYPE_ENDPOINT, is_person, open_pair};
 
 /// What the typing side types when told to type a wrong code, or when the
 /// displaying side shows none.
 const WRONG_CODE: &str = "000000";
 /// The script's operations, in the order of their codes.
 const OPERATIONS: u8 = 17;
-/// The wire type byte of a Hello.
+/// The wire type bytes of a Hello, a Share and a Reply.
 const HELLO_TYPE: u8 = 1;
+const SHARE_TYPE: u8 = 2;
+const REPLY_TYPE: u8 = 3;
 /// Clock steps are this many seconds per unit of the script's operand, so
 /// one byte reaches past the code lifetime (five minutes).
 const SECONDS_PER_CLOCK_UNIT: u64 = 2;
@@ -80,6 +85,8 @@ impl<'a> Script<'a> {
 /// invariants are checked against.
 struct World {
     pair: Pair,
+    /// Whether the sheets were opened for a Person pairing.
+    person: bool,
     to_display: Option<Vec<u8>>,
     to_typing: Option<Vec<u8>>,
     shares_sent: u8,
@@ -96,6 +103,10 @@ struct World {
     /// the script has seen. It can outlive a run that timed out unnoticed,
     /// which only makes the stranger check below skip a case.
     display_run_peer: Option<[u8; 32]>,
+}
+
+fn first_byte(message: Option<&Vec<u8>>) -> Option<u8> {
+    message.and_then(|message| message.first().copied())
 }
 
 fn same_code(a: Option<&PairingCode>, b: Option<&PairingCode>) -> bool {
@@ -127,6 +138,16 @@ impl World {
         );
     }
 
+    /// A Person pairing hands out a session only with the other account's
+    /// checked key set recorded on it; a device pairing records none.
+    fn assert_the_account_is_recorded(&self, session: &VerifiedSession, side: &str) {
+        assert_eq!(
+            session.peer_account().is_some(),
+            self.person,
+            "the {side} side's session has the wrong idea of its peer's account"
+        );
+    }
+
     fn to_display_sheet(&mut self, sender: [u8; 32], message: &[u8]) {
         let showing = self.pair.display.shown_code_without_refresh_for_fuzzing();
         let response = self
@@ -152,15 +173,20 @@ impl World {
                 response.outcome
             );
         }
+        // A Share going out is a run started. (In a Person pairing the
+        // displaying side also carries on after the Reply, with its
+        // Confirm: that is the same run.)
+        let started_a_run = first_byte(response.reply.as_ref()) == Some(SHARE_TYPE);
         match response.outcome {
-            Outcome::Continue => {
+            Outcome::Continue if started_a_run => {
                 self.shares_sent += 1;
                 // The run that just started consumed the code that was
                 // showing.
                 self.display_run_code = showing;
                 self.display_run_peer = Some(sender);
             }
-            Outcome::Verified(_) => {
+            Outcome::Verified(session) => {
+                self.assert_the_account_is_recorded(&session, "displaying");
                 self.assert_the_codes_matched("displaying");
                 self.display_verified = true;
                 self.display_run_peer = None;
@@ -183,9 +209,13 @@ impl World {
             assert!(response.reply.is_none());
             return;
         }
+        // A Reply going out is a guess spent. (In a Person pairing the
+        // typing side also carries on after the Confirm, with its key set.)
+        let spent_a_guess = first_byte(response.reply.as_ref()) == Some(REPLY_TYPE);
         match response.outcome {
-            Outcome::Continue => self.replies_sent += 1,
-            Outcome::Verified(_) => {
+            Outcome::Continue if spent_a_guess => self.replies_sent += 1,
+            Outcome::Verified(session) => {
+                self.assert_the_account_is_recorded(&session, "typing");
                 self.assert_the_codes_matched("typing");
                 self.typing_verified = true;
             }
@@ -246,20 +276,39 @@ impl World {
     }
 }
 
-/// An honest run, start to finish, on sheets of its own.
-fn an_honest_run_verifies() {
-    let mut pair = open_pair(0);
+/// An honest run, start to finish, on sheets of its own: a device pairing
+/// or a Person pairing, as `selector` says.
+fn an_honest_run_verifies(selector: u8) {
+    let mut pair = open_pair(selector);
     let reply = pair.reply();
-    let confirm = pair.display.handle(TYPE_ENDPOINT, &reply).expect("handle");
-    let Outcome::Verified(mut display_session) = confirm.outcome else {
+    let mut from_display = pair.display.handle(TYPE_ENDPOINT, &reply).expect("handle");
+    let mut from_typing = pair.typing.handle(
+        DISPLAY_ENDPOINT,
+        &from_display.reply.take().expect("a Confirm"),
+    );
+    // A Person pairing goes one more round: the two key sets.
+    assert_eq!(from_typing.reply.is_some(), is_person(selector));
+    if let Some(typing_keys) = from_typing.reply.take() {
+        from_display = pair
+            .display
+            .handle(TYPE_ENDPOINT, &typing_keys)
+            .expect("handle");
+        from_typing = pair.typing.handle(
+            DISPLAY_ENDPOINT,
+            &from_display.reply.take().expect("a key set"),
+        );
+    }
+    let Outcome::Verified(mut display_session) = from_display.outcome else {
         panic!("an honest run verifies the displaying side");
     };
-    let finish = pair
-        .typing
-        .handle(DISPLAY_ENDPOINT, &confirm.reply.expect("a Confirm"));
-    let Outcome::Verified(mut typing_session) = finish.outcome else {
+    let Outcome::Verified(mut typing_session) = from_typing.outcome else {
         panic!("an honest run verifies the typing side");
     };
+    assert_eq!(
+        display_session.peer_account().is_some(),
+        is_person(selector)
+    );
+    assert_eq!(typing_session.peer_account().is_some(), is_person(selector));
     assert!(matches!(
         pair.display.status().expect("status"),
         DisplayStatus::VerifiedAwaitingPeer
@@ -287,6 +336,10 @@ fn an_honest_run_verifies() {
     );
 }
 
+/// One selector of each kind (see `common::credentials`).
+const HONEST_DEVICE_RUN: u8 = 0;
+const HONEST_PERSON_RUN: u8 = 1;
+
 static HONEST_RUN_CHECKED: Once = Once::new();
 
 fn clock_step(units: u8) -> Duration {
@@ -294,13 +347,17 @@ fn clock_step(units: u8) -> Duration {
 }
 
 fuzz_target!(|data: &[u8]| {
-    HONEST_RUN_CHECKED.call_once(an_honest_run_verifies);
+    HONEST_RUN_CHECKED.call_once(|| {
+        an_honest_run_verifies(HONEST_DEVICE_RUN);
+        an_honest_run_verifies(HONEST_PERSON_RUN);
+    });
     let mut script = Script(data);
     let Some(selector) = script.byte() else {
         return;
     };
     let mut world = World {
         pair: open_pair(selector),
+        person: is_person(selector),
         to_display: None,
         to_typing: None,
         shares_sent: 0,

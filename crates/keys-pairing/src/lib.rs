@@ -15,7 +15,8 @@
 //! - [`code`]: drawing and parsing the code.
 //! - [`keys`]: the account and device key sets a pairing binds.
 //! - `protocol`: the four-message exchange, transcript binding and key
-//!   confirmation.
+//!   confirmation, and for a Person pairing the two signed key sets that
+//!   follow inside the session.
 //! - [`session`]: the verified session's frames.
 //! - [`sheet`]: the policy a client drives: one run per code, a run budget
 //!   per sheet, code expiry and run timeouts.
@@ -58,6 +59,9 @@ static TEST_ALLOCATOR: heap_watch::WatchingAllocator = heap_watch::WatchingAlloc
 pub fn script_random_for_fuzzing(seed: &[u8]) {
     random::scripted::start(seed);
 }
+
+#[cfg(fuzzing)]
+pub use protocol::key_set_is_accepted_for_fuzzing;
 
 /// A transport endpoint id: the 32-byte public key the transport
 /// authenticated the peer as.

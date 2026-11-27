@@ -105,11 +105,9 @@ future uniffi version removes the `Drop`-versus-`Record` constraint.
 - **A few transient values of our own** that pass through the stack: a freshly sampled scalar and a freshly generated key seed on their way into their allocations, the Diffie-Hellman result K as it is returned to the one call that hashes it, the password-derived generator, which only ever lives on the stack, and the copy of an X25519 secret that is made, and clamped, each time its public key is computed. Each is wiped where it ends up; the places it passed through are not. Stale stack bytes can also be carried into the heap later, in the unused padding of some unrelated value that is moved there.
 - **Everything that crosses the FFI as a plain value.** The displayed code, the typed code, and each session payload in the clear are handed to (or come from) the Swift / Kotlin side as ordinary strings and byte arrays. Rust wipes its own copy of the typed code. Byte arrays and optional strings travel through the binding generator's own buffers on the Rust heap, which are freed unwiped, and neither those nor the copies the foreign runtime holds can be wiped from here.
 
-**Separately, a Person pairing's public keys are not private.** This is not a memory matter and needs no access to either device: each side's account public keys and an identity-key signature over them travel in the clear in the exchange, before the other party has proved it knows the code. An endpoint that can reach a device while its Person sheet is open learns which account is behind that endpoint, at the cost of one burnt code. The signature cannot be replayed into another run.
+**Severity:** Low. Reading any of these needs the memory of a live (or core-dumped) process on one of the two devices during or shortly after a pairing. The code is single-use and worthless once its run ends. The scalar and session keys matter more: with one of them and a recording of that run's messages, the run's session payloads can be read.
 
-**Severity:** Low. Reading any of the copies needs the memory of a live (or core-dumped) process on one of the two devices during or shortly after a pairing. The code is single-use and worthless once its run ends. The scalar and session keys matter more: with one of them and a recording of that run's messages, the run's session payloads can be read.
-
-**Why it is documented rather than fixed.** Wiping another crate's stack frames is not possible from safe Rust, and the workspace denies `unsafe`. The foreign-side copies are the client's to minimise: show the code and drop it, and don't log anything named in `crates/keys-ffi/src/pairing.rs`'s list of secrets that cross the seam. The Person-pairing disclosure is how the exchange binds the keys into its transcript today; a later change sends them inside the verified session instead, after both sides have proved the code.
+**Why it is documented rather than fixed.** Wiping another crate's stack frames is not possible from safe Rust, and the workspace denies `unsafe`. The foreign-side copies are the client's to minimise: show the code and drop it, and don't log anything named in `crates/keys-ffi/src/pairing.rs`'s list of secrets that cross the seam.
 
 ---
 
@@ -119,7 +117,7 @@ future uniffi version removes the `Drop`-versus-`Record` constraint.
 |---|------------|----------|----------------------|
 | 1 | Unencrypted `iroh-docs` redb capability store | Medium | Secret lives in `iroh-docs`'s own store — needs upstream encryption-at-rest or a `doc_dir` wrapper; OS at-rest protection mitigates meanwhile |
 | 2 | Heap identity bytes not zeroized on drop | Low | uniffi `Record`-versus-`Drop` constraint; revisit when upstream lifts it |
-| 3 | Pairing: transient stack copies and FFI-side copies of secrets not wiped; a Person pairing's public keys visible before the code is proved | Low | Dependencies' stack frames can't be wiped from safe Rust; foreign-runtime copies are the client's to minimise |
+| 3 | Pairing: transient stack copies and FFI-side copies of secrets not wiped | Low | Dependencies' stack frames can't be wiped from safe Rust; foreign-runtime copies are the client's to minimise |
 
 **Items 1 and 2 are not a confidentiality break of vault contents** — vault data
 syncs and rests only as KDBX ciphertext. Both are device-impersonation /

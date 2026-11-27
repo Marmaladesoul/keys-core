@@ -30,6 +30,13 @@
 //! construction rather than by caller discipline. In both flows the typing
 //! side has something to send first anyway: a new device's public keys, or
 //! an inviter's opening frame.
+//!
+//! **A Person pairing's first frame each way is not the client's.** The
+//! exchange uses it for each side's signed key set (see `protocol`), before
+//! the session is handed over, so the client's frames start at the second
+//! sequence number. Having sent its key set last, the displaying side is
+//! back to waiting: its session seals nothing more until the typing side's
+//! next frame shows that key set was accepted.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,7 +89,8 @@ pub enum SessionError {
     #[error("the session has sent all the frames it can")]
     Exhausted,
     /// The displaying side may not send until it has opened a frame from the
-    /// typing side.
+    /// typing side since its own last message of the pairing: its
+    /// confirmation or, in a Person pairing, its key set.
     #[error("the session can't send until the other side has spoken")]
     AwaitingPeer,
 }
@@ -104,11 +112,13 @@ pub struct VerifiedSession {
     next_send: u64,
     next_receive: u64,
     spoilt: bool,
-    /// Whether the other side has shown it verified this side's confirmation.
-    /// True from the start on the typing side, which received the last
-    /// exchange message; on the displaying side, set by the first frame
-    /// opened. Shared with the displaying sheet, so its status can tell the
-    /// two apart.
+    role: SessionRole,
+    /// Whether the other side has shown it accepted everything this side
+    /// sent to establish the session. True from the start on the typing
+    /// side, which receives the last such message; on the displaying side,
+    /// set by a frame opened (and, in a Person pairing, cleared again when
+    /// it sends its key set, until the typing side's next frame). Shared
+    /// with the displaying sheet, so its status can tell the two apart.
     peer_confirmed: Arc<AtomicBool>,
     peer_account: Option<AccountPublicKeys>,
 }
@@ -143,11 +153,11 @@ impl VerifiedSession {
         kind: PairingKind,
         peer: EndpointId,
         keys: SessionKeys,
-        peer_account: Option<AccountPublicKeys>,
     ) -> Self {
         let SessionKeys { send, receive } = keys;
         Self {
             kind,
+            role,
             peer,
             send_key: send,
             receive_key: receive,
@@ -155,8 +165,30 @@ impl VerifiedSession {
             next_receive: 0,
             spoilt: false,
             peer_confirmed: Arc::new(AtomicBool::new(role == SessionRole::Typing)),
-            peer_account,
+            peer_account: None,
         }
+    }
+
+    pub(crate) fn role(&self) -> SessionRole {
+        self.role
+    }
+
+    /// The endpoint this session listens to.
+    pub(crate) fn peer(&self) -> EndpointId {
+        self.peer
+    }
+
+    /// Records the other account's keys, once its signed key set has been
+    /// checked (Person pairings).
+    pub(crate) fn set_peer_account(&mut self, keys: AccountPublicKeys) {
+        self.peer_account = Some(keys);
+    }
+
+    /// The displaying side has just sent its key set (Person pairings): it
+    /// can't tell whether the typing side accepted it until the typing side
+    /// speaks again, so until then the session is back to not sending.
+    pub(crate) fn await_peer_again(&self) {
+        self.peer_confirmed.store(false, Ordering::Release);
     }
 
     #[must_use]
@@ -171,11 +203,12 @@ impl VerifiedSession {
     }
 
     /// Whether the other side is known to hold this session too. Always
-    /// true on the typing side, which checked the displaying side's
-    /// confirmation last. On the displaying side it turns true when the
-    /// first frame from the typing side opens: until then it can't tell a
-    /// typing side that accepted its confirmation from one that never
-    /// received it.
+    /// true on the typing side, which checks the displaying side's last
+    /// message (its confirmation, or in a Person pairing its key set) before
+    /// it has a session at all. On the displaying side it turns true when
+    /// the first frame the client is handed from the typing side opens:
+    /// until then it can't tell a typing side that accepted that last
+    /// message from one that never received it, or refused it.
     #[must_use]
     pub fn peer_confirmed(&self) -> bool {
         self.peer_confirmed.load(Ordering::Acquire)
@@ -189,8 +222,8 @@ impl VerifiedSession {
     /// Seals `payload` as the next frame to send.
     ///
     /// # Errors
-    /// [`SessionError::AwaitingPeer`] on the displaying side before it has
-    /// opened a frame from the typing side, [`SessionError::Exhausted`] once
+    /// [`SessionError::AwaitingPeer`] on the displaying side while it waits
+    /// to hear from the typing side (see the variant), [`SessionError::Exhausted`] once
     /// every sequence number is used, [`SessionError::FrameRejected`] if the
     /// session is spoilt, and [`SessionError::PayloadTooLarge`] if the
     /// payload is more than one frame can carry.
@@ -299,7 +332,6 @@ mod tests {
                 send: type_to_display.clone(),
                 receive: display_to_type.clone(),
             },
-            None,
         );
         let displaying = VerifiedSession::new(
             SessionRole::Displaying,
@@ -309,7 +341,6 @@ mod tests {
                 send: display_to_type,
                 receive: type_to_display,
             },
-            None,
         );
         (typing, displaying)
     }

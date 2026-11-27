@@ -1,11 +1,12 @@
 //! Fuzz target for every message the displaying side parses: a Hello in
-//! place of the honest one, or a Reply after an honest Hello and Share.
+//! place of the honest one, a Reply after an honest Hello and Share, or (in
+//! a Person pairing) a key-set frame after an honest Confirm.
 //!
 //! The first byte picks the credentials and the stage; the rest is the
 //! message, sent from the typing endpoint. A panic is a bug. So is a fuzzed
 //! message verifying a run, and so is a sheet whose state doesn't match the
 //! outcome it reported: in particular, whatever arrives in place of the
-//! Reply must cost the run.
+//! Reply or the key set must cost the run.
 
 #![no_main]
 
@@ -17,7 +18,9 @@ use libfuzzer_sys::fuzz_target;
 use keys_pairing::sheet::MAX_RUNS_PER_SHEET as ALL_RUNS;
 use keys_pairing::{DisplayStatus, Outcome};
 
-use common::{TYPE_ENDPOINT, assert_not_verified, open_pair};
+use common::{
+    AWAITING_KEY_SET, PAST_FIRST_MESSAGE, TYPE_ENDPOINT, assert_not_verified, is_person, open_pair,
+};
 
 /// The wire type byte of a Hello.
 const HELLO_TYPE: u8 = 1;
@@ -29,8 +32,12 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mut pair = open_pair(selector);
-    let run_in_flight = selector & 0x80 != 0;
-    if run_in_flight {
+    let run_in_flight = selector & PAST_FIRST_MESSAGE != 0;
+    if run_in_flight && is_person(selector) && selector & AWAITING_KEY_SET != 0 {
+        // Stage 3 (Person pairings): the fuzzed message arrives where the
+        // typing side's key-set frame belongs.
+        let _typing_keys = pair.typing_key_set();
+    } else if run_in_flight {
         // Stage 2: the fuzzed message arrives where the Reply belongs.
         let _share = pair.share();
     }
@@ -44,7 +51,8 @@ fuzz_target!(|data: &[u8]| {
     let status = pair.display.status().expect("status");
     let is_hello = message.first() == Some(&HELLO_TYPE);
     if run_in_flight && !is_hello {
-        // Anything from the run's peer but a valid Reply fails the run.
+        // Anything from the run's peer but the message the run is waiting
+        // for (a valid Reply, a valid key set) fails the run.
         assert!(matches!(response.outcome, Outcome::RunFailed { .. }));
         assert!(
             matches!(status, DisplayStatus::ShowingCode { runs_left, .. } if runs_left == ONE_RUN_SPENT)

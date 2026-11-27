@@ -41,6 +41,8 @@ const HELLO_OF_UNKNOWN_VERSION: [u8; 19] = {
     hello[1] = 0xff;
     hello
 };
+/// A byte added to the end of a message that should end where it does.
+const TRAILING_BYTE: u8 = 0;
 /// How far inside the run timeout a "slow leg" lands, in milliseconds.
 const SLOW_LEG_MARGIN_MS: u64 = 1;
 /// A stray Confirm-typed message (type 4 and a 64-byte tag), as a late or
@@ -88,6 +90,15 @@ pub enum SimTamper {
     Reply,
     /// The first payload byte of the Confirm: the displaying side's tag.
     Confirm,
+    /// Person pairings: the last byte of the typing side's key-set frame.
+    KeySet,
+    /// Person pairings: the last byte of the displaying side's key-set
+    /// frame.
+    DisplayKeySet,
+    /// One more byte on the end of the Share.
+    ShareTrailing,
+    /// One more byte on the end of the Reply.
+    ReplyTrailing,
 }
 
 /// An active attack on the exchange.
@@ -117,6 +128,9 @@ pub enum SimAttack {
     /// Before the first attempt, the displaying side is sent a Hello it
     /// can't run. The code it shows must survive.
     UnusableHello,
+    /// Person pairings, first attempt: the displaying side's key set never
+    /// reaches the typing side, which times the run out.
+    DropKeySet,
 }
 
 /// What the wire remembers from the first attempt, for the attacks that
@@ -138,6 +152,7 @@ pub struct SimScript {
     pub impostor_guesses: u32,
     pub relay: bool,
     pub pin: SimPin,
+    pub type_pin: SimPin,
     pub stall: bool,
     pub slow_legs: bool,
     pub tamper: Option<SimTamper>,
@@ -251,6 +266,17 @@ fn flip_bit_at(message: &mut [u8], offset: usize) {
     }
 }
 
+/// Flips a bit of the message's last byte. Says whether there was one.
+fn flip_last_bit(message: &mut [u8]) -> bool {
+    match message.last_mut() {
+        Some(last) => {
+            *last ^= 1;
+            true
+        }
+        None => false,
+    }
+}
+
 fn flip_first_payload_bit(message: &mut [u8]) {
     // Byte 0 is the message type; corrupt the first byte after it.
     flip_bit_at(message, 1);
@@ -291,36 +317,40 @@ struct Parties {
 }
 
 fn open_parties(script: &SimScript, clock: &Arc<PairingTestClock>) -> Result<Parties> {
-    let (display_credentials, typing_credentials, display_account, typing_account) =
-        match script.kind {
-            SimKind::Device => (
-                PairingCredentials::Device,
-                PairingCredentials::Device,
-                None,
-                None,
-            ),
-            SimKind::Person => {
-                let displaying = generate_pairing_account()?.keys;
-                let typing = generate_pairing_account()?.keys;
-                let pin = match script.pin {
+    let (display_credentials, typing_credentials, display_account, typing_account) = match script
+        .kind
+    {
+        SimKind::Device => (
+            PairingCredentials::Device,
+            PairingCredentials::Device,
+            None,
+            None,
+        ),
+        SimKind::Person => {
+            let displaying = generate_pairing_account()?.keys;
+            let typing = generate_pairing_account()?.keys;
+            // What a side pins of the other's identity.
+            let pinned = |pin: SimPin, other: &PairingAccountKeys| -> Result<Option<Vec<u8>>> {
+                Ok(match pin {
                     SimPin::None => None,
-                    SimPin::Right => Some(typing.public_keys().identity),
+                    SimPin::Right => Some(other.public_keys().identity),
                     SimPin::Wrong => Some(generate_pairing_account()?.keys.public_keys().identity),
-                };
-                (
-                    PairingCredentials::Person {
-                        account: Arc::clone(&displaying),
-                        expected_peer_identity: pin,
-                    },
-                    PairingCredentials::Person {
-                        account: Arc::clone(&typing),
-                        expected_peer_identity: None,
-                    },
-                    Some(displaying),
-                    Some(typing),
-                )
-            }
-        };
+                })
+            };
+            (
+                PairingCredentials::Person {
+                    account: Arc::clone(&displaying),
+                    expected_peer_identity: pinned(script.pin, &typing)?,
+                },
+                PairingCredentials::Person {
+                    account: Arc::clone(&typing),
+                    expected_peer_identity: pinned(script.type_pin, &displaying)?,
+                },
+                Some(displaying),
+                Some(typing),
+            )
+        }
+    };
     Ok(Parties {
         display: PairingDisplaySheet::open_with_test_clock(
             display_credentials,
@@ -371,6 +401,80 @@ fn deliver_to_typing(
     let response = parties.typing.handle(DISPLAY_ENDPOINT.to_vec(), reply)?;
     println!("type: {}", describe(&response.outcome));
     Ok(Some(response))
+}
+
+/// Person pairings: says whether any of the two accounts' public keys
+/// appears, in the clear, in the exchange's messages. They must not: a key
+/// set travels only inside the verified session.
+fn report_account_keys_in_exchange(parties: &Parties, messages: &[&Vec<u8>]) {
+    let accounts = [&parties.display_account, &parties.typing_account];
+    let keys: Vec<Vec<u8>> = accounts
+        .into_iter()
+        .flatten()
+        .flat_map(|account| {
+            let keys = account.public_keys();
+            [keys.identity, keys.recovery, keys.encryption]
+        })
+        .collect();
+    if keys.is_empty() {
+        return;
+    }
+    let leaked = messages.iter().any(|message| {
+        keys.iter().any(|key| {
+            message
+                .windows(key.len())
+                .any(|window| window == key.as_slice())
+        })
+    });
+    println!(
+        "wire: account-keys-in-exchange {}",
+        if leaked { "LEAKED" } else { "none" }
+    );
+}
+
+/// The last message of a run (the Confirm, or the displaying side's key
+/// set) never arrives. Nothing arrives, so no outcome is returned: a status
+/// poll is what fails the run, and each sheet says what it was lost to.
+fn report_lost_message(
+    parties: &Parties,
+    clock: &Arc<PairingTestClock>,
+    display_session: Option<&Arc<PairingSession>>,
+) -> Result<()> {
+    clock.advance_ms(pairing_policy().run_timeout_ms);
+    println!("clock: past run timeout");
+    let lost_run = match parties.typing.status() {
+        PairingTypeStatus::AwaitingCode { runs_left } => {
+            let failure = failure_name(parties.typing.last_failure());
+            format!("lost-run failure={failure} runs-left={runs_left}")
+        }
+        other => format!("unexpected-status {other:?}"),
+    };
+    println!("type: {lost_run}");
+    shown_code(&parties.display)?;
+    // A displaying side still waiting (for a Person pairing's key set) has
+    // lost its run too; one that had verified has not.
+    if let Some(failure) = parties.display.last_failure() {
+        println!("display: lost-run failure={}", failure_name(Some(failure)));
+    }
+    if let Some(display) = display_session {
+        println!(
+            "session: display peer-confirmed {}",
+            if display.peer_confirmed() {
+                "YES"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "session: display-sends-first {}",
+            if display.seal(b"bundle".to_vec()).is_err() {
+                "refused"
+            } else {
+                "ALLOWED"
+            }
+        );
+    }
+    Ok(())
 }
 
 /// Why a sheet's last failed run failed, as a trace word.
@@ -483,6 +587,10 @@ fn attempt(
         flip_bit_at(&mut share_message, SHARE_POINT_OFFSET);
         println!("wire: tampered share point");
     }
+    if first && script.tamper == Some(SimTamper::ShareTrailing) {
+        share_message.push(TRAILING_BYTE);
+        println!("wire: share with a trailing byte");
+    }
     if first && script.stall {
         clock.advance_ms(pairing_policy().run_timeout_ms);
         println!("clock: past run timeout");
@@ -567,13 +675,35 @@ fn attempt(
         flip_first_payload_bit(&mut reply_message);
         println!("wire: tampered reply");
     }
-    let confirm = parties.display.handle(seen.to_vec(), reply_message)?;
+    if first && script.tamper == Some(SimTamper::ReplyTrailing) {
+        reply_message.push(TRAILING_BYTE);
+        println!("wire: reply with a trailing byte");
+    }
+    let confirm = parties
+        .display
+        .handle(seen.to_vec(), reply_message.clone())?;
     println!("display: {}", describe(&confirm.outcome));
-    let display_session = match &confirm.outcome {
+    let mut display_session = match &confirm.outcome {
         PairingOutcomeFfi::Verified { session } => Some(Arc::clone(session)),
         _ => None,
     };
     let mut confirm_message = confirm.reply;
+    if let Some(answer) = &confirm_message {
+        if ends(&confirm.outcome).is_none() {
+            // The exchange is the same four messages, of the same lengths,
+            // whatever is being paired.
+            println!(
+                "wire: exchange-lengths hello={} share={} reply={} confirm={}",
+                hello.len(),
+                share_message.len(),
+                reply_message.len(),
+                answer.len()
+            );
+        }
+        // Whether the run went on or was refused here, nothing sent so far
+        // may carry an account key.
+        report_account_keys_in_exchange(parties, &[&hello, &share_message, &reply_message, answer]);
+    }
     if first
         && script.tamper == Some(SimTamper::Confirm)
         && let Some(message) = confirm_message.as_mut()
@@ -583,45 +713,47 @@ fn attempt(
     }
     if first && script.attack == Some(SimAttack::DropConfirm) {
         println!("wire: confirm dropped");
-        clock.advance_ms(pairing_policy().run_timeout_ms);
-        println!("clock: past run timeout");
-        // Nothing arrives, so no outcome is returned: the status poll is
-        // what fails the run, and the sheet says what it was lost to.
-        let lost_run = match parties.typing.status() {
-            PairingTypeStatus::AwaitingCode { runs_left } => {
-                let failure = failure_name(parties.typing.last_failure());
-                format!("lost-run failure={failure} runs-left={runs_left}")
-            }
-            other => format!("unexpected-status {other:?}"),
-        };
-        println!("type: {lost_run}");
-        shown_code(&parties.display)?;
-        if let Some(display) = display_session {
-            println!(
-                "session: display peer-confirmed {}",
-                if display.peer_confirmed() {
-                    "YES"
-                } else {
-                    "no"
-                }
-            );
-            println!(
-                "session: display-sends-first {}",
-                if display.seal(b"bundle".to_vec()).is_err() {
-                    "refused"
-                } else {
-                    "ALLOWED"
-                }
-            );
-        }
+        report_lost_message(parties, clock, display_session.as_ref())?;
         return Ok(Attempt::Failed);
     }
     if first && script.slow_legs {
         slow_leg(clock);
     }
-    let Some(last) = deliver_to_typing(parties, confirm_message)? else {
+    let Some(mut last) = deliver_to_typing(parties, confirm_message)? else {
         bail!("no confirmation to deliver");
     };
+    // A Person pairing goes one more round, inside the session: the typing
+    // side's key set, then the displaying side's (or its refusal).
+    if let (PairingOutcomeFfi::Continue, Some(mut typing_keys)) =
+        (&last.outcome, last.reply.clone())
+    {
+        if first && script.tamper == Some(SimTamper::KeySet) && flip_last_bit(&mut typing_keys) {
+            println!("wire: tampered key set");
+        }
+        let answer = parties.display.handle(seen.to_vec(), typing_keys)?;
+        println!("display: {}", describe(&answer.outcome));
+        if let PairingOutcomeFfi::Verified { session } = &answer.outcome {
+            display_session = Some(Arc::clone(session));
+        }
+        let mut display_keys = answer.reply;
+        if first
+            && script.tamper == Some(SimTamper::DisplayKeySet)
+            && display_keys
+                .as_mut()
+                .is_some_and(|keys| flip_last_bit(keys))
+        {
+            println!("wire: tampered displaying side's key set");
+        }
+        if first && script.attack == Some(SimAttack::DropKeySet) {
+            println!("wire: displaying side's key set dropped");
+            report_lost_message(parties, clock, display_session.as_ref())?;
+            return Ok(Attempt::Failed);
+        }
+        let Some(delivered) = deliver_to_typing(parties, display_keys)? else {
+            bail!("no key set or refusal to deliver");
+        };
+        last = delivered;
+    }
     match (display_session, &last.outcome) {
         (Some(display), PairingOutcomeFfi::Verified { session }) => Ok(Attempt::Verified {
             display,
@@ -636,9 +768,21 @@ fn attempt(
                 "session: display-sends-first {}",
                 if refused { "refused" } else { "ALLOWED" }
             );
+            shown_code(&parties.display)?;
             Ok(ends(outcome).unwrap_or(Attempt::Failed))
         }
-        (None, outcome) => Ok(ends(outcome).unwrap_or(Attempt::Failed)),
+        (None, PairingOutcomeFfi::Verified { .. }) => {
+            bail!("the typing side verified a run the displaying side did not")
+        }
+        (None, outcome) => {
+            // A Person pairing's displaying side is still waiting for a key
+            // set if the typing side gave up first: its connection is gone,
+            // so it gives up on the run too.
+            if matches!(parties.display.status()?, PairingDisplayStatus::Running) {
+                abandon_display_run(parties)?;
+            }
+            Ok(ends(outcome).unwrap_or(Attempt::Failed))
+        }
     }
 }
 

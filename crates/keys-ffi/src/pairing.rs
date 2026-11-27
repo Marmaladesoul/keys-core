@@ -10,6 +10,10 @@
 //! **What a client must do, because nothing here can do it for it:**
 //! - Carry each run on one ordered, reliable connection, a new one per run,
 //!   and send a sheet's reply only to the sender of the message it answers.
+//! - Keep carrying messages for as long as a sheet's response has a reply:
+//!   don't count them. A device pairing takes four; a Person pairing takes
+//!   six, because each side's signed key set follows the confirmations,
+//!   inside the session, before either sheet reports the pairing verified.
 //! - Never resubmit a code by itself, whatever the outcome (a "busy"
 //!   refusal included: someone else's Hello may have used the code up). The
 //!   person retypes.
@@ -381,9 +385,12 @@ pub enum PairingOutcomeFfi {
     },
     /// The run failed and the sheet is spent.
     DeadEnd { failure: PairingFailure },
-    /// This side verified the other and holds a session. On the typing
-    /// side both confirmations have now verified. On the displaying side
-    /// only the typing side's has: it is **not paired yet** (see
+    /// This side verified the other and holds a session; in a Person
+    /// pairing that includes having checked the other account's signed key
+    /// set, so [`PairingSession::peer_account`] is set. On the typing side
+    /// everything has now verified. On the displaying side its own last
+    /// message (its confirmation, or in a Person pairing its key set) is
+    /// only now on its way: it is **not paired yet** (see
     /// [`PairingDisplayStatus::VerifiedAwaitingPeer`]).
     Verified { session: Arc<PairingSession> },
     /// The message isn't one this sheet answers from that sender, in its
@@ -757,9 +764,10 @@ impl PairingSession {
 
     /// Whether the other side is known to hold this session too. Always
     /// true on the typing side. On the displaying side it turns true when
-    /// the first frame from the typing side opens: until then the displaying
-    /// side can't tell a typing side that confirmed from one that never
-    /// will, so treat the pairing as complete only once this is true.
+    /// the first frame this session opens from the typing side arrives:
+    /// until then the displaying side can't tell a typing side that accepted
+    /// its last message from one that never will, so treat the pairing as
+    /// complete only once this is true.
     pub fn peer_confirmed(&self) -> bool {
         lock(&self.inner).peer_confirmed()
     }
@@ -768,7 +776,7 @@ impl PairingSession {
     ///
     /// # Errors
     /// [`PairingFfiError::SessionAwaitingPeer`] on the displaying side before
-    /// it has opened a frame from the typing side;
+    /// this session has opened a frame from the typing side;
     /// [`PairingFfiError::SessionExhausted`];
     /// [`PairingFfiError::SessionPayloadTooLarge`]; or
     /// [`PairingFfiError::FrameRejected`] if the session is spoilt.

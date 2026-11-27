@@ -50,6 +50,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "pairing_key_set"
+path = "fuzz_targets/pairing_key_set.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pairing_code"
 path = "fuzz_targets/pairing_code.rs"
 test = false

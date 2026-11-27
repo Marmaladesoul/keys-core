@@ -73,11 +73,6 @@ impl<'a> Reader<'a> {
         self.array::<N>()
     }
 
-    /// Everything not yet read.
-    pub(crate) fn rest(&mut self) -> &'a [u8] {
-        std::mem::take(&mut self.bytes)
-    }
-
     /// Fails if anything is left over.
     pub(crate) fn finish(&self) -> Result<(), RunFailure> {
         if self.bytes.is_empty() {
