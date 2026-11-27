@@ -1,0 +1,3 @@
+(* The Person-keys signature of protocol version 1: over the role, CI, sid,
+   the three public keys and the signer's own CPace share. *)
+letfun shareBinding(y: G) = shareBound(y).

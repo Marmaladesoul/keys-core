@@ -1,0 +1,72 @@
+# Re-runs the ProVerif protocol models under formal/ and fails unless every
+# query gives its expected result (formal/run.sh checks each one).
+#
+# ProVerif is built from the official INRIA release tarball, pinned by
+# SHA-256, without the interactive simulator (which would pull in GTK), on a
+# pinned runner image so the OCaml that builds it doesn't move unannounced. The
+# build takes about a minute; the models take a few minutes of CPU, spread
+# across the runner's cores.
+#
+# Runs when the models or the pairing crate they describe change, and weekly.
+# It proves the models, not that the Rust conforms to them: a change to the
+# crate's messages, transcript or acceptance order must change the model in
+# the same pull request, and review is what checks that it did.
+
+name: Formal models
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "formal/**"
+      - "crates/keys-pairing/**"
+      - ".github/workflows/formal.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "formal/**"
+      - "crates/keys-pairing/**"
+      - ".github/workflows/formal.yml"
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROVERIF_VERSION: "2.05"
+  PROVERIF_SHA256: "4871f53c32ab4a04669a060c4886ba5d9080496963fb980a9a62d2c429ceabc4"
+
+jobs:
+  proverif:
+    name: proverif
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install OCaml
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ocaml ocaml-findlib ocamlbuild
+
+      - name: Build ProVerif
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o proverif.tar.gz "https://proverif.inria.fr/proverif${PROVERIF_VERSION}.tar.gz"
+          echo "${PROVERIF_SHA256}  proverif.tar.gz" | sha256sum -c -
+          tar xzf proverif.tar.gz
+          cd "proverif${PROVERIF_VERSION}"
+          ./build -nointeract
+          echo "PROVERIF=$PWD/proverif" >> "$GITHUB_ENV"
+
+      - name: Run the models
+        run: formal/run.sh

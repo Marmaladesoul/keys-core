@@ -1,0 +1,11 @@
+(* Transport variant (b), authenticated: a party accepts a message as coming
+   from endpoint `src` only if that endpoint's key authenticated it for this
+   destination. The attacker has endpoints of its own and can authenticate
+   as those, but not as an honest endpoint.
+
+   This is weaker than a real mutually authenticated channel: it gives no
+   confidentiality, and a message authenticated once can be replayed to the
+   same destination on any later connection. Whatever holds here holds over
+   a real authenticated channel. *)
+reduc forall k: esk, dst: ep, m: bitstring;
+  transportAccepts(epk(k), dst, m, tsig(k, dst, m)) = true.

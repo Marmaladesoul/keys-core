@@ -1,0 +1,25 @@
+(* Lever witnesses. EVERY QUERY HERE IS EXPECTED TO BE FALSE: each shows
+   that one of the attacker's levers other than the lucky guess is wired,
+   so the files that open it are not proving their properties in a world
+   where it does nothing.
+
+   World: the adversary counterparty, the after-use leak and long-term
+   compromise open; lucky guesses shut. *)
+
+query a: pkey, i: skey, e: xsk, fk: aeadkey, ft: bitstring, c: code, p: bitstring;
+
+  (* L1. The attacker can be the counterparty a Person code was shown
+     to. *)
+  event(AdversaryPeer(c)) ==> false;
+
+  (* L2. Long-term compromise does hand over an account's identity
+     private key. *)
+  attacker(i) && event(AccountSecrets(a, i, e, fk, ft)) && event(LongTermLeaked(a)) ==> false;
+
+  (* L3. The after-use leak does hand over the code of a run a typing
+     side took part in, with no adversary counterparty involved. *)
+  attacker(c) && event(TypeReplied(c, p)) && event(TrustedCode(a, c)) ==> false.
+
+process
+  new shut: channel;
+  World(shut, net, net, net)

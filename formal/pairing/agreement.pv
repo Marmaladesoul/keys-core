@@ -1,0 +1,25 @@
+(* Agreement on the exchange.
+
+   World: any number of honest accounts and devices running device pairings
+   in both directions and Person pairings, concurrently. The attacker may
+   make one correct online guess per code (Lucky), may be the counterparty
+   a Person code was shown to (AdversaryPeer), and may take any account's
+   long-term secrets, as a compromised device of that account would give
+   them up. Pairing rests on the code alone, so long-term compromise earns
+   no exception below. *)
+
+(* A1. The displaying side accepts only a run the typing side replied to,
+   with the same kind, endpoint ids, sid, shares and ADs; once each. *)
+query c: code, p: bitstring;
+  inj-event(DisplayAccepted(c, p)) ==> inj-event(TypeReplied(c, p))
+    || event(Lucky(c)) || event(AdversaryPeer(c)).
+
+(* A2. The typing side accepts only a run the displaying side accepted,
+   with the same parameters; once each. *)
+query c: code, p: bitstring;
+  inj-event(TypeAccepted(c, p)) ==> inj-event(DisplayAccepted(c, p))
+    || event(Lucky(c)) || event(AdversaryPeer(c)).
+
+process
+  new shut: channel;
+  World(net, net, shut, net)

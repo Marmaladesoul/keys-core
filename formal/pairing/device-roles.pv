@@ -1,0 +1,69 @@
+(* Device pairing with the roles mixed up.
+
+   The exchange does not say which side is the trusted device: a device
+   pairing's AD is empty and nothing else in the transcript carries it.
+   So this world lets one code be used by any combination: a trusted
+   device of any account or a new device displays it, and trusted devices
+   of any accounts and new devices type it, each behaving as its own role
+   and side dictate. Trusted meets trusted, new meets new, and accounts
+   cross.
+
+   What keeps this safe is the payload layer: a trusted device enrols only
+   a frame shaped as device keys, and a new device installs only a frame
+   shaped as a bundle. The lucky guess is open. *)
+
+table trustedDevices(pkey, bitstring, esk).
+table newDevices(bitstring, esk).
+
+let Typers(c: code) =
+    (! get trustedDevices(idpk, trusted, e) in
+       event TrustedCode(idpk, c);
+       Type(deviceNewDisplays, c, e, deviceCred, trusted))
+  | (! get newDevices(newKeys, e) in
+       Type(deviceTrustedDisplays, c, e, deviceCred, newKeys)).
+
+query a: pkey, i: skey, e: xsk, fk: aeadkey, ft: bitstring, c: code;
+
+  (* X1-X4. The bundle's secrets stay secret unless the attacker guessed a
+     code that a trusted device of that same account displayed or typed. *)
+  attacker(i) && event(AccountSecrets(a, i, e, fk, ft)) ==> event(Lucky(c)) && event(TrustedCode(a, c));
+  attacker(e) && event(AccountSecrets(a, i, e, fk, ft)) ==> event(Lucky(c)) && event(TrustedCode(a, c));
+  attacker(fk) && event(AccountSecrets(a, i, e, fk, ft)) ==> event(Lucky(c)) && event(TrustedCode(a, c));
+  attacker(ft) && event(AccountSecrets(a, i, e, fk, ft)) ==> event(Lucky(c)) && event(TrustedCode(a, c)).
+
+(* X5. P1 of payload.pv: a trusted device enrols only device keys a new
+   device sent in that run. *)
+query c: code, p: bitstring, dk: bitstring;
+  inj-event(Enrolled(c, p, dk)) ==> inj-event(KeysSent(c, p, dk)) || event(Lucky(c)).
+
+(* X6. P2 of payload.pv: a new device installs only a bundle a trusted
+   device sent in that run. *)
+query c: code, p: bitstring, b: bitstring;
+  inj-event(Installed(c, p, b)) ==> inj-event(BundleSent(c, p, b)) || event(Lucky(c)).
+
+(* X7-X8. EXPECTED FALSE: both device flows can run to completion in this
+   world, so X1-X6 are not about runs that can never happen. *)
+query event(Completed(deviceTrustedDisplays));
+      event(Completed(deviceNewDisplays)).
+
+process
+    (! new idsk: skey; new encsk: xsk; new recsk: skey;
+       new fleetKey: aeadkey; new fleetTicket: bitstring;
+       event AccountSecrets(spk(idsk), idsk, encsk, fleetKey, fleetTicket);
+       out(net, spk(idsk));
+       ! new e: esk; out(net, epk(e));
+         insert trustedDevices(spk(idsk),
+           trustedSide(idsk, bundle(idsk, encsk, spk(recsk), fleetTicket, fleetKey)), e))
+  | (! new e: esk; new dsk: skey; new rsk: xsk; new vsk: xsk; new author: bitstring;
+       out(net, (epk(e), deviceKeys(spk(dsk), xpk(rsk), xpk(vsk), author)));
+       insert newDevices(deviceKeys(spk(dsk), xpk(rsk), xpk(vsk), author), e))
+    (* A trusted device displays. *)
+  | (! get trustedDevices(idpk, trusted, e) in
+       new c: code; event TrustedCode(idpk, c);
+       ( Display(deviceTrustedDisplays, c, e, deviceCred, trusted)
+       | Typers(c) | LuckyGuess(net, c) ))
+    (* A new device displays. *)
+  | (! get newDevices(newKeys, e) in
+       new c: code;
+       ( Display(deviceNewDisplays, c, e, deviceCred, newKeys)
+       | Typers(c) | LuckyGuess(net, c) ))

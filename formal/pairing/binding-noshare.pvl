@@ -1,0 +1,4 @@
+(* A weakened Person-keys signature that leaves the signer's CPace share
+   out. Not the protocol: loaded only by the misbinding models, to show what
+   covering the share is for. See Findings in ../README.md. *)
+letfun shareBinding(y: G) = noShareBound.
