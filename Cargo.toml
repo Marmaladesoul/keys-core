@@ -4,6 +4,7 @@ members = [
     "crates/keys-engine",
     "crates/keys-ffi",
     "crates/keys-iroh-sync",
+    "crates/keys-pairing",
     "crates/uniffi-bindgen-swift",
     "keyhole",
 ]
@@ -25,6 +26,9 @@ publish = false
 
 [workspace.lints.rust]
 unsafe_code = "deny"  # not "forbid" — uniffi-generated code may need unsafe internally
+# `fuzzing` is the cfg cargo-fuzz sets; keys-pairing uses it to make a fuzz
+# input replay exactly. Declared here so the cfg checker knows the name.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

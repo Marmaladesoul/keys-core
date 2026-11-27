@@ -6,7 +6,9 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: "/"
+    # /fuzz is the fuzz crate's own workspace and lockfile, which also
+    # carries keys-pairing's dependencies; the same options apply to both.
+    directories: ["/", "/fuzz"]
     schedule:
       interval: weekly
       day: monday

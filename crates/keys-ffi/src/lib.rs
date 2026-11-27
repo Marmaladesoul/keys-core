@@ -19,6 +19,7 @@ mod identity;
 mod kdf;
 mod keyfile;
 mod merge;
+mod pairing;
 mod protector;
 mod test_vault;
 mod totp;
@@ -58,6 +59,15 @@ pub use merge::{
     DeleteEditChoiceFfi, DeleteEditConflictFfi, EntryAttachmentChoiceFfi, EntryConflictFfi,
     EntryFieldChoiceFfi, EntryIconChoiceFfi, FieldChoiceFfi, FieldDeltaFfi, FieldDeltaKindFfi,
     IconDeltaFfi, ResolutionFfi,
+};
+#[cfg(feature = "pairing-test-clock")]
+pub use pairing::PairingTestClock;
+pub use pairing::{
+    GeneratedPairingAccount, PairingAccountKeys, PairingAccountPublicKeys, PairingCodeReason,
+    PairingCredentials, PairingDeviceKeys, PairingDevicePublicKeys, PairingDisplaySheet,
+    PairingDisplayStatus, PairingFailure, PairingFfiError, PairingKindFfi, PairingOutcomeFfi,
+    PairingPolicy, PairingRecoverySecret, PairingRefuseReason, PairingResponse, PairingSession,
+    PairingTypeSheet, PairingTypeStatus, generate_pairing_account, pairing_policy,
 };
 pub use protector::{VaultFieldProtector, VaultProtectorError};
 pub use test_vault::mark_test_vault_file;

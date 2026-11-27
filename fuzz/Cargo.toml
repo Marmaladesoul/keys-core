@@ -1,0 +1,64 @@
+[package]
+name = "keys-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-3.0-only"
+
+# Standalone crate (deliberately not a member of the top-level workspace):
+# cargo-fuzz needs nightly and libFuzzer-specific flags. The empty
+# [workspace] table makes this its own root, so stable `cargo build` /
+# `cargo test` in the main workspace never see libFuzzer.
+[workspace]
+
+# Supply chain: this workspace has its own lockfile and its own cargo-vet
+# store (supply-chain/, policy safe-to-run: fuzz binaries are built and run
+# in CI and never shipped). ci.yml runs cargo audit, cargo deny and cargo
+# vet against it on every PR, and builds the targets.
+#
+# The lockfile was created from the root one, so every crate keys-pairing
+# itself depends on started at the root's version; the fuzz-only tooling
+# (libfuzzer-sys and what it pulls in) has versions of its own. Nothing
+# keeps the two in step afterwards: Dependabot updates each directory
+# separately, so land an update of a shared crate in both.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+keys-pairing = { path = "../crates/keys-pairing" }
+
+[[bin]]
+name = "pairing_display"
+path = "fuzz_targets/pairing_display.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_type"
+path = "fuzz_targets/pairing_type.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_session"
+path = "fuzz_targets/pairing_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_code"
+path = "fuzz_targets/pairing_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_sequence"
+path = "fuzz_targets/pairing_sequence.rs"
+test = false
+doc = false
+bench = false

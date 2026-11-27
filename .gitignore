@@ -4,6 +4,12 @@
 Cargo.lock.bak
 *.rs.bk
 
+# Fuzz artefacts
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+
 # Reference material — other Rust KeePass libraries cloned for study.
 # Not part of our code; do not commit.
 /_reference/

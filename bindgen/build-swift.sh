@@ -104,6 +104,45 @@ if [[ "$SLICES" == all ]]; then
     done
 fi
 
+# 1b. Refuse to package test scaffolding. keys-ffi's `pairing-test-clock`
+#     feature exports a clock that moves only when told to, for the headless
+#     driver; a pairing sheet on it never expires a code. `-p keys-ffi` above
+#     leaves the feature off, but a workspace-wide build to the same target
+#     directory turns it on, so check each library that was just built
+#     rather than trust how it was built.
+TEST_SCAFFOLDING_SYMBOL="pairingtestclock"
+# A symbol every build exports, to prove the search itself still works: if
+# the pairing objects are ever renamed, this fails here rather than letting
+# the check above pass on a name that no longer exists.
+EXPECTED_PAIRING_SYMBOL="pairingdisplaysheet"
+BUILT_TARGETS=("${MACOS_TARGETS[@]}")
+if [[ "$SLICES" == all ]]; then
+    BUILT_TARGETS+=("$IOS_DEVICE_TARGET" "${IOS_SIM_TARGETS[@]}")
+fi
+for target in "${BUILT_TARGETS[@]}"; do
+    lib="target/$target/$PROFILE_DIR/$LIB_NAME"
+    # nm's failure must fail the build, not read as "no such symbol".
+    # `--no-llvm-bc`: a Rust staticlib carries LLVM bitcode in its standard
+    # library objects, from a newer LLVM than Xcode's nm can parse; without
+    # the flag nm exits 1 on every such library.
+    lib_symbols="$(nm -g --no-llvm-bc "$lib" 2>/dev/null)" || {
+        echo "error: could not list the symbols of $lib." >&2
+        exit 1
+    }
+    # `grep -c` exits 1 on a count of zero, hence the `|| true`.
+    expected_symbols="$(grep -ci "$EXPECTED_PAIRING_SYMBOL" <<<"$lib_symbols" || true)"
+    if [[ "$expected_symbols" == 0 ]]; then
+        echo "error: $lib exports no '$EXPECTED_PAIRING_SYMBOL' symbol; the test-scaffolding check can't be trusted." >&2
+        exit 1
+    fi
+    scaffolding_symbols="$(grep -ci "$TEST_SCAFFOLDING_SYMBOL" <<<"$lib_symbols" || true)"
+    if [[ "$scaffolding_symbols" != 0 ]]; then
+        echo "error: $lib exports the pairing test clock ($scaffolding_symbols symbols)." >&2
+        echo "       It was built with the pairing-test-clock feature; clients must not ship it." >&2
+        exit 1
+    fi
+done
+
 # 2. lipo each multi-arch group to a universal staticlib.
 mkdir -p "$MACOS_UNIVERSAL_DIR"
 lipo -create \

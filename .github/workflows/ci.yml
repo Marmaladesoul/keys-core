@@ -76,6 +76,28 @@ jobs:
           KEYS_TEST_FIXTURES_DIR: ${{ github.workspace }}/_keepass-core/tests/fixtures
         run: cargo test --workspace --all-features --no-fail-fast
 
+      # keys-pairing's freed-memory checks depend on what the optimiser
+      # does with a secret, so they run in the release profile too.
+      - name: cargo test (keys-pairing, release)
+        run: cargo test -p keys-pairing --release
+
+      # The fuzz targets (fuzz/, their own workspace) use keys-pairing's
+      # public API and its fuzzing-only hooks, and otherwise compile only
+      # in the nightly fuzz workflow. Check them here so a change that
+      # breaks them fails its own pull request. The step's RUSTFLAGS
+      # replaces the workflow's, so it repeats the warning gate.
+      - name: cargo fmt --check (fuzz targets)
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+      - name: cargo check (fuzz targets)
+        env:
+          RUSTFLAGS: --cfg fuzzing -D warnings
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
+
+      # --all-features above builds keys-ffi with its test scaffolding
+      # (pairing-test-clock). Clients build it without: check that shape.
+      - name: cargo clippy (keys-ffi, default features)
+        run: cargo clippy -p keys-ffi --all-targets -- -D warnings
+
       - name: doc
         run: cargo doc --workspace --no-deps --all-features
 
@@ -132,6 +154,8 @@ jobs:
     permissions:
       contents: read
       checks: write
+    env:
+      CARGO_AUDIT_VERSION: "0.23.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
@@ -145,6 +169,17 @@ jobs:
           # SQLCipher build is patched yet. Mirrors deny.toml, which
           # carries the rationale and the drop trigger.
           ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2026-0459
+      # The fuzz crate is its own workspace with its own lockfile, which
+      # carries none of the crates ignored above. Runs even if the root
+      # audit failed, so both results show.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: success() || failure()
+      - name: Install cargo-audit
+        if: success() || failure()
+        run: cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+      - name: Audit fuzz/Cargo.lock
+        if: success() || failure()
+        run: cargo audit --file fuzz/Cargo.lock
 
   deny:
     name: cargo deny
@@ -158,6 +193,14 @@ jobs:
         with:
           command: check
           arguments: --all-features
+      # The fuzz crate is its own workspace with its own lockfile; the same
+      # deny.toml applies. Runs even if the root check failed.
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
+        if: success() || failure()
+        with:
+          command: check
+          manifest-path: ./fuzz/Cargo.toml
+          arguments: --all-features --locked
 
   vet:
     name: cargo vet
@@ -181,3 +224,8 @@ jobs:
       # change in someone else's published audits can't pass or fail a
       # build without a commit here.
       - run: cargo vet --locked
+      # The fuzz crate is its own workspace, vetted against its own store
+      # (fuzz/supply-chain/) at safe-to-run: it is built and run in CI and
+      # never shipped. Runs even if the root check failed.
+      - if: success() || failure()
+        run: cargo vet --locked --manifest-path fuzz/Cargo.toml

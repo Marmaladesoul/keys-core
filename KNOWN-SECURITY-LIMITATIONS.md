@@ -97,15 +97,34 @@ future uniffi version removes the `Drop`-versus-`Record` constraint.
 
 ---
 
+## 3. Pairing secrets: some transient stack copies, and every copy the foreign side holds, are not wiped
+
+**What it is.** `keys-pairing` keeps each long-lived secret (of a pairing run: the code digits, the CPace scalar, the intermediate key, the confirmation key and both session keys; of a key set: the signing seeds, the X25519 secrets and the recovery secret) in a heap allocation of its own that is wiped in place when dropped, so moving the state that owns them never copies them. A test-only allocator checks that no block is freed with one of them in it. Three kinds of copy are outside that:
+
+- **Transient stack copies inside dependencies.** `hmac`'s keyed constructor builds its padded key block in a local it does not wipe; `curve25519-dalek`'s scalar multiplication leaves the scalar's digit expansion on the stack; `aes-gcm`'s constructor copies the key into a local, and the `aes` crate's runtime-detected cipher is a union whose unused half is not wiped (which is why a session holds raw keys and builds its cipher per frame, never storing one). These live in stack frames that later calls overwrite.
+- **A few transient values of our own** that pass through the stack: a freshly sampled scalar and a freshly generated key seed on their way into their allocations, the Diffie-Hellman result K as it is returned to the one call that hashes it, the password-derived generator, which only ever lives on the stack, and the copy of an X25519 secret that is made, and clamped, each time its public key is computed. Each is wiped where it ends up; the places it passed through are not. Stale stack bytes can also be carried into the heap later, in the unused padding of some unrelated value that is moved there.
+- **Everything that crosses the FFI as a plain value.** The displayed code, the typed code, and each session payload in the clear are handed to (or come from) the Swift / Kotlin side as ordinary strings and byte arrays. Rust wipes its own copy of the typed code. Byte arrays and optional strings travel through the binding generator's own buffers on the Rust heap, which are freed unwiped, and neither those nor the copies the foreign runtime holds can be wiped from here.
+
+**Separately, a Person pairing's public keys are not private.** This is not a memory matter and needs no access to either device: each side's account public keys and an identity-key signature over them travel in the clear in the exchange, before the other party has proved it knows the code. An endpoint that can reach a device while its Person sheet is open learns which account is behind that endpoint, at the cost of one burnt code. The signature cannot be replayed into another run.
+
+**Severity:** Low. Reading any of the copies needs the memory of a live (or core-dumped) process on one of the two devices during or shortly after a pairing. The code is single-use and worthless once its run ends. The scalar and session keys matter more: with one of them and a recording of that run's messages, the run's session payloads can be read.
+
+**Why it is documented rather than fixed.** Wiping another crate's stack frames is not possible from safe Rust, and the workspace denies `unsafe`. The foreign-side copies are the client's to minimise: show the code and drop it, and don't log anything named in `crates/keys-ffi/src/pairing.rs`'s list of secrets that cross the seam. The Person-pairing disclosure is how the exchange binds the keys into its transcript today; a later change sends them inside the verified session instead, after both sides have proved the code.
+
+---
+
 ## Summary
 
 | # | Limitation | Severity | Why not simply fixed |
 |---|------------|----------|----------------------|
 | 1 | Unencrypted `iroh-docs` redb capability store | Medium | Secret lives in `iroh-docs`'s own store — needs upstream encryption-at-rest or a `doc_dir` wrapper; OS at-rest protection mitigates meanwhile |
 | 2 | Heap identity bytes not zeroized on drop | Low | uniffi `Record`-versus-`Drop` constraint; revisit when upstream lifts it |
+| 3 | Pairing: transient stack copies and FFI-side copies of secrets not wiped; a Person pairing's public keys visible before the code is proved | Low | Dependencies' stack frames can't be wiped from safe Rust; foreign-runtime copies are the client's to minimise |
 
-**Neither item is a confidentiality break of vault contents** — vault data
+**Items 1 and 2 are not a confidentiality break of vault contents** — vault data
 syncs and rests only as KDBX ciphertext. Both are device-impersonation /
 sync-integrity concerns gated behind an already-compromised device, and
 both are blocked on an external dependency (`iroh-docs`, `uniffi`) rather
 than on a fix we are choosing not to make.
+
+**Item 3** is about what a pairing run's session carries, and likewise needs the memory of one of the two devices at the time.
