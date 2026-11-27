@@ -9,7 +9,7 @@
    no exception below. *)
 
 (* A1. The displaying side accepts only a run the typing side replied to,
-   with the same kind, endpoint ids, sid, shares and ADs; once each. *)
+   with the same kind, endpoint ids, sid and shares; once each. *)
 query c: code, p: bitstring;
   inj-event(DisplayAccepted(c, p)) ==> inj-event(TypeReplied(c, p))
     || event(Lucky(c)) || event(AdversaryPeer(c)).

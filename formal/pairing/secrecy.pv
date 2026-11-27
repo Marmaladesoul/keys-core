@@ -6,7 +6,7 @@
    the code is live. *)
 
 query a: pkey, i: skey, e: xsk, fk: aeadkey, ft: bitstring, c: code,
-      t: bitstring, p: bitstring, x: bitstring, k: aeadkey, j: aeadkey;
+      t: bitstring, p: bitstring, k: aeadkey, j: aeadkey;
 
   (* S1-S4. The bundle's secrets (account identity private key, account
      encryption private key, fleet key, fleet ticket) stay secret unless
@@ -25,10 +25,10 @@ query a: pkey, i: skey, e: xsk, fk: aeadkey, ft: bitstring, c: code,
 
   (* S7-S10. Both session keys, as each side holds them, stay secret under
      the same condition. *)
-  attacker(k) && event(DisplayKeys(c, p, x, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
-  attacker(j) && event(DisplayKeys(c, p, x, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
-  attacker(k) && event(TypeKeys(c, p, x, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
-  attacker(j) && event(TypeKeys(c, p, x, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c)).
+  attacker(k) && event(DisplayKeys(c, p, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
+  attacker(j) && event(DisplayKeys(c, p, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
+  attacker(k) && event(TypeKeys(c, p, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c));
+  attacker(j) && event(TypeKeys(c, p, k, j)) ==> event(Lucky(c)) || event(AdversaryPeer(c)).
 
 process
   new shut: channel;

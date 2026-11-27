@@ -27,7 +27,7 @@ manifest="$models/expected.txt"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 TRANSPORTS="claimed authenticated"
 # Every model must be listed with each of these. Other bindings (the
-# weakened `noshare`) are run only where the manifest lists them.
+# weakened `noshares`) are run only where the manifest lists them.
 BINDINGS="current"
 
 # The file a run's verdict is written to. Model, transport and binding

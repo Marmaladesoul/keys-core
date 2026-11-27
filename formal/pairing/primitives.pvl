@@ -116,7 +116,7 @@ reduc forall k: skey, m: bitstring; checksign(spk(k), m, sign(k, m)) = true.
 (* Signatures hide nothing. *)
 reduc forall k: skey, m: bitstring; signedMessage(sign(k, m)) = m.
 
-(* ─── credentials and associated data ─────────────────────────────────── *)
+(* ─── credentials ─────────────────────────────────────────────────────── *)
 
 (* What a side brings to a run: nothing for a device pairing, its account's
    identity private key and recovery and encryption public keys for a Person
@@ -124,27 +124,19 @@ reduc forall k: skey, m: bitstring; signedMessage(sign(k, m)) = m.
 const deviceCred: bitstring.
 fun personCred(skey, pkey, pkey): bitstring [data].
 
-(* AD: empty for a device pairing; identity, recovery, encryption and a
-   signature for a Person pairing. *)
+(* The exchange's associated data is empty for both kinds: nothing about an
+   account travels before the code is proved. The constant keeps AD's place
+   in the transcript hash and the tags. *)
 const emptyAD: bitstring.
-fun personAD(pkey, pkey, pkey, bitstring): bitstring [data].
-
-(* What the identity key signs:
-   lv_cat("keys-pairing person keys", role, CI, sid, identity, recovery,
-          encryption), plus whatever the binding library adds. *)
-fun personKeysMsg(role, bitstring, bitstring, pkey, pkey, pkey, bitstring): bitstring [data].
-const noShareBound: bitstring.
-fun shareBound(G): bitstring [data].
 
 (* What a run learnt about the other account. *)
-const noPeerAccount: bitstring.
 fun peerAccount(pkey, pkey, pkey): bitstring [data].
 
 (* ─── wire messages ───────────────────────────────────────────────────── *)
 
 fun hello(version, kind, nonce): bitstring [data].
-fun share(nonce, G, bitstring): bitstring [data].
-fun reply(G, tag, bitstring): bitstring [data].
+fun share(nonce, G): bitstring [data].
+fun reply(G, tag): bitstring [data].
 fun confirm(tag): bitstring [data].
 
 (* ─── payloads carried by the verified session ────────────────────────── *)
@@ -162,6 +154,13 @@ fun enrolment(bitstring): bitstring [data].
 (* The frame a typing trusted device opens with when the new device
    displays. *)
 const opening: bitstring.
+(* An account's signed key set, each side's first frame in a Person
+   pairing: identity, recovery and encryption public keys and the identity
+   key's signature. *)
+fun keySet(pkey, pkey, pkey, bitstring): bitstring [data].
+(* What the identity key signs: a label (this constructor), the fields the
+   binding library chooses, and the three public keys. *)
+fun keySetMsg(bitstring, pkey, pkey, pkey): bitstring [data].
 (* A friendship's bootstrap: its document ticket and pairwise key. *)
 fun friendship(bitstring, aeadkey): bitstring [data].
 (* What the invitee sends back: its display name and the like. *)
@@ -169,8 +168,8 @@ fun profile(bitstring): bitstring [data].
 const nothing: bitstring.
 
 (* Everything a run agrees on: kind, both endpoint ids in their roles, sid,
-   both shares, both ADs. The version is a constant. *)
-fun params(kind, ep, ep, bitstring, G, bitstring, G, bitstring): bitstring [data].
+   both shares. The version is a constant and both ADs are empty. *)
+fun params(kind, ep, ep, bitstring, G, G): bitstring [data].
 
 (* ─── the three flows ─────────────────────────────────────────────────── *)
 
@@ -197,10 +196,20 @@ event AdversaryPeer(code).
 event TypeReplied(code, bitstring).
 event DisplayAccepted(code, bitstring).
 event TypeAccepted(code, bitstring).
-(* code, params, what the run learnt of the peer account, the two session
-   keys (display to type, type to display). *)
-event DisplayKeys(code, bitstring, bitstring, aeadkey, aeadkey).
-event TypeKeys(code, bitstring, bitstring, aeadkey, aeadkey).
+(* code, params, the two session keys (display to type, type to display). *)
+event DisplayKeys(code, bitstring, aeadkey, aeadkey).
+event TypeKeys(code, bitstring, aeadkey, aeadkey).
+
+(* Person key sets. *)
+(* code, params, the signer's role, its three public keys: a side sealed
+   its key set into the session. *)
+event KeySetSent(code, bitstring, role, pkey, pkey, pkey).
+(* code, the signer's identity, the signature it released. *)
+event KeySetSigned(code, pkey, bitstring).
+(* code, params, the peer account recorded, the two session keys: a side
+   opened the other's key set, verified it and recorded the account. *)
+event DisplayRecorded(code, bitstring, bitstring, aeadkey, aeadkey).
+event TypeRecorded(code, bitstring, bitstring, aeadkey, aeadkey).
 
 (* Payloads. *)
 event KeysSent(code, bitstring, bitstring).

@@ -8,35 +8,34 @@
    counterparty any Person code was shown to, and any honest device may
    type such a code.
 
-   With the protocol's signature (binding-current.pvl) it cannot, under
-   either transport. With the signer's share left out of the signature
-   (binding-noshare.pvl) it can under the claimed transport, which is why
-   the share is signed; expected.txt records each combination. *)
+   With the protocol's key-set signature (binding-current.pvl) it cannot,
+   under either transport. With both shares left out of the signature
+   (binding-noshares.pvl) it can under the claimed transport, which is why
+   the shares are signed; expected.txt records each combination. *)
 
 query c: code, p: bitstring, i: pkey, r: pkey, e: pkey, k: aeadkey, j: aeadkey;
 
   (* U1. The typing side has recorded honest account i as its peer, and
      the attacker holds the key the typing side sends under. *)
-  attacker(j) && event(TypeKeys(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i)) ==> false;
+  attacker(j) && event(TypeRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i)) ==> false;
 
   (* U2. The displaying side has recorded honest account i as its peer,
      and the attacker holds the key the displaying side sends under. *)
-  attacker(k) && event(DisplayKeys(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i)) ==> false.
+  attacker(k) && event(DisplayRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i)) ==> false.
 
 (* I1. The positive form: a typing side that records honest account i as
-   its peer is in a run a displaying side accepted with the same code and
-   parameters; once each. The parameters include the displaying side's AD,
-   so that side is a device of account i. *)
+   its peer is in a run in which a displaying device of account i sealed
+   that key set, with the same code and parameters; once each. *)
 query c: code, p: bitstring, i: pkey, r: pkey, e: pkey, k: aeadkey, j: aeadkey;
-  inj-event(TypeKeys(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i))
-    ==> inj-event(DisplayAccepted(c, p)).
+  inj-event(TypeRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i))
+    ==> inj-event(KeySetSent(c, p, roleDisplay, i, r, e)).
 
 (* I2. A displaying side that records honest account i as its peer is in a
-   run a typing side of account i replied to, with the same code and
-   parameters; once each. *)
+   run in which a typing device of account i sealed that key set, with the
+   same code and parameters; once each. *)
 query c: code, p: bitstring, i: pkey, r: pkey, e: pkey, k: aeadkey, j: aeadkey;
-  inj-event(DisplayKeys(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i))
-    ==> inj-event(TypeReplied(c, p)).
+  inj-event(DisplayRecorded(c, p, peerAccount(i, r, e), k, j)) && event(HonestAccount(i))
+    ==> inj-event(KeySetSent(c, p, roleType, i, r, e)).
 
 process
   new shut: channel;

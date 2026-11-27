@@ -1,0 +1,5 @@
+(* A weakened key-set signature that leaves both CPace shares out: role, CI
+   and sid only. Not the protocol: loaded only by the misbinding models, to
+   show what covering the shares is for. See Findings in ../README.md. *)
+letfun keySetBinding(r: role, ci: bitstring, sessionId: bitstring, yD: G, yT: G) =
+  (r, ci, sessionId).

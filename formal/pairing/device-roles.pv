@@ -1,7 +1,7 @@
 (* Device pairing with the roles mixed up.
 
    The exchange does not say which side is the trusted device: a device
-   pairing's AD is empty and nothing else in the transcript carries it.
+   pairing's exchange carries nothing that says so.
    So this world lets one code be used by any combination: a trusted
    device of any account or a new device displays it, and trusted devices
    of any accounts and new devices type it, each behaving as its own role

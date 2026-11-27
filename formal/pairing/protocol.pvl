@@ -2,12 +2,12 @@
 
      typing (T)                                displaying (D)
      Hello   { version, kind, nonce_T }   -->
-                                          <--  Share   { nonce_D, Y_D, AD_D }
-     Reply   { Y_T, tag_T, AD_T }         -->
+                                          <--  Share   { nonce_D, Y_D }
+     Reply   { Y_T, tag_T }               -->
                                           <--  Confirm { tag_D }
 
-   Loaded after primitives.pvl, one transport library and one binding
-   library.
+   The exchange's associated data is empty for both kinds. Loaded after
+   primitives.pvl, one transport library and one binding library.
 
    Fresh names are written `new n[x, ...]`, which tells ProVerif which
    earlier values tell two instances of the name apart. Left to itself it
@@ -20,37 +20,31 @@
    reflection of its own share and tag that no real run allows, because a
    scalar is drawn fresh for each run and only after the Share arrives. *)
 
-(* ─── associated data ─────────────────────────────────────────────────── *)
+(* ─── kinds and key sets ──────────────────────────────────────────────── *)
 
 letfun kindOf(cred: bitstring) =
   let personCred(idsk, recpk, encpk) = cred in person else device.
 
-(* This side's AD: empty for a device pairing, the signed key set for a
-   Person pairing. *)
-letfun ownAD(cred: bitstring, r: role, ci: bitstring, sessionId: bitstring, y: G) =
-  let personCred(idsk, recpk, encpk) = cred in
-    personAD(spk(idsk), recpk, encpk,
-             sign(idsk, personKeysMsg(r, ci, sessionId, spk(idsk), recpk, encpk, shareBinding(y))))
-  else
-    emptyAD.
+(* The identity key's signature over this side's key set, bound to the run
+   by whatever the binding library chooses. *)
+letfun keySetSignature(idsk: skey, recpk: pkey, encpk: pkey, r: role,
+                       ci: bitstring, sessionId: bitstring, yD: G, yT: G) =
+  sign(idsk, keySetMsg(keySetBinding(r, ci, sessionId, yD, yT), spk(idsk), recpk, encpk)).
 
-(* Checks the other side's AD against what this side's credentials call for
-   and returns what it learnt of the other account. Fails (and so fails the
-   run) on AD of the wrong shape or a bad signature.
+(* Opens the other side's key-set frame and returns the account it names.
+   Fails (and so ends the flow) on a frame of the wrong shape or a bad
+   signature.
 
-   keys-pairing also lets a side hold an expected identity for the other
-   account and refuses a run that presents a different one. The model
-   leaves that check out, which is the most permissive setting: a side
-   that holds an expectation accepts a subset of the runs modelled here, so
-   every property proven without the check holds with it. *)
-letfun checkPeerAD(cred: bitstring, r: role, ci: bitstring, sessionId: bitstring,
-                   ad: bitstring, y: G) =
-  if cred = deviceCred then
-    (if ad = emptyAD then noPeerAccount)
-  else
-    (let personAD(idpk, recpk, encpk, sig) = ad in
-     if checksign(idpk, personKeysMsg(r, ci, sessionId, idpk, recpk, encpk, shareBinding(y)), sig) = true then
-     peerAccount(idpk, recpk, encpk)).
+   A side may also hold an expected identity for the other account and
+   refuse a different one. The model leaves that check out, which is the
+   most permissive setting: a side that holds an expectation records a
+   subset of what is recorded here, so every property proven without the
+   check holds with it. *)
+letfun checkKeySet(r: role, ci: bitstring, sessionId: bitstring, yD: G, yT: G,
+                   frame: bitstring) =
+  let keySet(idpk, recpk, encpk, sig) = frame in
+  if checksign(idpk, keySetMsg(keySetBinding(r, ci, sessionId, yD, yT), idpk, recpk, encpk), sig) = true then
+  peerAccount(idpk, recpk, encpk).
 
 (* ─── the displaying side ─────────────────────────────────────────────── *)
 
@@ -69,23 +63,21 @@ let Display(f: flow, c: code, ownEsk: esk, cred: bitstring, own: bitstring) =
   let ci = mkci(v1, k, ownEp, typeEp) in
   let sessionId = mksid(nT, nD) in
   let yD = exp(h2c(c, ci, sessionId), y) in
-  let adD = ownAD(cred, roleDisplay, ci, sessionId, yD) in
-  out(net, wrap(ownEsk, typeEp, share(nD, yD, adD)));
+  out(net, wrap(ownEsk, typeEp, share(nD, yD)));
   (* Reply, from the run's own peer only. *)
   in(net, (=typeEp, m3: bitstring, a3: bitstring));
   if transportAccepts(typeEp, ownEp, m3, a3) = true then
-  let reply(yT, tagT, adT) = m3 in
-  let peer = checkPeerAD(cred, roleType, ci, sessionId, adT, yT) in
-  let i = hisk(sessionId, dh(yT, y), yD, adD, yT, adT) in
+  let reply(yT, tagT) = m3 in
+  let i = hisk(sessionId, dh(yT, y), yD, emptyAD, yT, emptyAD) in
   let mk = hmackey(sessionId, i) in
   (* D checks T's tag before it sends its own. *)
-  if tagT = hmac(mk, yT, adT) then
-  let p = params(k, ownEp, typeEp, sessionId, yD, adD, yT, adT) in
+  if tagT = hmac(mk, yT, emptyAD) then
+  let p = params(k, ownEp, typeEp, sessionId, yD, yT) in
   let kSend = sessionKey(i, displayToType) in
   let kRecv = sessionKey(i, typeToDisplay) in
   event DisplayAccepted(c, p);
-  event DisplayKeys(c, p, peer, kSend, kRecv);
-  out(net, wrap(ownEsk, typeEp, confirm(hmac(mk, yD, adD))));
+  event DisplayKeys(c, p, kSend, kRecv);
+  out(net, wrap(ownEsk, typeEp, confirm(hmac(mk, yD, emptyAD))));
   (* The displaying side speaks second: it seals nothing until it has opened
      a frame from the typing side. *)
   in(net, frame0: bitstring);
@@ -110,12 +102,24 @@ let Display(f: flow, c: code, ownEsk: esk, cred: bitstring, own: bitstring) =
     event Installed(c, p, b);
     event Completed(f)
   ) else (
-    let friendship(ticket, pairwise) = first in
-    event FriendshipInstalled(c, p, first);
-    (* The invitee answers with its profile. *)
+    (* Person pairing. The typing side's key set came first; record the
+       account only once its signature verifies, then answer with this
+       side's own. *)
+    let personCred(idsk, recpk, encpk) = cred in
+    let peer = checkKeySet(roleType, ci, sessionId, yD, yT, first) in
+    event DisplayRecorded(c, p, peer, kSend, kRecv);
+    let sig = keySetSignature(idsk, recpk, encpk, roleDisplay, ci, sessionId, yD, yT) in
+    event KeySetSent(c, p, roleDisplay, spk(idsk), recpk, encpk);
+    event KeySetSigned(c, spk(idsk), sig);
+    out(net, aead(kSend, seq0, keySet(spk(idsk), recpk, encpk, sig)));
+    (* Then the friendship from the inviter, and this side's profile. *)
+    in(net, frame1: bitstring);
+    let second = adec(kRecv, seq1, frame1) in
+    let friendship(ticket, pairwise) = second in
+    event FriendshipInstalled(c, p, second);
     new name[c, ownEsk]: bitstring;
     event ProfileSent(c, p, profile(name));
-    out(net, aead(kSend, seq0, profile(name)))
+    out(net, aead(kSend, seq1, profile(name)))
   ).
 
 (* ─── the typing side ─────────────────────────────────────────────────── *)
@@ -129,27 +133,25 @@ let Type(f: flow, c: code, ownEsk: esk, cred: bitstring, own: bitstring) =
   out(net, wrap(ownEsk, displayEp, hello(v1, k, nT)));
   in(net, (=displayEp, m2: bitstring, a2: bitstring));
   if transportAccepts(displayEp, ownEp, m2, a2) = true then
-  let share(nD, yD, adD) = m2 in
+  let share(nD, yD) = m2 in
   let ci = mkci(v1, k, displayEp, ownEp) in
   let sessionId = mksid(nT, nD) in
-  let peer = checkPeerAD(cred, roleDisplay, ci, sessionId, adD, yD) in
   new y[c, ownEsk, displayEp, nD, yD]: scalar;
   let yT = exp(h2c(c, ci, sessionId), y) in
-  let adT = ownAD(cred, roleType, ci, sessionId, yT) in
-  let i = hisk(sessionId, dh(yD, y), yD, adD, yT, adT) in
+  let i = hisk(sessionId, dh(yD, y), yD, emptyAD, yT, emptyAD) in
   let mk = hmackey(sessionId, i) in
-  let p = params(k, displayEp, ownEp, sessionId, yD, adD, yT, adT) in
+  let p = params(k, displayEp, ownEp, sessionId, yD, yT) in
   event TypeReplied(c, p);
   (* T's tag goes out before it has seen any proof from D. *)
-  out(net, wrap(ownEsk, displayEp, reply(yT, hmac(mk, yT, adT), adT)));
+  out(net, wrap(ownEsk, displayEp, reply(yT, hmac(mk, yT, emptyAD))));
   in(net, (=displayEp, m4: bitstring, a4: bitstring));
   if transportAccepts(displayEp, ownEp, m4, a4) = true then
   let confirm(tagD) = m4 in
-  if tagD = hmac(mk, yD, adD) then
+  if tagD = hmac(mk, yD, emptyAD) then
   let kSend = sessionKey(i, typeToDisplay) in
   let kRecv = sessionKey(i, displayToType) in
   event TypeAccepted(c, p);
-  event TypeKeys(c, p, peer, kRecv, kSend);
+  event TypeKeys(c, p, kRecv, kSend);
   if f = deviceTrustedDisplays then (
     (* T is the new device. *)
     event KeysSent(c, p, own);
@@ -172,14 +174,26 @@ let Type(f: flow, c: code, ownEsk: esk, cred: bitstring, own: bitstring) =
     event BundleSent(c, p, b);
     out(net, aead(kSend, seq1, b))
   ) else (
-    (* The inviter creates the friendship and sends its bootstrap. *)
+    (* Person pairing. Both confirmations have verified, so this side's key
+       set goes first; the displaying side's comes back, and the account is
+       recorded only once its signature verifies. *)
+    let personCred(idsk, recpk, encpk) = cred in
+    let sig = keySetSignature(idsk, recpk, encpk, roleType, ci, sessionId, yD, yT) in
+    event KeySetSent(c, p, roleType, spk(idsk), recpk, encpk);
+    event KeySetSigned(c, spk(idsk), sig);
+    out(net, aead(kSend, seq0, keySet(spk(idsk), recpk, encpk, sig)));
+    in(net, frame0: bitstring);
+    let peer = checkKeySet(roleDisplay, ci, sessionId, yD, yT, adec(kRecv, seq0, frame0)) in
+    event TypeRecorded(c, p, peer, kRecv, kSend);
+    (* Only then the friendship: the inviter creates it and sends its
+       bootstrap; the invitee answers with its profile. *)
     new ticket[c, ownEsk]: bitstring;
     new pairwise[c, ownEsk]: aeadkey;
     event FriendshipSecrets(c, ticket, pairwise);
     event FriendshipSent(c, p, friendship(ticket, pairwise));
-    out(net, aead(kSend, seq0, friendship(ticket, pairwise)));
-    in(net, frame0: bitstring);
-    let profile(name) = adec(kRecv, seq0, frame0) in
+    out(net, aead(kSend, seq1, friendship(ticket, pairwise)));
+    in(net, frame1: bitstring);
+    let profile(name) = adec(kRecv, seq1, frame1) in
     event ProfileInstalled(c, p, profile(name));
     event Completed(f)
   ).

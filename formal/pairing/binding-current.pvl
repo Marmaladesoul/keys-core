@@ -1,3 +1,5 @@
-(* The Person-keys signature of protocol version 1: over the role, CI, sid,
-   the three public keys and the signer's own CPace share. *)
-letfun shareBinding(y: G) = shareBound(y).
+(* What the key-set signature of protocol version 1 covers, besides its
+   label and the three public keys: the signer's role, CI (version, kind
+   and both endpoint ids in their roles), sid and both CPace shares. *)
+letfun keySetBinding(r: role, ci: bitstring, sessionId: bitstring, yD: G, yT: G) =
+  (r, ci, sessionId, yD, yT).
