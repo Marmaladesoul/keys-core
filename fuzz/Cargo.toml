@@ -69,3 +69,31 @@ path = "fuzz_targets/pairing_sequence.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "pairing_link"
+path = "fuzz_targets/pairing_link.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_greeting"
+path = "fuzz_targets/pairing_greeting.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_advert"
+path = "fuzz_targets/pairing_advert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_invites"
+path = "fuzz_targets/pairing_invites.rs"
+test = false
+doc = false
+bench = false

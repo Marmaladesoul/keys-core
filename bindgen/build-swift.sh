@@ -106,11 +106,17 @@ fi
 
 # 1b. Refuse to package test scaffolding. keys-ffi's `pairing-test-clock`
 #     feature exports a clock that moves only when told to, for the headless
-#     driver; a pairing sheet on it never expires a code. `-p keys-ffi` above
-#     leaves the feature off, but a workspace-wide build to the same target
-#     directory turns it on, so check each library that was just built
-#     rather than trust how it was built.
-TEST_SCAFFOLDING_SYMBOL="pairingtestclock"
+#     driver; a pairing sheet on it never expires a code. Its
+#     `pairing-test-transport` feature exports a loopback-only node binder
+#     and a way to move a node's invite clock forward. `-p keys-ffi` above
+#     leaves both off, but a workspace-wide build to the same target
+#     directory turns them on, so check each library that was just built
+#     rather than trust how it was built. One pattern per scaffold.
+TEST_SCAFFOLDING_SYMBOLS=(
+    "pairingtestclock"
+    "bind_local_node_for_testing"
+    "pairing_test_advance_clock"
+)
 # A symbol every build exports, to prove the search itself still works: if
 # the pairing objects are ever renamed, this fails here rather than letting
 # the check above pass on a name that no longer exists.
@@ -135,12 +141,14 @@ for target in "${BUILT_TARGETS[@]}"; do
         echo "error: $lib exports no '$EXPECTED_PAIRING_SYMBOL' symbol; the test-scaffolding check can't be trusted." >&2
         exit 1
     fi
-    scaffolding_symbols="$(grep -ci "$TEST_SCAFFOLDING_SYMBOL" <<<"$lib_symbols" || true)"
-    if [[ "$scaffolding_symbols" != 0 ]]; then
-        echo "error: $lib exports the pairing test clock ($scaffolding_symbols symbols)." >&2
-        echo "       It was built with the pairing-test-clock feature; clients must not ship it." >&2
-        exit 1
-    fi
+    for scaffold in "${TEST_SCAFFOLDING_SYMBOLS[@]}"; do
+        scaffolding_symbols="$(grep -ci "$scaffold" <<<"$lib_symbols" || true)"
+        if [[ "$scaffolding_symbols" != 0 ]]; then
+            echo "error: $lib exports test scaffolding ('$scaffold', $scaffolding_symbols symbols)." >&2
+            echo "       It was built with a pairing-test-* feature; clients must not ship it." >&2
+            exit 1
+        fi
+    done
 done
 
 # 2. lipo each multi-arch group to a universal staticlib.

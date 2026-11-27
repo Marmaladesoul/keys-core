@@ -9,6 +9,7 @@ use keys_ffi::{
 
 const DISPLAY_ENDPOINT: [u8; 32] = [0xd1; 32];
 const TYPING_ENDPOINT: [u8; 32] = [0x71; 32];
+const OTHER_ENDPOINT: [u8; 32] = [0x57; 32];
 /// One byte short of an endpoint id.
 const SHORT_ENDPOINT: [u8; 31] = [0x71; 31];
 
@@ -41,6 +42,38 @@ fn an_endpoint_id_of_the_wrong_length_is_refused() {
         display.handle(SHORT_ENDPOINT.to_vec(), vec![1]),
         Err(PairingFfiError::InvalidKeyLength)
     ));
+    assert!(matches!(
+        display.abandon_run_of(SHORT_ENDPOINT.to_vec()),
+        Err(PairingFfiError::InvalidKeyLength)
+    ));
+}
+
+#[test]
+fn a_failed_connection_abandons_only_a_run_with_its_own_endpoint() {
+    let typing = typing_sheet();
+    let display = PairingDisplaySheet::open(PairingCredentials::Device, DISPLAY_ENDPOINT.to_vec())
+        .expect("open a displaying sheet");
+    // No run in flight: nothing happens, and it isn't an error.
+    assert!(matches!(
+        display.abandon_run_of(TYPING_ENDPOINT.to_vec()),
+        Ok(PairingOutcomeFfi::Ignored)
+    ));
+    let hello = typing.submit_code("123456".to_owned()).expect("a Hello");
+    display
+        .handle(TYPING_ENDPOINT.to_vec(), hello)
+        .expect("handle the Hello");
+    // Some other endpoint's connection failing leaves the run alone.
+    assert!(matches!(
+        display.abandon_run_of(OTHER_ENDPOINT.to_vec()),
+        Ok(PairingOutcomeFfi::Ignored)
+    ));
+    assert_eq!(display.shown_code().expect("status"), None);
+    // The run's own endpoint's does not.
+    assert!(matches!(
+        display.abandon_run_of(TYPING_ENDPOINT.to_vec()),
+        Ok(PairingOutcomeFfi::RunFailed { runs_left: 2, .. })
+    ));
+    assert!(display.shown_code().expect("status").is_some());
 }
 
 #[test]

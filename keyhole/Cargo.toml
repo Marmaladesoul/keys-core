@@ -20,7 +20,7 @@ path = "src/main.rs"
 # frontends bind to via uniffi. Anything keyhole can reach, a real
 # client reaches the same way. keys-ffi exposes an `rlib` crate-type
 # alongside its staticlib/cdylib, so it links as a normal Rust dep.
-keys-ffi = { path = "../crates/keys-ffi", features = ["pairing-test-clock"] }
+keys-ffi = { path = "../crates/keys-ffi", features = ["pairing-test-clock", "pairing-test-transport"] }
 
 # Only for the adversarial `forge-kdf` verb, which edits a KDBX header's
 # bytes directly — a hostile file, not a client capability, so it can't go

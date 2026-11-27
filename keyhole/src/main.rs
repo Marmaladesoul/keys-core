@@ -23,6 +23,7 @@
 mod adapters;
 mod kdf;
 mod pairing;
+mod pairing_net;
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -969,6 +970,42 @@ enum Command {
         #[arg(long)]
         payload: Option<String>,
     },
+    /// Run a scripted pairing over the pairing transport: every party is a
+    /// node of its own on the loopback interface, found by advertisement,
+    /// address link or invite, and keyhole plays the people. Prints one
+    /// `who: event` line per step and a final `result:` line for flows that
+    /// attempt a pairing; never prints a code. Touches no network beyond
+    /// this machine. Needs no vault and no password.
+    PairNet {
+        /// Which pairing to run.
+        #[arg(long, value_enum, default_value_t = pairing_net::NetFlow::DeviceNearby)]
+        flow: pairing_net::NetFlow,
+        /// Type a wrong code on this many attempts before typing it right.
+        #[arg(long, default_value_t = 0)]
+        typos: u32,
+        /// Person pairings: which of the inviter's devices types the code.
+        #[arg(long, value_enum, default_value_t = pairing_net::NetVerifier::Sibling)]
+        verify_from: pairing_net::NetVerifier,
+        /// What goes wrong, or who interferes.
+        #[arg(long, value_enum)]
+        attack: Option<pairing_net::NetAttack>,
+        /// After verifying, send this payload both ways down the session.
+        #[arg(long)]
+        payload: Option<String>,
+    },
+    /// Parse a `keys://pair/...` link through the seam and print what it
+    /// holds (`link: device|person` and its fields), or `refused: <why>`.
+    /// Exits 0 either way. Needs no vault and no password.
+    PairLink {
+        /// The link, as pasted or scanned.
+        text: String,
+    },
+    /// Print what a name from an unverified source (an invite, a discovered
+    /// device) is shown as. Needs no vault and no password.
+    PairName {
+        /// The name as its sender wrote it.
+        name: String,
+    },
 }
 
 // Flat verb dispatch: one match arm per CLI verb, growing linearly
@@ -1044,6 +1081,30 @@ async fn main() -> Result<()> {
                 attack: *attack,
                 payload: payload.clone(),
             });
+        }
+        Command::PairNet {
+            flow,
+            typos,
+            verify_from,
+            attack,
+            payload,
+        } => {
+            return pairing_net::run(&pairing_net::NetScript {
+                flow: *flow,
+                typos: *typos,
+                verify_from: *verify_from,
+                attack: *attack,
+                payload: payload.clone(),
+            })
+            .await;
+        }
+        Command::PairLink { text } => {
+            pairing_net::parse_link(text);
+            return Ok(());
+        }
+        Command::PairName { name } => {
+            pairing_net::sanitize_name(name);
+            return Ok(());
         }
         _ => {}
     }
@@ -1597,7 +1658,11 @@ async fn main() -> Result<()> {
         Command::VerifyIdentity { picked, expect } => {
             verify_identity(&picked, &expect, &password, keyfile.clone())?;
         }
-        Command::PairKeygen | Command::PairSim { .. } => {
+        Command::PairKeygen
+        | Command::PairSim { .. }
+        | Command::PairNet { .. }
+        | Command::PairLink { .. }
+        | Command::PairName { .. } => {
             unreachable!("dispatched before the password read")
         }
     }

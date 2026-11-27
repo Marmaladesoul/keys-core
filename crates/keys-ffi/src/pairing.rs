@@ -579,6 +579,19 @@ impl PairingDisplaySheet {
     pub fn abandon_run(&self) -> Result<PairingOutcomeFfi, PairingFfiError> {
         Ok(lock(&self.inner).abandon_run()?.into())
     }
+
+    /// A connection to `peer` failed: abandons the run in flight if it is
+    /// with that endpoint, and otherwise changes nothing (the outcome is
+    /// `Ignored`). A displaying sheet can be reached by several endpoints
+    /// at once and runs with one of them, so this, not
+    /// [`Self::abandon_run`], is what to call when a connection drops.
+    ///
+    /// # Errors
+    /// [`PairingFfiError::InvalidKeyLength`] for a malformed endpoint id;
+    /// [`PairingFfiError::Random`] if the next code can't be drawn.
+    pub fn abandon_run_of(&self, peer: Vec<u8>) -> Result<PairingOutcomeFfi, PairingFfiError> {
+        Ok(lock(&self.inner).abandon_run_of(key32(&peer)?)?.into())
+    }
 }
 
 #[cfg(feature = "pairing-test-clock")]

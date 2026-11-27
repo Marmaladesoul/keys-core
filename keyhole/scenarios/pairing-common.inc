@@ -27,3 +27,31 @@ count() { grep -cxF -- "$1" <<<"$OUT" || true; }
 expect_re() {
     grep -qxE -- "$1" <<<"$OUT" || { echo "FAIL: no line matching '$1' in:"; echo "$OUT"; exit 1; }
 }
+
+# net <flags...>: run a scripted pairing over the transport, output in $OUT.
+net() { OUT="$("$KEYHOLE" pair-net "$@")"; }
+
+# link_line: the link the last net run printed (links are public by design).
+link_line() { sed -n 's/^link: //p' <<<"$OUT" | head -1; }
+
+# before <first> <second>: in the last output, the first exact line comes
+# before the second.
+before() {
+    local first second
+    first="$(grep -nxF -- "$1" <<<"$OUT" | head -1 | cut -d: -f1)"
+    second="$(grep -nxF -- "$2" <<<"$OUT" | head -1 | cut -d: -f1)"
+    if [ -z "$first" ] || [ -z "$second" ] || [ "$first" -ge "$second" ]; then
+        echo "FAIL: expected '$1' before '$2' in:"; echo "$OUT"; exit 1
+    fi
+}
+
+# no_code_in_output: nothing in the last output looks like a pairing code.
+# Links and ids are hex and can hold six digits in a row by chance, so they
+# are set aside first.
+no_code_in_output() {
+    local rest
+    rest="$(sed -E '/^link: /d; s/(id|peer-identity)=[0-9a-f]+//g' <<<"$OUT")"
+    if grep -qE '[0-9]{6}' <<<"$rest"; then
+        echo "FAIL: a six-digit run in the output:"; echo "$OUT"; exit 1
+    fi
+}

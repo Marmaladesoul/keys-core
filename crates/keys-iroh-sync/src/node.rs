@@ -45,6 +45,7 @@ use tokio::sync::{Mutex, mpsc};
 use crate::error::{Result, SyncError};
 use crate::events::DocEvent;
 use crate::identity::Identity;
+use crate::pairing::{PAIRING_ALPN, PairingHub};
 use crate::policy::DownloadPolicy;
 
 /// What the mounted blobs protocol will serve to a connecting peer:
@@ -274,6 +275,9 @@ pub struct IrohNode {
     /// shape is "occasional writes from join/leave, never-hot reads"
     /// and Mutex generates substantially less code through uniffi.
     joined: Mutex<HashMap<NamespaceId, JoinedDoc>>,
+    /// Pairing: the invite book, the open listener, and the handler behind
+    /// the pairing ALPN (see [`crate::pairing`]).
+    pairing: PairingHub,
     /// `OnceCell::get_or_init` elects the first caller to run the
     /// teardown future; every concurrent or subsequent caller awaits
     /// the same init future and returns only after the work has
@@ -560,7 +564,7 @@ impl IrohNode {
     /// receive connections.
     #[uniffi::constructor]
     pub async fn bind(config: NodeConfig) -> Result<Arc<Self>> {
-        Self::bind_with_gc_interval(config, BLOB_GC_INTERVAL).await
+        Self::bind_on(config, BLOB_GC_INTERVAL, Network::Public).await
     }
 
     /// Join a doc described by `ticket` with the given download policy.
@@ -1421,10 +1425,81 @@ impl IrohNode {
     }
 }
 
+/// Which network a node's endpoint joins.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Network {
+    /// Relays, publishing and lookup as [`endpoint_builder`] sets them up.
+    Public,
+    /// This machine's loopback interface only, for tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    Loopback,
+}
+
+/// Where the loopback nodes of one process find each other: each adds its
+/// own loopback address when it binds.
+#[cfg(any(test, feature = "test-hooks"))]
+fn loopback_lookup() -> &'static iroh::address_lookup::memory::MemoryLookup {
+    static LOOKUP: std::sync::OnceLock<iroh::address_lookup::memory::MemoryLookup> =
+        std::sync::OnceLock::new();
+    LOOKUP.get_or_init(iroh::address_lookup::memory::MemoryLookup::new)
+}
+
+/// The builder for an endpoint that touches no network but this machine's
+/// loopback: no relay, no publishing, no DNS.
+#[cfg(any(test, feature = "test-hooks"))]
+fn loopback_endpoint_builder(secret: SecretKey) -> Result<iroh::endpoint::Builder> {
+    Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .address_lookup(loopback_lookup().clone())
+        .secret_key(secret)
+        .clear_ip_transports()
+        .bind_addr(LOOPBACK_BIND_ADDR)
+        .map_err(|e| SyncError::Generic(format!("loopback bind address: {e}")))
+}
+
+/// Any free port on the IPv4 loopback.
+#[cfg(any(test, feature = "test-hooks"))]
+const LOOPBACK_BIND_ADDR: &str = "127.0.0.1:0";
+
+/// Test scaffolding for the headless driver: [`IrohNode::bind`] for a node
+/// that talks only to other such nodes in this process, over the loopback
+/// interface. No relay, no publishing, no lookup beyond a table the nodes
+/// share, so dialling one by endpoint id alone works, as it does through a
+/// relay on the real network.
+#[cfg(feature = "test-hooks")]
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn bind_local_node_for_testing(config: NodeConfig) -> Result<Arc<IrohNode>> {
+    IrohNode::bind_on(config, BLOB_GC_INTERVAL, Network::Loopback).await
+}
+
+/// A loopback node for this crate's tests.
+#[cfg(test)]
+pub(crate) async fn bind_loopback_for_test(config: NodeConfig) -> Result<Arc<IrohNode>> {
+    IrohNode::bind_on(config, BLOB_GC_INTERVAL, Network::Loopback).await
+}
+
 impl IrohNode {
+    /// The endpoint pairing connections use: the node's own.
+    pub(crate) fn pairing_endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    pub(crate) fn pairing_hub(&self) -> &PairingHub {
+        &self.pairing
+    }
+
     /// [`IrohNode::bind`] with the blob sweep on a given schedule, so a
     /// test can watch a sweep without waiting [`BLOB_GC_INTERVAL`].
+    #[cfg(test)]
     async fn bind_with_gc_interval(config: NodeConfig, gc_interval: Duration) -> Result<Arc<Self>> {
+        Self::bind_on(config, gc_interval, Network::Public).await
+    }
+
+    async fn bind_on(
+        config: NodeConfig,
+        gc_interval: Duration,
+        network: Network,
+    ) -> Result<Arc<Self>> {
         let secret = config.identity.to_secret_key()?;
 
         let blob_dir = PathBuf::from(&config.blob_dir);
@@ -1442,8 +1517,12 @@ impl IrohNode {
             .with_context(|| format!("create doc_dir {}", doc_dir.display()))
             .map_err(SyncError::from)?;
 
-        let mut builder = endpoint_builder(secret);
-        if !config.relay_urls.is_empty() {
+        let mut builder = match network {
+            Network::Public => endpoint_builder(secret),
+            #[cfg(any(test, feature = "test-hooks"))]
+            Network::Loopback => loopback_endpoint_builder(secret)?,
+        };
+        if network == Network::Public && !config.relay_urls.is_empty() {
             let urls = config
                 .relay_urls
                 .iter()
@@ -1486,6 +1565,7 @@ impl IrohNode {
             .context("spawn docs")
             .map_err(SyncError::from)?;
 
+        let pairing = PairingHub::new();
         let router = Router::builder(endpoint.clone())
             .accept(
                 BLOBS_ALPN,
@@ -1500,7 +1580,17 @@ impl IrohNode {
             )
             .accept(GOSSIP_ALPN, gossip)
             .accept(DOCS_ALPN, docs.clone())
+            .accept(PAIRING_ALPN, pairing.clone())
             .spawn();
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        if network == Network::Loopback {
+            let loopback = endpoint
+                .bound_sockets()
+                .into_iter()
+                .map(iroh::TransportAddr::Ip);
+            loopback_lookup().add_endpoint_info(EndpointAddr::from_parts(endpoint.id(), loopback));
+        }
 
         // Wait for DERP registration but cap the wait at 30s. Without
         // a cap, an unreachable relay (network outage, captive portal,
@@ -1508,12 +1598,13 @@ impl IrohNode {
         // — and the caller has no way to recover except killing the
         // process. 30s is generous compared to a working DERP (~1-3s)
         // and short enough that a stuck network surfaces as an error.
-        if tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            endpoint.home_relay_status().initialized(),
-        )
-        .await
-        .is_err()
+        if network == Network::Public
+            && tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                endpoint.home_relay_status().initialized(),
+            )
+            .await
+            .is_err()
         {
             // Clean up the half-bound endpoint before bailing —
             // leaving it live would leak QUIC sockets and a
@@ -1532,6 +1623,7 @@ impl IrohNode {
             blobs_store,
             docs,
             joined: Mutex::new(HashMap::new()),
+            pairing,
             shutdown_cell: tokio::sync::OnceCell::new(),
         }))
     }

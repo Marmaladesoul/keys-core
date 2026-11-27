@@ -17,7 +17,18 @@ crate-type = ["rlib"]
 [lints]
 workspace = true
 
+[features]
+# Test scaffolding for the headless driver: a node that binds to the
+# loopback interface only and finds other such nodes in its process, and a
+# pairing wall clock that can be moved forward. Off by default, so client
+# builds don't carry it.
+test-hooks = []
+
 [dependencies]
+# The pairing transport carries keys-pairing's messages and answers knocks
+# from its invite book. Wire formats and policy live there; this crate only
+# moves the bytes.
+keys-pairing = { path = "../keys-pairing" }
 iroh = "1.0.0-rc.0"
 iroh-blobs = "0.101"
 iroh-docs = "0.99"

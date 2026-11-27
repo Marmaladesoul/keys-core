@@ -41,6 +41,7 @@ mod error;
 mod events;
 mod identity;
 mod node;
+mod pairing;
 mod policy;
 
 pub use diagnostics::{
@@ -49,5 +50,16 @@ pub use diagnostics::{
 pub use error::{Result, SyncError};
 pub use events::{DocEvent, DocEventListener};
 pub use identity::{Identity, identity_generate};
+#[cfg(feature = "test-hooks")]
+pub use node::bind_local_node_for_testing;
 pub use node::{DocSubscription, EntryInfo, IrohNode, NodeConfig, node_id};
+pub use pairing::{
+    DIAL_TIMEOUT, GREETING_TIMEOUT, MAX_DISPLAY_LINKS, MAX_EXCHANGE_MESSAGE_BYTES,
+    MAX_INBOUND_CONNECTIONS, MAX_SESSION_FRAME_BYTES, MAX_TYPE_LINKS, PAIRING_ALPN,
+    PairingAdvertisement, PairingIncomingRun, PairingInvite, PairingInviteListener,
+    PairingInviteRecord, PairingIssuedInvite, PairingKnockAnswer, PairingLink, PairingListener,
+    PairingParsedLink, PairingRole, PairingRunStream, PairingTarget, PairingTransportError,
+    PairingTransportKind, PairingTxtEntry, SEND_TIMEOUT, pairing_parse_link,
+    pairing_sanitize_display_name, pairing_target_from_advertisement,
+};
 pub use policy::DownloadPolicy;

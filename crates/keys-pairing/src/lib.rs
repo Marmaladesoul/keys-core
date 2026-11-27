@@ -21,14 +21,32 @@
 //! - [`sheet`]: the policy a client drives: one run per code, a run budget
 //!   per sheet, code expiry and run timeouts.
 //!
-//! The transport (how messages travel, and which endpoint id the peer
-//! authenticated as) and discovery are the caller's.
+//! Around the exchange, how two sides find each other. None of it is
+//! trusted by the exchange, and none of it carries a secret:
+//! - [`address`]: where an endpoint can be reached, and the sanitiser for
+//!   names from unverified sources.
+//! - [`link`]: the `keys://pair/…` links that carry an address or an invite
+//!   as text.
+//! - [`invite`]: Person invites, and the book that answers their knocks.
+//! - [`greeting`]: the first message on a pairing connection (a knock, a
+//!   call or an approach) and its answer.
+//! - [`advert`]: what a device with an open sheet advertises on the local
+//!   network.
+//!
+//! The transport itself (connections, and which endpoint id the peer
+//! authenticated as) is the caller's; this crate fixes only the bytes.
 
+pub mod address;
+pub mod advert;
 pub mod code;
 mod cpace;
+pub mod greeting;
 #[cfg(test)]
 mod heap_watch;
+mod hex;
+pub mod invite;
 pub mod keys;
+pub mod link;
 mod protocol;
 mod random;
 mod secret;
@@ -36,9 +54,15 @@ pub mod session;
 pub mod sheet;
 mod wire;
 
+pub use address::{AddressError, PairingAddress, sanitize_display_name};
 pub use code::PairingCode;
 pub use cpace::CPACE_DRAFT;
+pub use greeting::{Greeting, KnockAnswer, MeetingAnswer};
+pub use invite::{
+    Invite, InviteBook, InviteError, InviteId, InviteRecord, IssueError, KnockOutcome,
+};
 pub use keys::{AccountKeys, AccountPublicKeys, DeviceKeys, DevicePublicKeys, RecoverySecret};
+pub use link::{LinkError, PairingLink};
 pub use protocol::{Credentials, PROTOCOL_VERSION, PairingKind, RefuseReason, RunFailure};
 pub use session::{SessionError, VerifiedSession};
 pub use sheet::{

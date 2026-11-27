@@ -122,14 +122,14 @@ pub enum PairingKind {
 }
 
 impl PairingKind {
-    fn wire(self) -> u8 {
+    pub(crate) fn wire(self) -> u8 {
         match self {
             Self::Device => 1,
             Self::Person => 2,
         }
     }
 
-    fn from_wire(byte: u8) -> Option<Self> {
+    pub(crate) fn from_wire(byte: u8) -> Option<Self> {
         match byte {
             1 => Some(Self::Device),
             2 => Some(Self::Person),
@@ -184,6 +184,7 @@ pub enum RunFailure {
 }
 
 /// Wire tags for the exchange's five message types and the session's frames.
+/// Tags 7 to 11 are taken by the connection's greetings (see `greeting`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum MessageType {
