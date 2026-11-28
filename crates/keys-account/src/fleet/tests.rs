@@ -13,6 +13,16 @@ use crate::test_support::{kat_account, kat_device_sync, unhex, usable_ed25519};
 const DOC: [u8; 32] = [0xf1; 32];
 const VAULT: VaultId = [0x7a; 16];
 const VAULT_DOC: [u8; 32] = [0xd2; 32];
+/// How many fleets a test runs where its random keys decide which entry
+/// sorts first, so that a rule leaning on that order fails at least once
+/// but for a chance of 2^-16.
+const FLEETS_AGAINST_CHANCE_ORDER: usize = 16;
+/// The Ed25519 identity point: a valid encoding that is no one's key.
+const IDENTITY_POINT: [u8; 32] = {
+    let mut point = [0; 32];
+    point[0] = 1;
+    point
+};
 
 struct Device {
     keys: DeviceKeys,
@@ -377,7 +387,7 @@ fn account_records_not_signed_by_this_account_are_refused() {
         [
             FleetRefused::Record(RecordError::NotAccountSigned),
             FleetRefused::Record(RecordError::NotAccountSigned),
-            FleetRefused::Record(RecordError::NotEnrolled),
+            FleetRefused::Record(RecordError::NotAccountSigned),
         ]
     );
 }
@@ -490,7 +500,7 @@ fn a_vault_is_at_its_highest_epoch_and_the_entry_carrying_it_is_kept() {
 fn the_latest_name_wins_and_every_reader_agrees() {
     // Keys are random, so whether the higher signer's entry also sorts last
     // is chance: run enough fleets that a rule ignoring the signer fails.
-    for _ in 0..16 {
+    for _ in 0..FLEETS_AGAINST_CHANCE_ORDER {
         latest_name_wins_in(&Fleet::new());
     }
 }
@@ -852,11 +862,15 @@ fn an_enrolment_sharing_an_endpoint_clashes() {
 }
 
 #[test]
-fn a_removed_devices_enrolment_clashes_with_nothing() {
+fn a_removed_devices_ids_are_never_enrolled_again() {
     let fleet = Fleet::new();
-    // Carol is enrolled with the author Bob had, once Bob is removed.
+    let bob_removed = FleetRecord::Tombstone(
+        Tombstone::sign(&fleet.account, &fleet.bob.enrolment.device_id()).expect("usable id"),
+    );
+    // Carol, enrolled with the author Bob had: Bob still holds that author's
+    // key, so the enrolment is refused rather than handed to him.
     let carol = DeviceKeys::generate().expect("rng");
-    let successor = DeviceEnrolment::sign(
+    let on_bobs_author = DeviceEnrolment::sign(
         &fleet.account,
         carol.public_keys(),
         usable_ed25519(),
@@ -864,21 +878,29 @@ fn a_removed_devices_enrolment_clashes_with_nothing() {
     )
     .expect("usable keys");
     let mut entries = fleet.enrolled();
-    entries.push(fleet.own(
-        &fleet.alice,
-        2,
-        &FleetRecord::Tombstone(
-            Tombstone::sign(&fleet.account, &fleet.bob.enrolment.device_id()).expect("usable id"),
-        ),
-    ));
-    entries.push(fleet.own(&fleet.alice, 3, &FleetRecord::Enrolment(successor)));
+    entries.push(fleet.own(&fleet.alice, 2, &bob_removed));
+    entries.push(fleet.own(&fleet.alice, 3, &FleetRecord::Enrolment(on_bobs_author)));
+    let read = fleet.read(entries);
+    assert_eq!(device_ids(&read), [fleet.alice.enrolment.device_id()]);
+    assert_eq!(
+        reasons(&read),
+        [FleetRefused::Clashing, FleetRefused::Removed]
+    );
+    // Enrolled with ids of her own, she counts.
+    let fresh = DeviceEnrolment::sign(
+        &fleet.account,
+        carol.public_keys(),
+        usable_ed25519(),
+        usable_ed25519(),
+    )
+    .expect("usable keys");
+    let mut entries = fleet.enrolled();
+    entries.push(fleet.own(&fleet.alice, 2, &bob_removed));
+    entries.push(fleet.own(&fleet.alice, 3, &FleetRecord::Enrolment(fresh)));
     let read = fleet.read(entries);
     assert_eq!(
         device_ids(&read),
-        sorted(vec![
-            fleet.alice.enrolment.device_id(),
-            successor.device_id()
-        ])
+        sorted(vec![fleet.alice.enrolment.device_id(), fresh.device_id()])
     );
     assert_eq!(reasons(&read), [FleetRefused::Removed]);
 }
@@ -898,10 +920,10 @@ fn what_a_device_says_about_itself_is_only_its_own() {
 #[test]
 fn of_two_statements_at_one_sequence_the_greater_entry_is_kept() {
     let fleet = Fleet::new();
-    // Two sealings of one statement's slot at one sequence differ only in
-    // their salts.
+    // Two sealings of one statement differ only in their salts.
     let one = fleet.own(&fleet.alice, 2, &info(5));
-    let other = fleet.own(&fleet.alice, 2, &info(6));
+    let other = fleet.own(&fleet.alice, 2, &info(5));
+    assert_ne!(one, other);
     let greater = one.clone().max(other.clone());
     for order in [[one.clone(), other.clone()], [other, one]] {
         let mut entries = fleet.enrolled();
@@ -914,7 +936,14 @@ fn of_two_statements_at_one_sequence_the_greater_entry_is_kept() {
 
 #[test]
 fn of_two_records_at_one_epoch_the_higher_document_counts() {
-    let fleet = Fleet::new();
+    // Which entry sorts first is chance: run enough fleets that a rule
+    // ignoring the document fails.
+    for _ in 0..FLEETS_AGAINST_CHANCE_ORDER {
+        higher_document_counts_in(&Fleet::new());
+    }
+}
+
+fn higher_document_counts_in(fleet: &Fleet) {
     let mut entries = fleet.enrolled();
     let higher = fleet.own(&fleet.alice, 2, &fleet.epoch(4, [0xe9; 32]));
     entries.push(fleet.own(&fleet.bob, 2, &fleet.epoch(4, [0xe1; 32])));
@@ -949,11 +978,8 @@ fn a_peer_is_a_usable_key_and_only_current_devices_are_shown() {
             peer_heads: peers,
         })
     };
-    // The identity point isn't anyone's key.
-    let mut identity_point = [0; 32];
-    identity_point[0] = 1;
     assert_eq!(
-        holding(vec![(identity_point, [1; 32])]).encode(),
+        holding(vec![(IDENTITY_POINT, [1; 32])]).encode(),
         Err(RecordError::Invalid)
     );
     let mut peers = vec![(bob, [1; 32]), (stranger, [2; 32])];
@@ -969,10 +995,8 @@ fn a_peer_is_a_usable_key_and_only_current_devices_are_shown() {
 #[test]
 fn a_tombstone_names_a_usable_key() {
     let fleet = Fleet::new();
-    let mut identity_point = [0; 32];
-    identity_point[0] = 1;
     assert_eq!(
-        Tombstone::sign(&fleet.account, &identity_point).map(|_| ()),
+        Tombstone::sign(&fleet.account, &IDENTITY_POINT).map(|_| ()),
         Err(RecordError::Invalid)
     );
 }

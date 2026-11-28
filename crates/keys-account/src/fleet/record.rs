@@ -85,9 +85,10 @@ pub enum RecordError {
     /// A record the account identity key makes, not signed by it.
     #[error("not signed by the account")]
     NotAccountSigned,
-    /// An enrolment the account refuses ([`EnrolmentError`]).
-    #[error("not an enrolment of this account")]
-    NotEnrolled,
+    /// An enrolment signed by the account that names a key it can't use
+    /// ([`EnrolmentError::UnusableKey`]).
+    #[error("the enrolment names a key that can't be used")]
+    UnusableKey,
     /// A name with nothing visible in it, an identifier that isn't
     /// lower-case ASCII, or a field over its limit: nothing is written.
     #[error("the record can't be written as given")]
@@ -383,7 +384,8 @@ impl FleetRecord {
                 let enrolment = DeviceEnrolment::open(reader.rest(), identity).map_err(
                     |error| match error {
                         EnrolmentError::Malformed => RecordError::Malformed,
-                        _ => RecordError::NotEnrolled,
+                        EnrolmentError::NotSignedByAccount => RecordError::NotAccountSigned,
+                        EnrolmentError::UnusableKey => RecordError::UnusableKey,
                     },
                 )?;
                 Self::Enrolment(enrolment)
@@ -526,11 +528,12 @@ fn decode_holding(reader: &mut Reader<'_>) -> Result<Holding, RecordError> {
 /// of device id. (That the signer isn't among them is the reader's to check:
 /// the record doesn't know who signs it.)
 fn peers_are_canonical(peers: &[(DeviceId, HeadHash)]) -> bool {
+    // The cheap checks first: each key check costs a scalar multiplication.
     peers.len() <= MAX_PEER_HEADS
+        && peers.windows(2).all(|pair| pair[0].0 < pair[1].0)
         && peers
             .iter()
             .all(|(peer, _)| ed25519_public_key_is_usable(peer))
-        && peers.windows(2).all(|pair| pair[0].0 < pair[1].0)
 }
 
 /// `name` if it is a name as [`sanitize_display_name`] leaves it, and not

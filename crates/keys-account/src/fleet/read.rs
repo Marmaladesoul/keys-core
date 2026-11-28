@@ -23,8 +23,9 @@
 //! - **A tombstone outranks** every enrolment of its device: a removed
 //!   device is not in the roster, and nothing it signs counts.
 //! - **Enrolments that clash** (two different ones sharing a device,
-//!   endpoint or author id) are both refused, so an author always names one
-//!   device and the roster never has to guess.
+//!   endpoint or author id, a removed device's among them, so a removed
+//!   device's ids are never anyone's again) are both refused, so an author
+//!   always names one device and the roster never has to guess.
 //! - **Per signer and slot, the newest statement** (highest sequence) is the
 //!   one that counts. The account's own records are the exception: any copy
 //!   of one carries the same record, so a reader keeps one per slot,
@@ -32,7 +33,8 @@
 //! - **An enrolment is never re-made.** Enrolments carry no sequence, so a
 //!   second enrolment of a device, endpoint or author id clashes with the
 //!   first for good, and anyone with the fleet key can put the first back.
-//!   To re-enrol a device, remove it and enrol new keys.
+//!   To enrol a device again, remove it and enrol it with a new signing
+//!   key, endpoint and author.
 //! - **Epochs only go up:** a vault is at the highest epoch any valid record
 //!   gives it, and the entry carrying it is always kept.
 //! - **The latest wins** where any device may set a record: a device's
@@ -160,8 +162,12 @@ pub struct FleetView {
 #[derive(Debug, Clone)]
 pub struct FleetRead {
     pub view: FleetView,
-    /// The entries to keep and pass back in next time: every entry that
-    /// counts, newest per signer and slot, and each vault's highest epoch.
+    /// The entries to keep and pass back in next time: for a device's word,
+    /// the newest per signer and slot; one entry per enrolment and tombstone
+    /// however many copies there are; and the one carrying each vault's
+    /// highest epoch. Keep the entries themselves, not where they sat in the
+    /// document: what makes them hold is that their bytes come back, even
+    /// once the document's copy is overwritten.
     pub kept: Vec<FleetEntry>,
     /// Entries that don't count, and why.
     pub refused: Vec<Refusal>,
@@ -208,7 +214,7 @@ pub fn read_fleet(
             _ => None,
         })
         .collect();
-    let clashing = clashing_enrolments(&opened, &removed);
+    let clashing = clashing_enrolments(&opened);
     let roster_devices: BTreeMap<DeviceId, DeviceEnrolment> = opened
         .iter()
         .filter_map(|o| match &o.record {
@@ -282,18 +288,16 @@ fn open(
     Ok((statement, record))
 }
 
-/// Enrolments of current devices that share a device, endpoint or author id
-/// with a different one.
-fn clashing_enrolments(
-    opened: &[Opened],
-    removed: &BTreeSet<DeviceId>,
-) -> BTreeSet<DeviceEnrolment> {
+/// Enrolments that share a device, endpoint or author id with a different
+/// one. A removed device's enrolment takes part: its ids are spent, since
+/// the removed device still holds the keys behind them (it could write
+/// under its author, or answer as its endpoint), so an enrolment reusing
+/// one is refused rather than handed to them.
+fn clashing_enrolments(opened: &[Opened]) -> BTreeSet<DeviceEnrolment> {
     let enrolments: BTreeSet<DeviceEnrolment> = opened
         .iter()
         .filter_map(|o| match &o.record {
-            FleetRecord::Enrolment(enrolment) if !removed.contains(&enrolment.device_id()) => {
-                Some(*enrolment)
-            }
+            FleetRecord::Enrolment(enrolment) => Some(*enrolment),
             _ => None,
         })
         .collect();

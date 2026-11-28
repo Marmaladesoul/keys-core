@@ -207,11 +207,17 @@ fn signed(
     (key, value)
 }
 
+/// The fuzzer's choices: a mode, an author, an entry key, a record kind, a
+/// signer and a sequence, each from bytes of its own.
+const CHOICE_BYTES: usize = 13;
+
 fuzz_target!(|data: &[u8]| {
     let fixture = fixture();
-    let Some((&[mode, author, key, choice], rest)) = data.split_first_chunk::<4>() else {
+    let Some((choices, rest)) = data.split_first_chunk::<CHOICE_BYTES>() else {
         return;
     };
+    let [mode, author, key, choice, signer, sequence @ ..] = *choices;
+    let sequence = u64::from_be_bytes(sequence);
     let kind = FleetKind::ALL[usize::from(choice) % FleetKind::ALL.len()];
     let mode = mode % MODES;
     if mode == 4 {
@@ -233,10 +239,7 @@ fuzz_target!(|data: &[u8]| {
         .get(usize::from(key))
         .cloned()
         .unwrap_or_else(|| fixture.fleet_key.entry_key(&[key]).to_vec());
-    let signer = &fixture.signers[usize::from(key) % fixture.signers.len()];
-    let sequence = rest
-        .first_chunk::<8>()
-        .map_or(0, |bytes| u64::from_be_bytes(*bytes));
+    let signer = &fixture.signers[usize::from(signer) % fixture.signers.len()];
     let (key, value) = match mode {
         0 => (chosen_key, rest.to_vec()),
         // Sealed under the real fleet key for its place, as a holder of the

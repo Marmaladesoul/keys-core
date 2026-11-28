@@ -43,7 +43,7 @@ impl From<RecordError> for AccountFfiError {
     fn from(error: RecordError) -> Self {
         match error {
             RecordError::NotAccountSigned => Self::FleetRecordNotSignedByAccount,
-            RecordError::NotEnrolled => Self::EnrolmentNotSignedByAccount,
+            RecordError::UnusableKey => Self::EnrolmentUnusableKey,
             RecordError::Malformed | RecordError::Invalid => Self::FleetRecordInvalid,
         }
     }
@@ -412,9 +412,8 @@ pub enum FleetRefusal {
     Malformed,
     /// An account record not signed by the account.
     NotSignedByAccount,
-    /// An enrolment signed by the account but with a key the account
-    /// refuses to enrol ([`AccountFfiError`]'s enrolment errors).
-    NotEnrolled,
+    /// An enrolment signed by the account that names a key it can't use.
+    UnusableKey,
     /// An entry whose author isn't 32 bytes.
     NotAnAuthor,
     /// Not in its own slot's entry.
@@ -439,7 +438,7 @@ impl From<FleetRefused> for FleetRefusal {
             FleetRefused::NotAFleetRecord => Self::NotAFleetRecord,
             FleetRefused::Record(RecordError::Malformed | RecordError::Invalid) => Self::Malformed,
             FleetRefused::Record(RecordError::NotAccountSigned) => Self::NotSignedByAccount,
-            FleetRefused::Record(RecordError::NotEnrolled) => Self::NotEnrolled,
+            FleetRefused::Record(RecordError::UnusableKey) => Self::UnusableKey,
             FleetRefused::Misplaced => Self::Misplaced,
             FleetRefused::Clashing => Self::Clashing,
             FleetRefused::Removed => Self::Removed,

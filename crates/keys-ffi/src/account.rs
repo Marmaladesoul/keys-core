@@ -161,7 +161,9 @@ impl PairingAccountKeys {
     /// enrolment sharing the device's signing key, endpoint id or author id
     /// with the first clashes with it for good in the fleet document (both
     /// are refused, and anyone with the fleet key can put the first back).
-    /// To enrol a device again, remove it and enrol new keys.
+    /// The same goes for a removed device's ids, which the removed device
+    /// still holds the keys behind. To enrol a device again, remove it and
+    /// enrol it with a new signing key, endpoint and author.
     ///
     /// # Errors
     /// [`AccountFfiError::InvalidKeyLength`] for a key or id that isn't 32
