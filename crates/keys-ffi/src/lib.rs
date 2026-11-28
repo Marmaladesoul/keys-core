@@ -16,6 +16,7 @@ mod engine_observer;
 mod engine_portable;
 mod engine_types;
 mod error;
+mod fleet;
 mod identity;
 mod kdf;
 mod keyfile;
@@ -54,6 +55,12 @@ pub use engine_types::{
     TagUsageCount, VaultState,
 };
 pub use error::VaultError;
+pub use fleet::{
+    FleetDeviceInfo, FleetDeviceRecord, FleetEntryRecord, FleetHoldingRecord, FleetKey,
+    FleetReadResult, FleetRecordInput, FleetRefusal, FleetRefusalRecord, FleetSettingRecord,
+    FleetVaultLook, FleetVaultRecord, PeerHead, SealedFleetEntry, fleet_entry_max_bytes,
+    fleet_entry_to_fetch, fleet_last_seen_due, read_fleet,
+};
 pub use identity::{VaultIdentityVerdict, verify_vault_identity};
 pub use kdf::{
     Argon2Kind, KdfCeilingProfile, KdfSettings, KdfSummary, KdfWeakening, kdf_weakenings,

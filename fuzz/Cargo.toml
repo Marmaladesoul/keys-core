@@ -126,3 +126,10 @@ path = "fuzz_targets/account_vault_head.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "account_fleet"
+path = "fuzz_targets/account_fleet.rs"
+test = false
+doc = false
+bench = false

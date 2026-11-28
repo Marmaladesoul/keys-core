@@ -7,14 +7,20 @@
 
 #![no_main]
 
-use keys_pairing::{AccountKeys, DeviceSyncKeys, DeviceVaultKey};
+use keys_pairing::{AccountKeys, DeviceSyncKeys, DeviceVaultKey, FleetKey};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let account = AccountKeys::from_stored(data).ok();
     let sync = DeviceSyncKeys::from_stored(data).ok();
     let vault = DeviceVaultKey::from_stored(data).ok();
-    let read = [account.is_some(), sync.is_some(), vault.is_some()];
+    let fleet = FleetKey::from_stored(data).ok();
+    let read = [
+        account.is_some(),
+        sync.is_some(),
+        vault.is_some(),
+        fleet.is_some(),
+    ];
     assert!(
         read.iter().filter(|&&ok| ok).count() <= 1,
         "one stored form read as two kinds"
@@ -31,5 +37,8 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Some(key) = vault {
         assert_eq!(key.to_stored().as_slice(), data, "vault form not canonical");
+    }
+    if let Some(key) = fleet {
+        assert_eq!(key.to_stored().as_slice(), data, "fleet form not canonical");
     }
 });

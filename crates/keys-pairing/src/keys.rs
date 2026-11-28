@@ -71,6 +71,7 @@ const STORED_FORMAT_VERSION: u8 = 1;
 const STORED_KIND_ACCOUNT: u8 = b'A';
 const STORED_KIND_DEVICE_SYNC: u8 = b'S';
 const STORED_KIND_DEVICE_VAULT: u8 = b'V';
+pub(crate) const STORED_KIND_FLEET: u8 = b'F';
 /// Length of a stored form's header: the version and the kind.
 const STORED_HEADER_BYTES: usize = 2;
 // A stored form's fields are all 32 bytes: secrets, and the account's
@@ -101,6 +102,12 @@ pub enum SignedStatement {
     /// A device's enrolment in the account: its public keys, its endpoint id
     /// and its document author id.
     DeviceEnrolment,
+    /// A device's removal from the account: its id, which no enrolment of
+    /// it outranks.
+    DeviceTombstone,
+    /// A vault's epoch: the vault id, the epoch and the id of the document
+    /// that epoch syncs through.
+    VaultEpoch,
 }
 
 impl SignedStatement {
@@ -108,6 +115,8 @@ impl SignedStatement {
         match self {
             Self::PersonKeys => b"keys-pairing person keys",
             Self::DeviceEnrolment => b"keys account device enrolment",
+            Self::DeviceTombstone => b"keys account device tombstone",
+            Self::VaultEpoch => b"keys account vault epoch",
         }
     }
 
@@ -138,12 +147,16 @@ pub enum DeviceStatement {
     /// The head of a device's copy of a vault: which content it published,
     /// in which document.
     VaultHead,
+    /// A record in the account's fleet document. Which record it is, is
+    /// part of what the signature covers.
+    FleetRecord,
 }
 
 impl DeviceStatement {
     const fn label(self) -> &'static [u8] {
         match self {
             Self::VaultHead => b"keys device vault head",
+            Self::FleetRecord => b"keys device fleet record",
         }
     }
 
@@ -224,7 +237,7 @@ fn is_canonical_field_element(bytes: &[u8; PUBLIC_KEY_BYTES]) -> bool {
 
 /// A stored form of `kind` holding `fields`, in an allocation sized once so
 /// it never moves while it is written.
-fn stored_form(kind: u8, fields: &[&[u8; SECRET_KEY_BYTES]]) -> Zeroizing<Vec<u8>> {
+pub(crate) fn stored_form(kind: u8, fields: &[&[u8; SECRET_KEY_BYTES]]) -> Zeroizing<Vec<u8>> {
     let mut out = Zeroizing::new(Vec::with_capacity(
         STORED_HEADER_BYTES + fields.len() * SECRET_KEY_BYTES,
     ));
@@ -236,7 +249,7 @@ fn stored_form(kind: u8, fields: &[&[u8; SECRET_KEY_BYTES]]) -> Zeroizing<Vec<u8
 }
 
 /// The `N` 32-byte fields of a stored form of `kind`, borrowed from it.
-fn stored_fields<const N: usize>(
+pub(crate) fn stored_fields<const N: usize>(
     stored: &[u8],
     kind: u8,
 ) -> Result<[&[u8; SECRET_KEY_BYTES]; N], StoredKeysError> {
@@ -250,6 +263,7 @@ fn stored_fields<const N: usize>(
         STORED_KIND_ACCOUNT,
         STORED_KIND_DEVICE_SYNC,
         STORED_KIND_DEVICE_VAULT,
+        STORED_KIND_FLEET,
     ]
     .contains(&header[1])
     {
@@ -265,7 +279,7 @@ fn stored_fields<const N: usize>(
     Ok(std::array::from_fn(|index| &fields[index]))
 }
 
-fn random_secret() -> Result<Zeroizing<[u8; SECRET_KEY_BYTES]>, PairingError> {
+pub(crate) fn random_secret() -> Result<Zeroizing<[u8; SECRET_KEY_BYTES]>, PairingError> {
     let mut bytes = Zeroizing::new([0u8; SECRET_KEY_BYTES]);
     crate::random::fill(bytes.as_mut()).map_err(|_| PairingError::Random)?;
     Ok(bytes)
@@ -676,16 +690,19 @@ mod tests {
         let other = DeviceKeys::generate().expect("rng").public_keys().signing;
         assert!(!statement.verify(&other, &[b"message"], &signature));
 
-        // No device statement's label is an account statement's, so a
-        // device signature can never pass as the account's over the same
-        // fields, even if the two keys were one.
-        let device_labels = [DeviceStatement::VaultHead.label()];
-        let account_labels = [
+        // Every label is different, across both registries: a device
+        // signature can never pass as the account's over the same fields,
+        // even if the two keys were one, nor one statement as another.
+        let labels = [
+            DeviceStatement::VaultHead.label(),
+            DeviceStatement::FleetRecord.label(),
             SignedStatement::PersonKeys.label(),
             SignedStatement::DeviceEnrolment.label(),
+            SignedStatement::DeviceTombstone.label(),
+            SignedStatement::VaultEpoch.label(),
         ];
-        for label in device_labels {
-            assert!(!account_labels.contains(&label));
+        for (index, label) in labels.iter().enumerate() {
+            assert!(!labels[index + 1..].contains(label), "{label:?} twice");
         }
     }
 

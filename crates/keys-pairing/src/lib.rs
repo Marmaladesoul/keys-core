@@ -40,6 +40,7 @@ pub mod address;
 pub mod advert;
 pub mod code;
 mod cpace;
+pub mod fleet_key;
 pub mod greeting;
 #[cfg(test)]
 mod heap_watch;
@@ -57,6 +58,7 @@ mod wire;
 pub use address::{AddressError, PairingAddress, sanitize_display_name};
 pub use code::PairingCode;
 pub use cpace::CPACE_DRAFT;
+pub use fleet_key::FleetKey;
 pub use greeting::{Greeting, KnockAnswer, MeetingAnswer};
 pub use invite::{
     Invite, InviteBook, InviteError, InviteId, InviteRecord, IssueError, KnockOutcome,

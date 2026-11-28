@@ -22,10 +22,11 @@
 
 use sha2::{Digest, Sha512};
 
+use crate::address::MAX_DISPLAY_NAME_BYTES;
 use crate::address::{MAX_RELAY_URL_BYTES, PairingAddress, sanitize_display_name};
 use crate::cpace::push_prepend_len;
 use crate::hex::{self, HEX_CHARS_PER_BYTE};
-use crate::invite::{INVITE_ID_BYTES, Invite, MAX_DISPLAY_NAME_BYTES};
+use crate::invite::{INVITE_ID_BYTES, Invite};
 use crate::keys::PUBLIC_KEY_BYTES;
 use crate::wire::Reader;
 
