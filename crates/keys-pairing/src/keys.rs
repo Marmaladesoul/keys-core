@@ -322,15 +322,17 @@ pub struct AccountPublicKeys {
 }
 
 impl AccountPublicKeys {
-    /// Whether the recovery and encryption keys are usable keys at all: the
-    /// recovery key a valid Ed25519 point that isn't of small order, the
-    /// encryption key an X25519 point on the curve (not its twist) that
-    /// isn't of small order, so a later key agreement with it can't be
-    /// forced to a known shared secret. The identity key
-    /// is checked by verifying its signature, strictly.
+    /// Whether all three are usable keys: the identity and recovery keys
+    /// usable Ed25519 keys, the encryption key a usable X25519 key, each
+    /// canonically encoded in the prime-order subgroup
+    /// ([`ed25519_public_key_is_usable`], [`x25519_public_key_is_usable`]).
+    /// So no key here is a small-order key, which would force a known
+    /// shared secret, or another spelling of a key. The identity key's
+    /// signature is checked separately, strictly.
     #[must_use]
-    pub(crate) fn recovery_and_encryption_are_well_formed(&self) -> bool {
-        ed25519_public_key_is_usable(&self.recovery)
+    pub(crate) fn are_well_formed(&self) -> bool {
+        ed25519_public_key_is_usable(&self.identity)
+            && ed25519_public_key_is_usable(&self.recovery)
             && x25519_public_key_is_usable(&self.encryption)
     }
 }
@@ -846,6 +848,24 @@ mod tests {
         assert_ne!(aliased, public.identity);
         assert!(ed25519_public_key_is_usable(&public.identity));
         assert!(!ed25519_public_key_is_usable(&aliased));
+    }
+
+    /// A Person's key set is refused if any of its three keys is another
+    /// spelling of a key, the identity key included.
+    #[test]
+    fn a_key_set_with_a_torsion_component_is_not_well_formed() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+        let (keys, _) = AccountKeys::generate().expect("rng");
+        let public = keys.public_keys();
+        assert!(public.are_well_formed());
+        let identity = CompressedEdwardsY(public.identity)
+            .decompress()
+            .expect("on the curve");
+        let aliased = AccountPublicKeys {
+            identity: (identity + EIGHT_TORSION[1]).compress().to_bytes(),
+            ..public
+        };
+        assert!(!aliased.are_well_formed());
     }
 
     #[test]

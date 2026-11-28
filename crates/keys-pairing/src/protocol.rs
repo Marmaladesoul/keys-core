@@ -450,7 +450,7 @@ fn check_key_set(
         &keys.identity,
         &person_keys_fields(signer_role, transcript, &keys),
         &signature,
-    ) || !keys.recovery_and_encryption_are_well_formed()
+    ) || !keys.are_well_formed()
     {
         return Err(RunFailure::InvalidPeerKeys);
     }
