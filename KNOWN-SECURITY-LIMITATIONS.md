@@ -58,6 +58,31 @@ store.
 **Severity:** Medium. It widens the blast radius of an already-compromised
 data directory. It is inherited from `iroh-docs`, not introduced here.
 
+**What the author no longer proves.** An author signature therefore says
+only "someone with this store wrote this". So `keys-account` doesn't treat
+it as proof of which device wrote anything: a device signs what it
+publishes in a vault document (its head record, naming its copy's content
+hash and size) with its own device signing key, which the account's
+enrolment of that device certifies, and a reader acts on a head only if
+that device signed it for this document, it sits under the author the
+enrolment binds to that device, and its sequence is above the last one the
+reader accepted (`keys_account::vault_head`); that last sequence is the
+reader's to keep, so a reader that has none yet, or lost it, accepts any
+genuine head. Someone holding a copy of `doc_dir` can still write under
+the device's author. What that buys them is suppression, not forgery:
+their entries fail the check and are ignored, but iroh-docs keeps one
+entry per author and key, newest first, so they can overwrite the device's
+own head or copy entry in replicas and hide it until the device writes
+again, and can put an older genuine head back in front of a reader that
+never saw the newer one. `iroh-docs` accepts timestamps up to ten minutes
+ahead, so a holder who keeps writing can keep winning those slots. They
+can also write a head entry recording a small size for a large blob: the
+reader's fetch cap bounds what it reads into memory, not what reaches its
+disk before the blob's size is known (`IrohNode::fetch_checked_blob`).
+The remedy, replacing the device's author by removing it from the account
+and enrolling it again, is not built yet: today an enrolment, once made,
+binds its author for good.
+
 **Why it is documented rather than fixed.** The secret material lives
 inside `iroh-docs`'s own `redb` store, which `keys-iroh-sync` does not
 control. A clean fix needs either upstream encryption-at-rest support in

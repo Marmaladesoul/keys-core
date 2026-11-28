@@ -21,6 +21,7 @@
 //! scenario scripts can parse them.
 
 mod account;
+mod account_doc;
 mod adapters;
 mod kdf;
 mod pairing;
@@ -1062,6 +1063,16 @@ enum Command {
         #[arg(long)]
         payload: Option<String>,
     },
+    /// A vault document's signed head records over real document sync:
+    /// two enrolled devices on the loopback interface, one publishing its
+    /// copy and the other reading it as a client must, with one thing that
+    /// must not work per case. Prints one `who: what` line per event.
+    /// Needs no vault and no password.
+    AccountHeads {
+        /// What else happens in the document.
+        #[arg(long, value_enum, default_value_t = account_doc::HeadsCase::Honest)]
+        case: account_doc::HeadsCase,
+    },
     /// Parse a `keys://pair/...` link through the seam and print what it
     /// holds (`link: device|person` and its fields), or `refused: <why>`.
     /// Exits 0 either way. Needs no vault and no password.
@@ -1188,6 +1199,7 @@ async fn main() -> Result<()> {
             })
             .await;
         }
+        Command::AccountHeads { case } => return account_doc::run(*case).await,
         Command::PairLink { text } => {
             pairing_net::parse_link(text);
             return Ok(());
@@ -1757,6 +1769,7 @@ async fn main() -> Result<()> {
         | Command::PairKeygen
         | Command::PairSim { .. }
         | Command::PairNet { .. }
+        | Command::AccountHeads { .. }
         | Command::PairLink { .. }
         | Command::PairName { .. } => {
             unreachable!("dispatched before the password read")
