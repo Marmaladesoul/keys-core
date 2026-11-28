@@ -22,6 +22,7 @@
 
 mod account;
 mod account_doc;
+mod account_net;
 mod adapters;
 mod kdf;
 mod pairing;

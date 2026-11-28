@@ -109,13 +109,21 @@ impl Roster {
         account_identity: &[u8; PUBLIC_KEY_BYTES],
         enrolments: impl IntoIterator<Item = &'a [u8]>,
     ) -> Result<Self, RosterError> {
-        let mut devices: Vec<DeviceEnrolment> = Vec::new();
-        for bytes in enrolments {
-            let enrolment = DeviceEnrolment::open(bytes, account_identity)?;
-            if !devices.contains(&enrolment) {
-                devices.push(enrolment);
-            }
-        }
+        let devices = enrolments
+            .into_iter()
+            .map(|bytes| DeviceEnrolment::open(bytes, account_identity))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::from_checked(devices)
+    }
+
+    /// A roster of enrolments already checked against the account. The same
+    /// enrolment more than once counts once.
+    ///
+    /// # Errors
+    /// [`RosterError::SharedKey`] if two different enrolments share a key.
+    pub(crate) fn from_checked(mut devices: Vec<DeviceEnrolment>) -> Result<Self, RosterError> {
+        devices.sort_unstable();
+        devices.dedup();
         let mut keys: Vec<[u8; PUBLIC_KEY_BYTES]> = devices
             .iter()
             .flat_map(|d| [d.device_id(), d.endpoint_id(), d.author_id()])

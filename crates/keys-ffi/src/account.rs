@@ -67,6 +67,21 @@ pub enum AccountFfiError {
     /// id.
     #[error("two enrolments share a key")]
     RosterSharedKey,
+    /// A vault id that isn't 16 bytes.
+    #[error("a vault id must be 16 bytes")]
+    InvalidVaultIdLength,
+    /// A fleet record that can't be written as given: a name with nothing
+    /// visible in it, an identifier that isn't lower-case ASCII, a field
+    /// over its limit, or an account record that isn't one.
+    #[error("the fleet record can't be written as given")]
+    FleetRecordInvalid,
+    /// An account record (a tombstone or vault epoch) not signed by the
+    /// account it was checked against.
+    #[error("the record isn't signed by this account")]
+    FleetRecordNotSignedByAccount,
+    /// The system random source failed.
+    #[error("the system random source failed")]
+    Random,
 }
 
 impl From<kp::StoredKeysError> for AccountFfiError {
@@ -99,7 +114,7 @@ impl From<RosterError> for AccountFfiError {
 
 /// A 32-byte id or key: a public key, an author or document id, a content
 /// hash. All four are 32 bytes in this format.
-fn key32(bytes: &[u8]) -> Result<[u8; kp::keys::PUBLIC_KEY_BYTES], AccountFfiError> {
+pub(crate) fn key32(bytes: &[u8]) -> Result<[u8; kp::keys::PUBLIC_KEY_BYTES], AccountFfiError> {
     crate::pairing::key32_or(bytes, AccountFfiError::InvalidKeyLength)
 }
 
@@ -244,7 +259,7 @@ impl PairingDeviceKeys {
 /// A device's signing and relay keys, read back from their stored form.
 #[derive(uniffi::Object)]
 pub struct DeviceSyncKeys {
-    inner: kp::DeviceSyncKeys,
+    pub(crate) inner: kp::DeviceSyncKeys,
 }
 
 #[uniffi::export]
@@ -348,17 +363,23 @@ pub fn open_device_enrolment(
     account_identity: Vec<u8>,
 ) -> Result<DeviceEnrolmentRecord, AccountFfiError> {
     let enrolment = DeviceEnrolment::open(&enrolment, &key32(&account_identity)?)?;
-    let keys = enrolment.device_keys();
-    Ok(DeviceEnrolmentRecord {
-        device_id: enrolment.device_id().to_vec(),
-        keys: PairingDevicePublicKeys {
-            signing: keys.signing.to_vec(),
-            relay: keys.relay.to_vec(),
-            vault: keys.vault.to_vec(),
-        },
-        endpoint_id: enrolment.endpoint_id().to_vec(),
-        author_id: enrolment.author_id().to_vec(),
-    })
+    Ok((&enrolment).into())
+}
+
+impl From<&DeviceEnrolment> for DeviceEnrolmentRecord {
+    fn from(enrolment: &DeviceEnrolment) -> Self {
+        let keys = enrolment.device_keys();
+        Self {
+            device_id: enrolment.device_id().to_vec(),
+            keys: PairingDevicePublicKeys {
+                signing: keys.signing.to_vec(),
+                relay: keys.relay.to_vec(),
+                vault: keys.vault.to_vec(),
+            },
+            endpoint_id: enrolment.endpoint_id().to_vec(),
+            author_id: enrolment.author_id().to_vec(),
+        }
+    }
 }
 
 // ─── vault document heads ───────────────────────────────────────────────────
@@ -395,6 +416,12 @@ pub fn next_statement_sequence(previous: Option<u64>, now_micros: u64) -> Option
 #[derive(uniffi::Object)]
 pub struct AccountRoster {
     inner: Roster,
+}
+
+impl AccountRoster {
+    pub(crate) fn from_roster(inner: Roster) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
 }
 
 /// Whether to fetch an entry as a head record.

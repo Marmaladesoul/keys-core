@@ -42,22 +42,72 @@ pub const MAX_ENTRY_KEY_BYTES: usize = 64;
 
 /// What a statement says, which fixes the label its signature is made under
 /// and the shape of its payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StatementKind {
     /// The head of a device's copy of a vault ([`crate::vault_head`]).
     VaultHead,
+    /// A record in the account's fleet document ([`crate::fleet`]).
+    Fleet(FleetKind),
+}
+
+/// The records of the fleet document ([`crate::fleet`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FleetKind {
+    /// A device's enrolment, signed by the account identity key.
+    Enrolment,
+    /// A device's removal, signed by the account identity key.
+    Tombstone,
+    /// A vault's epoch and sync document, signed by the account identity key.
+    VaultEpoch,
+    /// What a device says about itself: its platform and when it was last seen.
+    DeviceInfo,
+    /// A device's name, which any device of the account may set.
+    DeviceName,
+    /// How a vault looks: its name, icon and colour.
+    VaultLook,
+    /// Which epoch of a vault a device holds, and the copies it has.
+    Holding,
+    /// One of the account's settings.
+    Setting,
+}
+
+impl FleetKind {
+    /// Every fleet record kind, in wire order.
+    pub const ALL: [Self; 8] = [
+        Self::Enrolment,
+        Self::Tombstone,
+        Self::VaultEpoch,
+        Self::DeviceInfo,
+        Self::DeviceName,
+        Self::VaultLook,
+        Self::Holding,
+        Self::Setting,
+    ];
 }
 
 impl StatementKind {
-    const fn wire(self) -> u8 {
+    /// The wire byte: 1 for a vault head, 2 to 9 for the fleet records in
+    /// [`FleetKind::ALL`]'s order.
+    pub(crate) const fn wire(self) -> u8 {
         match self {
             Self::VaultHead => 1,
+            Self::Fleet(kind) => match kind {
+                FleetKind::Enrolment => 2,
+                FleetKind::Tombstone => 3,
+                FleetKind::VaultEpoch => 4,
+                FleetKind::DeviceInfo => 5,
+                FleetKind::DeviceName => 6,
+                FleetKind::VaultLook => 7,
+                FleetKind::Holding => 8,
+                FleetKind::Setting => 9,
+            },
         }
     }
 
     const fn from_wire(byte: u8) -> Option<Self> {
         match byte {
             1 => Some(Self::VaultHead),
+            2..=9 => Some(Self::Fleet(FleetKind::ALL[(byte - 2) as usize])),
             _ => None,
         }
     }
@@ -65,6 +115,9 @@ impl StatementKind {
     const fn signed_as(self) -> DeviceStatement {
         match self {
             Self::VaultHead => DeviceStatement::VaultHead,
+            // One label for the fleet records: the kind byte, which the
+            // signature also covers, tells them apart.
+            Self::Fleet(_) => DeviceStatement::FleetRecord,
         }
     }
 }
@@ -266,6 +319,23 @@ mod tests {
 
     const DOC: [u8; DOC_ID_BYTES] = [0xd0; DOC_ID_BYTES];
     const KEY: &[u8] = b"keys/v1/test";
+
+    #[test]
+    fn every_kind_has_a_wire_byte_of_its_own() {
+        let kinds: Vec<StatementKind> = std::iter::once(StatementKind::VaultHead)
+            .chain(FleetKind::ALL.map(StatementKind::Fleet))
+            .collect();
+        for (index, kind) in kinds.iter().enumerate() {
+            assert_eq!(StatementKind::from_wire(kind.wire()), Some(*kind));
+            assert!(
+                kinds[index + 1..]
+                    .iter()
+                    .all(|other| other.wire() != kind.wire())
+            );
+        }
+        assert_eq!(StatementKind::from_wire(0), None);
+        assert_eq!(StatementKind::from_wire(10), None);
+    }
 
     fn place() -> Placement<'static> {
         Placement {

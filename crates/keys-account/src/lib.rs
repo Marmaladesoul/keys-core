@@ -16,8 +16,12 @@
 //! - [`vault_head`]: a vault document's signed head records, the account's
 //!   roster of devices, and the checks a reader makes before it fetches
 //!   anything.
+//! - [`fleet`]: the account's fleet document, sealed under the fleet key:
+//!   the roster, tombstones, vault index, holdings and settings, and how a
+//!   reader reduces its entries to one view of the account.
 
 pub mod enrolment;
+pub mod fleet;
 pub mod recovery_code;
 pub mod statement;
 pub mod vault_head;

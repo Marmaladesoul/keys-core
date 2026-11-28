@@ -62,6 +62,19 @@ pub struct DeviceEnrolment {
     signature: [u8; SIGNATURE_BYTES],
 }
 
+/// Ordered by byte form, so sets of enrolments have one order everywhere.
+impl Ord for DeviceEnrolment {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.to_bytes().cmp(&other.to_bytes())
+    }
+}
+
+impl PartialOrd for DeviceEnrolment {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl DeviceEnrolment {
     /// Enrols the device with public keys `device`, transport endpoint id
     /// `endpoint_id` and document author id `author_id` into `account`.
