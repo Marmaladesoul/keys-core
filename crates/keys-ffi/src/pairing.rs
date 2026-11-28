@@ -101,10 +101,16 @@ impl From<kp::SessionError> for PairingFfiError {
     }
 }
 
-fn key32(bytes: &[u8]) -> Result<[u8; 32], PairingFfiError> {
-    bytes
-        .try_into()
-        .map_err(|_| PairingFfiError::InvalidKeyLength)
+fn key32(bytes: &[u8]) -> Result<[u8; kp::keys::PUBLIC_KEY_BYTES], PairingFfiError> {
+    key32_or(bytes, PairingFfiError::InvalidKeyLength)
+}
+
+/// A 32-byte key from the foreign side's bytes, or `wrong_length`.
+pub(crate) fn key32_or<E>(
+    bytes: &[u8],
+    wrong_length: E,
+) -> Result<[u8; kp::keys::PUBLIC_KEY_BYTES], E> {
+    bytes.try_into().map_err(|_| wrong_length)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

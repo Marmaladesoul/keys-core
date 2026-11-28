@@ -2602,6 +2602,7 @@ dependencies = [
 name = "keys-account"
 version = "0.0.0"
 dependencies = [
+ "curve25519-dalek",
  "keys-pairing",
  "thiserror",
  "zeroize",

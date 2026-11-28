@@ -82,8 +82,10 @@ pub fn device_keygen(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `account-show`: read the stored keys back. A locked device reads only
-/// what is readable after first unlock: the device's signing and relay keys.
+/// `account-show`: read the stored keys back from a directory made by
+/// `account-create` (one from `account-device-keygen` has no account to
+/// show, and reads only `--locked`). A locked device reads only what is
+/// readable after first unlock: the device's signing and relay keys.
 pub fn show(dir: &Path, locked: bool) -> Result<()> {
     let sync = match DeviceSyncKeys::from_stored(read(dir, DEVICE_SYNC_FILE)?) {
         Ok(sync) => sync,
@@ -151,8 +153,20 @@ pub fn enrol(
             return Ok(());
         }
     };
-    let sync = DeviceSyncKeys::from_stored(read(device_dir, DEVICE_SYNC_FILE)?)?;
-    let vault = DeviceVaultKey::from_stored(read(device_dir, DEVICE_VAULT_FILE)?)?;
+    let sync = match DeviceSyncKeys::from_stored(read(device_dir, DEVICE_SYNC_FILE)?) {
+        Ok(sync) => sync,
+        Err(error) => {
+            refused(DEVICE_SYNC_FILE, &error);
+            return Ok(());
+        }
+    };
+    let vault = match DeviceVaultKey::from_stored(read(device_dir, DEVICE_VAULT_FILE)?) {
+        Ok(vault) => vault,
+        Err(error) => {
+            refused(DEVICE_VAULT_FILE, &error);
+            return Ok(());
+        }
+    };
     let device = keys_ffi::PairingDevicePublicKeys {
         signing: sync.signing_public_key(),
         relay: sync.relay_public_key(),
@@ -236,6 +250,9 @@ fn describe_check(check: RecoveryCodeCheck) -> String {
 }
 
 fn parse_key(text: &str, flag: &str) -> Result<[u8; 32]> {
+    if !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{flag} must be 32 bytes of hex");
+    }
     let bytes = (0..text.len())
         .step_by(2)
         .map(|i| {
@@ -254,7 +271,7 @@ fn parse_key(text: &str, flag: &str) -> Result<[u8; 32]> {
 fn make_secret_dir(dir: &Path) -> Result<()> {
     if dir.exists() {
         bail!(
-            "{} already exists; account-create wants a fresh directory",
+            "{} already exists; keys go in a fresh directory",
             dir.display()
         );
     }

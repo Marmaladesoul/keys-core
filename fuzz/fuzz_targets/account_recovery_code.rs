@@ -7,7 +7,7 @@
 
 #![no_main]
 
-use keys_account::recovery_code::{CHARACTERS, GROUP_LENGTH};
+use keys_account::recovery_code::{CHARACTERS, GROUP_LENGTH, is_separator};
 use keys_account::{RecoveryCodeError, parse_recovery_code, recovery_code};
 use keys_pairing::RecoverySecret;
 use libfuzzer_sys::fuzz_target;
@@ -17,7 +17,7 @@ use libfuzzer_sys::fuzz_target;
 fn normalised(typed: &str) -> String {
     typed
         .chars()
-        .filter(|c| !c.is_whitespace() && *c != '-')
+        .filter(|&c| !is_separator(c))
         .map(|c| match c.to_ascii_uppercase() {
             'O' => '0',
             'I' | 'L' => '1',

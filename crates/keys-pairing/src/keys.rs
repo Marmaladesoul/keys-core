@@ -38,7 +38,7 @@
 //! forms are kept, and how the recovery secret is rendered for a person to
 //! write down, is the caller's business.
 
-use curve25519_dalek::edwards::CompressedEdwardsY;
+use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha512};
@@ -82,7 +82,9 @@ const _: () = assert!(PUBLIC_KEY_BYTES == SECRET_KEY_BYTES);
 /// later build reads as damaged here and is still the only copy of the keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StoredKeysError {
-    /// It is a well-formed stored form of another kind.
+    /// It is tagged as a stored form of another kind, the account's handed
+    /// in as a device's, say. The kind is read before the rest, so a form
+    /// of another kind is reported as this whether or not it is intact.
     #[error("the stored keys are of another kind")]
     WrongKind,
     /// It is not a stored form at all, or one that is damaged.
@@ -110,7 +112,7 @@ impl SignedStatement {
     }
 
     /// The bytes signed for this statement over `fields`.
-    pub(crate) fn message(self, fields: &[&[u8]]) -> Vec<u8> {
+    fn message(self, fields: &[&[u8]]) -> Vec<u8> {
         let mut parts = Vec::with_capacity(fields.len() + 1);
         parts.push(self.label());
         parts.extend_from_slice(fields);
@@ -131,30 +133,42 @@ impl SignedStatement {
 }
 
 /// Whether `key` is a usable Ed25519 public key: the canonical encoding of a
-/// valid point that isn't of small order. Canonical (it re-encodes to the
-/// same bytes) so that one key has one byte string and can't be passed off
-/// as another by an alias.
+/// point in the prime-order subgroup, other than the identity. Canonical (it
+/// re-encodes to the same bytes) so that one key has one byte string; in the
+/// prime-order subgroup, because a key plus a point of small order is a
+/// different byte string that its holder can still sign for (a signature
+/// verifies for both whenever the challenge hash is a multiple of 8). Every
+/// honestly generated key is a multiple of the base point, so is in it.
 #[must_use]
 pub fn ed25519_public_key_is_usable(key: &[u8; PUBLIC_KEY_BYTES]) -> bool {
     CompressedEdwardsY(*key)
         .decompress()
-        .is_some_and(|point| point.compress().to_bytes() == *key && !point.is_small_order())
+        .is_some_and(|point| point.compress().to_bytes() == *key && in_prime_order_subgroup(&point))
+}
+
+/// Whether `point` is in the prime-order subgroup and isn't the identity:
+/// it has no small-order component, and isn't of small order itself.
+fn in_prime_order_subgroup(point: &EdwardsPoint) -> bool {
+    point.is_torsion_free() && !point.is_small_order()
 }
 
 /// Whether `key` is a usable X25519 public key: the canonical encoding (top
 /// bit clear, below the field prime) of a point on the curve, not its twist,
-/// that isn't of small order. Canonical, because X25519 ignores the top bit
-/// and reduces the rest, so otherwise two byte strings could be one key; on
-/// the curve and not of small order, so a key agreement with it can't be
-/// forced to a known shared secret.
+/// in the prime-order subgroup and not the identity. Canonical, because
+/// X25519 ignores the top bit and reduces the rest, so otherwise two byte
+/// strings could be one key; in the prime-order subgroup, because X25519's
+/// clamped scalar is a multiple of 8, so a key plus a point of small order
+/// is a different byte string with exactly the key's agreements, and a
+/// small-order key forces a known shared secret. Every honestly generated
+/// key is a multiple of the base point, so is in it.
 #[must_use]
 pub fn x25519_public_key_is_usable(key: &[u8; PUBLIC_KEY_BYTES]) -> bool {
-    // Either sign choice gives a point of the same order.
+    // Either sign choice gives a point with the same small-order component.
     const EDWARDS_SIGN: u8 = 0;
     is_canonical_field_element(key)
         && MontgomeryPoint(*key)
             .to_edwards(EDWARDS_SIGN)
-            .is_some_and(|point| !point.is_small_order())
+            .is_some_and(|point| in_prime_order_subgroup(&point))
 }
 
 /// The field prime 2²⁵⁵ − 19, little-endian.
@@ -387,16 +401,30 @@ impl AccountKeys {
         statement: SignedStatement,
         fields: &[&[u8]],
     ) -> [u8; SIGNATURE_BYTES] {
-        self.sign(&statement.message(fields))
+        self.identity.sign(&statement.message(fields)).to_bytes()
     }
 
+    /// All three public keys. Computing the encryption public key uses the
+    /// encryption secret; where only one key is wanted, ask for it alone.
     #[must_use]
     pub fn public_keys(&self) -> AccountPublicKeys {
         AccountPublicKeys {
-            identity: self.identity.verifying_key().to_bytes(),
+            identity: self.identity_public_key(),
             recovery: self.recovery_public,
             encryption: self.encryption.public_key(),
         }
+    }
+
+    /// The identity public key, which the signing key holds already.
+    #[must_use]
+    pub fn identity_public_key(&self) -> [u8; PUBLIC_KEY_BYTES] {
+        self.identity.verifying_key().to_bytes()
+    }
+
+    /// The recovery public key, which is stored as it is.
+    #[must_use]
+    pub fn recovery_public_key(&self) -> [u8; PUBLIC_KEY_BYTES] {
+        self.recovery_public
     }
 
     /// Registers the identity seed and the encryption secret with the
@@ -407,15 +435,11 @@ impl AccountKeys {
         crate::heap_watch::register(self.identity.as_bytes());
         crate::heap_watch::register(self.encryption.0.as_bytes());
     }
-
-    pub(crate) fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_BYTES] {
-        self.identity.sign(message).to_bytes()
-    }
 }
 
 /// Verifies an Ed25519 signature by `public_key` over `message`, strictly
 /// (no small-order keys, no malleable signatures).
-pub(crate) fn verify_signature(
+fn verify_signature(
     public_key: &[u8; PUBLIC_KEY_BYTES],
     message: &[u8],
     signature: &[u8; SIGNATURE_BYTES],
@@ -582,15 +606,12 @@ mod tests {
     fn identity_signatures_verify_and_bind_the_message() {
         let (keys, _) = AccountKeys::generate().expect("rng");
         let identity = keys.public_keys().identity;
-        let signature = keys.sign(b"message");
-        assert!(verify_signature(&identity, b"message", &signature));
-        assert!(!verify_signature(&identity, b"messagf", &signature));
+        let statement = SignedStatement::DeviceEnrolment;
+        let signature = keys.sign_statement(statement, &[b"message"]);
+        assert!(statement.verify(&identity, &[b"message"], &signature));
+        assert!(!statement.verify(&identity, &[b"messagf"], &signature));
         let (other, _) = AccountKeys::generate().expect("rng");
-        assert!(!verify_signature(
-            &other.public_keys().identity,
-            b"message",
-            &signature
-        ));
+        assert!(!statement.verify(&other.public_keys().identity, &[b"message"], &signature));
     }
 
     #[test]
@@ -790,6 +811,41 @@ mod tests {
             }
         }
         assert!(ed25519_public_key_is_usable(&public.identity));
+    }
+
+    /// A key plus a point of small order is another encoding of no use: it
+    /// differs from the key, isn't itself of small order, but X25519's
+    /// clamped scalar (a multiple of 8) can't tell it from the key, and an
+    /// Ed25519 signer for the key can sign for it in a few tries. So a key
+    /// must also have no small-order component.
+    #[test]
+    fn public_key_checks_refuse_keys_with_a_torsion_component() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+        let (keys, _) = AccountKeys::generate().expect("rng");
+        let public = keys.public_keys();
+        let torsion = EIGHT_TORSION[1];
+
+        let encryption = MontgomeryPoint(public.encryption)
+            .to_edwards(0)
+            .expect("on the curve");
+        let aliased = (encryption + torsion).to_montgomery().to_bytes();
+        assert_ne!(aliased, public.encryption);
+        // The same key agreement as the honest key, for every secret.
+        let secret = [0x5a; SECRET_KEY_BYTES];
+        assert_eq!(
+            MontgomeryPoint(aliased).mul_clamped(secret),
+            MontgomeryPoint(public.encryption).mul_clamped(secret)
+        );
+        assert!(x25519_public_key_is_usable(&public.encryption));
+        assert!(!x25519_public_key_is_usable(&aliased));
+
+        let identity = CompressedEdwardsY(public.identity)
+            .decompress()
+            .expect("on the curve");
+        let aliased = (identity + torsion).compress().to_bytes();
+        assert_ne!(aliased, public.identity);
+        assert!(ed25519_public_key_is_usable(&public.identity));
+        assert!(!ed25519_public_key_is_usable(&aliased));
     }
 
     #[test]

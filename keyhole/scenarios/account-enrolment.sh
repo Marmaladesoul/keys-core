@@ -79,13 +79,20 @@ run account-enrol "$WORK/account" --device "$WORK/merged" \
     --endpoint "$ENDPOINT" --author "$AUTHOR" --out "$WORK/merged-enrolment"
 expect "refused: enrolment enrolment-unusable-key"
 [ ! -e "$WORK/merged-enrolment" ] || { echo "FAIL: an unusable enrolment was written"; exit 1; }
-# Nor for one key in two roles, or an endpoint id that isn't a key at all.
-run account-enrol "$WORK/account" --device "$WORK/new" \
-    --endpoint "$NEW_ID" --author "$AUTHOR" --out "$WORK/twice"
-expect "refused: enrolment enrolment-unusable-key"
-run account-enrol "$WORK/account" --device "$WORK/new" \
-    --endpoint "$(printf '00%.0s' {1..32})" --author "$AUTHOR" --out "$WORK/twice"
-expect "refused: enrolment enrolment-unusable-key"
-[ ! -e "$WORK/twice" ] || { echo "FAIL: an unusable enrolment was written"; exit 1; }
+# Nor for one key in two roles (the device's own id, or the account's
+# identity key, as its endpoint id), or an endpoint id that isn't a key.
+for endpoint in "$NEW_ID" "$IDENTITY" "$(printf '00%.0s' {1..32})"; do
+    rm -f "$WORK/unusable"
+    run account-enrol "$WORK/account" --device "$WORK/new" \
+        --endpoint "$endpoint" --author "$AUTHOR" --out "$WORK/unusable"
+    expect "refused: enrolment enrolment-unusable-key"
+    [ ! -e "$WORK/unusable" ] || { echo "FAIL: an unusable enrolment was written"; exit 1; }
+done
+# A device's stored form in the wrong place is refused, not read as keys.
+rm -rf "$WORK/swapped" && cp -R "$WORK/new" "$WORK/swapped"
+cp "$WORK/new/device-vault.keys" "$WORK/swapped/device-sync.keys"
+run account-enrol "$WORK/account" --device "$WORK/swapped" \
+    --endpoint "$ENDPOINT" --author "$AUTHOR" --out "$WORK/unusable"
+expect "refused: device-sync.keys stored-keys-wrong-kind"
 
 echo "PASS: an enrolment checks out only against its own account, every key and the signature are covered, other shapes and unusable keys are refused"

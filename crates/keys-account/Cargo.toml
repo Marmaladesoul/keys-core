@@ -18,3 +18,7 @@ workspace = true
 keys-pairing = { path = "../keys-pairing" }
 thiserror = "2"
 zeroize = "1"
+
+[dev-dependencies]
+# To build keys with a small-order component, which enrolment must refuse.
+curve25519-dalek = { version = "5.0.0-pre.6", default-features = false }

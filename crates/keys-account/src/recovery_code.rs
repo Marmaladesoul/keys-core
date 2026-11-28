@@ -16,7 +16,8 @@
 //!   and a single wrong character is located: reading back names the group
 //!   it is in.
 //! - **Reading is lenient** where Crockford's base32 is: any case, `O` for
-//!   `0`, `I` or `L` for `1`, and spaces and hyphens anywhere.
+//!   `0`, `I` or `L` for `1`, and spaces and hyphens (or the dashes that
+//!   text editors and autocorrect put in their place) anywhere.
 //!
 //! The group a [`RecoveryCodeError::Typo`] names is a hint. With one wrong
 //! character it is always the right group; with more it may not be, and a
@@ -50,6 +51,19 @@ const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// What goes between groups when a code is written out.
 const GROUP_SEPARATOR: char = '-';
 
+/// Whether a typed character is set aside when reading a code: white space,
+/// the group separator, or a dash that stands in for it once a code has been
+/// through a text editor (the Unicode hyphens and dashes U+2010 to U+2015,
+/// and the minus sign U+2212).
+#[must_use]
+pub fn is_separator(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            GROUP_SEPARATOR | '\u{2010}'..='\u{2015}' | '\u{2212}'
+        )
+}
+
 const _: () = assert!(
     PAD_BITS < BITS_PER_CHARACTER,
     "the secret fills the data characters"
@@ -63,7 +77,7 @@ const _: () = assert!(
 /// code itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RecoveryCodeError {
-    /// Not 28 characters, once spaces and hyphens are set aside.
+    /// Not 28 characters, once separators are set aside ([`is_separator`]).
     #[error("a recovery code is {CHARACTERS} characters, and this has {characters}")]
     WrongLength { characters: usize },
     /// A character that is never in a recovery code, in this group
@@ -124,7 +138,7 @@ pub fn parse_recovery_code(typed: &str) -> Result<RecoverySecret, RecoveryCodeEr
     let mut symbols = Zeroizing::new([0u8; CHARACTERS]);
     let mut count = 0;
     for character in typed.chars() {
-        if character.is_whitespace() || character == GROUP_SEPARATOR {
+        if is_separator(character) {
             continue;
         }
         if count < CHARACTERS {
@@ -406,6 +420,10 @@ mod tests {
             secret_of(&format!("  {}\n", code.replace('-', " - "))),
             secret
         );
+        // The dashes an editor substitutes for hyphens.
+        for dash in ['\u{2010}', '\u{2011}', '\u{2013}', '\u{2014}', '\u{2212}'] {
+            assert_eq!(secret_of(&code.replace('-', &dash.to_string())), secret);
+        }
         // O for 0 and I or L for 1, in either case.
         let zeros = code_for([0; RECOVERY_SECRET_BYTES]);
         assert_eq!(

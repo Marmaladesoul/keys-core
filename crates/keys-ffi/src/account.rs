@@ -38,8 +38,8 @@ use crate::pairing::{
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum AccountFfiError {
-    /// A stored form of another kind: the account's handed in as a device's,
-    /// say.
+    /// A stored form tagged as another kind, the account's handed in as a
+    /// device's, say, whether or not it is intact.
     #[error("the stored keys are of another kind")]
     StoredKeysWrongKind,
     /// Not a stored form, or a damaged one.
@@ -79,9 +79,7 @@ impl From<EnrolmentError> for AccountFfiError {
 }
 
 fn key32(bytes: &[u8]) -> Result<[u8; kp::keys::PUBLIC_KEY_BYTES], AccountFfiError> {
-    bytes
-        .try_into()
-        .map_err(|_| AccountFfiError::InvalidKeyLength)
+    crate::pairing::key32_or(bytes, AccountFfiError::InvalidKeyLength)
 }
 
 // ─── account keys ───────────────────────────────────────────────────────────
@@ -113,7 +111,7 @@ impl PairingAccountKeys {
     #[must_use]
     pub fn check_recovery_code(&self, typed: String) -> RecoveryCodeCheck {
         let typed = Zeroizing::new(typed);
-        keys_account::check_recovery_code(&typed, &self.inner.public_keys().recovery).into()
+        keys_account::check_recovery_code(&typed, &self.inner.recovery_public_key()).into()
     }
 
     /// Enrols a device into this account: the signed statement for its
@@ -161,7 +159,7 @@ pub enum RecoveryCodeCheck {
     /// Well formed and, where it was checked against an account, that
     /// account's.
     Valid,
-    /// Not 28 characters, once spaces and hyphens are set aside.
+    /// Not 28 characters, once spaces, hyphens and dashes are set aside.
     WrongLength { characters: u64 },
     /// A character that is never in a recovery code, in this group.
     NotInAlphabet { group: u8 },

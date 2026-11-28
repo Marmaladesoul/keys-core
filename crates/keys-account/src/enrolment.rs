@@ -19,8 +19,9 @@
 //! the five keys, each a field of its own. There is no way to hold an
 //! enrolment that hasn't been checked: [`DeviceEnrolment::open`] parses and
 //! verifies in one step, and an enrolment of unusable keys (not canonically
-//! encoded, of small order, off the curve, or one key in two roles) is
-//! neither signed nor accepted.
+//! encoded, off the curve, not in the prime-order subgroup, or one key in
+//! two roles, the account's identity key among them) is neither signed nor
+//! accepted.
 
 use keys_pairing::keys::{
     PUBLIC_KEY_BYTES, SIGNATURE_BYTES, ed25519_public_key_is_usable, x25519_public_key_is_usable,
@@ -44,8 +45,9 @@ pub enum EnrolmentError {
     /// The signature isn't this account's over these keys.
     #[error("the enrolment isn't signed by this account")]
     NotSignedByAccount,
-    /// One of the device's keys isn't usable: not canonically encoded, of
-    /// small order, off the curve, or the same key in two roles.
+    /// One of the device's keys isn't usable: not canonically encoded, off
+    /// the curve, not in the prime-order subgroup, or the same key in two
+    /// roles (the account's identity key among them).
     #[error("the enrolment names a key that can't be used")]
     UnusableKey,
 }
@@ -73,7 +75,12 @@ impl DeviceEnrolment {
         endpoint_id: [u8; PUBLIC_KEY_BYTES],
         author_id: [u8; PUBLIC_KEY_BYTES],
     ) -> Result<Self, EnrolmentError> {
-        check_device_keys(&device, &endpoint_id, &author_id)?;
+        check_device_keys(
+            &device,
+            &endpoint_id,
+            &author_id,
+            &account.identity_public_key(),
+        )?;
         let signature = account.sign_statement(
             SignedStatement::DeviceEnrolment,
             &signed_fields(&device, &endpoint_id, &author_id),
@@ -122,7 +129,7 @@ impl DeviceEnrolment {
         ) {
             return Err(EnrolmentError::NotSignedByAccount);
         }
-        check_device_keys(&device, &endpoint_id, &author_id)?;
+        check_device_keys(&device, &endpoint_id, &author_id, account_identity)?;
         Ok(Self {
             device,
             endpoint_id,
@@ -194,22 +201,27 @@ fn signed_fields<'a>(
 
 /// A device's keys are usable if its signing key, endpoint id and author id
 /// are usable Ed25519 keys (the transport's endpoint and author ids are
-/// Ed25519 keys too) and three different keys, so no key signs for two
-/// protocols; and its relay and vault keys are usable X25519 keys that
-/// differ, so the two protection classes stay two. The checks demand
-/// canonical encodings, so "differ" compares keys, not spellings.
+/// Ed25519 keys too) and, with the account identity key, four different
+/// keys, so no key signs for two protocols; and its relay and vault keys are
+/// usable X25519 keys that differ, so the two protection classes stay two.
+/// The checks demand canonical encodings in the prime-order subgroup, so
+/// "differ" compares keys, not spellings.
 fn check_device_keys(
     device: &DevicePublicKeys,
     endpoint_id: &[u8; PUBLIC_KEY_BYTES],
     author_id: &[u8; PUBLIC_KEY_BYTES],
+    account_identity: &[u8; PUBLIC_KEY_BYTES],
 ) -> Result<(), EnrolmentError> {
     let signing_keys = [&device.signing, endpoint_id, author_id];
+    let distinct = |keys: &[&[u8; PUBLIC_KEY_BYTES]]| {
+        keys.iter()
+            .enumerate()
+            .all(|(index, key)| !keys[..index].contains(key))
+    };
     let usable = signing_keys
         .iter()
         .all(|key| ed25519_public_key_is_usable(key))
-        && device.signing != *endpoint_id
-        && device.signing != *author_id
-        && endpoint_id != author_id
+        && distinct(&[&device.signing, endpoint_id, author_id, account_identity])
         && x25519_public_key_is_usable(&device.relay)
         && x25519_public_key_is_usable(&device.vault)
         && device.relay != device.vault;
@@ -232,6 +244,26 @@ mod tests {
             DeviceKeys::generate().expect("rng").public_keys().signing,
             DeviceKeys::generate().expect("rng").public_keys().signing,
         )
+    }
+
+    /// `key` plus a point of order 8, as an X25519 key.
+    fn with_torsion_x25519(key: [u8; PUBLIC_KEY_BYTES]) -> [u8; PUBLIC_KEY_BYTES] {
+        let point = curve25519_dalek::MontgomeryPoint(key)
+            .to_edwards(0)
+            .expect("on the curve");
+        (point + curve25519_dalek::constants::EIGHT_TORSION[1])
+            .to_montgomery()
+            .to_bytes()
+    }
+
+    /// `key` plus a point of order 8, as an Ed25519 key.
+    fn with_torsion_ed25519(key: [u8; PUBLIC_KEY_BYTES]) -> [u8; PUBLIC_KEY_BYTES] {
+        let point = curve25519_dalek::edwards::CompressedEdwardsY(key)
+            .decompress()
+            .expect("on the curve");
+        (point + curve25519_dalek::constants::EIGHT_TORSION[1])
+            .compress()
+            .to_bytes()
     }
 
     fn enrolled() -> (AccountKeys, DevicePublicKeys, DeviceEnrolment) {
@@ -347,6 +379,19 @@ mod tests {
             (good, good.signing, author),
             (good, endpoint, good.signing),
             (good, endpoint, endpoint),
+            // The account's own identity key in a device's role.
+            device(DevicePublicKeys {
+                signing: account.identity_public_key(),
+                ..good
+            }),
+            (good, account.identity_public_key(), author),
+            (good, endpoint, account.identity_public_key()),
+            // A key plus a point of small order: another spelling of no use.
+            device(DevicePublicKeys {
+                vault: with_torsion_x25519(good.relay),
+                ..good
+            }),
+            (good, with_torsion_ed25519(good.signing), author),
         ];
         for (index, (device, endpoint, author)) in cases.into_iter().enumerate() {
             assert_eq!(
