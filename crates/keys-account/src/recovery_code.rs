@@ -69,11 +69,11 @@ pub enum RecoveryCodeError {
     /// A character that is never in a recovery code, in this group
     /// (counting from 1).
     #[error("group {group} has a character that is never in a recovery code")]
-    NotInAlphabet { group: usize },
+    NotInAlphabet { group: u8 },
     /// The checks fail, most likely because of a mistyped character in this
     /// group (counting from 1).
     #[error("the recovery code doesn't check out: group {group} looks mistyped")]
-    Typo { group: usize },
+    Typo { group: u8 },
     /// The checks fail, and no single character explains it.
     #[error("the recovery code doesn't check out")]
     Unreadable,
@@ -203,9 +203,15 @@ fn symbol_value(character: char) -> Option<u8> {
         .map(|value| value as u8)
 }
 
-/// The group, counting from 1, of the character at `index`.
-fn group_of(index: usize) -> usize {
-    index / GROUP_LENGTH + 1
+/// The group, counting from 1, of the character at `index`, which is less
+/// than [`CHARACTERS`].
+fn group_of(index: usize) -> u8 {
+    const { assert!(GROUPS <= u8::MAX as usize) };
+    debug_assert!(index < CHARACTERS);
+    // At most GROUPS, which fits.
+    #[allow(clippy::cast_possible_truncation)]
+    let group = (index / GROUP_LENGTH + 1) as u8;
+    group
 }
 
 /// The weight of the character at `index` in the codeword polynomial: αᵖ for
@@ -410,16 +416,15 @@ mod tests {
             secret_of(&zeros.replace('0', "o")),
             [0; RECOVERY_SECRET_BYTES]
         );
-        let ones = code_for([0xff; RECOVERY_SECRET_BYTES]);
-        if ones.contains('1') {
-            assert_eq!(
-                secret_of(&ones.replace('1', "I")),
-                [0xff; RECOVERY_SECRET_BYTES]
-            );
-            assert_eq!(
-                secret_of(&ones.replace('1', "l")),
-                [0xff; RECOVERY_SECRET_BYTES]
-            );
+        // The bit pattern 00001 repeated: every data character is a 1.
+        let ones_secret = [
+            0x08, 0x42, 0x10, 0x84, 0x21, 0x08, 0x42, 0x10, 0x84, 0x21, 0x08, 0x42, 0x10, 0x84,
+            0x21, 0x08,
+        ];
+        let ones = code_for(ones_secret);
+        assert!(ones.starts_with("1111-1111"), "{ones}");
+        for one in ["I", "i", "L", "l"] {
+            assert_eq!(secret_of(&ones.replace('1', one)), ones_secret, "{one}");
         }
     }
 
@@ -437,7 +442,7 @@ mod tests {
                     assert_eq!(
                         parse_recovery_code(&with_characters(&typed)).err(),
                         Some(RecoveryCodeError::Typo {
-                            group: index / GROUP_LENGTH + 1
+                            group: u8::try_from(index / GROUP_LENGTH + 1).expect("seven groups")
                         }),
                         "character {index} replaced"
                     );
@@ -496,7 +501,7 @@ mod tests {
             assert_eq!(
                 parse_recovery_code(&with_characters(&typed)).err(),
                 Some(RecoveryCodeError::NotInAlphabet {
-                    group: index / GROUP_LENGTH + 1
+                    group: u8::try_from(index / GROUP_LENGTH + 1).expect("seven groups")
                 })
             );
         }

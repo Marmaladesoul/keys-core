@@ -16,8 +16,10 @@
 //! Every stored form is the secret keys themselves, as is the recovery code
 //! ([`PairingRecoverySecret::recovery_code`]): the client must not log them,
 //! and should drop its copies as soon as they are stored or shown. Rust
-//! wipes the copies it holds, including the byte vectors handed in to the
-//! `from_stored` constructors, but can't wipe the foreign side's.
+//! wipes the byte vectors handed in to the `from_stored` constructors and
+//! the typed recovery codes it checks. The stored forms and the recovery
+//! code it hands out are plain copies on their way across the FFI: they are
+//! freed unwiped, on both sides, as is anything the foreign side holds.
 
 // uniffi exports take owned arguments.
 #![allow(clippy::needless_pass_by_value)]
@@ -76,7 +78,7 @@ impl From<EnrolmentError> for AccountFfiError {
     }
 }
 
-fn key32(bytes: &[u8]) -> Result<[u8; 32], AccountFfiError> {
+fn key32(bytes: &[u8]) -> Result<[u8; kp::keys::PUBLIC_KEY_BYTES], AccountFfiError> {
     bytes
         .try_into()
         .map_err(|_| AccountFfiError::InvalidKeyLength)
@@ -160,7 +162,7 @@ pub enum RecoveryCodeCheck {
     /// account's.
     Valid,
     /// Not 28 characters, once spaces and hyphens are set aside.
-    WrongLength { characters: u32 },
+    WrongLength { characters: u64 },
     /// A character that is never in a recovery code, in this group.
     NotInAlphabet { group: u8 },
     /// Most likely a mistyped character in this group.
@@ -173,16 +175,14 @@ pub enum RecoveryCodeCheck {
 
 impl<T> From<Result<T, RecoveryCodeError>> for RecoveryCodeCheck {
     fn from(result: Result<T, RecoveryCodeError>) -> Self {
-        let group = |group: usize| u8::try_from(group).unwrap_or(u8::MAX);
         match result {
             Ok(_) => Self::Valid,
+            // usize is at most 64 bits on every target Rust supports.
             Err(RecoveryCodeError::WrongLength { characters }) => Self::WrongLength {
-                characters: u32::try_from(characters).unwrap_or(u32::MAX),
+                characters: characters as u64,
             },
-            Err(RecoveryCodeError::NotInAlphabet { group: g }) => {
-                Self::NotInAlphabet { group: group(g) }
-            }
-            Err(RecoveryCodeError::Typo { group: g }) => Self::Typo { group: group(g) },
+            Err(RecoveryCodeError::NotInAlphabet { group }) => Self::NotInAlphabet { group },
+            Err(RecoveryCodeError::Typo { group }) => Self::Typo { group },
             Err(RecoveryCodeError::Unreadable) => Self::Unreadable,
             Err(RecoveryCodeError::NotThisAccount) => Self::NotThisAccount,
         }

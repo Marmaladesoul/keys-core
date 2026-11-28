@@ -13,9 +13,15 @@
 set -euo pipefail
 source "$(dirname "$0")/account-common.inc"
 
-DEV="$WORK/device"
-run account-create "$DEV" >/dev/null
-CODE="$(cat "$DEV/recovery-code")"
+# An account whose code has both a 0 and a 1, so the O and I/L spellings
+# below change something. About a third of codes do; give up after many.
+for attempt in $(seq 1 64); do
+    DEV="$WORK/device-$attempt"
+    run account-create "$DEV" >/dev/null
+    CODE="$(cat "$DEV/recovery-code")"
+    [[ "$CODE" == *0* && "$CODE" == *1* ]] && break
+done
+[[ "$CODE" == *0* && "$CODE" == *1* ]] || { echo "FAIL: no code with a 0 and a 1 in 64 accounts"; exit 1; }
 [[ "$CODE" =~ ^([0-9A-HJKMNP-TV-Z]{4}-){6}[0-9A-HJKMNP-TV-Z]{4}$ ]] \
     || { echo "FAIL: not seven groups of four from the alphabet"; exit 1; }
 
@@ -32,7 +38,8 @@ typed "$(tr 'A-Z' 'a-z' <<<"$CODE")" --dir "$DEV"; expect "recovery-code: valid"
 typed "${CODE//-/}" --dir "$DEV"; expect "recovery-code: valid"
 typed "${CODE//-/ }" --dir "$DEV"; expect "recovery-code: valid"
 typed "$(tr '01' 'OI' <<<"$CODE")" --dir "$DEV"; expect "recovery-code: valid"
-typed "$(tr '1' 'l' <<<"$CODE")" --dir "$DEV"; expect "recovery-code: valid"
+typed "$(tr '01' 'ol' <<<"$CODE")" --dir "$DEV"; expect "recovery-code: valid"
+typed "$(tr '1' 'L' <<<"$CODE")" --dir "$DEV"; expect "recovery-code: valid"
 # Form alone, with no account to hand.
 typed "$CODE"; expect "recovery-code: valid"
 

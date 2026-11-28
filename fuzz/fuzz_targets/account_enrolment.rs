@@ -31,7 +31,17 @@ fn fixture() -> &'static Fixture {
         let device = DeviceKeys::generate()
             .expect("scripted random")
             .public_keys();
-        let genuine = DeviceEnrolment::sign(&account, device, [0xe1; 32], [0xa7; 32])
+        // The transport's endpoint and author ids are Ed25519 keys; other
+        // devices' signing keys stand in for them.
+        let endpoint = DeviceKeys::generate()
+            .expect("scripted random")
+            .public_keys()
+            .signing;
+        let author = DeviceKeys::generate()
+            .expect("scripted random")
+            .public_keys()
+            .signing;
+        let genuine = DeviceEnrolment::sign(&account, device, endpoint, author)
             .expect("usable keys")
             .to_bytes()
             .to_vec();

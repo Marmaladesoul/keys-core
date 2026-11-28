@@ -31,8 +31,12 @@ run account-show "$DEV"
 [ "$(sort <<<"$OUT")" = "$(sort <<<"$CREATED")" ] \
     || { echo "FAIL: read-back keys differ:"; echo "$CREATED"; echo "---"; echo "$OUT"; exit 1; }
 
-# A locked device reads its id and relay key only.
-run account-show "$DEV" --locked
+# A locked device reads its id and relay key only, and needs nothing else:
+# with the items behind the app's unlock gone, as they are unreadable to a
+# locked device, the locked read is unchanged.
+rm -rf "$WORK/locked" && cp -R "$DEV" "$WORK/locked"
+rm "$WORK/locked/account.keys" "$WORK/locked/device-vault.keys"
+run account-show "$WORK/locked" --locked
 expect "device id $DEVICE_ID"
 expect "account: locked"
 refute_re "^(account identity|account recovery|account encryption|device vault) "

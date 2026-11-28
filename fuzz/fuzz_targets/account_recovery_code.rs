@@ -63,7 +63,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(
         parse_recovery_code(&typed).err(),
         Some(RecoveryCodeError::Typo {
-            group: position / GROUP_LENGTH + 1
+            group: u8::try_from(position / GROUP_LENGTH + 1).expect("seven groups")
         }),
         "a single typo wasn't put in its group"
     );

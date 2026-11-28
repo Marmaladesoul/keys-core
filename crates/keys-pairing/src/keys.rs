@@ -20,7 +20,7 @@
 //! `lv_cat(label, fields...)` for one [`SignedStatement`], each with a label
 //! of its own, so a signature made for one purpose can't be presented for
 //! another. The enum is the whole list: a new purpose is a new variant with a
-//! fresh label, and there is no way to sign anything else.
+//! fresh label, and there is no way to sign under any other label.
 //!
 //! **Stored forms.** Each key set has a byte form for the platform's secure
 //! storage, one per protection class, so nothing readable on a locked device
@@ -38,6 +38,7 @@
 //! forms are kept, and how the recovery secret is rendered for a person to
 //! write down, is the caller's business.
 
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha512};
@@ -72,8 +73,13 @@ const STORED_KIND_DEVICE_SYNC: u8 = b'S';
 const STORED_KIND_DEVICE_VAULT: u8 = b'V';
 /// Length of a stored form's header: the version and the kind.
 const STORED_HEADER_BYTES: usize = 2;
+// A stored form's fields are all 32 bytes: secrets, and the account's
+// recovery public key.
+const _: () = assert!(PUBLIC_KEY_BYTES == SECRET_KEY_BYTES);
 
-/// Why a stored form was refused.
+/// Why a stored form was refused. Neither means the stored item may be
+/// deleted: a client keeps it and reports the problem, since a form from a
+/// later build reads as damaged here and is still the only copy of the keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StoredKeysError {
     /// It is a well-formed stored form of another kind.
@@ -124,23 +130,46 @@ impl SignedStatement {
     }
 }
 
-/// Whether `key` is a usable Ed25519 public key: a valid point that isn't of
-/// small order.
+/// Whether `key` is a usable Ed25519 public key: the canonical encoding of a
+/// valid point that isn't of small order. Canonical (it re-encodes to the
+/// same bytes) so that one key has one byte string and can't be passed off
+/// as another by an alias.
 #[must_use]
 pub fn ed25519_public_key_is_usable(key: &[u8; PUBLIC_KEY_BYTES]) -> bool {
-    VerifyingKey::from_bytes(key).is_ok_and(|key| !key.is_weak())
+    CompressedEdwardsY(*key)
+        .decompress()
+        .is_some_and(|point| point.compress().to_bytes() == *key && !point.is_small_order())
 }
 
-/// Whether `key` is a usable X25519 public key: a point on the curve (not its
-/// twist) that isn't of small order, so a key agreement with it can't be
+/// Whether `key` is a usable X25519 public key: the canonical encoding (top
+/// bit clear, below the field prime) of a point on the curve, not its twist,
+/// that isn't of small order. Canonical, because X25519 ignores the top bit
+/// and reduces the rest, so otherwise two byte strings could be one key; on
+/// the curve and not of small order, so a key agreement with it can't be
 /// forced to a known shared secret.
 #[must_use]
 pub fn x25519_public_key_is_usable(key: &[u8; PUBLIC_KEY_BYTES]) -> bool {
     // Either sign choice gives a point of the same order.
     const EDWARDS_SIGN: u8 = 0;
-    MontgomeryPoint(*key)
-        .to_edwards(EDWARDS_SIGN)
-        .is_some_and(|point| !point.is_small_order())
+    is_canonical_field_element(key)
+        && MontgomeryPoint(*key)
+            .to_edwards(EDWARDS_SIGN)
+            .is_some_and(|point| !point.is_small_order())
+}
+
+/// The field prime 2²⁵⁵ − 19, little-endian.
+const FIELD_PRIME: [u8; PUBLIC_KEY_BYTES] = {
+    let mut prime = [0xff; PUBLIC_KEY_BYTES];
+    prime[0] = 0xed;
+    prime[PUBLIC_KEY_BYTES - 1] = 0x7f;
+    prime
+};
+
+/// Whether `bytes`, little-endian, is a field element below the prime (which
+/// also means its top bit is clear).
+fn is_canonical_field_element(bytes: &[u8; PUBLIC_KEY_BYTES]) -> bool {
+    // Compare from the most significant byte down.
+    bytes.iter().rev().cmp(FIELD_PRIME.iter().rev()) == std::cmp::Ordering::Less
 }
 
 /// A stored form of `kind` holding `fields`, in an allocation sized once so
@@ -733,6 +762,36 @@ mod tests {
         assert!(!SignedStatement::DeviceEnrolment.verify(&identity, &[b"onet", b"wo"], &signature));
     }
 
+    /// One key, one byte string: aliases of a key (X25519's ignored top bit,
+    /// either encoding at or above the field prime) are refused.
+    #[test]
+    fn public_key_checks_refuse_non_canonical_encodings() {
+        let (keys, _) = AccountKeys::generate().expect("rng");
+        let public = keys.public_keys();
+        let mut top_bit = public.encryption;
+        top_bit[PUBLIC_KEY_BYTES - 1] ^= 0x80;
+        assert!(!x25519_public_key_is_usable(&top_bit));
+        // p + 9: the X25519 base point's u, unreduced (0xed + 9 carries
+        // nothing).
+        let mut base_plus_p = FIELD_PRIME;
+        base_plus_p[0] += 9;
+        assert!(!x25519_public_key_is_usable(&base_plus_p));
+        let mut base = [0u8; PUBLIC_KEY_BYTES];
+        base[0] = 9;
+        assert!(x25519_public_key_is_usable(&base));
+        assert!(!x25519_public_key_is_usable(&FIELD_PRIME));
+        // Ed25519: y at or above the prime, with either sign bit.
+        for offset in [3u8, 4, 9, 14] {
+            let mut alias = FIELD_PRIME;
+            alias[0] = 0xed + offset;
+            for sign in [0, 0x80] {
+                alias[PUBLIC_KEY_BYTES - 1] = 0x7f | sign;
+                assert!(!ed25519_public_key_is_usable(&alias), "p + {offset}");
+            }
+        }
+        assert!(ed25519_public_key_is_usable(&public.identity));
+    }
+
     #[test]
     fn public_key_checks_refuse_small_order_points() {
         assert!(!ed25519_public_key_is_usable(&IDENTITY_POINT));
@@ -749,6 +808,56 @@ mod tests {
         point[0] = 1;
         point
     };
+
+    /// The stored forms' bytes, pinned with literal headers (version 1;
+    /// kinds `A`, `S`, `V`) so a change to the format can't pass unnoticed:
+    /// every existing device's keys would stop reading. Also pins the
+    /// recovery key's derivation from its secret.
+    #[test]
+    fn stored_forms_known_answers() {
+        let recovery = RecoverySecret::from_bytes(&[0x33; RECOVERY_SECRET_BYTES]);
+        assert_eq!(hex(&recovery.public_key()), KAT_RECOVERY_PUBLIC);
+
+        let mut account_form = vec![0x01, 0x41];
+        account_form.extend_from_slice(&[0x11; SECRET_KEY_BYTES]);
+        account_form.extend_from_slice(&[0x22; SECRET_KEY_BYTES]);
+        account_form.extend_from_slice(&recovery.public_key());
+        let account = AccountKeys::from_stored(&account_form).expect("pinned account form");
+        let public = account.public_keys();
+        assert_eq!(hex(&public.identity), KAT_IDENTITY);
+        assert_eq!(hex(&public.encryption), KAT_ENCRYPTION);
+        assert_eq!(account.to_stored().as_slice(), account_form.as_slice());
+
+        let mut sync_form = vec![0x01, 0x53];
+        sync_form.extend_from_slice(&[0x44; SECRET_KEY_BYTES]);
+        sync_form.extend_from_slice(&[0x55; SECRET_KEY_BYTES]);
+        let sync = DeviceSyncKeys::from_stored(&sync_form).expect("pinned sync form");
+        assert_eq!(hex(&sync.signing_public_key()), KAT_SIGNING);
+        assert_eq!(hex(&sync.relay_public_key()), KAT_RELAY);
+        assert_eq!(sync.to_stored().as_slice(), sync_form.as_slice());
+
+        let mut vault_form = vec![0x01, 0x56];
+        vault_form.extend_from_slice(&[0x66; SECRET_KEY_BYTES]);
+        let vault = DeviceVaultKey::from_stored(&vault_form).expect("pinned vault form");
+        assert_eq!(hex(&vault.public_key()), KAT_VAULT);
+        assert_eq!(vault.to_stored().as_slice(), vault_form.as_slice());
+    }
+
+    const KAT_RECOVERY_PUBLIC: &str =
+        "85dd34bca900fd4bc10106af65de65c60a810d87fb7ceccd7f1347059f053bf0";
+    const KAT_IDENTITY: &str = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737";
+    const KAT_ENCRYPTION: &str = "0faa684ed28867b97f4a6a2dee5df8ce974e76b7018e3f22a1c4cf2678570f20";
+    const KAT_SIGNING: &str = "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48";
+    const KAT_RELAY: &str = "38ab664bd86f77d7e66bdd9ae0792913a94fd8b33a1260027e4b46c1f4884c67";
+    const KAT_VAULT: &str = "219e4d800da968d2a5fcb009c784f4746c7138edb9ee4844b739e830b05cf424";
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        bytes.iter().fold(String::new(), |mut out, byte| {
+            write!(out, "{byte:02x}").expect("writing to a String");
+            out
+        })
+    }
 
     #[test]
     fn recovery_secret_debug_is_redacted() {

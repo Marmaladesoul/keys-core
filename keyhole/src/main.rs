@@ -126,11 +126,12 @@ enum CeilingArg {
     MemoryConstrained,
 }
 
-/// Stand-in transport endpoint and author ids for the account verbs: any 32
-/// bytes do, since nothing dials them.
+/// Stand-in transport endpoint and author ids for the account verbs. Nothing
+/// dials them, but an enrolment only names usable Ed25519 keys, so these are
+/// the public keys of the fixed seeds `[0x77; 32]` and `[0x88; 32]`.
 const DEFAULT_ENDPOINT_HEX: &str =
-    "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1";
-const DEFAULT_AUTHOR_HEX: &str = "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7";
+    "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7";
+const DEFAULT_AUTHOR_HEX: &str = "b2491d9502ae28630a2bacb2e0c74510ffcdd328c334ff3e1393e75b2d31e7dc";
 
 #[derive(Subcommand)]
 enum Command {
