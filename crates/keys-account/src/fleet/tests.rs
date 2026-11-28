@@ -906,6 +906,39 @@ fn a_removed_devices_ids_are_never_enrolled_again() {
 }
 
 #[test]
+fn a_removed_devices_ids_stay_spent_once_its_enrolment_is_gone() {
+    let fleet = Fleet::new();
+    let mut entries = fleet.enrolled();
+    entries.push(fleet.own(
+        &fleet.alice,
+        2,
+        &FleetRecord::Tombstone(
+            Tombstone::sign(&fleet.account, &fleet.bob.enrolment.device_id()).expect("usable id"),
+        ),
+    ));
+    let first = fleet.read(entries);
+    // Bob overwrites his own enrolment, and the account then enrols Carol
+    // on his author by mistake: a reader that kept the first read still
+    // refuses her.
+    let carol = DeviceKeys::generate().expect("rng");
+    let on_bobs_author = DeviceEnrolment::sign(
+        &fleet.account,
+        carol.public_keys(),
+        usable_ed25519(),
+        fleet.bob.author,
+    )
+    .expect("usable keys");
+    let mut later = first.kept.clone();
+    later.push(fleet.own(&fleet.alice, 3, &FleetRecord::Enrolment(on_bobs_author)));
+    let read = fleet.read(later);
+    assert_eq!(device_ids(&read), [fleet.alice.enrolment.device_id()]);
+    assert_eq!(
+        reasons(&read),
+        [FleetRefused::Clashing, FleetRefused::Removed]
+    );
+}
+
+#[test]
 fn what_a_device_says_about_itself_is_only_its_own() {
     let fleet = Fleet::new();
     let mut entries = fleet.enrolled();

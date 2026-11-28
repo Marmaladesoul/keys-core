@@ -164,8 +164,9 @@ pub struct FleetRead {
     pub view: FleetView,
     /// The entries to keep and pass back in next time: for a device's word,
     /// the newest per signer and slot; one entry per enrolment and tombstone
-    /// however many copies there are; and the one carrying each vault's
-    /// highest epoch. Keep the entries themselves, not where they sat in the
+    /// however many copies there are, a removed device's enrolment included
+    /// (it counts for nothing, but keeps its ids spent); and the one
+    /// carrying each vault's highest epoch. Keep the entries themselves, not where they sat in the
     /// document: what makes them hold is that their bytes come back, even
     /// once the document's copy is overwritten.
     pub kept: Vec<FleetEntry>,
@@ -215,6 +216,18 @@ pub fn read_fleet(
         })
         .collect();
     let clashing = clashing_enrolments(&opened);
+    // A removed device's enrolment counts for nothing, but is kept (one per
+    // slot, the least entry) so its ids stay spent even once the document's
+    // copy is gone: the removed device could delete that itself.
+    let mut spent: BTreeMap<Vec<u8>, FleetEntry> = BTreeMap::new();
+    for o in &opened {
+        if let FleetRecord::Enrolment(enrolment) = &o.record
+            && removed.contains(&enrolment.device_id())
+            && spent.get(&o.entry.key).is_none_or(|kept| o.entry < *kept)
+        {
+            spent.insert(o.entry.key.clone(), o.entry.clone());
+        }
+    }
     let roster_devices: BTreeMap<DeviceId, DeviceEnrolment> = opened
         .iter()
         .filter_map(|o| match &o.record {
@@ -238,7 +251,12 @@ pub fn read_fleet(
 
     let kept_opened = kept_entries(counting);
     let view = view(&kept_opened, roster_devices, removed);
-    let kept = kept_opened.into_iter().map(|o| o.entry).collect();
+    let mut kept: Vec<FleetEntry> = kept_opened
+        .into_iter()
+        .map(|o| o.entry)
+        .chain(spent.into_values())
+        .collect();
+    kept.sort();
     FleetRead {
         view,
         kept,
