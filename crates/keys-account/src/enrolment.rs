@@ -235,15 +235,13 @@ fn check_device_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{kat_account, kat_device_sync, stored, unhex, usable_ed25519};
     use keys_pairing::DeviceKeys;
 
     /// Stand-ins for the transport's endpoint and author ids: any usable
     /// Ed25519 keys, here other devices' signing keys.
     fn transport_ids() -> ([u8; PUBLIC_KEY_BYTES], [u8; PUBLIC_KEY_BYTES]) {
-        (
-            DeviceKeys::generate().expect("rng").public_keys().signing,
-            DeviceKeys::generate().expect("rng").public_keys().signing,
-        )
+        (usable_ed25519(), usable_ed25519())
     }
 
     /// `key` plus a point of order 8, as an X25519 key.
@@ -425,20 +423,9 @@ mod tests {
     /// Computed independently of this crate.
     #[test]
     fn enrolment_known_answer() {
-        use keys_pairing::{DeviceSyncKeys, DeviceVaultKey, RecoverySecret};
-        let stored = |kind: u8, fields: &[[u8; PUBLIC_KEY_BYTES]]| {
-            let mut form = vec![0x01, kind];
-            for field in fields {
-                form.extend_from_slice(field);
-            }
-            form
-        };
-        let recovery_public = RecoverySecret::from_bytes(&[0x33; 16]).public_key();
-        let account =
-            AccountKeys::from_stored(&stored(b'A', &[[0x11; 32], [0x22; 32], recovery_public]))
-                .expect("account form");
-        let sync = DeviceSyncKeys::from_stored(&stored(b'S', &[[0x44; 32], [0x55; 32]]))
-            .expect("sync form");
+        use keys_pairing::DeviceVaultKey;
+        let account = kat_account();
+        let sync = kat_device_sync();
         let vault = DeviceVaultKey::from_stored(&stored(b'V', &[[0x66; 32]])).expect("vault form");
         let device = DevicePublicKeys {
             signing: sync.signing_public_key(),
@@ -472,13 +459,6 @@ mod tests {
         "00c3fa0447ed04ab5887c793456cc29f8df52c4bb71a2e15150e577b4bd4be37",
         "bf21398e204f0c620cd29bb0ddce2433d378f154f1ec58d3543ee13ea1a83504",
     );
-
-    fn unhex(text: &str) -> Vec<u8> {
-        (0..text.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
-            .collect()
-    }
 
     /// The account's signature over an enrolment is no other statement's.
     #[test]

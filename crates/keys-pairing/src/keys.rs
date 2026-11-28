@@ -113,10 +113,7 @@ impl SignedStatement {
 
     /// The bytes signed for this statement over `fields`.
     fn message(self, fields: &[&[u8]]) -> Vec<u8> {
-        let mut parts = Vec::with_capacity(fields.len() + 1);
-        parts.push(self.label());
-        parts.extend_from_slice(fields);
-        lv_cat(&parts)
+        labelled_message(self.label(), fields)
     }
 
     /// Whether `signature` is the account identity key `identity`'s
@@ -130,6 +127,45 @@ impl SignedStatement {
     ) -> bool {
         verify_signature(identity, &self.message(fields), signature)
     }
+}
+
+/// Everything a device signing key signs. Each statement is signed over
+/// `lv_cat(label, fields...)` with a label of its own, none of them shared
+/// with [`SignedStatement`], so nothing a device signs can be read as
+/// something the account identity key signed, or the other way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceStatement {
+    /// The head of a device's copy of a vault: which content it published,
+    /// in which document.
+    VaultHead,
+}
+
+impl DeviceStatement {
+    const fn label(self) -> &'static [u8] {
+        match self {
+            Self::VaultHead => b"keys device vault head",
+        }
+    }
+
+    /// Whether `signature` is the device signing key `signer`'s signature
+    /// of this statement over `fields`, verified strictly.
+    #[must_use]
+    pub fn verify(
+        self,
+        signer: &[u8; PUBLIC_KEY_BYTES],
+        fields: &[&[u8]],
+        signature: &[u8; SIGNATURE_BYTES],
+    ) -> bool {
+        verify_signature(signer, &labelled_message(self.label(), fields), signature)
+    }
+}
+
+/// `lv_cat(label, fields...)`: the bytes a statement's signature covers.
+fn labelled_message(label: &[u8], fields: &[&[u8]]) -> Vec<u8> {
+    let mut parts = Vec::with_capacity(fields.len() + 1);
+    parts.push(label);
+    parts.extend_from_slice(fields);
+    lv_cat(&parts)
 }
 
 /// Whether `key` is a usable Ed25519 public key: the canonical encoding of a
@@ -524,6 +560,19 @@ impl DeviceSyncKeys {
         self.relay.public_key()
     }
 
+    /// Signs `statement` over `fields` with the device signing key. The
+    /// signing key signs nothing else.
+    #[must_use]
+    pub fn sign_statement(
+        &self,
+        statement: DeviceStatement,
+        fields: &[&[u8]],
+    ) -> [u8; SIGNATURE_BYTES] {
+        self.signing
+            .sign(&labelled_message(statement.label(), fields))
+            .to_bytes()
+    }
+
     /// The stored form: signing seed, relay secret.
     #[must_use]
     pub fn to_stored(&self) -> Zeroizing<Vec<u8>> {
@@ -614,6 +663,30 @@ mod tests {
         assert!(!statement.verify(&identity, &[b"messagf"], &signature));
         let (other, _) = AccountKeys::generate().expect("rng");
         assert!(!statement.verify(&other.public_keys().identity, &[b"message"], &signature));
+    }
+
+    #[test]
+    fn device_statements_verify_bind_the_message_and_stay_apart_from_the_account() {
+        let device = DeviceKeys::generate().expect("rng");
+        let signer = device.public_keys().signing;
+        let statement = DeviceStatement::VaultHead;
+        let signature = device.sync_keys().sign_statement(statement, &[b"message"]);
+        assert!(statement.verify(&signer, &[b"message"], &signature));
+        assert!(!statement.verify(&signer, &[b"messagf"], &signature));
+        let other = DeviceKeys::generate().expect("rng").public_keys().signing;
+        assert!(!statement.verify(&other, &[b"message"], &signature));
+
+        // No device statement's label is an account statement's, so a
+        // device signature can never pass as the account's over the same
+        // fields, even if the two keys were one.
+        let device_labels = [DeviceStatement::VaultHead.label()];
+        let account_labels = [
+            SignedStatement::PersonKeys.label(),
+            SignedStatement::DeviceEnrolment.label(),
+        ];
+        for label in device_labels {
+            assert!(!account_labels.contains(&label));
+        }
     }
 
     #[test]

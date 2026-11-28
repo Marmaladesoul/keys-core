@@ -11,11 +11,26 @@
 //!   record, and read back, with check characters that point at a typo.
 //! - [`enrolment`]: the account-signed statement that makes a device one of
 //!   the account's.
+//! - [`statement`]: what a device writes into the account's documents,
+//!   signed by its own signing key, which its enrolment certifies.
+//! - [`vault_head`]: a vault document's signed head records, the account's
+//!   roster of devices, and the checks a reader makes before it fetches
+//!   anything.
 
 pub mod enrolment;
 pub mod recovery_code;
+pub mod statement;
+pub mod vault_head;
+
+#[cfg(test)]
+mod test_support;
 
 pub use enrolment::{DeviceEnrolment, EnrolmentError};
 pub use recovery_code::{
     RecoveryCodeError, check_recovery_code, parse_recovery_code, recovery_code,
+};
+pub use statement::{Placement, Statement, StatementError, StatementKind, next_sequence};
+pub use vault_head::{
+    AcceptedHead, HeadIgnored, HeadRefused, Roster, RosterError, VaultHead, accept_vault_head,
+    head_to_fetch, sign_vault_head,
 };

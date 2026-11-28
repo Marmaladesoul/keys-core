@@ -27,8 +27,10 @@ mod totp;
 mod vault_create;
 
 pub use account::{
-    AccountFfiError, DeviceEnrolmentRecord, DeviceSyncKeys, DeviceVaultKey, RecoveryCodeCheck,
-    open_device_enrolment, read_recovery_code,
+    AccountFfiError, AccountRoster, DeviceEnrolmentRecord, DeviceSyncKeys, DeviceVaultKey,
+    RecoveryCodeCheck, VaultHeadCheck, VaultHeadFetch, VaultHeadIgnored, VaultHeadRefusal,
+    next_statement_sequence, open_device_enrolment, read_recovery_code, vault_copy_entry_key,
+    vault_head_entry_key,
 };
 pub use db_key_provider::{VaultDbKeyProvider, VaultDbKeyProviderError};
 pub use engine::{

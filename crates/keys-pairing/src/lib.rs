@@ -62,8 +62,8 @@ pub use invite::{
     Invite, InviteBook, InviteError, InviteId, InviteRecord, IssueError, KnockOutcome,
 };
 pub use keys::{
-    AccountKeys, AccountPublicKeys, DeviceKeys, DevicePublicKeys, DeviceSyncKeys, DeviceVaultKey,
-    RecoverySecret, SignedStatement, StoredKeysError,
+    AccountKeys, AccountPublicKeys, DeviceKeys, DevicePublicKeys, DeviceStatement, DeviceSyncKeys,
+    DeviceVaultKey, RecoverySecret, SignedStatement, StoredKeysError,
 };
 pub use link::{LinkError, PairingLink};
 pub use protocol::{Credentials, PROTOCOL_VERSION, PairingKind, RefuseReason, RunFailure};

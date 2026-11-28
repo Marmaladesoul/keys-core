@@ -1,5 +1,6 @@
 //! Account identity across the FFI: keeping the account and device keys in
-//! the platform's secure storage, the recovery code, and device enrolment.
+//! the platform's secure storage, the recovery code, device enrolment, and
+//! the device-signed head records of a vault document.
 //!
 //! The key objects are pairing's ([`PairingAccountKeys`],
 //! [`PairingDeviceKeys`]), since a pairing binds them; this module adds what
@@ -26,7 +27,12 @@
 
 use std::sync::Arc;
 
-use keys_account::{DeviceEnrolment, EnrolmentError, RecoveryCodeError};
+use keys_account::statement::DOC_ID_BYTES;
+use keys_account::vault_head::{CONTENT_HASH_BYTES, VAULT_COPY_KEY, VAULT_HEAD_KEY};
+use keys_account::{
+    DeviceEnrolment, EnrolmentError, HeadIgnored, HeadRefused, RecoveryCodeError, Roster,
+    RosterError, StatementError, VaultHead,
+};
 use keys_pairing as kp;
 use zeroize::Zeroizing;
 
@@ -57,6 +63,10 @@ pub enum AccountFfiError {
     /// The enrolment names a key that can't be used.
     #[error("the enrolment names a key that can't be used")]
     EnrolmentUnusableKey,
+    /// Two enrolments in a roster share a device id, endpoint id or author
+    /// id.
+    #[error("two enrolments share a key")]
+    RosterSharedKey,
 }
 
 impl From<kp::StoredKeysError> for AccountFfiError {
@@ -78,9 +88,23 @@ impl From<EnrolmentError> for AccountFfiError {
     }
 }
 
+impl From<RosterError> for AccountFfiError {
+    fn from(error: RosterError) -> Self {
+        match error {
+            RosterError::Enrolment(error) => error.into(),
+            RosterError::SharedKey => Self::RosterSharedKey,
+        }
+    }
+}
+
+/// A 32-byte id or key: a public key, an author or document id, a content
+/// hash. All four are 32 bytes in this format.
 fn key32(bytes: &[u8]) -> Result<[u8; kp::keys::PUBLIC_KEY_BYTES], AccountFfiError> {
     crate::pairing::key32_or(bytes, AccountFfiError::InvalidKeyLength)
 }
+
+const _: () = assert!(DOC_ID_BYTES == kp::keys::PUBLIC_KEY_BYTES);
+const _: () = assert!(CONTENT_HASH_BYTES == kp::keys::PUBLIC_KEY_BYTES);
 
 // ─── account keys ───────────────────────────────────────────────────────────
 
@@ -246,6 +270,33 @@ impl DeviceSyncKeys {
     pub fn relay_public_key(&self) -> Vec<u8> {
         self.inner.relay_public_key().to_vec()
     }
+
+    /// This device's head record for its copy of a vault in document
+    /// `doc_id`: the copy's `content_hash` and `size_bytes`, signed with
+    /// sequence `sequence` (see [`next_statement_sequence`]). Write it under
+    /// [`vault_head_entry_key`], and the copy itself under
+    /// [`vault_copy_entry_key`], both with this device's author.
+    ///
+    /// # Errors
+    /// [`AccountFfiError::InvalidKeyLength`] if `doc_id` or `content_hash`
+    /// isn't 32 bytes.
+    pub fn sign_vault_head(
+        &self,
+        doc_id: Vec<u8>,
+        sequence: u64,
+        content_hash: Vec<u8>,
+        size_bytes: u64,
+    ) -> Result<Vec<u8>, AccountFfiError> {
+        Ok(keys_account::sign_vault_head(
+            &self.inner,
+            &key32(&doc_id)?,
+            sequence,
+            VaultHead {
+                content_hash: key32(&content_hash)?,
+                size: size_bytes,
+            },
+        ))
+    }
 }
 
 /// A device's vault key, read back from its stored form.
@@ -308,4 +359,224 @@ pub fn open_device_enrolment(
         endpoint_id: enrolment.endpoint_id().to_vec(),
         author_id: enrolment.author_id().to_vec(),
     })
+}
+
+// ─── vault document heads ───────────────────────────────────────────────────
+
+/// The entry key every device writes its head record under in a vault
+/// document. Entries are kept per author and key, so all devices share it.
+#[uniffi::export]
+#[must_use]
+pub fn vault_head_entry_key() -> Vec<u8> {
+    VAULT_HEAD_KEY.to_vec()
+}
+
+/// The entry key every device writes its copy of the vault under.
+#[uniffi::export]
+#[must_use]
+pub fn vault_copy_entry_key() -> Vec<u8> {
+    VAULT_COPY_KEY.to_vec()
+}
+
+/// The sequence for this device's next statement in a place: above
+/// `previous` (the sequence of its last statement there, if it knows it,
+/// say from its own head read back from the document) and no lower than
+/// `now_micros`, its clock in microseconds since the Unix epoch. `None` once
+/// `previous` is the last sequence there is: nothing more can be published
+/// in that place.
+#[uniffi::export]
+#[must_use]
+pub fn next_statement_sequence(previous: Option<u64>, now_micros: u64) -> Option<u64> {
+    keys_account::next_sequence(previous, now_micros)
+}
+
+/// The devices of one account, each from an enrolment checked against the
+/// account identity key: what binds a document author to a device.
+#[derive(uniffi::Object)]
+pub struct AccountRoster {
+    inner: Roster,
+}
+
+/// Whether to fetch an entry as a head record.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum VaultHeadFetch {
+    /// Fetch it (within the size the entry records), then check it with
+    /// [`AccountRoster::accept_vault_head`]. `device_id` is the device its
+    /// author is bound to.
+    Fetch { device_id: Vec<u8> },
+    /// Leave it unfetched.
+    Ignore { reason: VaultHeadIgnored },
+}
+
+/// Why an entry is left unfetched.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultHeadIgnored {
+    /// Not under the head entry key.
+    NotAHead,
+    /// Written by an author no device in the roster is bound to.
+    UnboundAuthor,
+    /// It records a size no head can have.
+    TooLarge,
+}
+
+/// The result of checking a fetched head record.
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
+pub enum VaultHeadCheck {
+    /// Act on it: fetch the copy by `content_hash`, with `size_bytes` as the
+    /// fetch's cap, and once the copy has arrived keep `sequence` as the
+    /// last accepted from `device_id` in this document (not before: a copy
+    /// that didn't arrive leaves the head to be read again). `device_id` is
+    /// the copy's owner.
+    Accepted {
+        device_id: Vec<u8>,
+        sequence: u64,
+        content_hash: Vec<u8>,
+        size_bytes: u64,
+    },
+    /// Ignore it.
+    Refused { reason: VaultHeadRefusal },
+}
+
+/// Why a fetched head record was refused.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultHeadRefusal {
+    /// Not a statement's byte form.
+    Malformed,
+    /// Not signed by its signer for this document's head: forged, damaged,
+    /// or moved from another document.
+    NotSigned,
+    /// Written by an author no device in the roster is bound to.
+    UnboundAuthor,
+    /// A statement, but not a head.
+    NotAHead,
+    /// Signed by a device other than the one its author is bound to.
+    NotItsDevice,
+    /// Not newer than the last head accepted from that device here.
+    NotNewer,
+    /// It names a copy over the caller's cap.
+    CopyTooLarge,
+}
+
+impl From<HeadIgnored> for VaultHeadIgnored {
+    fn from(reason: HeadIgnored) -> Self {
+        match reason {
+            HeadIgnored::NotAHead => Self::NotAHead,
+            HeadIgnored::UnboundAuthor => Self::UnboundAuthor,
+            HeadIgnored::TooLarge => Self::TooLarge,
+        }
+    }
+}
+
+impl From<HeadRefused> for VaultHeadRefusal {
+    fn from(reason: HeadRefused) -> Self {
+        match reason {
+            HeadRefused::Statement(StatementError::Malformed | StatementError::TooLarge) => {
+                Self::Malformed
+            }
+            HeadRefused::Statement(StatementError::NotSigned) => Self::NotSigned,
+            HeadRefused::UnboundAuthor => Self::UnboundAuthor,
+            HeadRefused::NotAHead => Self::NotAHead,
+            HeadRefused::NotItsDevice => Self::NotItsDevice,
+            HeadRefused::NotNewer => Self::NotNewer,
+            HeadRefused::CopyTooLarge => Self::CopyTooLarge,
+        }
+    }
+}
+
+#[uniffi::export]
+impl AccountRoster {
+    /// Opens each of `enrolments` against the account whose identity key is
+    /// `account_identity`. One refused enrolment refuses the whole roster.
+    ///
+    /// # Errors
+    /// [`AccountFfiError::InvalidKeyLength`] if `account_identity` isn't 32
+    /// bytes; an enrolment's own refusal; or
+    /// [`AccountFfiError::RosterSharedKey`].
+    #[uniffi::constructor]
+    pub fn open(
+        account_identity: Vec<u8>,
+        enrolments: Vec<Vec<u8>>,
+    ) -> Result<Arc<Self>, AccountFfiError> {
+        Ok(Arc::new(Self {
+            inner: Roster::open(
+                &key32(&account_identity)?,
+                enrolments.iter().map(Vec::as_slice),
+            )?,
+        }))
+    }
+
+    /// Step one, from an entry's metadata alone: whether the entry at
+    /// `entry_key`, written by `author` and recording `size_bytes`, is to be
+    /// fetched as a head record.
+    ///
+    /// # Errors
+    /// [`AccountFfiError::InvalidKeyLength`] if `author` isn't 32 bytes.
+    pub fn head_to_fetch(
+        &self,
+        author: Vec<u8>,
+        entry_key: Vec<u8>,
+        size_bytes: u64,
+    ) -> Result<VaultHeadFetch, AccountFfiError> {
+        Ok(
+            match keys_account::head_to_fetch(&self.inner, &key32(&author)?, &entry_key, size_bytes)
+            {
+                Ok(device_id) => VaultHeadFetch::Fetch {
+                    device_id: device_id.to_vec(),
+                },
+                Err(reason) => VaultHeadFetch::Ignore {
+                    reason: reason.into(),
+                },
+            },
+        )
+    }
+
+    /// Step two: whether `head`, the content of a head entry in document
+    /// `doc_id` written by `author`, is one to act on. `last_accepted` is
+    /// the sequence of the last head accepted from the same device in this
+    /// document; `max_copy_bytes` is the most the caller will fetch for a
+    /// copy.
+    ///
+    /// # Errors
+    /// [`AccountFfiError::InvalidKeyLength`] if `doc_id` or `author` isn't
+    /// 32 bytes.
+    pub fn accept_vault_head(
+        &self,
+        doc_id: Vec<u8>,
+        author: Vec<u8>,
+        head: Vec<u8>,
+        last_accepted: Option<u64>,
+        max_copy_bytes: u64,
+    ) -> Result<VaultHeadCheck, AccountFfiError> {
+        Ok(
+            match keys_account::accept_vault_head(
+                &self.inner,
+                &key32(&doc_id)?,
+                &key32(&author)?,
+                &head,
+                last_accepted,
+                max_copy_bytes,
+            ) {
+                Ok(accepted) => VaultHeadCheck::Accepted {
+                    device_id: accepted.device_id.to_vec(),
+                    sequence: accepted.sequence,
+                    content_hash: accepted.head.content_hash.to_vec(),
+                    size_bytes: accepted.head.size,
+                },
+                Err(reason) => VaultHeadCheck::Refused {
+                    reason: reason.into(),
+                },
+            },
+        )
+    }
+
+    /// The ids of the roster's devices, in the order their enrolments were
+    /// given.
+    #[must_use]
+    pub fn device_ids(&self) -> Vec<Vec<u8>> {
+        self.inner
+            .devices()
+            .iter()
+            .map(|d| d.device_id().to_vec())
+            .collect()
+    }
 }

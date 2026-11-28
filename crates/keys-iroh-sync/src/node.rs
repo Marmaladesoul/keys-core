@@ -635,6 +635,68 @@ impl IrohNode {
         self.fetch_blob_with_deadline(doc_id, hash_hex, max_size_bytes, FETCH_BLOB_DEADLINE)
             .await
     }
+
+    /// Fetch content the caller has checked for itself, whatever the doc's
+    /// [`DownloadPolicy`], and return its bytes, waiting at most
+    /// `FETCH_BLOB_DEADLINE` (60s).
+    ///
+    /// This is how a doc joined with nothing downloaded by default is read:
+    /// the caller lists the entries, decides from what it trusts (who wrote
+    /// an entry, a signed record naming this hash and its size) that the
+    /// content is wanted, and asks for exactly that hash. The request goes
+    /// to the doc's peers at once, since the doc engine may never fetch it.
+    ///
+    /// The reach is still bounded by the doc: only a hash named by one of
+    /// its entries whose recorded size is within `max_size_bytes` is
+    /// requested, so a caller can't be made to fetch arbitrary content, and
+    /// an entry recording a size over the cap is never requested. The cap
+    /// always applies to what is read into memory: the fetch fails as soon
+    /// as the blob's validated size is known to exceed it, and its own
+    /// transfer is aborted when the call returns. It doesn't bound disk: an
+    /// entry can record a small size for a large blob, and as
+    /// [`Self::fetch_blob_with_deadline`] describes, the validated size can
+    /// be known only once much of it has landed, so up to the deadline's
+    /// worth of transfer can reach disk first. Ask only for a hash whose
+    /// writer the caller trusts to have recorded its size honestly.
+    pub async fn fetch_checked_blob(
+        &self,
+        doc_id: String,
+        hash_hex: String,
+        max_size_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        self.fetch_blob_within(
+            doc_id,
+            hash_hex,
+            FETCH_BLOB_DEADLINE,
+            FetchReach::Checked { max_size_bytes },
+        )
+        .await
+    }
+}
+
+/// Which of a doc's entries let a fetch ask the doc's peers for a hash, and
+/// what bounds the fetch.
+#[derive(Debug, Clone, Copy)]
+enum FetchReach {
+    /// An entry the doc's [`DownloadPolicy`] admits: content the doc engine
+    /// would have fetched itself. `max_size_bytes` of `0` means no cap (the
+    /// [`IrohNode::fetch_blob`] contract).
+    Policy { max_size_bytes: u64 },
+    /// An entry whose recorded size is within `max_size_bytes`, whatever the
+    /// policy: content the caller checked itself. The cap always applies.
+    Checked { max_size_bytes: u64 },
+}
+
+impl FetchReach {
+    /// The most this fetch will read, if anything bounds it.
+    fn cap(self) -> Option<u64> {
+        match self {
+            Self::Policy { max_size_bytes: 0 } => None,
+            Self::Policy { max_size_bytes } | Self::Checked { max_size_bytes } => {
+                Some(max_size_bytes)
+            }
+        }
+    }
 }
 
 // Deliberately not `#[uniffi::export]`: the `Duration` deadline is a
@@ -692,6 +754,25 @@ impl IrohNode {
         max_size_bytes: u64,
         deadline: std::time::Duration,
     ) -> Result<Vec<u8>> {
+        self.fetch_blob_within(
+            doc_id,
+            hash_hex,
+            deadline,
+            FetchReach::Policy { max_size_bytes },
+        )
+        .await
+    }
+
+    /// The fetch behind [`Self::fetch_blob_with_deadline`] and
+    /// [`Self::fetch_checked_blob`]; `reach` says which entries may name the
+    /// hash for a request to go to the doc's peers, and what caps it.
+    async fn fetch_blob_within(
+        &self,
+        doc_id: String,
+        hash_hex: String,
+        deadline: std::time::Duration,
+        reach: FetchReach,
+    ) -> Result<Vec<u8>> {
         use iroh_blobs::api::blobs::BlobStatus;
 
         // Doc id is required so we can fail fast on "you forgot to
@@ -734,10 +815,18 @@ impl IrohNode {
             .map_err(SyncError::from)?;
         let deadline_at = tokio::time::Instant::now() + deadline;
         // A transfer this call requested itself; dropping it (whichever way
-        // the call returns) aborts it. The first request waits an interval,
-        // so a download the engine has only just queued isn't duplicated.
+        // the call returns) aborts it. Under the policy the first request
+        // waits an interval, so a download the engine has only just queued
+        // isn't duplicated; content the caller checked is requested at once,
+        // since the engine may never fetch it.
         let mut requested: Option<AbortOnDropHandle<()>> = None;
-        let mut next_request_at = tokio::time::Instant::now() + MISSING_BLOB_REQUEST_INTERVAL;
+        let mut next_request_at = match reach {
+            FetchReach::Policy { .. } => {
+                tokio::time::Instant::now() + MISSING_BLOB_REQUEST_INTERVAL
+            }
+            FetchReach::Checked { .. } => tokio::time::Instant::now(),
+        };
+        let cap = reach.cap();
         loop {
             let status = self
                 .blobs_store
@@ -749,7 +838,7 @@ impl IrohNode {
             let request_live = requested.as_ref().is_some_and(|r| !r.is_finished());
             if incomplete && !request_live && tokio::time::Instant::now() >= next_request_at {
                 next_request_at = tokio::time::Instant::now() + MISSING_BLOB_REQUEST_INTERVAL;
-                requested = self.request_missing_blob(&doc, hash).await;
+                requested = self.request_missing_blob(&doc, hash, reach).await;
             }
             // Reject as soon as the true size is known, without reading
             // the blob into memory. A partial entry carries a size only
@@ -760,16 +849,21 @@ impl IrohNode {
             // having: the size it reports is bao-tree-committed, so a
             // publisher cannot understate it without failing
             // verification.
-            match status {
-                BlobStatus::Partial {
-                    size: Some(validated_size),
-                } if max_size_bytes > 0 && validated_size > max_size_bytes => {
+            match (&status, cap) {
+                (
+                    BlobStatus::Partial {
+                        size: Some(validated_size),
+                    },
+                    Some(max_size_bytes),
+                ) if *validated_size > max_size_bytes => {
                     return Err(SyncError::Generic(format!(
                         "blob {hash_hex} has validated size {validated_size} bytes, exceeds max_size_bytes {max_size_bytes}"
                     )));
                 }
-                BlobStatus::Complete { size } => {
-                    if max_size_bytes > 0 && size > max_size_bytes {
+                (BlobStatus::Complete { size }, cap) => {
+                    if let Some(max_size_bytes) = cap
+                        && *size > max_size_bytes
+                    {
                         return Err(SyncError::Generic(format!(
                             "blob {hash_hex} completed at {size} bytes, exceeds max_size_bytes {max_size_bytes}"
                         )));
@@ -850,9 +944,11 @@ impl IrohNode {
     /// entry synced — only lands in the engine's in-memory "missing" set:
     /// nothing retries it, and a restart forgets it.
     ///
-    /// Only a hash named by an entry the doc's [`DownloadPolicy`] admits is
-    /// requested, i.e. content the engine would have pulled down itself, so
-    /// this adds no reach beyond the policy's.
+    /// Under [`FetchReach::Policy`] only a hash named by an entry the doc's
+    /// [`DownloadPolicy`] admits is requested, i.e. content the engine would
+    /// have pulled down itself, so this adds no reach beyond the policy's.
+    /// Under [`FetchReach::Checked`] it is also how content the caller
+    /// checked is fetched at all: a hash named by an entry within the cap.
     ///
     /// Best effort: returns the transfer (aborted when dropped), or `None`
     /// when there is nothing to request or the lookup failed — the caller
@@ -861,8 +957,9 @@ impl IrohNode {
         &self,
         doc: &Doc,
         hash: iroh_blobs::Hash,
+        reach: FetchReach,
     ) -> Option<AbortOnDropHandle<()>> {
-        match self.admitted_providers(doc, hash).await {
+        match self.admitted_providers(doc, hash, reach).await {
             Ok(providers) if !providers.is_empty() => {
                 tracing::debug!(
                     doc = %doc.id().fmt_short(),
@@ -890,19 +987,29 @@ impl IrohNode {
     }
 
     /// The doc's sync peers to ask for `hash` — empty unless an entry in
-    /// the doc names `hash` and the doc's download policy admits it.
+    /// the doc names `hash` and `reach` admits that entry.
     async fn admitted_providers(
         &self,
         doc: &Doc,
         hash: iroh_blobs::Hash,
+        reach: FetchReach,
     ) -> Result<Vec<PublicKey>> {
         use iroh_docs::store::Query;
 
-        let policy = doc
-            .get_download_policy()
-            .await
-            .context("download policy")
-            .map_err(SyncError::from)?;
+        // What an entry naming `hash` must satisfy for it to be requested.
+        enum Admits {
+            Policy(iroh_docs::store::DownloadPolicy),
+            WithinCap(u64),
+        }
+        let admits = match reach {
+            FetchReach::Policy { .. } => Admits::Policy(
+                doc.get_download_policy()
+                    .await
+                    .context("download policy")
+                    .map_err(SyncError::from)?,
+            ),
+            FetchReach::Checked { max_size_bytes } => Admits::WithinCap(max_size_bytes),
+        };
         let entries = doc
             .get_many(Query::all().build())
             .await
@@ -914,7 +1021,11 @@ impl IrohNode {
             let entry = entry
                 .context("entry stream item")
                 .map_err(SyncError::from)?;
-            if entry.content_hash() == hash && policy.matches(&entry) {
+            let reachable = match &admits {
+                Admits::Policy(policy) => policy.matches(&entry),
+                Admits::WithinCap(max_size_bytes) => entry.content_len() <= *max_size_bytes,
+            };
+            if entry.content_hash() == hash && reachable {
                 admitted = true;
                 break;
             }
@@ -2717,6 +2828,96 @@ mod tests {
         assert!(
             matches!(status, iroh_blobs::api::blobs::BlobStatus::NotFound),
             "excluded content must not reach disk, got {status:?}"
+        );
+        publisher.shutdown().await.expect("shutdown");
+        subscriber.shutdown().await.expect("shutdown");
+    }
+
+    /// A checked fetch reads content a nothing-by-default doc excludes, and
+    /// asks at once rather than leaving it to the doc engine first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checked_fetch_reads_content_the_policy_excludes() {
+        let (publisher, _pb, _pd) = bind_test_node().await;
+        let (subscriber, _sb, _sd) = bind_test_node().await;
+        let payload = b"content the caller checked".to_vec();
+        let hash = iroh_blobs::Hash::new(&payload);
+
+        let body = async {
+            let doc_id = share_one_entry(
+                &publisher,
+                &subscriber,
+                b"copy",
+                &payload,
+                true,
+                DownloadPolicy::NothingExcept {
+                    key_prefixes: Vec::new(),
+                },
+            )
+            .await;
+            // Nothing was fetched by the doc engine.
+            assert!(matches!(
+                subscriber.blobs_store.status(hash).await.expect("status"),
+                iroh_blobs::api::blobs::BlobStatus::NotFound
+            ));
+            tokio::time::timeout(
+                MISSING_BLOB_REQUEST_INTERVAL,
+                subscriber.fetch_checked_blob(doc_id, hash.to_string(), payload.len() as u64),
+            )
+            .await
+        };
+        let fetched = tokio::time::timeout(Duration::from_secs(60), body)
+            .await
+            .expect("test finished in time")
+            .expect("requested at once, inside the policy's wait")
+            .expect("the checked fetch reads it");
+        assert_eq!(fetched, payload);
+        publisher.shutdown().await.expect("shutdown");
+        subscriber.shutdown().await.expect("shutdown");
+    }
+
+    /// A checked fetch never requests a hash whose entry records a size over
+    /// the cap, and the cap of a checked fetch is never "none": a cap of
+    /// zero admits only empty content.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checked_fetch_never_requests_an_entry_over_its_cap() {
+        let (publisher, _pb, _pd) = bind_test_node().await;
+        let (subscriber, _sb, _sd) = bind_test_node().await;
+        let payload = b"content bigger than the cap".to_vec();
+        let hash = iroh_blobs::Hash::new(&payload);
+
+        let body = async {
+            let doc_id = share_one_entry(
+                &publisher,
+                &subscriber,
+                b"copy",
+                &payload,
+                true,
+                DownloadPolicy::NothingExcept {
+                    key_prefixes: Vec::new(),
+                },
+            )
+            .await;
+            for cap in [0, payload.len() as u64 - 1] {
+                let fetched = subscriber
+                    .fetch_blob_within(
+                        doc_id.clone(),
+                        hash.to_string(),
+                        MISSING_BLOB_REQUEST_INTERVAL,
+                        FetchReach::Checked {
+                            max_size_bytes: cap,
+                        },
+                    )
+                    .await;
+                assert!(fetched.is_err(), "cap {cap}: an over-cap entry was fetched");
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), body)
+            .await
+            .expect("test finished in time");
+        let status = subscriber.blobs_store.status(hash).await.expect("status");
+        assert!(
+            matches!(status, iroh_blobs::api::blobs::BlobStatus::NotFound),
+            "over-cap content must not reach disk, got {status:?}"
         );
         publisher.shutdown().await.expect("shutdown");
         subscriber.shutdown().await.expect("shutdown");
