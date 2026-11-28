@@ -41,9 +41,9 @@ dependencies = [
 
 [[package]]
 name = "aes"
-version = "0.9.1"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1fc76eaeac4c9164506c466d4ffdd8ec9d0c5bf57ee97177c4d8eceb3a0e138"
+checksum = "fc0fc36d7440d015b45468ba08a21e80e056ebbd014c611c6298bb7503e04bd1"
 dependencies = [
  "cipher 0.5.2",
  "cpubits",
@@ -72,7 +72,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdf011db2e21ce0d575593d749db5554b47fed37aff429e4dc50bc91ac93a028"
 dependencies = [
  "aead 0.6.1",
- "aes 0.9.1",
+ "aes 0.9.4",
  "cipher 0.5.2",
  "ctr 0.10.1",
  "ghash 0.6.0",
@@ -2549,7 +2549,7 @@ name = "keepass-core"
 version = "0.0.0"
 source = "git+https://github.com/Marmaladesoul/keepass-core#1eb78e9b5e6a4a33fdb2696aa7aa16f73f884aa7"
 dependencies = [
- "aes 0.9.1",
+ "aes 0.9.4",
  "aes-gcm 0.11.0",
  "argon2",
  "base64",
@@ -2681,7 +2681,7 @@ dependencies = [
 name = "keys-pairing"
 version = "0.0.0"
 dependencies = [
- "aes 0.9.1",
+ "aes 0.9.4",
  "aes-gcm 0.11.0",
  "curve25519-dalek",
  "ed25519-dalek",
