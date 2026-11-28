@@ -4,7 +4,8 @@
 //!
 //! Anyone holding the document's id, its write ticket or a copy of a
 //! device's document store sees only sealed values under opaque entry keys.
-//! The key travels in the pairing bundle and is stored readable after the
+//! It is for the pairing bundle to carry to a new device (that bundle isn't
+//! built yet), and is stored readable after the
 //! device's first unlock, like the device's sync keys: a locked device still
 //! reads the fleet document to know which authors its vault documents bind.
 //!

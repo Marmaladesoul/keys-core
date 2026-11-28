@@ -83,4 +83,4 @@ expect "alice: device alice name=Kitchen Mac platform=macos"
 expect "bob: device alice name=Kitchen Mac platform=macos"
 refute_re "name=Alice's Mac"
 
-echo "PASS: fleet values open only under the fleet key in their own place; a device's word counts only from a current device under its own author; a tombstone outranks the device's enrolment; a kept epoch never goes back; the latest name reaches every device"
+echo "PASS: another account's fleet values never open here; a name a thief signed under a device's author doesn't count, and a reader keeps the device's own; a tombstone outranks the device's enrolment and nothing it signs counts; a kept epoch never goes back; the latest name reaches every device"

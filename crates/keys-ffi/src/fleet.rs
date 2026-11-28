@@ -24,13 +24,13 @@
 
 use std::sync::Arc;
 
+use keys_account::DeviceEnrolment;
 use keys_account::fleet::record::VAULT_ID_BYTES;
 use keys_account::fleet::{
     self, DeviceInfo, DeviceName, FleetEntry, FleetRead, FleetRecord, FleetRefused, Holding,
     RecordError, SealError, Setting, Tombstone, VaultEpoch, VaultLook,
 };
 use keys_account::statement::FleetKind;
-use keys_account::{DeviceEnrolment, EnrolmentError};
 use keys_pairing as kp;
 use zeroize::Zeroizing;
 
@@ -118,9 +118,11 @@ impl PairingAccountKeys {
     /// [`FleetRecordInput::Tombstone`].
     ///
     /// # Errors
-    /// [`AccountFfiError::InvalidKeyLength`] if `device_id` isn't 32 bytes.
+    /// [`AccountFfiError::InvalidKeyLength`] if `device_id` isn't 32 bytes,
+    /// [`AccountFfiError::FleetRecordInvalid`] if it isn't a usable Ed25519
+    /// key, so isn't any device's id.
     pub fn sign_device_tombstone(&self, device_id: Vec<u8>) -> Result<Vec<u8>, AccountFfiError> {
-        Ok(FleetRecord::Tombstone(Tombstone::sign(&self.inner, &key32(&device_id)?)).encode()?)
+        Ok(FleetRecord::Tombstone(Tombstone::sign(&self.inner, &key32(&device_id)?)?).encode()?)
     }
 
     /// The account's statement that epoch `epoch` of the vault `vault_id`
@@ -204,12 +206,9 @@ impl FleetRecordInput {
     /// The record, with the account's records checked against `identity`.
     fn into_record(self, identity: &[u8; 32]) -> Result<FleetRecord, AccountFfiError> {
         let record = match self {
-            Self::Enrolment { enrolment } => FleetRecord::Enrolment(
-                DeviceEnrolment::open(&enrolment, identity).map_err(|error| match error {
-                    EnrolmentError::Malformed => AccountFfiError::EnrolmentMalformed,
-                    other => other.into(),
-                })?,
-            ),
+            Self::Enrolment { enrolment } => {
+                FleetRecord::Enrolment(DeviceEnrolment::open(&enrolment, identity)?)
+            }
             Self::Tombstone { tombstone } => {
                 FleetRecord::decode(FleetKind::Tombstone, &tombstone, identity)?
             }
@@ -367,7 +366,8 @@ pub struct FleetVaultLook {
     pub colour_rgb: u32,
 }
 
-/// What a device holds of a vault.
+/// What a device holds of a vault: that device's claim, so `epoch` may
+/// differ from the vault's. `peer_heads` lists only current devices.
 #[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
 pub struct FleetHoldingRecord {
     pub device_id: Vec<u8>,
@@ -412,6 +412,11 @@ pub enum FleetRefusal {
     Malformed,
     /// An account record not signed by the account.
     NotSignedByAccount,
+    /// An enrolment signed by the account but with a key the account
+    /// refuses to enrol ([`AccountFfiError`]'s enrolment errors).
+    NotEnrolled,
+    /// An entry whose author isn't 32 bytes.
+    NotAnAuthor,
     /// Not in its own slot's entry.
     Misplaced,
     /// An enrolment that clashes with another; both are refused.
@@ -433,9 +438,8 @@ impl From<FleetRefused> for FleetRefusal {
             FleetRefused::Statement(_) => Self::NotSigned,
             FleetRefused::NotAFleetRecord => Self::NotAFleetRecord,
             FleetRefused::Record(RecordError::Malformed | RecordError::Invalid) => Self::Malformed,
-            FleetRefused::Record(RecordError::NotAccountSigned | RecordError::NotEnrolled) => {
-                Self::NotSignedByAccount
-            }
+            FleetRefused::Record(RecordError::NotAccountSigned) => Self::NotSignedByAccount,
+            FleetRefused::Record(RecordError::NotEnrolled) => Self::NotEnrolled,
             FleetRefused::Misplaced => Self::Misplaced,
             FleetRefused::Clashing => Self::Clashing,
             FleetRefused::Removed => Self::Removed,
@@ -474,9 +478,12 @@ pub struct FleetReadResult {
 /// `account_identity`, from `entries`: what was fetched, and what was kept
 /// from the last read.
 ///
+/// One entry's failure is that entry's: an entry whose author isn't 32
+/// bytes is refused ([`FleetRefusal::NotAnAuthor`]) and the rest are read.
+///
 /// # Errors
-/// [`AccountFfiError::InvalidKeyLength`] if `account_identity`, `doc_id` or
-/// an entry's author isn't 32 bytes.
+/// [`AccountFfiError::InvalidKeyLength`] if `account_identity` or `doc_id`
+/// isn't 32 bytes.
 #[uniffi::export]
 pub fn read_fleet(
     account_identity: Vec<u8>,
@@ -484,23 +491,32 @@ pub fn read_fleet(
     doc_id: Vec<u8>,
     entries: Vec<FleetEntryRecord>,
 ) -> Result<FleetReadResult, AccountFfiError> {
-    let entries = entries
-        .into_iter()
-        .map(|entry| {
-            Ok(FleetEntry {
-                author: key32(&entry.author)?,
+    let identity = key32(&account_identity)?;
+    let doc_id = key32(&doc_id)?;
+    let mut not_authors = Vec::new();
+    let mut readable = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match <[u8; 32]>::try_from(entry.author.as_slice()) {
+            Ok(author) => readable.push(FleetEntry {
+                author,
                 key: entry.key,
                 value: entry.value,
-            })
-        })
-        .collect::<Result<Vec<_>, AccountFfiError>>()?;
-    let read = fleet::read_fleet(
-        &key32(&account_identity)?,
+            }),
+            Err(_) => not_authors.push(FleetRefusalRecord {
+                author: entry.author,
+                key: entry.key,
+                reason: FleetRefusal::NotAnAuthor,
+            }),
+        }
+    }
+    let mut result = FleetReadResult::from(fleet::read_fleet(
+        &identity,
         &fleet_key.inner,
-        &key32(&doc_id)?,
-        entries,
-    );
-    Ok(read.into())
+        &doc_id,
+        readable,
+    ));
+    result.refused.extend(not_authors);
+    Ok(result)
 }
 
 impl From<FleetRead> for FleetReadResult {

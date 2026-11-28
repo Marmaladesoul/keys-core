@@ -19,7 +19,8 @@
 //! left over. So two readers given the same bytes read the same record, and
 //! a writer can't make one record that readers read two ways.
 
-use keys_pairing::keys::{PUBLIC_KEY_BYTES, SIGNATURE_BYTES};
+use keys_pairing::address::MAX_DISPLAY_NAME_BYTES;
+use keys_pairing::keys::{PUBLIC_KEY_BYTES, SIGNATURE_BYTES, ed25519_public_key_is_usable};
 use keys_pairing::{AccountKeys, SignedStatement, sanitize_display_name};
 
 use crate::enrolment::{DeviceEnrolment, ENROLMENT_BYTES, EnrolmentError};
@@ -45,9 +46,6 @@ pub const MAX_ICON_BYTES: usize = 64;
 pub const MAX_SETTING_NAME_BYTES: usize = 64;
 /// The longest setting value.
 pub const MAX_SETTING_VALUE_BYTES: usize = 256;
-/// The longest name, in bytes: [`sanitize_display_name`] keeps at most 64
-/// characters, each at most four bytes.
-const MAX_NAME_BYTES: usize = 64 * 4;
 /// The version of the fields the account identity key signs in a record.
 const ACCOUNT_FIELDS_VERSION: u8 = 1;
 /// Holding flags.
@@ -60,7 +58,7 @@ const COLOUR_BYTES: usize = 3;
 
 // Every record's longest byte form fits in a statement.
 const _: () = assert!(
-    VAULT_ID_BYTES + COLOUR_BYTES + 2 * LENGTH_BYTES + MAX_ICON_BYTES + MAX_NAME_BYTES
+    VAULT_ID_BYTES + COLOUR_BYTES + 2 * LENGTH_BYTES + MAX_ICON_BYTES + MAX_DISPLAY_NAME_BYTES
         <= MAX_PAYLOAD_BYTES
 );
 const _: () = assert!(
@@ -106,15 +104,22 @@ pub struct Tombstone {
 
 impl Tombstone {
     /// The account's tombstone for `device_id`.
-    #[must_use]
-    pub fn sign(account: &AccountKeys, device_id: &DeviceId) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// [`RecordError::Invalid`] if `device_id` isn't a usable Ed25519 key
+    /// ([`ed25519_public_key_is_usable`]), so isn't any device's id: a
+    /// tombstone for it would remove nobody.
+    pub fn sign(account: &AccountKeys, device_id: &DeviceId) -> Result<Self, RecordError> {
+        if !ed25519_public_key_is_usable(device_id) {
+            return Err(RecordError::Invalid);
+        }
+        Ok(Self {
             device_id: *device_id,
             signature: account.sign_statement(
                 SignedStatement::DeviceTombstone,
                 &tombstone_fields(device_id),
             ),
-        }
+        })
     }
 
     #[must_use]
@@ -389,6 +394,9 @@ impl FleetRecord {
                     signature: reader.array()?,
                 };
                 reader.finish()?;
+                if !ed25519_public_key_is_usable(&tombstone.device_id) {
+                    return Err(RecordError::Malformed);
+                }
                 if !tombstone.verify(identity) {
                     return Err(RecordError::NotAccountSigned);
                 }
@@ -513,11 +521,16 @@ fn decode_holding(reader: &mut Reader<'_>) -> Result<Holding, RecordError> {
     })
 }
 
-/// At most [`MAX_PEER_HEADS`], in strictly ascending order of device id.
-/// (That the signer isn't among them is the reader's to check: the record
-/// doesn't know who signs it.)
+/// At most [`MAX_PEER_HEADS`], each a usable Ed25519 key (so one device has
+/// one id here, never a second spelling of it), in strictly ascending order
+/// of device id. (That the signer isn't among them is the reader's to check:
+/// the record doesn't know who signs it.)
 fn peers_are_canonical(peers: &[(DeviceId, HeadHash)]) -> bool {
-    peers.len() <= MAX_PEER_HEADS && peers.windows(2).all(|pair| pair[0].0 < pair[1].0)
+    peers.len() <= MAX_PEER_HEADS
+        && peers
+            .iter()
+            .all(|(peer, _)| ed25519_public_key_is_usable(peer))
+        && peers.windows(2).all(|pair| pair[0].0 < pair[1].0)
 }
 
 /// `name` if it is a name as [`sanitize_display_name`] leaves it, and not
@@ -526,7 +539,7 @@ fn display_name(name: &str) -> Result<&[u8], RecordError> {
     if name.is_empty() || sanitize_display_name(name) != name {
         return Err(RecordError::Invalid);
     }
-    debug_assert!(name.len() <= MAX_NAME_BYTES);
+    debug_assert!(name.len() <= MAX_DISPLAY_NAME_BYTES);
     Ok(name.as_bytes())
 }
 

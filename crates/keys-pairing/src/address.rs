@@ -12,6 +12,10 @@ use crate::EndpointId;
 pub const MAX_RELAY_URL_BYTES: usize = 255;
 /// The longest display name shown from an unverified source, in characters.
 pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
+/// The most bytes one character takes in UTF-8.
+const MAX_UTF8_CHAR_BYTES: usize = 4;
+/// The longest a sanitised name is in UTF-8.
+pub const MAX_DISPLAY_NAME_BYTES: usize = MAX_DISPLAY_NAME_CHARS * MAX_UTF8_CHAR_BYTES;
 
 /// The only scheme a relay URL may have.
 const RELAY_URL_SCHEME: &str = "https://";

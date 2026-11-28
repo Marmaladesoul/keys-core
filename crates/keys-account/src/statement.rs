@@ -104,12 +104,21 @@ impl StatementKind {
         }
     }
 
+    /// The kind whose [`wire`](Self::wire) byte is `byte`: the inverse of
+    /// that one table, so the two can't drift apart.
     const fn from_wire(byte: u8) -> Option<Self> {
-        match byte {
-            1 => Some(Self::VaultHead),
-            2..=9 => Some(Self::Fleet(FleetKind::ALL[(byte - 2) as usize])),
-            _ => None,
+        if byte == Self::VaultHead.wire() {
+            return Some(Self::VaultHead);
         }
+        let mut i = 0;
+        while i < FleetKind::ALL.len() {
+            let kind = Self::Fleet(FleetKind::ALL[i]);
+            if kind.wire() == byte {
+                return Some(kind);
+            }
+            i += 1;
+        }
+        None
     }
 
     const fn signed_as(self) -> DeviceStatement {

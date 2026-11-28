@@ -157,6 +157,12 @@ impl PairingAccountKeys {
     /// roster entry, over its public keys, its transport endpoint id and its
     /// document author id.
     ///
+    /// Enrol a device's keys once. Enrolments carry no sequence, so a second
+    /// enrolment sharing the device's signing key, endpoint id or author id
+    /// with the first clashes with it for good in the fleet document (both
+    /// are refused, and anyone with the fleet key can put the first back).
+    /// To enrol a device again, remove it and enrol new keys.
+    ///
     /// # Errors
     /// [`AccountFfiError::InvalidKeyLength`] for a key or id that isn't 32
     /// bytes; [`AccountFfiError::EnrolmentUnusableKey`] if the device's keys
@@ -596,8 +602,8 @@ impl AccountRoster {
         )
     }
 
-    /// The ids of the roster's devices, in the order their enrolments were
-    /// given.
+    /// The ids of the roster's devices, in ascending order of their
+    /// enrolments' byte forms (not the order they were given in).
     #[must_use]
     pub fn device_ids(&self) -> Vec<Vec<u8>> {
         self.inner

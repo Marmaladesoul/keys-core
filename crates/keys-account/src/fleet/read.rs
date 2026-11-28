@@ -26,7 +26,13 @@
 //!   endpoint or author id) are both refused, so an author always names one
 //!   device and the roster never has to guess.
 //! - **Per signer and slot, the newest statement** (highest sequence) is the
-//!   one that counts.
+//!   one that counts. The account's own records are the exception: any copy
+//!   of one carries the same record, so a reader keeps one per slot,
+//!   however many signers have copied it.
+//! - **An enrolment is never re-made.** Enrolments carry no sequence, so a
+//!   second enrolment of a device, endpoint or author id clashes with the
+//!   first for good, and anyone with the fleet key can put the first back.
+//!   To re-enrol a device, remove it and enrol new keys.
 //! - **Epochs only go up:** a vault is at the highest epoch any valid record
 //!   gives it, and the entry carrying it is always kept.
 //! - **The latest wins** where any device may set a record: a device's
@@ -122,7 +128,9 @@ pub struct FleetVault {
     pub doc_id: [u8; DOC_ID_BYTES],
     pub look: Option<VaultLook>,
     /// What each current device says it holds, in ascending order of
-    /// device id.
+    /// device id: its claim, so its epoch may differ from the vault's (a
+    /// device behind, or ahead of what this reader has seen). Its peers are
+    /// only current devices; a peer that isn't one is left out.
     pub holdings: Vec<(DeviceId, Holding)>,
 }
 
@@ -222,7 +230,7 @@ pub fn read_fleet(
         }
     }
 
-    let kept_opened = newest_per_signer_and_slot(counting);
+    let kept_opened = kept_entries(counting);
     let view = view(&kept_opened, roster_devices, removed);
     let kept = kept_opened.into_iter().map(|o| o.entry).collect();
     FleetRead {
@@ -341,38 +349,52 @@ fn counts(
     }
 }
 
-/// The newest statement per signer and slot (highest sequence, then the
-/// greater entry, so every reader keeps the same one), plus, for each vault,
-/// an entry carrying its highest epoch wherever it sits (the least such
-/// entry, likewise).
-fn newest_per_signer_and_slot(counting: Vec<Opened>) -> Vec<Opened> {
+/// What a reader keeps: for a device's word, the newest statement per
+/// signer and slot (highest sequence, then the greater entry, so every
+/// reader keeps the same one); for an enrolment or a tombstone, one entry
+/// per slot whoever signed its statement (the least, likewise), since any
+/// copy carries the same record and a copier mustn't be able to make a
+/// reader keep more; and for each vault, the one entry carrying its highest
+/// epoch wherever it sits.
+fn kept_entries(counting: Vec<Opened>) -> Vec<Opened> {
     type CarrierRank = (u64, [u8; DOC_ID_BYTES], Reverse<FleetEntry>);
     let mut newest: BTreeMap<(DeviceId, Vec<u8>), Opened> = BTreeMap::new();
+    let mut accounts: BTreeMap<Vec<u8>, Opened> = BTreeMap::new();
     let mut carriers: BTreeMap<VaultId, (CarrierRank, Opened)> = BTreeMap::new();
     for o in counting {
-        if let FleetRecord::VaultEpoch(epoch) = &o.record {
-            let rank = (epoch.epoch(), epoch.doc_id(), Reverse(o.entry.clone()));
-            match carriers.get(&epoch.vault_id()) {
-                Some((best, _)) if *best >= rank => {}
+        match &o.record {
+            FleetRecord::VaultEpoch(epoch) => {
+                let rank = (epoch.epoch(), epoch.doc_id(), Reverse(o.entry.clone()));
+                match carriers.get(&epoch.vault_id()) {
+                    Some((best, _)) if *best >= rank => {}
+                    _ => {
+                        carriers.insert(epoch.vault_id(), (rank, o));
+                    }
+                }
+            }
+            record if record.is_the_accounts() => match accounts.get(&o.entry.key) {
+                Some(current) if current.entry <= o.entry => {}
                 _ => {
-                    carriers.insert(epoch.vault_id(), (rank, o.clone()));
+                    accounts.insert(o.entry.key.clone(), o);
+                }
+            },
+            _ => {
+                let slot = (o.signer, o.entry.key.clone());
+                match newest.get(&slot) {
+                    Some(current)
+                        if (current.sequence, &current.entry) >= (o.sequence, &o.entry) => {}
+                    _ => {
+                        newest.insert(slot, o);
+                    }
                 }
             }
         }
-        let slot = (o.signer, o.entry.key.clone());
-        match newest.get(&slot) {
-            Some(current) if (current.sequence, &current.entry) >= (o.sequence, &o.entry) => {}
-            _ => {
-                newest.insert(slot, o);
-            }
-        }
     }
-    let mut kept: Vec<Opened> = newest.into_values().collect();
-    for (_, carrier) in carriers.into_values() {
-        if !kept.iter().any(|o| o.entry == carrier.entry) {
-            kept.push(carrier);
-        }
-    }
+    let mut kept: Vec<Opened> = newest
+        .into_values()
+        .chain(accounts.into_values())
+        .chain(carriers.into_values().map(|(_, carrier)| carrier))
+        .collect();
     kept.sort_by(|a, b| a.entry.cmp(&b.entry));
     kept
 }
@@ -434,7 +456,14 @@ fn view(
                         }
                         _ => None,
                     }))
-                    .map(|holding| (*device, holding))
+                    .map(|mut holding| {
+                        // A peer is a claim about a device; only current
+                        // devices' copies are anyone's to count.
+                        holding
+                            .peer_heads
+                            .retain(|(peer, _)| roster_devices.contains_key(peer));
+                        (*device, holding)
+                    })
                 })
                 .collect();
             FleetVault {

@@ -227,12 +227,12 @@ fn print_view(who: &str, read: &FleetReadResult, names: &Names, epochs: &Epochs)
     for vault in &read.vaults {
         let look = vault.look.as_ref();
         println!(
-            "{who}: vault epoch={} doc={} name={} icon={} colour={:06x}",
+            "{who}: vault epoch={} doc={} name={} icon={} colour={}",
             vault.epoch,
             epochs.name(&vault.doc_id),
             look.map_or("-", |l| l.name.as_str()),
             look.map_or("-", |l| l.icon.as_str()),
-            look.map_or(0, |l| l.colour_rgb),
+            look.map_or_else(|| "-".to_owned(), |l| format!("{:06x}", l.colour_rgb)),
         );
         for holding in &vault.holdings {
             println!(

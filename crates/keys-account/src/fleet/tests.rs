@@ -131,6 +131,26 @@ fn device_ids(read: &FleetRead) -> Vec<DeviceId> {
         .collect()
 }
 
+/// Everything a read shows, the roster included, to compare reads by.
+type Seen = (
+    Vec<FleetDevice>,
+    Vec<DeviceId>,
+    Vec<FleetVault>,
+    Vec<FleetSetting>,
+    Vec<DeviceEnrolment>,
+);
+
+fn seen(read: &FleetRead) -> Seen {
+    let view = &read.view;
+    (
+        view.devices.clone(),
+        view.removed.clone(),
+        view.vaults.clone(),
+        view.settings.clone(),
+        view.roster.devices().to_vec(),
+    )
+}
+
 fn sorted(mut ids: Vec<DeviceId>) -> Vec<DeviceId> {
     ids.sort_unstable();
     ids
@@ -340,10 +360,10 @@ fn account_records_not_signed_by_this_account_are_refused() {
         fleet.own(
             &fleet.alice,
             2,
-            &FleetRecord::Tombstone(Tombstone::sign(
-                &other.account,
-                &fleet.alice.enrolment.device_id(),
-            )),
+            &FleetRecord::Tombstone(
+                Tombstone::sign(&other.account, &fleet.alice.enrolment.device_id())
+                    .expect("usable id"),
+            ),
         ),
         fleet.own(
             &fleet.alice,
@@ -370,7 +390,7 @@ fn a_tombstone_outranks_every_enrolment_and_word_of_its_device() {
     entries.push(fleet.own(
         &fleet.alice,
         5,
-        &FleetRecord::Tombstone(Tombstone::sign(&fleet.account, &bob)),
+        &FleetRecord::Tombstone(Tombstone::sign(&fleet.account, &bob).expect("usable id")),
     ));
     // Bob, removed, writes his enrolment back with a later sequence, and
     // goes on writing.
@@ -468,7 +488,14 @@ fn a_vault_is_at_its_highest_epoch_and_the_entry_carrying_it_is_kept() {
 
 #[test]
 fn the_latest_name_wins_and_every_reader_agrees() {
-    let fleet = Fleet::new();
+    // Keys are random, so whether the higher signer's entry also sorts last
+    // is chance: run enough fleets that a rule ignoring the signer fails.
+    for _ in 0..16 {
+        latest_name_wins_in(&Fleet::new());
+    }
+}
+
+fn latest_name_wins_in(fleet: &Fleet) {
     let mut entries = fleet.enrolled();
     entries.push(fleet.own(&fleet.alice, 5, &name(&fleet.alice, "Older")));
     entries.push(fleet.own(&fleet.bob, 8, &name(&fleet.alice, "Newer")));
@@ -571,7 +598,7 @@ fn every_record_round_trips_through_its_byte_form() {
             )
             .expect("usable keys"),
         ),
-        FleetRecord::Tombstone(Tombstone::sign(&account, &device)),
+        FleetRecord::Tombstone(Tombstone::sign(&account, &device).expect("usable id")),
         FleetRecord::VaultEpoch(VaultEpoch::sign(&account, &VAULT, &VAULT_DOC, 3)),
         info(5),
         FleetRecord::DeviceName(DeviceName {
@@ -589,8 +616,9 @@ fn every_record_round_trips_through_its_byte_form() {
             epoch: 3,
             has_secrets: true,
             own_head: Some([9; 32]),
-            peer_heads: (0..MAX_PEER_HEADS)
-                .map(|i| ([u8::try_from(i).expect("small"); 32], [7; 32]))
+            peer_heads: sorted((0..MAX_PEER_HEADS).map(|_| usable_ed25519()).collect())
+                .into_iter()
+                .map(|peer| (peer, [7; 32]))
                 .collect(),
         }),
         FleetRecord::Setting(Setting {
@@ -735,7 +763,7 @@ fn only_entries_small_enough_to_be_records_are_fetched() {
 fn account_records_known_answer() {
     let account = kat_account();
     let device = kat_device_sync().signing_public_key();
-    let tombstone = FleetRecord::Tombstone(Tombstone::sign(&account, &device))
+    let tombstone = FleetRecord::Tombstone(Tombstone::sign(&account, &device).expect("usable id"))
         .encode()
         .expect("encodes");
     assert_eq!(tombstone, unhex(KAT_TOMBSTONE));
@@ -747,3 +775,204 @@ fn account_records_known_answer() {
 
 const KAT_TOMBSTONE: &str = "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48bb2c196262a58e767280f73aca41a1de81fc9513265eaacf47aede3b0e8b49511093086508b34ae49cb2f527c5ee154005056d42abe262ccc01b074a0031640b";
 const KAT_VAULT_EPOCH: &str = "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7ad2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d200000000000000035405d824395365f6393543a7ae7a66a0435a96906f857bf4978a327b7917157aec16c8f5bf8a1af3f3102090094a5b7e4ff68ab14530157ab718f70dfee8ae03";
+
+#[test]
+fn copies_of_the_accounts_records_are_kept_once_whoever_copies_them() {
+    let fleet = Fleet::new();
+    let tombstone = FleetRecord::Tombstone(
+        Tombstone::sign(&fleet.account, &fleet.bob.enrolment.device_id()).expect("usable id"),
+    );
+    let mut entries = fleet.enrolled();
+    entries.push(fleet.own(&fleet.alice, 2, &tombstone));
+    entries.push(fleet.own(&fleet.alice, 3, &fleet.epoch(1, VAULT_DOC)));
+    let honest = fleet.read(entries.clone());
+    // Anyone with the fleet key wraps the same records in statements of
+    // throwaway keys, under authors of their own.
+    for _ in 0..8 {
+        let stranger = Fleet::device(&fleet.account);
+        entries.push(fleet.entry(&stranger, usable_ed25519(), 1, &tombstone));
+        entries.push(fleet.entry(&stranger, usable_ed25519(), 1, &fleet.epoch(1, VAULT_DOC)));
+        entries.push(fleet.entry(
+            &stranger,
+            usable_ed25519(),
+            1,
+            &FleetRecord::Enrolment(fleet.alice.enrolment),
+        ));
+    }
+    let copied = fleet.read(entries);
+    assert_eq!(seen(&copied), seen(&honest));
+    assert_eq!(copied.kept.len(), honest.kept.len());
+    assert_eq!(reasons(&copied), reasons(&honest));
+}
+
+#[test]
+fn a_read_is_the_same_in_any_order_and_its_kept_entries_read_back_as_it() {
+    let fleet = Fleet::new();
+    let mut entries = fleet.enrolled();
+    entries.push(fleet.own(&fleet.alice, 2, &info(5)));
+    entries.push(fleet.own(&fleet.bob, 2, &name(&fleet.alice, "Kitchen")));
+    entries.push(fleet.own(&fleet.alice, 3, &fleet.epoch(1, VAULT_DOC)));
+    entries.push(fleet.own(&fleet.alice, 4, &fleet.epoch(2, [0xe2; 32])));
+    entries.push(fleet.own(
+        &fleet.bob,
+        3,
+        &FleetRecord::Setting(Setting {
+            name: "retention".to_owned(),
+            value: b"30d".to_vec(),
+        }),
+    ));
+    let forwards = fleet.read(entries.clone());
+    entries.reverse();
+    let mut twice = entries.clone();
+    twice.extend(entries.iter().cloned());
+    let backwards = fleet.read(twice);
+    assert_eq!(seen(&forwards), seen(&backwards));
+    assert_eq!(forwards.kept, backwards.kept);
+    let again = fleet.read(forwards.kept.clone());
+    assert_eq!(seen(&again), seen(&forwards));
+    assert_eq!(again.kept, forwards.kept);
+}
+
+#[test]
+fn an_enrolment_sharing_an_endpoint_clashes() {
+    let fleet = Fleet::new();
+    let carol = DeviceKeys::generate().expect("rng");
+    let squatter = DeviceEnrolment::sign(
+        &fleet.account,
+        carol.public_keys(),
+        fleet.alice.enrolment.endpoint_id(),
+        usable_ed25519(),
+    )
+    .expect("usable keys");
+    let mut entries = fleet.enrolled();
+    entries.push(fleet.own(&fleet.alice, 2, &FleetRecord::Enrolment(squatter)));
+    let read = fleet.read(entries);
+    assert_eq!(device_ids(&read), [fleet.bob.enrolment.device_id()]);
+    assert_eq!(reasons(&read), [FleetRefused::Clashing; 2]);
+}
+
+#[test]
+fn a_removed_devices_enrolment_clashes_with_nothing() {
+    let fleet = Fleet::new();
+    // Carol is enrolled with the author Bob had, once Bob is removed.
+    let carol = DeviceKeys::generate().expect("rng");
+    let successor = DeviceEnrolment::sign(
+        &fleet.account,
+        carol.public_keys(),
+        usable_ed25519(),
+        fleet.bob.author,
+    )
+    .expect("usable keys");
+    let mut entries = fleet.enrolled();
+    entries.push(fleet.own(
+        &fleet.alice,
+        2,
+        &FleetRecord::Tombstone(
+            Tombstone::sign(&fleet.account, &fleet.bob.enrolment.device_id()).expect("usable id"),
+        ),
+    ));
+    entries.push(fleet.own(&fleet.alice, 3, &FleetRecord::Enrolment(successor)));
+    let read = fleet.read(entries);
+    assert_eq!(
+        device_ids(&read),
+        sorted(vec![
+            fleet.alice.enrolment.device_id(),
+            successor.device_id()
+        ])
+    );
+    assert_eq!(reasons(&read), [FleetRefused::Removed]);
+}
+
+#[test]
+fn what_a_device_says_about_itself_is_only_its_own() {
+    let fleet = Fleet::new();
+    let mut entries = fleet.enrolled();
+    entries.push(fleet.own(&fleet.alice, 2, &info(5)));
+    let read = fleet.read(entries);
+    for device in &read.view.devices {
+        let expected = (device.enrolment == fleet.alice.enrolment).then_some(5);
+        assert_eq!(device.info.as_ref().map(|i| i.last_seen), expected);
+    }
+}
+
+#[test]
+fn of_two_statements_at_one_sequence_the_greater_entry_is_kept() {
+    let fleet = Fleet::new();
+    // Two sealings of one statement's slot at one sequence differ only in
+    // their salts.
+    let one = fleet.own(&fleet.alice, 2, &info(5));
+    let other = fleet.own(&fleet.alice, 2, &info(6));
+    let greater = one.clone().max(other.clone());
+    for order in [[one.clone(), other.clone()], [other, one]] {
+        let mut entries = fleet.enrolled();
+        entries.extend(order);
+        let read = fleet.read(entries);
+        assert!(read.kept.contains(&greater));
+        assert_eq!(read.kept.len(), 3);
+    }
+}
+
+#[test]
+fn of_two_records_at_one_epoch_the_higher_document_counts() {
+    let fleet = Fleet::new();
+    let mut entries = fleet.enrolled();
+    let higher = fleet.own(&fleet.alice, 2, &fleet.epoch(4, [0xe9; 32]));
+    entries.push(fleet.own(&fleet.bob, 2, &fleet.epoch(4, [0xe1; 32])));
+    entries.push(higher.clone());
+    let read = fleet.read(entries);
+    assert_eq!(read.view.vaults[0].doc_id, [0xe9; 32]);
+    assert!(read.kept.contains(&higher));
+    assert_eq!(read.kept.len(), 3);
+}
+
+#[test]
+fn an_entry_too_large_to_be_a_record_is_refused_unopened() {
+    let fleet = Fleet::new();
+    let mut big = fleet.own(&fleet.alice, 2, &info(5));
+    big.value.resize(MAX_SEALED_BYTES + 1, 0);
+    let mut entries = fleet.enrolled();
+    entries.push(big);
+    assert_eq!(reasons(&fleet.read(entries)), [FleetRefused::TooLarge]);
+}
+
+#[test]
+fn a_peer_is_a_usable_key_and_only_current_devices_are_shown() {
+    let fleet = Fleet::new();
+    let bob = fleet.bob.enrolment.device_id();
+    let stranger = usable_ed25519();
+    let holding = |peers: Vec<(DeviceId, HeadHash)>| {
+        FleetRecord::Holding(Holding {
+            vault_id: VAULT,
+            epoch: 1,
+            has_secrets: true,
+            own_head: None,
+            peer_heads: peers,
+        })
+    };
+    // The identity point isn't anyone's key.
+    let mut identity_point = [0; 32];
+    identity_point[0] = 1;
+    assert_eq!(
+        holding(vec![(identity_point, [1; 32])]).encode(),
+        Err(RecordError::Invalid)
+    );
+    let mut peers = vec![(bob, [1; 32]), (stranger, [2; 32])];
+    peers.sort_unstable();
+    let mut entries = fleet.enrolled();
+    entries.push(fleet.own(&fleet.alice, 2, &fleet.epoch(1, VAULT_DOC)));
+    entries.push(fleet.own(&fleet.alice, 3, &holding(peers)));
+    let read = fleet.read(entries);
+    let (_, shown) = &read.view.vaults[0].holdings[0];
+    assert_eq!(shown.peer_heads, [(bob, [1; 32])]);
+}
+
+#[test]
+fn a_tombstone_names_a_usable_key() {
+    let fleet = Fleet::new();
+    let mut identity_point = [0; 32];
+    identity_point[0] = 1;
+    assert_eq!(
+        Tombstone::sign(&fleet.account, &identity_point).map(|_| ()),
+        Err(RecordError::Invalid)
+    );
+}

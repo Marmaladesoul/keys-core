@@ -93,7 +93,8 @@ pub struct Roster {
 
 impl Roster {
     /// Opens each of `enrolments` against the account whose identity key is
-    /// `account_identity`.
+    /// `account_identity`. The roster holds them in ascending order of their
+    /// byte forms, whatever order they were given in.
     ///
     /// The same enrolment given more than once counts once, so a copy
     /// written twice can't refuse the roster. Two *different* enrolments of

@@ -40,7 +40,7 @@
 //! wrong keeps an invite for too long or too short a time; all that rides on
 //! it is whether a knock is recorded.
 
-use crate::address::{MAX_DISPLAY_NAME_CHARS, PairingAddress, sanitize_display_name};
+use crate::address::{PairingAddress, sanitize_display_name};
 use crate::keys::PUBLIC_KEY_BYTES;
 use crate::{EndpointId, PairingError};
 
@@ -51,8 +51,6 @@ pub const MAX_INVITE_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 /// How many invites one book holds at once. Issuing is the person's act, so
 /// this only stops a runaway caller growing the book without end.
 pub const MAX_OUTSTANDING_INVITES: usize = 64;
-/// The longest a sanitised name is in UTF-8: every character four bytes.
-pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = MAX_DISPLAY_NAME_CHARS * 4;
 
 /// A single-use invite id: 128 random bits. It names an invite; it is not a
 /// secret, since it travels in the invite.
