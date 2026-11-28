@@ -504,8 +504,8 @@ pub fn read_fleet(
 }
 
 impl From<FleetRead> for FleetReadResult {
-    fn from(read: FleetRead) -> Self {
-        let view = read.view;
+    fn from(fleet_read: FleetRead) -> Self {
+        let view = fleet_read.view;
         Self {
             devices: view
                 .devices
@@ -565,7 +565,7 @@ impl From<FleetRead> for FleetReadResult {
                 })
                 .collect(),
             roster: AccountRoster::from_roster(view.roster),
-            kept: read
+            kept: fleet_read
                 .kept
                 .into_iter()
                 .map(|entry| FleetEntryRecord {
@@ -574,7 +574,7 @@ impl From<FleetRead> for FleetReadResult {
                     value: entry.value,
                 })
                 .collect(),
-            refused: read
+            refused: fleet_read
                 .refused
                 .into_iter()
                 .map(|refusal| FleetRefusalRecord {

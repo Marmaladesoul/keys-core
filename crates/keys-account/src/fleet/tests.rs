@@ -513,7 +513,37 @@ fn a_holding_counts_only_from_its_device_and_never_lists_itself() {
     let mut entries = fleet.enrolled();
     entries.push(fleet.own(&fleet.alice, 2, &fleet.epoch(1, VAULT_DOC)));
     entries.push(fleet.own(&fleet.bob, 3, &holding(vec![])));
-    entries.push(fleet.own(&fleet.alice, 3, &holding(vec![(alice, [1; 32])])));
+    let lists_itself = holding(vec![(alice, [1; 32])]);
+    assert_eq!(
+        seal_record(
+            &fleet.key,
+            &DOC,
+            fleet.alice.keys.sync_keys(),
+            3,
+            &lists_itself
+        ),
+        Err(SealError::Record(RecordError::Invalid)),
+        "the writer refuses a holding that lists itself"
+    );
+    // Signed and sealed in its own slot past the writer's check, as a
+    // device not using this crate could.
+    let key = fleet.key.entry_key(&lists_itself.slot());
+    let statement = Statement::sign(
+        fleet.alice.keys.sync_keys(),
+        StatementKind::Fleet(FleetKind::Holding),
+        3,
+        Placement {
+            doc_id: &DOC,
+            entry_key: &key,
+        },
+        &lists_itself.encode().expect("encodes"),
+    )
+    .expect("signs");
+    entries.push(FleetEntry {
+        author: fleet.alice.author,
+        key: key.to_vec(),
+        value: fleet.key.seal(&[&DOC, &key], &statement).expect("rng"),
+    });
     let read = fleet.read(entries);
     assert_eq!(reasons(&read), [FleetRefused::SelfPeer]);
     assert_eq!(

@@ -22,6 +22,7 @@
 
 mod account;
 mod account_doc;
+mod account_fleet;
 mod account_net;
 mod adapters;
 mod kdf;
@@ -1074,6 +1075,16 @@ enum Command {
         #[arg(long, value_enum, default_value_t = account_doc::HeadsCase::Honest)]
         case: account_doc::HeadsCase,
     },
+    /// The account's fleet document over real document sync, on loopback:
+    /// one device creating the account and its sealed fleet document, a
+    /// second enrolled into it, each reading the other's records as a client
+    /// must, with one thing that must not work per case. Prints one
+    /// `who: what` line per event. Needs no vault and no password.
+    AccountFleet {
+        /// What else happens in the document.
+        #[arg(long, value_enum, default_value_t = account_fleet::FleetCase::Honest)]
+        case: account_fleet::FleetCase,
+    },
     /// Parse a `keys://pair/...` link through the seam and print what it
     /// holds (`link: device|person` and its fields), or `refused: <why>`.
     /// Exits 0 either way. Needs no vault and no password.
@@ -1201,6 +1212,7 @@ async fn main() -> Result<()> {
             .await;
         }
         Command::AccountHeads { case } => return account_doc::run(*case).await,
+        Command::AccountFleet { case } => return account_fleet::run(*case).await,
         Command::PairLink { text } => {
             pairing_net::parse_link(text);
             return Ok(());
@@ -1771,6 +1783,7 @@ async fn main() -> Result<()> {
         | Command::PairSim { .. }
         | Command::PairNet { .. }
         | Command::AccountHeads { .. }
+        | Command::AccountFleet { .. }
         | Command::PairLink { .. }
         | Command::PairName { .. } => {
             unreachable!("dispatched before the password read")

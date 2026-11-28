@@ -158,6 +158,22 @@ future uniffi version removes the `Drop`-versus-`Record` constraint.
 
 ---
 
+## 5. The fleet document: what the fleet key, a device's store and the write ticket each let someone do
+
+**What it is.** An account's fleet document (`keys_account::fleet`) holds the roster, the tombstones of removed devices, the vault index, what each device holds, and the account's settings. Every value is sealed under the account's fleet key, bound to its document and entry key, and every entry key is the fleet key's name for the record's slot, so the document's id, its write ticket or a device's `iroh-docs` store shows ciphertext under opaque keys. Inside each seal is a statement signed by the device that wrote it; enrolments, tombstones and vault epochs are also signed by the account identity key. None of the following yields vault contents or a key that unlocks one. They are what each kind of holder can still do:
+
+- **Whoever holds the write ticket** sees how many entries there are, their sizes, their authors and when they change, though not what they are. They can also write any number of entries small enough to be a fleet record under authors of their own, and a reader fetches and tries to open every one (the roster that says which authors count is itself in the document, so the reader can't filter by author before fetching). Each is refused, but each costs the reader a fetch and a failed open.
+- **Whoever holds the fleet key** (every device of the account, and, until the document is replaced, every device removed from it) reads the whole document: device names, platforms and when each was last seen, vault names, icons and colours, which device holds which vault at which head, and the settings. They can seal values that open, but not sign them, so nothing they write counts unless it is a copy of a record the account or a current device already signed. A removed device's signatures stop counting at once; its reading of the document stops only when the account replaces the document under a new fleet key, which is not built yet.
+- **Whoever holds a copy of a device's store** can write under that device's author. As with vault heads (§1), that buys suppression, not forgery: they can overwrite that device's entries and so hide them from a reader that hasn't already kept them, including a tombstone or a vault epoch that device wrote. Suppressing a tombstone shows the removed device as current to a reader with nothing kept; suppressing an epoch shows a vault at an older one.
+- **A reader's memory is its own.** `read_fleet` hands back the entries that make its view (`FleetRead::kept`) and the reader passes them in again next time, so an overwritten entry, or an older epoch's record put back, changes nothing for it. A reader that has kept nothing (a new device, or one that lost its state) sees what the document says now.
+- **Latest means the writer's clock.** Where any device may set a record (a device's name, a vault's look, a setting) the highest sequence wins, and a device's sequence is its own clock. A current device whose clock runs far ahead wins those slots until the others' clocks pass it. Only a current device's records count there, so this is a member being unruly, not a stranger getting in.
+
+**Severity:** Low. Reading the document needs the fleet key, which only the account's devices have; changing what it says needs a device's or the account's signing key; and suppression needs the store of the very device whose entry is hidden, which already means that device is compromised.
+
+**Why it is documented rather than fixed.** Suppression and the fetch cost come from `iroh-docs` keeping one entry per author and key, and from a reader needing the document to learn which authors count (§1). The rest is the remedy not being built yet: replacing the fleet document under a new fleet key when a device is removed is a later step of the sync rollout. Meanwhile a client can narrow suppression by having each device copy the account's records (the enrolments, tombstones and vault epochs, which count whoever writes them) under its own author, so that hiding one takes every copier's store, and by keeping `FleetRead::kept` with the rest of its sync state.
+
+---
+
 ## Summary
 
 | # | Limitation | Severity | Why not simply fixed |
@@ -166,6 +182,7 @@ future uniffi version removes the `Drop`-versus-`Record` constraint.
 | 2 | Heap identity bytes not zeroized on drop | Low | uniffi `Record`-versus-`Drop` constraint; revisit when upstream lifts it |
 | 3 | Pairing and account keys: transient stack copies and FFI-side copies of secrets not wiped | Low | Dependencies' stack frames can't be wiped from safe Rust; foreign-runtime copies are the client's to minimise |
 | 4 | Pairing discovery: links and advertisements are unauthenticated; first to reach a waiting device or knock on an invite wins; connection slots can be held and unread data buffered | Low | Finding an unknown device without a server means acting on unauthenticated hints; they are made worthless without the code instead |
+| 5 | Fleet document: write-ticket holders cost readers fetches; fleet-key holders (removed devices included) read it; a device's store can hide that device's entries from a reader with nothing kept; latest-wins follows the writer's clock | Low | Inherited from `iroh-docs`' one-entry-per-author model; replacing the document when a device is removed is a later rollout step |
 
 **Items 1 and 2 are not a confidentiality break of vault contents** — vault data
 syncs and rests only as KDBX ciphertext. Both are device-impersonation /
@@ -176,3 +193,5 @@ than on a fix we are choosing not to make.
 **Item 3** is about what a pairing run's session carries, and likewise needs the memory of one of the two devices at the time.
 
 **Item 4** yields no pairing, key or vault data: it is about delay, failed attempts and what a device reveals of its network presence while pairing.
+
+**Item 5** yields no vault data and no key: it is about what the account's own devices, removed ones included, can read of its fleet document, and what a compromised device can hide.
