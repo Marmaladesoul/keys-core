@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/keys-account",
     "crates/keys-engine",
     "crates/keys-ffi",
     "crates/keys-iroh-sync",

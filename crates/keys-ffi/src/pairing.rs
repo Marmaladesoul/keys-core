@@ -101,10 +101,16 @@ impl From<kp::SessionError> for PairingFfiError {
     }
 }
 
-fn key32(bytes: &[u8]) -> Result<[u8; 32], PairingFfiError> {
-    bytes
-        .try_into()
-        .map_err(|_| PairingFfiError::InvalidKeyLength)
+fn key32(bytes: &[u8]) -> Result<[u8; kp::keys::PUBLIC_KEY_BYTES], PairingFfiError> {
+    key32_or(bytes, PairingFfiError::InvalidKeyLength)
+}
+
+/// A 32-byte key from the foreign side's bytes, or `wrong_length`.
+pub(crate) fn key32_or<E>(
+    bytes: &[u8],
+    wrong_length: E,
+) -> Result<[u8; kp::keys::PUBLIC_KEY_BYTES], E> {
+    bytes.try_into().map_err(|_| wrong_length)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -169,7 +175,7 @@ pub struct PairingDevicePublicKeys {
 /// An account's keys. The private halves stay on the Rust side.
 #[derive(uniffi::Object)]
 pub struct PairingAccountKeys {
-    inner: Arc<kp::AccountKeys>,
+    pub(crate) inner: Arc<kp::AccountKeys>,
 }
 
 #[uniffi::export]
@@ -180,12 +186,11 @@ impl PairingAccountKeys {
     }
 }
 
-/// The recovery secret, handed back once at account generation. Opaque for
-/// now: how it is rendered as a recovery code for a person to write down is
-/// not decided yet, so nothing reads it across the seam.
+/// The recovery secret, handed back once at account generation. It crosses
+/// the seam only as the recovery code (`recovery_code`, in `account.rs`).
 #[derive(uniffi::Object)]
 pub struct PairingRecoverySecret {
-    _inner: kp::RecoverySecret,
+    pub(crate) inner: kp::RecoverySecret,
 }
 
 /// A freshly generated account.
@@ -206,14 +211,14 @@ pub fn generate_pairing_account() -> Result<GeneratedPairingAccount, PairingFfiE
         keys: Arc::new(PairingAccountKeys {
             inner: Arc::new(keys),
         }),
-        recovery_secret: Arc::new(PairingRecoverySecret { _inner: recovery }),
+        recovery_secret: Arc::new(PairingRecoverySecret { inner: recovery }),
     })
 }
 
 /// One device's keys. The private halves stay on the Rust side.
 #[derive(uniffi::Object)]
 pub struct PairingDeviceKeys {
-    inner: kp::DeviceKeys,
+    pub(crate) inner: kp::DeviceKeys,
 }
 
 #[uniffi::export]

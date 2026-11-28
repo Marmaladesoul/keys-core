@@ -80,7 +80,7 @@ use crate::EndpointId;
 use crate::code::PairingCode;
 use crate::cpace::{CpaceParty, CpaceRole, ISK_BYTES, Isk, SHARE_BYTES, lv_cat};
 use crate::keys::{
-    AccountKeys, AccountPublicKeys, PUBLIC_KEY_BYTES, SIGNATURE_BYTES, verify_signature,
+    AccountKeys, AccountPublicKeys, PUBLIC_KEY_BYTES, SIGNATURE_BYTES, SignedStatement,
 };
 use crate::secret::Secret;
 use crate::session::{SESSION_KEY_BYTES, SessionError, SessionKeys, SessionRole, VerifiedSession};
@@ -98,7 +98,6 @@ pub const TAG_BYTES: usize = 64;
 const CI_LABEL: &[u8] = b"keys-pairing";
 const ROLE_DISPLAY: &[u8] = b"display";
 const ROLE_TYPE: &[u8] = b"type";
-const PERSON_KEYS_LABEL: &[u8] = b"keys-pairing person keys";
 /// The confirmation-key prefix from §10.4.
 const CPACE_MAC_LABEL: &[u8] = b"CPaceMac";
 const SESSION_KEY_LABEL: &[u8] = b"keys-pairing session key";
@@ -303,13 +302,14 @@ pub(crate) struct Transcript {
 /// party at one end of two sessions can make their session ids equal and
 /// carry a signed key set from one into the other; without the role, a
 /// side's own key set verifies when reflected back at it.
-fn person_keys_message(
+/// What a side's account signs over its key set: the role, the run's
+/// transcript, and the keys.
+fn person_keys_fields<'a>(
     role: SessionRole,
-    transcript: &Transcript,
-    keys: &AccountPublicKeys,
-) -> Vec<u8> {
-    lv_cat(&[
-        PERSON_KEYS_LABEL,
+    transcript: &'a Transcript,
+    keys: &'a AccountPublicKeys,
+) -> [&'a [u8]; 8] {
+    [
         role_label(role),
         &transcript.ci,
         &transcript.sid,
@@ -318,7 +318,19 @@ fn person_keys_message(
         &keys.identity,
         &keys.recovery,
         &keys.encryption,
-    ])
+    ]
+}
+
+fn sign_person_keys(
+    account: &AccountKeys,
+    role: SessionRole,
+    transcript: &Transcript,
+    keys: &AccountPublicKeys,
+) -> [u8; SIGNATURE_BYTES] {
+    account.sign_statement(
+        SignedStatement::PersonKeys,
+        &person_keys_fields(role, transcript, keys),
+    )
 }
 
 fn role_label(role: SessionRole) -> &'static [u8] {
@@ -376,8 +388,8 @@ impl PersonKeyExchange {
     /// Seals this side's signed key set as the session's next frame.
     fn seal_own_keys(&mut self) -> Vec<u8> {
         let keys = self.account.public_keys();
-        let message = person_keys_message(self.session.role(), &self.transcript, &keys);
-        let signature = self.account.sign(&message);
+        let signature =
+            sign_person_keys(&self.account, self.session.role(), &self.transcript, &keys);
         let key_set = lv_cat(&[&keys.identity, &keys.recovery, &keys.encryption, &signature]);
         // The typing side's session may always send, and seals this once,
         // from `type_finish`. The displaying side's may send once it has
@@ -434,9 +446,11 @@ fn check_key_set(
     };
     let signature = reader.lv_array::<SIGNATURE_BYTES>()?;
     reader.finish()?;
-    let message = person_keys_message(signer_role, transcript, &keys);
-    if !verify_signature(&keys.identity, &message, &signature)
-        || !keys.recovery_and_encryption_are_well_formed()
+    if !SignedStatement::PersonKeys.verify(
+        &keys.identity,
+        &person_keys_fields(signer_role, transcript, &keys),
+        &signature,
+    ) || !keys.are_well_formed()
     {
         return Err(RunFailure::InvalidPeerKeys);
     }
@@ -987,7 +1001,7 @@ mod tests {
         transcript: &Transcript,
         keys: AccountPublicKeys,
     ) -> Vec<u8> {
-        let signature = signer.sign(&person_keys_message(role, transcript, &keys));
+        let signature = sign_person_keys(signer, role, transcript, &keys);
         let key_set = lv_cat(&[&keys.identity, &keys.recovery, &keys.encryption, &signature]);
         sender.session.seal(&key_set).unwrap()
     }
@@ -1208,11 +1222,7 @@ mod tests {
         // A frame the session opens, holding a key set with a byte too many.
         let (display, mut typing) = exchanges();
         let keys = a.public_keys();
-        let signature = a.sign(&person_keys_message(
-            SessionRole::Typing,
-            &typing.transcript,
-            &keys,
-        ));
+        let signature = sign_person_keys(&a, SessionRole::Typing, &typing.transcript, &keys);
         let mut key_set = lv_cat(&[&keys.identity, &keys.recovery, &keys.encryption, &signature]);
         key_set.push(0);
         let frame = typing.session.seal(&key_set).unwrap();
@@ -1244,11 +1254,7 @@ mod tests {
         ];
         for sent in altered {
             let (display, mut typing) = person_exchanges(person(&b, None), person(&a, None));
-            let signature = a.sign(&person_keys_message(
-                SessionRole::Typing,
-                &typing.transcript,
-                &genuine,
-            ));
+            let signature = sign_person_keys(&a, SessionRole::Typing, &typing.transcript, &genuine);
             let key_set = lv_cat(&[&sent.identity, &sent.recovery, &sent.encryption, &signature]);
             let frame = typing.session.seal(&key_set).unwrap();
             assert_eq!(
@@ -1292,11 +1298,7 @@ mod tests {
             typing_share: [4; SHARE_BYTES],
         };
         let keys = a.public_keys();
-        let signature = a.sign(&person_keys_message(
-            SessionRole::Typing,
-            &transcript,
-            &keys,
-        ));
+        let signature = sign_person_keys(&a, SessionRole::Typing, &transcript, &keys);
         let key_set = lv_cat(&[&keys.identity, &keys.recovery, &keys.encryption, &signature]);
         let check = |key_set: &[u8]| check_key_set(key_set, SessionRole::Typing, &transcript, None);
         assert_eq!(check(&key_set), Ok(keys));

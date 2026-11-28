@@ -20,6 +20,7 @@
 //! `resolve`). Diagnostics go to stderr; verb results go to stdout so
 //! scenario scripts can parse them.
 
+mod account;
 mod adapters;
 mod kdf;
 mod pairing;
@@ -124,6 +125,13 @@ enum CeilingArg {
     /// A process with a hard memory budget.
     MemoryConstrained,
 }
+
+/// Stand-in transport endpoint and author ids for the account verbs. Nothing
+/// dials them, but an enrolment only names usable Ed25519 keys, so these are
+/// the public keys of the fixed seeds `[0x77; 32]` and `[0x88; 32]`.
+const DEFAULT_ENDPOINT_HEX: &str =
+    "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7";
+const DEFAULT_AUTHOR_HEX: &str = "b2491d9502ae28630a2bacb2e0c74510ffcdd328c334ff3e1393e75b2d31e7dc";
 
 #[derive(Subcommand)]
 enum Command {
@@ -910,6 +918,67 @@ enum Command {
         #[arg(long)]
         expect: String,
     },
+    /// Create a throwaway account and this device's keys, keeping each stored
+    /// form in a file of its own in `dir` (a stand-in for the device's
+    /// secure storage, created fresh), with this device's enrolment and the
+    /// recovery code (in a file, never printed). Prints the public keys.
+    /// Needs no vault and no password.
+    AccountCreate {
+        /// Fresh directory to keep the stored forms in.
+        dir: PathBuf,
+        /// This device's transport endpoint id, 32 bytes of hex.
+        #[arg(long, default_value = DEFAULT_ENDPOINT_HEX)]
+        endpoint: String,
+        /// This device's document author id, 32 bytes of hex.
+        #[arg(long, default_value = DEFAULT_AUTHOR_HEX)]
+        author: String,
+    },
+    /// Generate a device's keys only, stored in `dir` (a new device before it
+    /// is paired). Needs no vault and no password.
+    AccountDeviceKeygen {
+        /// Fresh directory to keep the stored forms in.
+        dir: PathBuf,
+    },
+    /// Read the stored keys in `dir` back in a fresh process and print their
+    /// public halves, or `refused: <file> <reason>`. Needs no vault and no
+    /// password.
+    AccountShow {
+        dir: PathBuf,
+        /// Read only what a locked device can: its signing and relay keys.
+        #[arg(long)]
+        locked: bool,
+    },
+    /// Check the recovery code typed into `code_file` against the account
+    /// stored in `--dir`, or for its form alone without one. Prints
+    /// `recovery-code: <verdict>`. Needs no vault and no password.
+    AccountRecovery {
+        /// File holding the typed code (kept off the command line).
+        code_file: PathBuf,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// The account stored in `dir` enrols the device whose keys are stored
+    /// in `--device`, writing the enrolment to `--out`. Needs no vault and no
+    /// password.
+    AccountEnrol {
+        dir: PathBuf,
+        #[arg(long)]
+        device: PathBuf,
+        #[arg(long, default_value = DEFAULT_ENDPOINT_HEX)]
+        endpoint: String,
+        #[arg(long, default_value = DEFAULT_AUTHOR_HEX)]
+        author: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Check an enrolment against the account identity key `--identity` and
+    /// print what it certifies, or `refused: enrolment <reason>`. Needs no
+    /// vault and no password.
+    AccountOpenEnrolment {
+        enrolment: PathBuf,
+        #[arg(long)]
+        identity: String,
+    },
     /// Generate a fresh account key set (identity, recovery, encryption) and
     /// a device key set (signing, relay, vault) through the pairing seam, and
     /// print their public halves as `<set> <role> <hex>` lines. Nothing is
@@ -1045,9 +1114,30 @@ async fn main() -> Result<()> {
         CeilingArg::Standard => KdfCeilingProfile::Standard,
         CeilingArg::MemoryConstrained => KdfCeilingProfile::MemoryConstrained,
     });
-    // The pairing verbs touch no vault, so they run before the password is
-    // read.
+    // The account and pairing verbs touch no vault, so they run before the
+    // password is read.
     match &cli.command {
+        Command::AccountCreate {
+            dir,
+            endpoint,
+            author,
+        } => return account::create(dir, endpoint, author),
+        Command::AccountDeviceKeygen { dir } => return account::device_keygen(dir),
+        Command::AccountShow { dir, locked } => return account::show(dir, *locked),
+        Command::AccountRecovery { code_file, dir } => {
+            return account::recovery(dir.as_deref(), code_file);
+        }
+        Command::AccountEnrol {
+            dir,
+            device,
+            endpoint,
+            author,
+            out,
+        } => return account::enrol(dir, device, endpoint, author, out),
+        Command::AccountOpenEnrolment {
+            enrolment,
+            identity,
+        } => return account::open_enrolment(enrolment, identity),
         Command::PairKeygen => return pairing::keygen(),
         Command::PairSim {
             kind,
@@ -1658,7 +1748,13 @@ async fn main() -> Result<()> {
         Command::VerifyIdentity { picked, expect } => {
             verify_identity(&picked, &expect, &password, keyfile.clone())?;
         }
-        Command::PairKeygen
+        Command::AccountCreate { .. }
+        | Command::AccountDeviceKeygen { .. }
+        | Command::AccountShow { .. }
+        | Command::AccountRecovery { .. }
+        | Command::AccountEnrol { .. }
+        | Command::AccountOpenEnrolment { .. }
+        | Command::PairKeygen
         | Command::PairSim { .. }
         | Command::PairNet { .. }
         | Command::PairLink { .. }

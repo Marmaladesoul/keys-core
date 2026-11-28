@@ -2599,6 +2599,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "keys-account"
+version = "0.0.0"
+dependencies = [
+ "curve25519-dalek",
+ "keys-pairing",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "keys-engine"
 version = "0.0.0"
 dependencies = [
@@ -2632,6 +2642,7 @@ dependencies = [
  "chrono",
  "keepass-core",
  "keepass-merge",
+ "keys-account",
  "keys-engine",
  "keys-iroh-sync",
  "keys-pairing",

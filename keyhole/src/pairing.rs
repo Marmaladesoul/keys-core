@@ -208,7 +208,7 @@ pub(crate) fn describe(outcome: &PairingOutcomeFfi) -> String {
 }
 
 /// `ConfirmationFailed` → `confirmation-failed`.
-fn kebab(name: &str) -> String {
+pub(crate) fn kebab(name: &str) -> String {
     let mut out = String::new();
     for (index, ch) in name.chars().enumerate() {
         if ch.is_ascii_uppercase() {

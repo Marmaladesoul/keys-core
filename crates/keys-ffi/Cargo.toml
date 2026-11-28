@@ -28,6 +28,8 @@ pairing-test-transport = ["keys-iroh-sync/test-hooks"]
 keepass-core = { git = "https://github.com/Marmaladesoul/keepass-core" }
 keepass-merge = { git = "https://github.com/Marmaladesoul/keepass-core" }
 keys-engine = { path = "../keys-engine" }
+# Account identity (the recovery code, device enrolment), in `account.rs`.
+keys-account = { path = "../keys-account" }
 # Code-authenticated pairing (CPace over a six-digit code), surfaced as uniffi
 # objects in `pairing.rs`.
 keys-pairing = { path = "../keys-pairing" }
