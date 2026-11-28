@@ -61,7 +61,10 @@ pub use greeting::{Greeting, KnockAnswer, MeetingAnswer};
 pub use invite::{
     Invite, InviteBook, InviteError, InviteId, InviteRecord, IssueError, KnockOutcome,
 };
-pub use keys::{AccountKeys, AccountPublicKeys, DeviceKeys, DevicePublicKeys, RecoverySecret};
+pub use keys::{
+    AccountKeys, AccountPublicKeys, DeviceKeys, DevicePublicKeys, DeviceSyncKeys, DeviceVaultKey,
+    RecoverySecret, SignedStatement, StoredKeysError,
+};
 pub use link::{LinkError, PairingLink};
 pub use protocol::{Credentials, PROTOCOL_VERSION, PairingKind, RefuseReason, RunFailure};
 pub use session::{SessionError, VerifiedSession};

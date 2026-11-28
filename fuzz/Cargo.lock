@@ -292,9 +292,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "keys-account"
+version = "0.0.0"
+dependencies = [
+ "keys-pairing",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "keys-core-fuzz"
 version = "0.0.0"
 dependencies = [
+ "keys-account",
  "keys-pairing",
  "libfuzzer-sys",
 ]

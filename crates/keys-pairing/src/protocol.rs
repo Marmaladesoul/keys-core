@@ -80,7 +80,8 @@ use crate::EndpointId;
 use crate::code::PairingCode;
 use crate::cpace::{CpaceParty, CpaceRole, ISK_BYTES, Isk, SHARE_BYTES, lv_cat};
 use crate::keys::{
-    AccountKeys, AccountPublicKeys, PUBLIC_KEY_BYTES, SIGNATURE_BYTES, verify_signature,
+    AccountKeys, AccountPublicKeys, PUBLIC_KEY_BYTES, SIGNATURE_BYTES, SignedStatement,
+    verify_signature,
 };
 use crate::secret::Secret;
 use crate::session::{SESSION_KEY_BYTES, SessionError, SessionKeys, SessionRole, VerifiedSession};
@@ -98,7 +99,6 @@ pub const TAG_BYTES: usize = 64;
 const CI_LABEL: &[u8] = b"keys-pairing";
 const ROLE_DISPLAY: &[u8] = b"display";
 const ROLE_TYPE: &[u8] = b"type";
-const PERSON_KEYS_LABEL: &[u8] = b"keys-pairing person keys";
 /// The confirmation-key prefix from §10.4.
 const CPACE_MAC_LABEL: &[u8] = b"CPaceMac";
 const SESSION_KEY_LABEL: &[u8] = b"keys-pairing session key";
@@ -308,8 +308,7 @@ fn person_keys_message(
     transcript: &Transcript,
     keys: &AccountPublicKeys,
 ) -> Vec<u8> {
-    lv_cat(&[
-        PERSON_KEYS_LABEL,
+    SignedStatement::PersonKeys.message(&[
         role_label(role),
         &transcript.ci,
         &transcript.sid,

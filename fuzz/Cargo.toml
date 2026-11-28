@@ -26,6 +26,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+keys-account = { path = "../crates/keys-account" }
 keys-pairing = { path = "../crates/keys-pairing" }
 
 [[bin]]
@@ -94,6 +95,27 @@ bench = false
 [[bin]]
 name = "pairing_invites"
 path = "fuzz_targets/pairing_invites.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "account_recovery_code"
+path = "fuzz_targets/account_recovery_code.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "account_stored_keys"
+path = "fuzz_targets/account_stored_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "account_enrolment"
+path = "fuzz_targets/account_enrolment.rs"
 test = false
 doc = false
 bench = false

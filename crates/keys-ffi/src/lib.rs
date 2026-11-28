@@ -7,6 +7,7 @@
 //! API shape is driven by Keys' UI needs and carries no stability
 //! guarantee for external consumers; it is not published to crates.io.
 
+mod account;
 mod db_key_provider;
 mod engine;
 mod engine_error;
@@ -25,6 +26,10 @@ mod test_vault;
 mod totp;
 mod vault_create;
 
+pub use account::{
+    AccountFfiError, DeviceEnrolmentRecord, DeviceSyncKeys, DeviceVaultKey, RecoveryCodeCheck,
+    open_device_enrolment, read_recovery_code,
+};
 pub use db_key_provider::{VaultDbKeyProvider, VaultDbKeyProviderError};
 pub use engine::{
     Engine, SelfHealingOpen, SidecarRebuildReason, open_vault_self_healing, purge_vault_local_data,

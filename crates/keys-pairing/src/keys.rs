@@ -17,15 +17,26 @@
 //! author keys belong to the sync transport and are not generated here.
 //!
 //! **What the account identity key signs.** Every signature it makes is over
-//! `lv_cat(label, ...)` with a label of its own, so a signature made for one
-//! purpose can't be presented for another. Labels in use:
-//! - `"keys-pairing person keys"`: a Person pairing's key set (`protocol`).
+//! `lv_cat(label, fields...)` for one [`SignedStatement`], each with a label
+//! of its own, so a signature made for one purpose can't be presented for
+//! another. The enum is the whole list: a new purpose is a new variant with a
+//! fresh label, and there is no way to sign anything else.
 //!
-//! Add each new signing purpose here with a fresh label.
+//! **Stored forms.** Each key set has a byte form for the platform's secure
+//! storage, one per protection class, so nothing readable on a locked device
+//! can decrypt a vault or act as the account:
+//! - [`AccountKeys::to_stored`]: behind the app's unlock;
+//! - [`DeviceSyncKeys::to_stored`] (signing and relay keys): readable after
+//!   the device's first unlock, so an unattended device can keep syncing;
+//! - [`DeviceVaultKey::to_stored`]: behind the app's unlock.
 //!
-//! This module only generates and holds keys. Where they are stored, and how
-//! the recovery secret is rendered for a person to write down, is the
-//! caller's business.
+//! A stored form is `[version, kind]` followed by the 32-byte secrets (and,
+//! for an account, the recovery public key). It is a secret: it is handed
+//! back wiped-on-drop, and the caller must not log it.
+//!
+//! This module only generates, holds and serialises keys. Where the stored
+//! forms are kept, and how the recovery secret is rendered for a person to
+//! write down, is the caller's business.
 
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -50,6 +61,130 @@ const RECOVERY_DIGEST_BYTES: usize = 64;
 /// Domain separator for deriving the recovery signing key from the recovery
 /// secret.
 const RECOVERY_KEY_LABEL: &[u8] = b"keys recovery key v1";
+
+/// The version of every stored form. There is one; a form of any other
+/// version is refused as damaged.
+const STORED_FORMAT_VERSION: u8 = 1;
+/// What a stored form holds, so one kept in the wrong place is refused
+/// rather than read as another kind.
+const STORED_KIND_ACCOUNT: u8 = b'A';
+const STORED_KIND_DEVICE_SYNC: u8 = b'S';
+const STORED_KIND_DEVICE_VAULT: u8 = b'V';
+/// Length of a stored form's header: the version and the kind.
+const STORED_HEADER_BYTES: usize = 2;
+
+/// Why a stored form was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StoredKeysError {
+    /// It is a well-formed stored form of another kind.
+    #[error("the stored keys are of another kind")]
+    WrongKind,
+    /// It is not a stored form at all, or one that is damaged.
+    #[error("the stored keys are damaged")]
+    Damaged,
+}
+
+/// Everything the account identity key signs. Each statement is signed over
+/// `lv_cat(label, fields...)` with a label of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignedStatement {
+    /// A Person pairing's key set, as one role of one exchange (`protocol`).
+    PersonKeys,
+    /// A device's enrolment in the account: its public keys, its endpoint id
+    /// and its document author id.
+    DeviceEnrolment,
+}
+
+impl SignedStatement {
+    const fn label(self) -> &'static [u8] {
+        match self {
+            Self::PersonKeys => b"keys-pairing person keys",
+            Self::DeviceEnrolment => b"keys account device enrolment",
+        }
+    }
+
+    /// The bytes signed for this statement over `fields`.
+    pub(crate) fn message(self, fields: &[&[u8]]) -> Vec<u8> {
+        let mut parts = Vec::with_capacity(fields.len() + 1);
+        parts.push(self.label());
+        parts.extend_from_slice(fields);
+        lv_cat(&parts)
+    }
+
+    /// Whether `signature` is the account identity key `identity`'s
+    /// signature of this statement over `fields`, verified strictly.
+    #[must_use]
+    pub fn verify(
+        self,
+        identity: &[u8; PUBLIC_KEY_BYTES],
+        fields: &[&[u8]],
+        signature: &[u8; SIGNATURE_BYTES],
+    ) -> bool {
+        verify_signature(identity, &self.message(fields), signature)
+    }
+}
+
+/// Whether `key` is a usable Ed25519 public key: a valid point that isn't of
+/// small order.
+#[must_use]
+pub fn ed25519_public_key_is_usable(key: &[u8; PUBLIC_KEY_BYTES]) -> bool {
+    VerifyingKey::from_bytes(key).is_ok_and(|key| !key.is_weak())
+}
+
+/// Whether `key` is a usable X25519 public key: a point on the curve (not its
+/// twist) that isn't of small order, so a key agreement with it can't be
+/// forced to a known shared secret.
+#[must_use]
+pub fn x25519_public_key_is_usable(key: &[u8; PUBLIC_KEY_BYTES]) -> bool {
+    // Either sign choice gives a point of the same order.
+    const EDWARDS_SIGN: u8 = 0;
+    MontgomeryPoint(*key)
+        .to_edwards(EDWARDS_SIGN)
+        .is_some_and(|point| !point.is_small_order())
+}
+
+/// A stored form of `kind` holding `fields`, in an allocation sized once so
+/// it never moves while it is written.
+fn stored_form(kind: u8, fields: &[&[u8; SECRET_KEY_BYTES]]) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(
+        STORED_HEADER_BYTES + fields.len() * SECRET_KEY_BYTES,
+    ));
+    out.extend_from_slice(&[STORED_FORMAT_VERSION, kind]);
+    for field in fields {
+        out.extend_from_slice(*field);
+    }
+    out
+}
+
+/// The `N` 32-byte fields of a stored form of `kind`, borrowed from it.
+fn stored_fields<const N: usize>(
+    stored: &[u8],
+    kind: u8,
+) -> Result<[&[u8; SECRET_KEY_BYTES]; N], StoredKeysError> {
+    let (header, body) = stored
+        .split_at_checked(STORED_HEADER_BYTES)
+        .ok_or(StoredKeysError::Damaged)?;
+    if header[0] != STORED_FORMAT_VERSION {
+        return Err(StoredKeysError::Damaged);
+    }
+    if ![
+        STORED_KIND_ACCOUNT,
+        STORED_KIND_DEVICE_SYNC,
+        STORED_KIND_DEVICE_VAULT,
+    ]
+    .contains(&header[1])
+    {
+        return Err(StoredKeysError::Damaged);
+    }
+    if header[1] != kind {
+        return Err(StoredKeysError::WrongKind);
+    }
+    let (fields, rest) = body.as_chunks::<SECRET_KEY_BYTES>();
+    if fields.len() != N || !rest.is_empty() {
+        return Err(StoredKeysError::Damaged);
+    }
+    Ok(std::array::from_fn(|index| &fields[index]))
+}
 
 fn random_secret() -> Result<Zeroizing<[u8; SECRET_KEY_BYTES]>, PairingError> {
     let mut bytes = Zeroizing::new([0u8; SECRET_KEY_BYTES]);
@@ -78,6 +213,10 @@ impl X25519Secret {
         Ok(Self(secret))
     }
 
+    fn copy_of(bytes: &[u8; SECRET_KEY_BYTES]) -> Self {
+        Self(Secret::copy_of(bytes))
+    }
+
     /// The public key, `X25519(secret, 9)` (RFC 7748, with its clamping).
     #[must_use]
     pub fn public_key(&self) -> [u8; PUBLIC_KEY_BYTES] {
@@ -98,6 +237,19 @@ impl std::fmt::Debug for RecoverySecret {
 }
 
 impl RecoverySecret {
+    /// The recovery secret with these bytes: a recovery code read back in.
+    /// The caller still owns, and must wipe, `bytes`.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8; RECOVERY_SECRET_BYTES]) -> Self {
+        Self(Secret::copy_of(bytes))
+    }
+
+    /// The recovery public key, which every device of the account holds.
+    #[must_use]
+    pub fn public_key(&self) -> [u8; PUBLIC_KEY_BYTES] {
+        self.signing_key().verifying_key().to_bytes()
+    }
+
     /// The recovery signing key: the Ed25519 seed is the first 32 bytes of
     /// `SHA-512(lv_cat("keys recovery key v1", secret))`.
     #[must_use]
@@ -135,13 +287,8 @@ impl AccountPublicKeys {
     /// is checked by verifying its signature, strictly.
     #[must_use]
     pub(crate) fn recovery_and_encryption_are_well_formed(&self) -> bool {
-        // Either sign choice gives a point of the same order.
-        const EDWARDS_SIGN: u8 = 0;
-        let recovery_ok = VerifyingKey::from_bytes(&self.recovery).is_ok_and(|key| !key.is_weak());
-        let encryption_ok = MontgomeryPoint(self.encryption)
-            .to_edwards(EDWARDS_SIGN)
-            .is_some_and(|point| !point.is_small_order());
-        recovery_ok && encryption_ok
+        ed25519_public_key_is_usable(&self.recovery)
+            && x25519_public_key_is_usable(&self.encryption)
     }
 }
 
@@ -167,9 +314,51 @@ impl AccountKeys {
         let keys = Self {
             identity: random_signing_key()?,
             encryption: X25519Secret::generate()?,
-            recovery_public: recovery.signing_key().verifying_key().to_bytes(),
+            recovery_public: recovery.public_key(),
         };
         Ok((keys, recovery))
+    }
+
+    /// The stored form: identity seed, encryption secret, recovery public
+    /// key. Behind the app's unlock.
+    #[must_use]
+    pub fn to_stored(&self) -> Zeroizing<Vec<u8>> {
+        stored_form(
+            STORED_KIND_ACCOUNT,
+            &[
+                self.identity.as_bytes(),
+                self.encryption.0.as_bytes(),
+                &self.recovery_public,
+            ],
+        )
+    }
+
+    /// Reads a stored form back. The caller still owns, and must wipe,
+    /// `stored`.
+    ///
+    /// # Errors
+    /// [`StoredKeysError`] if `stored` isn't an account's stored form, or its
+    /// recovery public key isn't a usable key.
+    pub fn from_stored(stored: &[u8]) -> Result<Self, StoredKeysError> {
+        let [identity, encryption, recovery_public] = stored_fields(stored, STORED_KIND_ACCOUNT)?;
+        if !ed25519_public_key_is_usable(recovery_public) {
+            return Err(StoredKeysError::Damaged);
+        }
+        Ok(Self {
+            identity: boxed_signing_key(identity),
+            encryption: X25519Secret::copy_of(encryption),
+            recovery_public: *recovery_public,
+        })
+    }
+
+    /// Signs `statement` over `fields` with the identity key.
+    #[must_use]
+    pub fn sign_statement(
+        &self,
+        statement: SignedStatement,
+        fields: &[&[u8]],
+    ) -> [u8; SIGNATURE_BYTES] {
+        self.sign(&statement.message(fields))
     }
 
     #[must_use]
@@ -216,11 +405,14 @@ pub struct DevicePublicKeys {
     pub vault: [u8; PUBLIC_KEY_BYTES],
 }
 
-/// One device's keys. Private halves are wiped on drop.
+/// One device's keys, as generated. Private halves are wiped on drop.
+///
+/// The keys belong to two protection classes, so they are stored, and can be
+/// held, apart: [`DeviceSyncKeys`] (readable after the device's first
+/// unlock) and [`DeviceVaultKey`] (behind the app's unlock).
 pub struct DeviceKeys {
-    signing: Box<SigningKey>,
-    relay: X25519Secret,
-    vault: X25519Secret,
+    sync: DeviceSyncKeys,
+    vault: DeviceVaultKey,
 }
 
 impl DeviceKeys {
@@ -230,19 +422,111 @@ impl DeviceKeys {
     /// [`PairingError::Random`] if the system random source fails.
     pub fn generate() -> Result<Self, PairingError> {
         Ok(Self {
-            signing: random_signing_key()?,
-            relay: X25519Secret::generate()?,
-            vault: X25519Secret::generate()?,
+            sync: DeviceSyncKeys {
+                signing: random_signing_key()?,
+                relay: X25519Secret::generate()?,
+            },
+            vault: DeviceVaultKey(X25519Secret::generate()?),
         })
     }
 
     #[must_use]
     pub fn public_keys(&self) -> DevicePublicKeys {
         DevicePublicKeys {
-            signing: self.signing.verifying_key().to_bytes(),
-            relay: self.relay.public_key(),
+            signing: self.sync.signing_public_key(),
+            relay: self.sync.relay_public_key(),
             vault: self.vault.public_key(),
         }
+    }
+
+    #[must_use]
+    pub fn sync_keys(&self) -> &DeviceSyncKeys {
+        &self.sync
+    }
+
+    #[must_use]
+    pub fn vault_key(&self) -> &DeviceVaultKey {
+        &self.vault
+    }
+}
+
+/// A device's signing and relay keys: what it needs to keep syncing while
+/// the app is locked. Readable after the device's first unlock.
+pub struct DeviceSyncKeys {
+    signing: Box<SigningKey>,
+    relay: X25519Secret,
+}
+
+impl DeviceSyncKeys {
+    /// The signing public key, which is also the device's id in the account.
+    #[must_use]
+    pub fn signing_public_key(&self) -> [u8; PUBLIC_KEY_BYTES] {
+        self.signing.verifying_key().to_bytes()
+    }
+
+    #[must_use]
+    pub fn relay_public_key(&self) -> [u8; PUBLIC_KEY_BYTES] {
+        self.relay.public_key()
+    }
+
+    /// The stored form: signing seed, relay secret.
+    #[must_use]
+    pub fn to_stored(&self) -> Zeroizing<Vec<u8>> {
+        stored_form(
+            STORED_KIND_DEVICE_SYNC,
+            &[self.signing.as_bytes(), self.relay.0.as_bytes()],
+        )
+    }
+
+    /// Reads a stored form back. The caller still owns, and must wipe,
+    /// `stored`.
+    ///
+    /// # Errors
+    /// [`StoredKeysError`] if `stored` isn't a device's stored sync keys.
+    pub fn from_stored(stored: &[u8]) -> Result<Self, StoredKeysError> {
+        let [signing, relay] = stored_fields(stored, STORED_KIND_DEVICE_SYNC)?;
+        Ok(Self {
+            signing: boxed_signing_key(signing),
+            relay: X25519Secret::copy_of(relay),
+        })
+    }
+
+    #[cfg(test)]
+    fn watch_secrets(&self) {
+        crate::heap_watch::register(self.signing.as_bytes());
+        crate::heap_watch::register(self.relay.0.as_bytes());
+    }
+}
+
+/// A device's vault key: what opens the vault secrets sealed to the device.
+/// Behind the app's unlock.
+pub struct DeviceVaultKey(X25519Secret);
+
+impl DeviceVaultKey {
+    #[must_use]
+    pub fn public_key(&self) -> [u8; PUBLIC_KEY_BYTES] {
+        self.0.public_key()
+    }
+
+    /// The stored form: the vault secret.
+    #[must_use]
+    pub fn to_stored(&self) -> Zeroizing<Vec<u8>> {
+        stored_form(STORED_KIND_DEVICE_VAULT, &[self.0.0.as_bytes()])
+    }
+
+    /// Reads a stored form back. The caller still owns, and must wipe,
+    /// `stored`.
+    ///
+    /// # Errors
+    /// [`StoredKeysError`] if `stored` isn't a device's stored vault key.
+    pub fn from_stored(stored: &[u8]) -> Result<Self, StoredKeysError> {
+        let [vault] = stored_fields(stored, STORED_KIND_DEVICE_VAULT)?;
+        Ok(Self(X25519Secret::copy_of(vault)))
+    }
+
+    #[cfg(test)]
+    fn watch_secrets(&self) {
+        crate::heap_watch::register(self.0.0.as_bytes());
     }
 }
 
@@ -312,6 +596,159 @@ mod tests {
             hex32("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
         );
     }
+
+    #[test]
+    fn account_keys_survive_their_stored_form() {
+        let (keys, recovery) = AccountKeys::generate().expect("rng");
+        let stored = keys.to_stored();
+        let restored = AccountKeys::from_stored(&stored).expect("restores");
+        assert_eq!(restored.public_keys(), keys.public_keys());
+        assert_eq!(restored.public_keys().recovery, recovery.public_key());
+        // The restored identity key signs as the original.
+        let signature = restored.sign_statement(SignedStatement::DeviceEnrolment, &[b"x"]);
+        assert!(SignedStatement::DeviceEnrolment.verify(
+            &keys.public_keys().identity,
+            &[b"x"],
+            &signature
+        ));
+    }
+
+    #[test]
+    fn device_keys_survive_their_stored_forms_apart() {
+        let device = DeviceKeys::generate().expect("rng");
+        let public = device.public_keys();
+        let sync = DeviceSyncKeys::from_stored(&device.sync_keys().to_stored()).expect("sync");
+        let vault = DeviceVaultKey::from_stored(&device.vault_key().to_stored()).expect("vault");
+        assert_eq!(sync.signing_public_key(), public.signing);
+        assert_eq!(sync.relay_public_key(), public.relay);
+        assert_eq!(vault.public_key(), public.vault);
+    }
+
+    #[test]
+    fn a_stored_form_of_another_kind_is_refused_as_such() {
+        let (account, _) = AccountKeys::generate().expect("rng");
+        let device = DeviceKeys::generate().expect("rng");
+        let account_form = account.to_stored();
+        let sync_form = device.sync_keys().to_stored();
+        let vault_form = device.vault_key().to_stored();
+        assert_eq!(
+            DeviceVaultKey::from_stored(&account_form).err(),
+            Some(StoredKeysError::WrongKind)
+        );
+        assert_eq!(
+            AccountKeys::from_stored(&sync_form).err(),
+            Some(StoredKeysError::WrongKind)
+        );
+        assert_eq!(
+            DeviceSyncKeys::from_stored(&vault_form).err(),
+            Some(StoredKeysError::WrongKind)
+        );
+    }
+
+    #[test]
+    fn a_damaged_stored_form_is_refused() {
+        let (account, _) = AccountKeys::generate().expect("rng");
+        let form = account.to_stored();
+        // Every truncation, and one byte too many.
+        for len in 0..form.len() {
+            assert_eq!(
+                AccountKeys::from_stored(&form[..len]).err(),
+                Some(StoredKeysError::Damaged),
+                "length {len}"
+            );
+        }
+        let mut long = form.to_vec();
+        long.push(0);
+        assert_eq!(
+            AccountKeys::from_stored(&long).err(),
+            Some(StoredKeysError::Damaged)
+        );
+        // Another version, and an unknown kind.
+        for (index, value) in [(0, STORED_FORMAT_VERSION + 1), (1, b'?')] {
+            let mut bad = form.to_vec();
+            bad[index] = value;
+            assert_eq!(
+                AccountKeys::from_stored(&bad).err(),
+                Some(StoredKeysError::Damaged)
+            );
+        }
+        // A recovery public key that isn't a usable key (the identity point).
+        let mut weak = form.to_vec();
+        let recovery = STORED_HEADER_BYTES + 2 * SECRET_KEY_BYTES;
+        weak[recovery..].copy_from_slice(&IDENTITY_POINT);
+        assert_eq!(
+            AccountKeys::from_stored(&weak).err(),
+            Some(StoredKeysError::Damaged)
+        );
+    }
+
+    #[test]
+    fn stored_forms_leave_no_secret_in_freed_memory() {
+        crate::heap_watch::start();
+        let (account, _) = AccountKeys::generate().expect("rng");
+        account.watch_secrets();
+        let device = DeviceKeys::generate().expect("rng");
+        device.sync_keys().watch_secrets();
+        device.vault_key().watch_secrets();
+        let account_form = account.to_stored();
+        let sync_form = device.sync_keys().to_stored();
+        let vault_form = device.vault_key().to_stored();
+        let restored = (
+            AccountKeys::from_stored(&account_form).expect("account"),
+            DeviceSyncKeys::from_stored(&sync_form).expect("sync"),
+            DeviceVaultKey::from_stored(&vault_form).expect("vault"),
+        );
+        drop((
+            account_form,
+            sync_form,
+            vault_form,
+            restored,
+            account,
+            device,
+        ));
+        assert_eq!(
+            crate::heap_watch::finish(),
+            0,
+            "a block was freed holding a secret"
+        );
+    }
+
+    #[test]
+    fn a_recovery_secret_read_back_derives_the_same_key() {
+        let (keys, recovery) = AccountKeys::generate().expect("rng");
+        let read_back = RecoverySecret::from_bytes(recovery.as_bytes());
+        assert_eq!(read_back.public_key(), keys.public_keys().recovery);
+    }
+
+    #[test]
+    fn a_statement_signature_doesnt_verify_as_another_statement() {
+        let (keys, _) = AccountKeys::generate().expect("rng");
+        let identity = keys.public_keys().identity;
+        let fields: [&[u8]; 2] = [b"one", b"two"];
+        let signature = keys.sign_statement(SignedStatement::DeviceEnrolment, &fields);
+        assert!(SignedStatement::DeviceEnrolment.verify(&identity, &fields, &signature));
+        assert!(!SignedStatement::PersonKeys.verify(&identity, &fields, &signature));
+        // The fields are length-prefixed: moving a byte across a boundary
+        // is a different statement.
+        assert!(!SignedStatement::DeviceEnrolment.verify(&identity, &[b"onet", b"wo"], &signature));
+    }
+
+    #[test]
+    fn public_key_checks_refuse_small_order_points() {
+        assert!(!ed25519_public_key_is_usable(&IDENTITY_POINT));
+        assert!(!x25519_public_key_is_usable(&[0; PUBLIC_KEY_BYTES]));
+        let (keys, _) = AccountKeys::generate().expect("rng");
+        let public = keys.public_keys();
+        assert!(ed25519_public_key_is_usable(&public.identity));
+        assert!(x25519_public_key_is_usable(&public.encryption));
+    }
+
+    /// The Edwards identity point's encoding: a valid point of small order.
+    const IDENTITY_POINT: [u8; PUBLIC_KEY_BYTES] = {
+        let mut point = [0u8; PUBLIC_KEY_BYTES];
+        point[0] = 1;
+        point
+    };
 
     #[test]
     fn recovery_secret_debug_is_redacted() {
