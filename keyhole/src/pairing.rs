@@ -160,7 +160,7 @@ pub struct SimScript {
     pub payload: Option<String>,
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut out, byte| {
         let _ = write!(out, "{byte:02x}");
         out
@@ -181,7 +181,7 @@ pub fn keygen() -> Result<()> {
     Ok(())
 }
 
-fn describe(outcome: &PairingOutcomeFfi) -> String {
+pub(crate) fn describe(outcome: &PairingOutcomeFfi) -> String {
     match outcome {
         PairingOutcomeFfi::Continue => "continue".to_owned(),
         PairingOutcomeFfi::NoRun { reason } => {
@@ -252,7 +252,7 @@ fn ensure_shown_code_differs(display: &PairingDisplaySheet, stale: &str) -> Resu
 }
 
 /// A code one digit off the real one: a typo, or a wrong guess.
-fn wrong(code: &str) -> String {
+pub(crate) fn wrong(code: &str) -> String {
     let mut digits = code.as_bytes().to_vec();
     if let Some(first) = digits.first_mut() {
         *first = if *first == b'9' { b'0' } else { *first + 1 };
@@ -786,7 +786,7 @@ fn attempt(
     }
 }
 
-fn ok(flag: bool) -> &'static str {
+pub(crate) fn ok(flag: bool) -> &'static str {
     if flag { "ok" } else { "FAILED" }
 }
 

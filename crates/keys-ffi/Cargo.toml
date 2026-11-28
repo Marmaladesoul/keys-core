@@ -18,6 +18,9 @@ workspace = true
 # Test scaffolding for the headless driver: a pairing clock that moves only
 # when told to. Off by default, so client builds don't carry it.
 pairing-test-clock = []
+# More of the same, for the pairing transport: nodes that bind to the
+# loopback interface only, and an invite clock that can be moved forward.
+pairing-test-transport = ["keys-iroh-sync/test-hooks"]
 
 [dependencies]
 # Git deps on the public keepass-core repo so a clean clone builds without a

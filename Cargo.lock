@@ -2655,6 +2655,7 @@ dependencies = [
  "iroh-docs",
  "iroh-gossip",
  "keys-ffi",
+ "keys-pairing",
  "n0-future",
  "tempfile",
  "thiserror",

@@ -111,6 +111,28 @@ future uniffi version removes the `Drop`-versus-`Record` constraint.
 
 ---
 
+## 4. Pairing discovery: what finding the other device gives away, and who can get in the way
+
+**What it is.** Before two devices can run the code exchange they have to find each other, and every way of doing that is unauthenticated by design: the code is the only thing a person verifies. Nothing below lets anyone complete a pairing without the code, or learn a secret. These are the things discovery does expose or allow.
+
+- **Opening a link contacts whatever it names.** An invite or an address link names an endpoint and, optionally, a relay. A device that opens an invite knocks on that endpoint, and one that reads an address link approaches it. Either way it connects to an endpoint and a relay chosen by whoever made the link, which learn its endpoint id and its network address. A link that was swapped or made up by someone else therefore gets the opener's device to call them. The relay must be a plain `https://` URL naming a public host: not an IP address, not a one-label name, and not a name reserved for a machine or its own network (`localhost`, `.local`, `.home.arpa`, `.internal`). That keeps a link from naming a device's own machine or network outright, but it is a check on the name only: a public name can resolve to a private address, so a link can still get a device to open an HTTPS connection to a service on its own network. Nothing restricts which public host.
+- **An invite names its issuer, lastingly.** An invite carries the inviter's account identity public key and the issuing device's endpoint id and relay. Pairing runs on the device's own endpoint, so that id is the device's permanent one: every invite from one device carries the same id, invites from one account carry the same identity key, and both outlive the invite's expiry. Whoever sees two invites can tell they came from the same device or account, and whoever keeps one can go on dialling that endpoint.
+- **An advertisement is public on its network.** While a pairing sheet is open for a device joining an account, the device advertises its endpoint id (and relay, if it has one) to the local network, under a service name the client chooses. Anyone on that network sees a device is pairing. It stops when the sheet closes.
+- **Whoever reaches a waiting device first is the one it talks to.** A device waiting to type a code takes the first endpoint that approaches it and tells later ones it is busy, until the person turns the first away. On a shared network a stranger can get in first. The person then types the code their own device shows into a run with the stranger: that run fails, the stranger has had one counted guess (the one-in-a-million chance the exchange already allows), and the real device has been kept out meanwhile.
+- **The first endpoint to knock is an invite's opener.** Someone who obtains an invite and knocks before the invited person takes their place on the issuer's record, and the invited person's device is told the invite isn't outstanding. The verification then runs against the interloper, who doesn't have the code. Nothing pairs, and the invite has to be sent again.
+- **Connection slots can be used up.** A device serves a bounded number of pairing connections at once, and a displaying sheet a bounded number of callers. Anyone who can reach the endpoint and knows its id can hold them: for up to half a minute each with connections that never say what they want or won't take the answer, and for as long as they keep a connection up once an open sheet has accepted them. That keeps a genuine pairing, or an invite's knock, waiting. They can equally spend an open displaying sheet's three runs on wrong guesses, which the exchange has always allowed.
+- **A connection's peer can make the device buffer data nobody reads.** The limits on pairing messages bound what the pairing code itself holds. Underneath, the QUIC layer grants each connection flow-control credit when it is set up, and the node's endpoint grants generously because sync needs it: a peer can open many streams and fill each to its window, and that data stays buffered for as long as the connection lasts, whether or not anything reads it. This was already true of the node's sync protocols for anyone who knew its endpoint id; pairing puts that id in links and on the local network. Bounding it means giving the whole endpoint finite windows, which changes how sync behaves and is not done here.
+- **An open sheet can be detected.** Anyone who knows a device's endpoint id can learn whether a pairing sheet is open on it, and for which role and kind of pairing, by trying each greeting and seeing which is accepted. A refusal gives one answer for "no sheet" and "a sheet of another kind", which hides nothing from someone who tries them all.
+- **A knock says whether an invite is live.** Anyone holding an invite's id and the issuer's address (that is, anyone who has seen the invite) can ask whether it is still outstanding, by knocking; if nobody has opened it yet, that knock opens it. An id that was never issued, was cancelled, has expired or was opened by another device all get one answer.
+
+- **A name is only a claim, before and after.** The name in an invite and the name a device advertises are chosen by their senders. The library strips control, format and invisible characters and caps the length of an invite's name when it is written and when it is read, and offers the same function for an advertised name, which reaches the client from the platform's browser and which the client must pass through it. That stops a name disguising itself; it doesn't stop a plausible lie or lookalike letters. Nor does a successful pairing vouch for it: the exchange doesn't cover the invite, so an invite's name altered on the way is still there afterwards.
+
+**Severity:** Low. Each of these costs a person a failed attempt, a delay or a fact about their network presence; none yields a pairing, a key or vault data.
+
+**Why it is documented rather than fixed.** Finding a device you have never spoken to, with no server that knows both of you, means acting on unauthenticated hints. The design answers that by making the hints worthless without the code, not by trying to authenticate them. Clients should say so where it matters: show an invite's name as a claim and don't keep it as the contact's name, show a code only once the person has chosen to accept, treat the endpoint a knock recorded as somewhere to dial and never as someone who was verified, and let the person dismiss a device that approached.
+
+---
+
 ## Summary
 
 | # | Limitation | Severity | Why not simply fixed |
@@ -118,6 +140,7 @@ future uniffi version removes the `Drop`-versus-`Record` constraint.
 | 1 | Unencrypted `iroh-docs` redb capability store | Medium | Secret lives in `iroh-docs`'s own store — needs upstream encryption-at-rest or a `doc_dir` wrapper; OS at-rest protection mitigates meanwhile |
 | 2 | Heap identity bytes not zeroized on drop | Low | uniffi `Record`-versus-`Drop` constraint; revisit when upstream lifts it |
 | 3 | Pairing: transient stack copies and FFI-side copies of secrets not wiped | Low | Dependencies' stack frames can't be wiped from safe Rust; foreign-runtime copies are the client's to minimise |
+| 4 | Pairing discovery: links and advertisements are unauthenticated; first to reach a waiting device or knock on an invite wins; connection slots can be held and unread data buffered | Low | Finding an unknown device without a server means acting on unauthenticated hints; they are made worthless without the code instead |
 
 **Items 1 and 2 are not a confidentiality break of vault contents** — vault data
 syncs and rests only as KDBX ciphertext. Both are device-impersonation /
@@ -126,3 +149,5 @@ both are blocked on an external dependency (`iroh-docs`, `uniffi`) rather
 than on a fix we are choosing not to make.
 
 **Item 3** is about what a pairing run's session carries, and likewise needs the memory of one of the two devices at the time.
+
+**Item 4** yields no pairing, key or vault data: it is about delay, failed attempts and what a device reveals of its network presence while pairing.

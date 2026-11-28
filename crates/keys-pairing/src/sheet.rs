@@ -63,12 +63,25 @@
 //!   was showing stays.
 //!
 //! **What the transport must provide.** Each run travels on one ordered,
-//! reliable connection to an authenticated endpoint; a new run uses a new
-//! one, and a sheet's reply goes back only to the sender of the message it
-//! answers. The messages carry no run number, so a duplicated or badly late
-//! message that reaches a later run is taken as part of it. That can fail
-//! runs, and so cost a pair of sheets their budget; it can never make one
-//! succeed.
+//! reliable stream to an authenticated endpoint; a new run uses a new
+//! stream, and a sheet's reply goes back only on the stream of the message
+//! it answers. The messages carry no run number, so a transport that let a
+//! duplicated or badly late message into a later run would have it taken as
+//! part of that run. That can fail runs, and so cost a pair of sheets their
+//! budget; it can never make one succeed. The workspace's transport gives
+//! each run a stream of its own and ends the last one on the same link when
+//! the next begins, so it can't happen within a link. A displaying side can
+//! hold more than one link to the same endpoint (one that reconnected, say),
+//! and a stream on an older link isn't ended by a run on a newer one: a
+//! client hands a sheet messages only from the run stream it is using.
+//!
+//! **Which endpoint a sheet runs with is not this module's to decide, and
+//! nothing here trusts it.** A typing sheet is opened against whatever
+//! endpoint discovery produced (an advertisement on the local network, an
+//! address link, the opener an invite's knock recorded, or a device that
+//! approached first), and a displaying sheet answers whoever sends a Hello.
+//! Any of those can be an impostor's. It gets what is described next: one
+//! counted guess per run.
 //!
 //! **What an attacker in the middle gets.** One guess per run, counted. A
 //! party the typing side was pointed at, standing between it and the real
@@ -679,6 +692,28 @@ impl DisplaySheet {
         match self.state {
             DisplayState::Running { .. } => self.fail_run(Failure::Abandoned, now),
             _ => Err(PairingError::WrongState),
+        }
+    }
+
+    /// [`Self::abandon_run`], but only if the run in flight is with `peer`:
+    /// what a client calls when a connection to `peer` fails. A displaying
+    /// sheet can be reached by several endpoints at once and runs with one
+    /// of them, so a connection that fails is not necessarily the run's.
+    /// With no run in flight, or one with another endpoint, nothing changes
+    /// and the answer is [`Outcome::Ignored`].
+    ///
+    /// The run is known by its endpoint, not by its connection. An endpoint
+    /// that holds two connections (it reconnected after its network
+    /// changed, say) loses its run if the old one is reported as failed:
+    /// one run from the budget, as any dropped run costs.
+    ///
+    /// # Errors
+    /// [`PairingError::Random`] if the next code can't be drawn; the sheet
+    /// is then a dead end.
+    pub fn abandon_run_of(&mut self, peer: EndpointId) -> Result<Outcome, PairingError> {
+        match self.state {
+            DisplayState::Running { peer: running, .. } if running == peer => self.abandon_run(),
+            _ => Ok(Outcome::Ignored),
         }
     }
 }
@@ -1420,6 +1455,43 @@ mod tests {
         assert!(matches!(stray.outcome, Outcome::Ignored));
         assert!(stray.reply.is_none());
         assert!(matches!(display.status().unwrap(), DisplayStatus::Running));
+    }
+
+    #[test]
+    fn a_connection_failing_abandons_only_its_own_endpoints_run() {
+        let clock = Arc::new(ManualClock::default());
+        let (mut display, mut typing) = sheets(&clock);
+
+        // No run in flight: nothing to abandon, nothing changes.
+        assert!(matches!(
+            display.abandon_run_of(TYPING).unwrap(),
+            Outcome::Ignored
+        ));
+        let (code, _) = shown_code(&mut display);
+        let hello = typing.submit_code(code).unwrap();
+        display.handle(TYPING, &hello).unwrap();
+
+        // Another endpoint's connection fails while the run is in flight.
+        let other: EndpointId = [0x22; 32];
+        assert!(matches!(
+            display.abandon_run_of(other).unwrap(),
+            Outcome::Ignored
+        ));
+        assert!(matches!(display.status().unwrap(), DisplayStatus::Running));
+        assert_eq!(display.last_failure(), None);
+
+        // The run's own connection fails.
+        assert!(matches!(
+            display.abandon_run_of(TYPING).unwrap(),
+            Outcome::RunFailed {
+                failure: Failure::Abandoned,
+                runs_left: 2
+            }
+        ));
+        assert!(matches!(
+            display.abandon_run_of(TYPING).unwrap(),
+            Outcome::Ignored
+        ));
     }
 
     #[test]

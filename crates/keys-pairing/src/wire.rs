@@ -73,6 +73,15 @@ impl<'a> Reader<'a> {
         self.array::<N>()
     }
 
+    /// A `prepend_len` field of at most `max` bytes.
+    pub(crate) fn lv_bytes(&mut self, max: usize) -> Result<&'a [u8], RunFailure> {
+        let len = self.length()?;
+        if len > max {
+            return Err(RunFailure::MalformedMessage);
+        }
+        self.take(len)
+    }
+
     /// Fails if anything is left over.
     pub(crate) fn finish(&self) -> Result<(), RunFailure> {
         if self.bytes.is_empty() {
@@ -117,5 +126,18 @@ mod tests {
 
         // A length prefix that never ends.
         assert!(Reader::new(&[0x80, 0x80, 0x80]).lv_array::<32>().is_err());
+    }
+
+    #[test]
+    fn reads_a_variable_field_up_to_its_cap() {
+        let encoded = lv_cat(&[b"relay", b""]);
+        let mut reader = Reader::new(&encoded);
+        assert_eq!(reader.lv_bytes(5).unwrap(), b"relay");
+        assert_eq!(reader.lv_bytes(0).unwrap(), b"");
+        reader.finish().unwrap();
+
+        assert!(Reader::new(&encoded).lv_bytes(4).is_err());
+        // A length that promises more than is there.
+        assert!(Reader::new(&[5, b'r', b'e']).lv_bytes(5).is_err());
     }
 }
